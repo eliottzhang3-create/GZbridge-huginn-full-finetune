@@ -216,3 +216,15 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+__pycache__/
+*.pyc
+*.log
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.bin
+*.npy
+*.pkl
+*.safetensors
+model-*.safetensors
