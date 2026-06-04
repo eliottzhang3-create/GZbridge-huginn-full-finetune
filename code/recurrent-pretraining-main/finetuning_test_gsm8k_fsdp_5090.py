@@ -72,7 +72,7 @@ class CLISettings:
     max_samples: Optional[int] = 200
     micro_batch_size: int = 1
     compile: bool = False
-    max_steps: Optional[int] = 3
+    max_steps: Optional[int] = 20
     epochs: int = 1
     batch_size: int = 5
     optim_config: dict[str, Any] = field(
@@ -1364,29 +1364,37 @@ def main():
 
     dataset_save_dir = f"{cfg.out_path}/{cfg.run_name}/dataset"
     if is_main_process() and os.path.exists(dataset_save_dir):
-        try:
-            shutil.rmtree(dataset_save_dir)
-        except OSError as e:
-            print(f"[cleanup-warning] failed to remove {dataset_save_dir}: {e}")
+        for cleanup_attempt in range(3):
+            try:
+                shutil.rmtree(dataset_save_dir)
+                break
+            except OSError as e:
+                if cleanup_attempt == 2:
+                    print(f"[cleanup-warning] failed to remove {dataset_save_dir}: {e}")
+                else:
+                    time.sleep(1)
     return cfg.run_name
 
 
 def shutdown():
     if torch.distributed.is_initialized():
         torch.distributed.destroy_process_group()
-    print(f"---------Total time: {str(datetime.timedelta(seconds=time.time() - global_start_time))} ---------")
-    print("-----------------Shutdown complete.--------------------------")
+    if is_main_process():
+        print(f"---------Total time: {str(datetime.timedelta(seconds=time.time() - global_start_time))} ---------")
+        print("-----------------Shutdown complete.--------------------------")
 
 
 def guarded_main():
     try:
         run_name = main()
-        print("--------------------------------------------------------------------")
-        print(f"Run {run_name} finished without error.")
+        if is_main_process():
+            print("--------------------------------------------------------------------")
+            print(f"Run {run_name} finished without error.")
     except BaseException:
-        print("--------------------------------------------------------------------")
-        print("Run finished with errors.")
-        traceback.print_exc()
+        if is_main_process():
+            print("--------------------------------------------------------------------")
+            print("Run finished with errors.")
+            traceback.print_exc()
         raise
     finally:
         shutdown()  # guarantee NCCL deconstruction
