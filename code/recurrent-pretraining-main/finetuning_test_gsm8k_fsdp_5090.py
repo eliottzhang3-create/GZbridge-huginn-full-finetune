@@ -897,6 +897,12 @@ def startup(cfg: CLISettings):
                 reduce_dtype=torch.float32,
                 buffer_dtype=torch.float32,
             )
+        elif cfg.precision == "bf16-mixed":
+            mp_policy = MixedPrecision(
+                param_dtype=torch.bfloat16,
+                reduce_dtype=torch.float32,
+                buffer_dtype=torch.float32,
+            )
         elif cfg.precision == "bf16-true":
             mp_policy = MixedPrecision(
                 param_dtype=torch.bfloat16,
