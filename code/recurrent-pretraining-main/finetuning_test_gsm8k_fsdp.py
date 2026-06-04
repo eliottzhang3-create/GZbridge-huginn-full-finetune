@@ -64,7 +64,7 @@ class CLISettings:
     out_path: str = "outputs"
     dataset_location: str = "/hpc_stor03/sjtu_home/jinwei.zhang/code/recurrent-pretraining-main/data/gsm8k_train.jsonl"
     val_dataset_location: str = "/hpc_stor03/sjtu_home/jinwei.zhang/code/recurrent-pretraining-main/data/gsm8k_test.jsonl"
-    model_name: str = "/hpc_stor03/sjtu_home/jinwei.zhang/models/huginn-0125"
+    model_name: str = "/hpc_stor03/sjtu_home/jinwei.zhang/models/huginn-0125_debug"
     dataset_args: dict[str, Any] = field(default_factory=lambda: dict(q_col="question", a_col="answer"))
     dataset_config: Optional[str] = None
     max_seq_length: int = 128
