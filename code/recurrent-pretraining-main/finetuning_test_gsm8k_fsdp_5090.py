@@ -70,7 +70,7 @@ class CLISettings:
     dataset_args: dict[str, Any] = field(default_factory=lambda: dict(q_col="question", a_col="answer"))
     dataset_config: Optional[str] = None
     max_seq_length: int = 128
-    max_samples: Optional[int] = 200
+    max_samples: Optional[int] = None
     micro_batch_size: int = 1
     compile: bool = False
     max_steps: Optional[int] = None
