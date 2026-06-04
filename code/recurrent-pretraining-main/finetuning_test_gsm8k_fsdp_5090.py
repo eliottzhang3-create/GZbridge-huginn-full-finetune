@@ -18,6 +18,7 @@ import os
 import socket
 import json
 import traceback
+import re
 
 from typing import TYPE_CHECKING, Any, Optional
 import sys
@@ -72,7 +73,7 @@ class CLISettings:
     max_samples: Optional[int] = 200
     micro_batch_size: int = 1
     compile: bool = False
-    max_steps: Optional[int] = 20
+    max_steps: Optional[int] = None
     epochs: int = 1
     batch_size: int = 5
     optim_config: dict[str, Any] = field(
@@ -85,7 +86,7 @@ class CLISettings:
     max_grad_norm: float = 0.25
     precision: str = "bf16-mixed"
     gradient_checkpointing: bool = False
-    save_interval: int = 0
+    save_interval: int = 100
     save_final_checkpoint: bool = False
     use_fsdp: bool = True
     fsdp_sharding_strategy: str = "full_shard"
@@ -170,6 +171,30 @@ def save_fsdp_checkpoint(state, cfg, ckpt_name):
 
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
+
+
+def cleanup_old_checkpoints(cfg, keep_last=2):
+    if not is_main_process():
+        return
+
+    run_dir = os.path.join(cfg.out_path, cfg.run_name)
+    if not os.path.isdir(run_dir):
+        return
+
+    checkpoint_dirs = []
+    for name in os.listdir(run_dir):
+        match = re.fullmatch(r"checkpoint-(\d+)", name)
+        if match:
+            checkpoint_dirs.append((int(match.group(1)), os.path.join(run_dir, name)))
+
+    checkpoint_dirs.sort()
+    stale = checkpoint_dirs[:-keep_last]
+    for _, stale_path in stale:
+        try:
+            shutil.rmtree(stale_path)
+            print(f"[checkpoint] removed old checkpoint {stale_path}")
+        except OSError as e:
+            print(f"[checkpoint-warning] failed to remove {stale_path}: {e}")
 
 from collections import deque
 
@@ -1274,6 +1299,7 @@ def train(state, device, cfg):
                     if is_main_process():
                         print(f"[checkpoint] saving checkpoint-{optimizer_step}")
                     save_fsdp_checkpoint(state, cfg, f"checkpoint-{optimizer_step}")
+                    cleanup_old_checkpoints(cfg, keep_last=2)
 
                 if state["rank"] == 0:
                     time_interval = (time.time() - step_time) / accumulation_steps
