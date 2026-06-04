@@ -83,7 +83,7 @@ class CLISettings:
     seed: int = 74
     take_loss_over_all_tokens: bool = False
     max_grad_norm: float = 0.25
-    precision: str = "fp16-mixed"
+    precision: str = "bf16-mixed"
     gradient_checkpointing: bool = False
     save_interval: int = 0
     save_final_checkpoint: bool = False
@@ -676,7 +676,11 @@ class ActivationDebugHookLogger:
         self.current_recur_step = -1
 
     def _should_log(self):
-        return self.enabled and self.current_recur_step < self.max_recur_steps
+        if not self.enabled:
+            return False
+        if self.num_steps_with_grad <= 0:
+            return self.current_recur_step < self.max_recur_steps
+        return self.current_recur_step >= max(self.num_steps_no_grad + self.num_steps_with_grad - self.max_recur_steps, 0)
 
     def _phase(self):
         return "no_grad" if self.current_recur_step < self.num_steps_no_grad else "with_grad"
@@ -724,7 +728,8 @@ class ActivationDebugHookLogger:
         if not self.forward_header_printed:
             print(
                 f"[act-debug] data_step={self.data_step} optimizer_step={self.optimizer_step} "
-                f"num_steps_no_grad={self.num_steps_no_grad} num_steps_with_grad={self.num_steps_with_grad}"
+                f"num_steps_no_grad={self.num_steps_no_grad} num_steps_with_grad={self.num_steps_with_grad} "
+                f"log_tail_recur_steps={self.max_recur_steps}"
             )
             self.forward_header_printed = True
         print(self._summarize_tensor("adapter_in", inputs[0]))
