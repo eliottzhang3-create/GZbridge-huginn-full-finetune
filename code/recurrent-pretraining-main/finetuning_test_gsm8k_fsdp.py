@@ -89,6 +89,7 @@ class CLISettings:
     use_fsdp: bool = True
     fsdp_sharding_strategy: str = "full_shard"
     fsdp_cpu_offload: bool = False
+    activation_debug_max_recur_steps: int = 3
 
     def __post_init__(self):
         pass
@@ -609,6 +610,125 @@ def find_first_nonfinite_grad(model):
             return name, tuple(g.shape), str(g.dtype), bad_count
     return None
 
+
+class ActivationDebugHookLogger:
+    """Hook-based forward activation logger that avoids editing official model code."""
+
+    def __init__(self, model, rank, max_recur_steps=3):
+        self.rank = rank
+        self.max_recur_steps = max_recur_steps
+        self.enabled = False
+        self.data_step = None
+        self.optimizer_step = None
+        self.num_steps_no_grad = 0
+        self.num_steps_with_grad = 0
+        self.current_recur_step = -1
+        self.forward_header_printed = False
+        self.handles = []
+
+        if not hasattr(model, "transformer"):
+            return
+        if not hasattr(model.transformer, "adapter"):
+            return
+        if not hasattr(model.transformer, "core_block"):
+            return
+
+        self.handles.append(model.transformer.adapter.register_forward_pre_hook(self._adapter_pre_hook))
+        self.handles.append(model.transformer.adapter.register_forward_hook(self._adapter_post_hook))
+
+        for block_idx, block in enumerate(model.transformer.core_block):
+            self.handles.append(block.register_forward_hook(self._make_core_block_hook(block_idx)))
+
+    def begin_forward(self, data_step, optimizer_step, num_steps):
+        self.enabled = self.rank == 0 and optimizer_step == 0
+        self.data_step = int(data_step)
+        self.optimizer_step = int(optimizer_step)
+        self.current_recur_step = -1
+        self.forward_header_printed = False
+
+        if hasattr(num_steps, "__len__") and len(num_steps) > 1:
+            no_grad_steps = num_steps[0]
+            with_grad_steps = num_steps[1]
+        else:
+            no_grad_steps = num_steps
+            with_grad_steps = 0
+
+        self.num_steps_no_grad = int(no_grad_steps.item()) if torch.is_tensor(no_grad_steps) else int(no_grad_steps)
+        self.num_steps_with_grad = (
+            int(with_grad_steps.item()) if torch.is_tensor(with_grad_steps) else int(with_grad_steps)
+        )
+
+    def end_forward(self):
+        self.enabled = False
+        self.current_recur_step = -1
+
+    def _should_log(self):
+        return self.enabled and self.current_recur_step < self.max_recur_steps
+
+    def _phase(self):
+        return "no_grad" if self.current_recur_step < self.num_steps_no_grad else "with_grad"
+
+    def _summarize_tensor(self, tag, x):
+        if isinstance(x, (tuple, list)):
+            x = x[0]
+
+        y = x.detach()
+        if y.numel() == 0:
+            return f"[act-debug] data_step={self.data_step} optimizer_step={self.optimizer_step} phase={self._phase()} recur_step={self.current_recur_step} sample=0 tag={tag} empty"
+
+        if y.dim() > 0:
+            y = y[0]
+        y = y.float()
+
+        finite = torch.isfinite(y)
+        finite_all = bool(finite.all().item())
+        nonfinite = int((~finite).sum().item())
+
+        if finite.any():
+            yf = y[finite]
+            min_v = float(yf.min().item())
+            max_v = float(yf.max().item())
+            mean_v = float(yf.mean().item())
+            abs_max = float(yf.abs().max().item())
+        else:
+            min_v = float("nan")
+            max_v = float("nan")
+            mean_v = float("nan")
+            abs_max = float("nan")
+
+        return (
+            f"[act-debug] data_step={self.data_step} optimizer_step={self.optimizer_step} "
+            f"phase={self._phase()} recur_step={self.current_recur_step} sample=0 tag={tag} "
+            f"shape={tuple(y.shape)} min={min_v:.4e} max={max_v:.4e} "
+            f"mean={mean_v:.4e} abs_max={abs_max:.4e} finite={finite_all} nonfinite={nonfinite}"
+        )
+
+    def _adapter_pre_hook(self, module, inputs):
+        self.current_recur_step += 1
+        if not self._should_log():
+            return
+
+        if not self.forward_header_printed:
+            print(
+                f"[act-debug] data_step={self.data_step} optimizer_step={self.optimizer_step} "
+                f"num_steps_no_grad={self.num_steps_no_grad} num_steps_with_grad={self.num_steps_with_grad}"
+            )
+            self.forward_header_printed = True
+        print(self._summarize_tensor("adapter_in", inputs[0]))
+
+    def _adapter_post_hook(self, module, inputs, output):
+        if not self._should_log():
+            return
+        print(self._summarize_tensor("adapter_out", output))
+
+    def _make_core_block_hook(self, block_idx):
+        def _hook(module, inputs, output):
+            if not self._should_log():
+                return
+            print(self._summarize_tensor(f"core_block_{block_idx}_out", output))
+
+        return _hook
+
 """
 def debug_grad_summary(model, rank, tag, topk=5):
     bad = []
@@ -737,6 +857,12 @@ def startup(cfg: CLISettings):
 
     if rank == 0:
         print_param_debug_report(model, rank, "after_load", topk=8)
+
+    activation_debugger = ActivationDebugHookLogger(
+        model,
+        rank=rank,
+        max_recur_steps=cfg.activation_debug_max_recur_steps,
+    )
 
     ##########  Distribute model   ##############
     if distributed and cfg.use_fsdp:
@@ -942,6 +1068,7 @@ def startup(cfg: CLISettings):
     scaler = ShardedGradScaler(enabled=use_grad_scaler)
 
     state = {
+        "activation_debugger": activation_debugger,
         "model": model,
         "optimizer": optimizer,
         "tokenizer": tokenizer,
@@ -1005,9 +1132,16 @@ def train(state, device, cfg):
                 )
 
             def tightly_scoped_fwd_bwd(model, input_ids, labels, num_steps):
+                activation_debugger = state.get("activation_debugger")
                 with model.no_sync() if is_accumulating and state["distributed"] else nullcontext():
                     with torch.autocast(**state["autocast_args"]):
-                        outputs = model(input_ids, labels=labels, num_steps=num_steps)
+                        if activation_debugger is not None:
+                            activation_debugger.begin_forward(data_step, optimizer_step, num_steps)
+                        try:
+                            outputs = model(input_ids, labels=labels, num_steps=num_steps)
+                        finally:
+                            if activation_debugger is not None:
+                                activation_debugger.end_forward()
 
                     scaled_loss = outputs["loss"] / accumulation_steps
                     if state["scaler"].is_enabled():
