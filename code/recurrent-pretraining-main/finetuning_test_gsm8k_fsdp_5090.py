@@ -17,6 +17,7 @@ global_start_time = time.time()
 import os
 import socket
 import json
+import traceback
 
 from typing import TYPE_CHECKING, Any, Optional
 import sys
@@ -552,6 +553,18 @@ def debug_first_batch(state, input_ids, labels, data_step):
     print(state["tokenizer"].decode(input_ids[0].tolist(), skip_special_tokens=False)[:1000])
     print(f"[debug-batch][rank={state['rank']}] sample_end")
 
+
+def collate_tokenized_batch(features):
+    batch = {}
+    for key in features[0].keys():
+        values = [feature[key] for feature in features]
+        first_value = values[0]
+        if isinstance(first_value, torch.Tensor):
+            batch[key] = torch.stack(values)
+        else:
+            batch[key] = torch.tensor(values)
+    return batch
+
 def debug_first_sample_alignment(state, raw_batch_input_ids, input_ids, labels, data_step, max_positions=160):
     if data_step != 1 or state["rank"] != 0:
         return
@@ -1022,8 +1035,6 @@ def startup(cfg: CLISettings):
         print(tokenizer.decode(tokenized_dataset[idx]["input_ids"], skip_special_tokens=False))
         print("--------------------------------------------------------------------------------------------")
 
-    tokenized_dataset.set_format("pt")
-
     if distributed:
         sampler = torch.utils.data.DistributedSampler(
             tokenized_dataset,  # type: ignore
@@ -1037,6 +1048,7 @@ def startup(cfg: CLISettings):
             batch_size=cfg.micro_batch_size,
             sampler=sampler,
             pin_memory=True,
+            collate_fn=collate_tokenized_batch,
         )
     else:
         dataloader = torch.utils.data.DataLoader(
@@ -1044,6 +1056,7 @@ def startup(cfg: CLISettings):
             batch_size=cfg.micro_batch_size,
             shuffle=True,
             pin_memory=True,
+            collate_fn=collate_tokenized_batch,
         )
 
     ##########     Scheduler       ##############
@@ -1362,6 +1375,7 @@ def guarded_main():
     except BaseException:
         print("--------------------------------------------------------------------")
         print("Run finished with errors.")
+        traceback.print_exc()
         raise
     finally:
         shutdown()  # guarantee NCCL deconstruction
