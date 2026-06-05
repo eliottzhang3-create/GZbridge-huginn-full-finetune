@@ -28,6 +28,7 @@ NUM_FEWSHOT="${NUM_FEWSHOT:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-bfloat16}"
 MEAN_RECURRENCE="${MEAN_RECURRENCE:-32}"
+BATCH_SIZE="${BATCH_SIZE:-1}"
 OUTPUT_DIR="${OUTPUT_DIR:-${WORKDIR}/outputs/lm_eval_${TASK}_$(basename "${CHECKPOINT_DIR}")}"
 
 mkdir -p scripts/fake_bin
@@ -45,6 +46,7 @@ chmod +x scripts/fake_bin/git
 export PATH="${WORKDIR}/scripts/fake_bin:/usr/bin:/bin:${PATH}"
 export HF_ENDPOINT="${HF_ENDPOINT:-https://hf-mirror.com}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "[step] env ready"
 echo "ACTIVE_ENV=${CONDA_DEFAULT_ENV}"
@@ -56,6 +58,8 @@ echo "NUM_FEWSHOT=${NUM_FEWSHOT}"
 echo "DEVICE=${DEVICE}"
 echo "DTYPE=${DTYPE}"
 echo "MEAN_RECURRENCE=${MEAN_RECURRENCE}"
+echo "BATCH_SIZE=${BATCH_SIZE}"
+echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
 
 echo "[step] python"
 which python || true
@@ -76,7 +80,7 @@ lm_eval run \
   --model_args "pretrained=${CHECKPOINT_DIR},trust_remote_code=True,dtype=${DTYPE},mean_recurrence=${MEAN_RECURRENCE}" \
   --tasks "${TASK}" \
   --device "${DEVICE}" \
-  --batch_size auto \
+  --batch_size "${BATCH_SIZE}" \
   --num_fewshot "${NUM_FEWSHOT}" \
   --output_path "${OUTPUT_DIR}" \
   --log_samples
