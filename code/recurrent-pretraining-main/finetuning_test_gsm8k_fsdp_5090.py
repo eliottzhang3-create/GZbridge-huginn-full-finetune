@@ -86,8 +86,8 @@ class CLISettings:
     max_grad_norm: float = 0.25
     precision: str = "bf16-mixed"
     gradient_checkpointing: bool = False
-    save_interval: int = 100
-    save_final_checkpoint: bool = False
+    save_interval: int = 20
+    save_final_checkpoint: bool = True
     use_fsdp: bool = True
     fsdp_sharding_strategy: str = "full_shard"
     fsdp_cpu_offload: bool = False
