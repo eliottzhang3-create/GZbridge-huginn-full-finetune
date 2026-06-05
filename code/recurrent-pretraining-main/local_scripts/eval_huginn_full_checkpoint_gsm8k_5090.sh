@@ -6,17 +6,7 @@ source "$USER_CONDA_BASE/etc/profile.d/conda.sh"
 conda activate "$USER_CONDA_BASE/envs/swift_huginn"
 
 WORKDIR="$(pwd)"
-RUN_DIR="${WORKDIR}/outputs/huginn-gsm8k-fsdp-5090"
-CHECKPOINT_DIR="${1:-${CHECKPOINT_DIR:-}}"
-
-if [[ -z "${CHECKPOINT_DIR}" ]]; then
-  CHECKPOINT_DIR="$(ls -dt "${RUN_DIR}"/checkpoint-* 2>/dev/null | head -n1 || true)"
-fi
-
-if [[ -z "${CHECKPOINT_DIR}" ]]; then
-  echo "No checkpoint found. Pass a checkpoint path as the first argument or set CHECKPOINT_DIR."
-  exit 1
-fi
+CHECKPOINT_DIR="/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/code/recurrent-pretraining-main/outputs/huginn-gsm8k-fsdp-5090/final_checkpoint"
 
 if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
   echo "Checkpoint directory does not exist: ${CHECKPOINT_DIR}"
