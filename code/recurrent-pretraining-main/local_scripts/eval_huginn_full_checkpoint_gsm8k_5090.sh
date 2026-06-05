@@ -50,6 +50,7 @@ echo "DTYPE=${DTYPE}"
 echo "MEAN_RECURRENCE=${MEAN_RECURRENCE}"
 echo "BATCH_SIZE=${BATCH_SIZE}"
 echo "PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF}"
+echo "APPLY_CHAT_TEMPLATE=true"
 
 echo "[step] python"
 which python || true
@@ -72,6 +73,7 @@ lm_eval run \
   --device "${DEVICE}" \
   --batch_size "${BATCH_SIZE}" \
   --num_fewshot "${NUM_FEWSHOT}" \
+  --apply_chat_template \
   --output_path "${OUTPUT_DIR}" \
   --log_samples
 
