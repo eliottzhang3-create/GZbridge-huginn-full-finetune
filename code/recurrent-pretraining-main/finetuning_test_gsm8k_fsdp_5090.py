@@ -1047,10 +1047,11 @@ def startup(cfg: CLISettings):
 
         tokenized_dataset = dataset.map(
             format_and_tokenize_examples,
-            num_proc=16,
+            num_proc=1,
             remove_columns=dataset.column_names,
             batched=True,
-            batch_size=1024,
+            batch_size=128,
+            desc="Tokenizing GSM8K",
         )
         before_len = len(tokenized_dataset)
         tokenized_dataset = tokenized_dataset.filter(lambda x: x["valid_supervised"] > 0)
