@@ -1,0 +1,11 @@
+vc submit \
+  -n huginn_eval_5090_with_sys \
+  -p pdgpu-5090 \
+  -t 08:00:00 \
+  -c 8 \
+  -m 32G \
+  -g 1 \
+  --desc "Huginn full-checkpoint GSM8K eval on 5090 with system prompt" \
+  -o log/huginn_eval_5090_with_sys.%J.log \
+  -d "$(pwd)" \
+  --cmd "bash local_scripts/eval_huginn_full_checkpoint_gsm8k_5090_with_sys.sh"
