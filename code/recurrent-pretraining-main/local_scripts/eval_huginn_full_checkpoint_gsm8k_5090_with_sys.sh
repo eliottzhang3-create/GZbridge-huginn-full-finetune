@@ -13,7 +13,7 @@ if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
   exit 1
 fi
 
-TASK="${TASK:-gsm8k_cot}"
+TASK="${TASK:-gsm8k}"
 NUM_FEWSHOT="${NUM_FEWSHOT:-0}"
 DEVICE="${DEVICE:-cuda:0}"
 DTYPE="${DTYPE:-bfloat16}"
@@ -78,7 +78,6 @@ lm_eval run \
   --num_fewshot "${NUM_FEWSHOT}" \
   --system_instruction "${SYSTEM_PROMPT}" \
   --apply_chat_template \
-  --fewshot_as_multiturn \
   --output_path "${OUTPUT_DIR}" \
   --log_samples
 
