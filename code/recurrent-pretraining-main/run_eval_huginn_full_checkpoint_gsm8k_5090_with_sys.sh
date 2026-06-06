@@ -1,5 +1,6 @@
+mkdir -p log
+
 vc submit \
-  -n huginn_eval_5090_with_sys \
   -p pdgpu-5090 \
   -t 08:00:00 \
   -c 8 \
