@@ -6,7 +6,7 @@ source "$USER_CONDA_BASE/etc/profile.d/conda.sh"
 conda activate "$USER_CONDA_BASE/envs/swift_huginn"
 
 WORKDIR="$(pwd)"
-CHECKPOINT_DIR="/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/code/recurrent-pretraining-main/outputs/huginn-gsm8k-fsdp-5090/final_checkpoint"
+CHECKPOINT_DIR="/hpc_stor03/sjtu_home/jinwei.zhang/models/huginn-0125"
 
 if [[ ! -d "${CHECKPOINT_DIR}" ]]; then
   echo "Checkpoint directory does not exist: ${CHECKPOINT_DIR}"
