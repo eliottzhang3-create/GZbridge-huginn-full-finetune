@@ -1,0 +1,219 @@
+"""Audio experiment wrapper around the original Huginn backbone."""
+
+from __future__ import annotations
+
+import gc
+from typing import Optional
+
+import torch
+from torch import nn
+from transformers import WhisperModel
+
+from ._base import CausalLMOutputRecurrentLatents, RavenForCausalLM
+from .raven_config_minimal import HuginnAudioConfig
+
+
+class TrainableTemporalCompressor(nn.Module):
+    def __init__(self, hidden_size: int, target_token_count: int):
+        super().__init__()
+        self.conv = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, stride=2, padding=1)
+        self.norm = nn.LayerNorm(hidden_size)
+        self.act = nn.GELU()
+        self.pool = nn.AdaptiveAvgPool1d(target_token_count)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = x.transpose(1, 2)
+        x = self.conv(x)
+        x = x.transpose(1, 2)
+        x = self.norm(x)
+        x = self.act(x)
+        x = x.transpose(1, 2)
+        x = self.pool(x)
+        return x.transpose(1, 2)
+
+
+class AudioProjector(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
+        super().__init__()
+        self.input_norm = nn.LayerNorm(input_dim)
+        self.fc1 = nn.Linear(input_dim, hidden_dim)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.output_norm = nn.LayerNorm(output_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.input_norm(x)
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.fc2(x)
+        return self.output_norm(x)
+
+
+class HuginnAudioForConditionalGeneration(RavenForCausalLM):
+    config_class = HuginnAudioConfig
+
+    def __init__(self, config: HuginnAudioConfig):
+        super().__init__(config)
+        self.config = config
+
+        whisper = WhisperModel.from_pretrained(config.audio_encoder_name)
+        self.audio_encoder = whisper.encoder
+        del whisper
+
+        self.temporal_compressor = TrainableTemporalCompressor(
+            hidden_size=config.audio_encoder_hidden_size,
+            target_token_count=config.audio_target_token_count,
+        )
+        self.audio_projector = AudioProjector(
+            input_dim=config.audio_encoder_hidden_size,
+            hidden_dim=config.audio_projector_hidden_size,
+            output_dim=config.n_embd,
+        )
+
+        if config.use_audio_boundary_embeddings:
+            self.audio_bos = nn.Parameter(torch.zeros(1, 1, config.n_embd))
+            self.audio_eos = nn.Parameter(torch.zeros(1, 1, config.n_embd))
+            nn.init.normal_(self.audio_bos, mean=0.0, std=config.init_values["std"])
+            nn.init.normal_(self.audio_eos, mean=0.0, std=config.init_values["std"])
+        else:
+            self.audio_bos = None
+            self.audio_eos = None
+
+        self._freeze_requested_modules()
+
+    def _freeze_requested_modules(self):
+        if self.config.freeze_text_backbone:
+            for param in self.transformer.parameters():
+                param.requires_grad = False
+            for param in self.lm_head.parameters():
+                param.requires_grad = False
+
+        if self.config.freeze_audio_encoder:
+            for param in self.audio_encoder.parameters():
+                param.requires_grad = False
+
+    @torch.no_grad()
+    def load_huginn_backbone_from_pretrained(
+        self,
+        base_model_name_or_path: str,
+        torch_dtype: Optional[torch.dtype] = None,
+    ):
+        base_model = RavenForCausalLM.from_pretrained(
+            base_model_name_or_path,
+            trust_remote_code=True,
+            torch_dtype=torch_dtype,
+            low_cpu_mem_usage=True,
+        )
+        incompatible = self.load_state_dict(base_model.state_dict(), strict=False)
+        del base_model
+        gc.collect()
+        self._freeze_requested_modules()
+        return incompatible
+
+    def build_audio_prefix(
+        self,
+        audio_input_features: torch.Tensor,
+        audio_attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        del audio_attention_mask
+        encoder_outputs = self.audio_encoder(
+            input_features=audio_input_features,
+            return_dict=True,
+        )
+        audio_hidden = encoder_outputs.last_hidden_state
+        audio_hidden = self.temporal_compressor(audio_hidden)
+        audio_embeds = self.audio_projector(audio_hidden)
+
+        prefix_chunks = []
+        if self.audio_bos is not None:
+            prefix_chunks.append(self.audio_bos.expand(audio_embeds.size(0), -1, -1))
+        prefix_chunks.append(audio_embeds)
+        if self.audio_eos is not None:
+            prefix_chunks.append(self.audio_eos.expand(audio_embeds.size(0), -1, -1))
+        return torch.cat(prefix_chunks, dim=1)
+
+    def trainable_parameter_summary(self):
+        trainable = []
+        frozen = []
+        for name, param in self.named_parameters():
+            (trainable if param.requires_grad else frozen).append(name)
+        return {"trainable": trainable, "frozen_count": len(frozen), "trainable_count": len(trainable)}
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        input_embeds: Optional[torch.Tensor] = None,
+        input_states: Optional[torch.Tensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        num_steps: Optional[torch.Tensor] = None,
+        past_key_values=None,
+        output_details: dict = {
+            "return_logits": True,
+            "return_latents": True,
+            "return_head": False,
+            "return_stats": False,
+        },
+        use_cache: bool = False,
+        cache_position: Optional[torch.Tensor] = None,
+        init_scale: float = 1.0,
+        audio_input_features: Optional[torch.Tensor] = None,
+        audio_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> CausalLMOutputRecurrentLatents:
+        model_input_ids = input_ids
+        model_labels = labels
+        model_attention_mask = attention_mask
+
+        if audio_input_features is not None and past_key_values is None:
+            if input_embeds is not None:
+                raise ValueError("Pass either input_embeds or audio_input_features, not both.")
+
+            text_embeds = self.transformer.wte(input_ids)  # type: ignore[attr-defined]
+            audio_prefix = self.build_audio_prefix(audio_input_features, audio_attention_mask)
+            input_embeds = torch.cat([audio_prefix.to(text_embeds.dtype), text_embeds], dim=1)
+
+            prefix_len = audio_prefix.shape[1]
+            prefix_ids = torch.full(
+                (input_ids.size(0), prefix_len),
+                fill_value=self.config.pad_token_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            model_input_ids = torch.cat([prefix_ids, input_ids], dim=1)
+
+            if labels is not None:
+                prefix_labels = torch.full(
+                    (labels.size(0), prefix_len),
+                    fill_value=-100,
+                    dtype=labels.dtype,
+                    device=labels.device,
+                )
+                model_labels = torch.cat([prefix_labels, labels], dim=1)
+
+            if attention_mask is not None:
+                prefix_mask = torch.ones(
+                    (attention_mask.size(0), prefix_len),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
+                )
+                model_attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
+
+        return super().forward(
+            input_ids=model_input_ids,
+            input_embeds=input_embeds,
+            input_states=input_states,
+            attention_mask=model_attention_mask,
+            position_ids=position_ids,
+            labels=model_labels,
+            num_steps=num_steps,
+            past_key_values=past_key_values,
+            output_details=output_details,
+            use_cache=use_cache,
+            cache_position=cache_position,
+            init_scale=init_scale,
+            audio_input_features=audio_input_features,
+            audio_attention_mask=audio_attention_mask,
+            **kwargs,
+        )
