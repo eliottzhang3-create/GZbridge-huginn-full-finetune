@@ -1,8 +1,6 @@
 """Configuration for the Huginn audio experiment branch."""
 
-from . import _base  # type: ignore
-
-RavenConfig = _base.RavenConfig
+from ._base import RavenConfig
 
 
 class HuginnAudioConfig(RavenConfig):
