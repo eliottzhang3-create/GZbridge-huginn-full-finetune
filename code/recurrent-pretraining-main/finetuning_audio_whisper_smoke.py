@@ -22,7 +22,7 @@ class CLISettings:
     max_seq_length: int = 128
     sample_rate: int = 16000
     duration_seconds: float = 1.0
-    micro_batch_size: int = 2
+    micro_batch_size: int = 1
     max_steps: int = 6
     lr: float = 1e-3
     precision: str = "bf16-mixed"
@@ -125,6 +125,36 @@ def print_trainable_summary(model):
     print(f"[audio-smoke] frozen_param_tensors={frozen_count} trainable_param_tensors={len(trainable)}")
 
 
+def resolve_model_dtype(precision: str) -> torch.dtype:
+    if precision == "bf16-mixed":
+        return torch.bfloat16
+    if precision == "fp16-mixed":
+        return torch.float16
+    return torch.float32
+
+
+def print_grad_summary(model):
+    grad_stats = []
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if param.grad is None:
+            grad_stats.append((name, "missing", None))
+        else:
+            grad_stats.append((name, "ok", float(param.grad.detach().abs().max().item())))
+
+    print("[audio-smoke] grad summary:")
+    for name, status, abs_max in grad_stats:
+        if status == "missing":
+            print(f"  - {name}: grad=missing")
+        else:
+            print(f"  - {name}: grad_abs_max={abs_max:.4e}")
+
+    missing = [name for name, status, _ in grad_stats if status == "missing"]
+    if missing:
+        raise RuntimeError(f"Trainable parameters missing gradients: {missing}")
+
+
 def main():
     cfg = CLISettings()
     seed_everything(cfg.seed)
@@ -135,6 +165,7 @@ def main():
     print("--------------------------------------------------------------------")
     print(f"Host={socket.gethostname()} Python={sys.version.split(' (')[0]} Torch={torch.__version__} Device={device}")
 
+    model_dtype = resolve_model_dtype(cfg.precision)
     config = AutoConfig.from_pretrained(cfg.audio_model_dir, trust_remote_code=True)
     config.audio_encoder_name = cfg.audio_encoder_name
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
@@ -142,15 +173,18 @@ def main():
     print(f"[audio-smoke] backbone load missing={len(load_result.missing_keys)} unexpected={len(load_result.unexpected_keys)}")
     if load_result.unexpected_keys:
         print("[audio-smoke] unexpected_keys:", load_result.unexpected_keys[:10])
+    if load_result.missing_keys:
+        print("[audio-smoke] first_missing_keys:", load_result.missing_keys[:10])
 
     tokenizer = AutoTokenizer.from_pretrained(cfg.base_model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     processor = AutoProcessor.from_pretrained(cfg.audio_encoder_name)
 
-    model.to(device)
+    model.to(device=device, dtype=model_dtype)
     model.train()
     print_trainable_summary(model)
+    print(f"[audio-smoke] model_dtype={model_dtype}")
 
     trainable_params = [param for param in model.parameters() if param.requires_grad]
     optimizer = torch.optim.AdamW(trainable_params, lr=cfg.lr)
@@ -196,14 +230,7 @@ def main():
                 raise RuntimeError(f"Non-finite loss in smoke test at step={step}: {loss}")
             loss.backward()
 
-            grad_found = False
-            for name, param in model.named_parameters():
-                if param.requires_grad and param.grad is not None:
-                    grad_found = True
-                    print(f"[audio-smoke] grad {name} abs_max={param.grad.detach().abs().max().item():.4e}")
-                    break
-            if not grad_found:
-                raise RuntimeError("Smoke test backward completed but no trainable gradient was found.")
+            print_grad_summary(model)
 
             optimizer.step()
             print(f"[audio-smoke] step={step} loss={loss.item():.4f}")
