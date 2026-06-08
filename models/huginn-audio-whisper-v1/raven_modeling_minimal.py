@@ -7,6 +7,7 @@ from typing import Optional
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from transformers import WhisperModel
 
 from ._base import CausalLMOutputRecurrentLatents, RavenForCausalLM
@@ -36,16 +37,17 @@ class AudioProjector(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
         self.input_norm = nn.LayerNorm(input_dim)
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.act = nn.GELU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
+        self.w1 = nn.Linear(input_dim, hidden_dim)
+        self.w2 = nn.Linear(input_dim, hidden_dim)
+        self.c_proj = nn.Linear(hidden_dim, output_dim)
         self.output_norm = nn.LayerNorm(output_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.input_norm(x)
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.fc2(x)
+        a1 = self.w1(x)
+        a2 = self.w2(x)
+        x = a1 * F.silu(a2)
+        x = self.c_proj(x)
         return self.output_norm(x)
 
 

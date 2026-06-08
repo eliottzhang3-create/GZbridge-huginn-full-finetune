@@ -723,7 +723,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             else None,
         )
 
-       def _should_debug_activation(self, current_step: int | Tensor) -> bool:
+    def _should_debug_activation(self, current_step: int | Tensor) -> bool:
         if not self.training:
             return False
         if not torch.distributed.is_available() or not torch.distributed.is_initialized():
@@ -813,7 +813,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             )
         return self.transformer.ln_f(x), num_steps_no_grad, num_steps_with_grad, xk.detach(), block_idx  # type: ignore # types broken in 2.6+
     
-        def core_block_forward(
+    def core_block_forward(
         self,
         x,
         input_embeds,
