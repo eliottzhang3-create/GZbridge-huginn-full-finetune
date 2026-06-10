@@ -15,7 +15,13 @@ from typing import Optional
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
-from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+from transformers import (
+    AutoConfig,
+    AutoModelForCausalLM,
+    AutoProcessor,
+    AutoTokenizer,
+    get_cosine_schedule_with_warmup,
+)
 
 
 @dataclass
@@ -30,10 +36,10 @@ class CLISettings:
     max_seq_length: int = 192
     target_sample_rate: int = 16000
     max_audio_seconds: float = 30.0
-    micro_batch_size: int = 1
+    micro_batch_size: int = 3
     epochs: int = 1
     max_steps: Optional[int] = None
-    lr: float = 2e-4
+    lr: float = 1e-4
     precision: str = "bf16-mixed"
     use_randomized_num_steps: bool = True
     fixed_num_steps_no_grad: int = 2
@@ -42,6 +48,7 @@ class CLISettings:
     log_interval: int = 20
     save_interval: int = 200
     keep_last_checkpoints: int = 2
+    warmup_ratio: float = 0.05
     system_prompt: str = "You are a helpful assistant that answers questions about audio."
 
 
@@ -288,6 +295,19 @@ def main():
         shuffle=True,
         collate_fn=build_collate_fn(tokenizer, processor, cfg),
     )
+    steps_per_epoch = len(dataloader)
+    total_train_steps = cfg.max_steps if cfg.max_steps is not None else steps_per_epoch * cfg.epochs
+    warmup_steps = max(1, int(total_train_steps * cfg.warmup_ratio)) if total_train_steps > 0 else 0
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=warmup_steps,
+        num_training_steps=total_train_steps,
+    )
+    print(
+        f"[audio-full] micro_batch_size={cfg.micro_batch_size} optimizer_update_every=1_micro_step "
+        f"steps_per_epoch={steps_per_epoch} total_train_steps={total_train_steps} "
+        f"warmup_steps={warmup_steps} base_lr={cfg.lr}"
+    )
 
     autocast_dtype = torch.bfloat16 if cfg.precision == "bf16-mixed" else torch.float16
     fixed_num_steps = torch.tensor(
@@ -329,7 +349,12 @@ def main():
                 print_grad_summary(model)
 
             optimizer.step()
-            print(f"[audio-full] epoch={epoch} step={step} loss={loss.item():.4f} audio={batch['audio_paths'][0]}")
+            scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            print(
+                f"[audio-full] epoch={epoch} step={step} loss={loss.item():.4f} "
+                f"lr={current_lr:.6e} audio={batch['audio_paths'][0]}"
+            )
 
             if step % cfg.save_interval == 0:
                 save_trainable_state(model, output_dir, step, cfg.keep_last_checkpoints)
