@@ -111,15 +111,24 @@ class ClothoAQADataset(Dataset):
         return len(self.examples)
 
     def __getitem__(self, idx):
-        record = self.examples[idx]
-        audio_path = self.dataset_dir / record["audio_path"]
-        waveform = load_wav_mono(audio_path, self.target_sr, self.max_audio_seconds)
-        return {
-            "audio": waveform,
-            "question": record["question"],
-            "answer": record["answer"],
-            "audio_path": str(audio_path),
-        }
+        last_error = None
+        for offset in range(len(self.examples)):
+            record = self.examples[(idx + offset) % len(self.examples)]
+            audio_path = self.dataset_dir / record["audio_path"]
+            try:
+                waveform = load_wav_mono(audio_path, self.target_sr, self.max_audio_seconds)
+                return {
+                    "audio": waveform,
+                    "question": record["question"],
+                    "answer": record["answer"],
+                    "audio_path": str(audio_path),
+                }
+            except (EOFError, wave.Error, ValueError) as exc:
+                last_error = exc
+                print(f"[audio-full][bad-audio] skip path={audio_path} error={type(exc).__name__}: {exc}")
+                continue
+
+        raise RuntimeError(f"Failed to load any audio example from dataset; last_error={last_error}")
 
 
 def build_collate_fn(tokenizer, processor, cfg: CLISettings):
