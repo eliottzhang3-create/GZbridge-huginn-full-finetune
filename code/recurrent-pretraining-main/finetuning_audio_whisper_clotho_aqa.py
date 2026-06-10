@@ -26,7 +26,7 @@ from transformers import (
 
 @dataclass
 class CLISettings:
-    run_name: str = "huginn-audio-whisper-clotho-aqa"
+    run_name: str = "huginn-audio-whisper-clotho-aqa-v2"
     out_path: str = "outputs"
     base_model_name: str = "/hpc_stor03/sjtu_home/jinwei.zhang/models/huginn-0125"
     audio_model_dir: str = "/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/models/huginn-audio-whisper-v1"
