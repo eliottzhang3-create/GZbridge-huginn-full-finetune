@@ -36,11 +36,11 @@ class CLISettings:
         "code/recurrent-pretraining-main/outputs/huginn-audio-whisper-clotho-aqa-v2/checkpoint-7029"
     )
     dataset_dir: str = "/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_caption_huginn"
-    train_jsonl: str = "train.jsonl"
+    train_jsonl: str = "train_expand.json"
     max_seq_length: int = 192
     target_sample_rate: int = 16000
     max_audio_seconds: float = 30.0
-    micro_batch_size: int = 3
+    micro_batch_size: int = 5
     epochs: int = 2
     max_steps: Optional[int] = None
     lr: float = 5e-5
@@ -108,7 +108,13 @@ class ClothoCaptionDataset(Dataset):
         self.max_audio_seconds = max_audio_seconds
         manifest_path = self.dataset_dir / train_jsonl
         with manifest_path.open("r", encoding="utf-8") as f:
-            self.examples = [json.loads(line) for line in f]
+            if manifest_path.suffix.lower() == ".json":
+                payload = json.load(f)
+                if not isinstance(payload, list):
+                    raise ValueError(f"Expected a JSON array in {manifest_path}")
+                self.examples = payload
+            else:
+                self.examples = [json.loads(line) for line in f if line.strip()]
         if not self.examples:
             raise ValueError(f"No training examples found in {manifest_path}")
 
