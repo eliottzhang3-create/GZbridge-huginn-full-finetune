@@ -223,6 +223,16 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def write_records(path: Path, records: list[dict]):
+    if path.suffix.lower() == ".jsonl":
+        with path.open("w", encoding="utf-8") as f:
+            for record in records:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    else:
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(records, f, ensure_ascii=False, indent=2)
+
+
 def main():
     args = parse_args()
     input_path = Path(args.input_jsonl)
@@ -232,8 +242,7 @@ def main():
     expanded, stats = iter_expanded_records(records, target_count=args.target_count)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    with output_path.open("w", encoding="utf-8") as f:
-        json.dump(expanded, f, ensure_ascii=False, indent=2)
+    write_records(output_path, expanded)
 
     print(f"[clotho-expand] input_jsonl={input_path}")
     print(f"[clotho-expand] output_json={output_path}")
