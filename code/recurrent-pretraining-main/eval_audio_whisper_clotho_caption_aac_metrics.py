@@ -25,6 +25,19 @@ def install_torchvision_stub():
     if "torchvision" in sys.modules:
         return
 
+    class _MissingTorchvisionAttr:
+        def __init__(self, name: str):
+            self._name = name
+
+        def __call__(self, *args, **kwargs):
+            raise RuntimeError(
+                f"torchvision stub attribute '{self._name}' was called. "
+                "This evaluation script expects caption metrics only and should not need real torchvision."
+            )
+
+        def __getattr__(self, item: str):
+            return _MissingTorchvisionAttr(f"{self._name}.{item}")
+
     root = types.ModuleType("torchvision")
     root.__spec__ = importlib.machinery.ModuleSpec("torchvision", loader=None)
     sys.modules["torchvision"] = root
@@ -46,6 +59,12 @@ def install_torchvision_stub():
         BOX = 5
 
     submodules["transforms"].InterpolationMode = _InterpolationMode
+    submodules["models"].resnet50 = _MissingTorchvisionAttr("torchvision.models.resnet50")
+    submodules["models"].vgg16 = _MissingTorchvisionAttr("torchvision.models.vgg16")
+    submodules["models"].VGG16_Weights = _MissingTorchvisionAttr("torchvision.models.VGG16_Weights")
+    submodules["models"].ResNet50_Weights = _MissingTorchvisionAttr("torchvision.models.ResNet50_Weights")
+    submodules["models"].__getattr__ = lambda name: _MissingTorchvisionAttr(f"torchvision.models.{name}")
+    root.__getattr__ = lambda name: _MissingTorchvisionAttr(f"torchvision.{name}")
 
 
 install_torchvision_stub()
