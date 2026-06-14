@@ -208,7 +208,7 @@ def main():
     probe_dataset = GroupedClothoEvalDataset(
         dataset_dir=args.dataset_dir,
         manifest_name=args.eval_manifest,
-        target_sample_rate=args.target_sample_rate,
+        target_sr=args.target_sample_rate,
         max_audio_seconds=args.max_audio_seconds,
     )
     desired_count = parse_sample_count(str(args.sample_count), len(probe_dataset))
