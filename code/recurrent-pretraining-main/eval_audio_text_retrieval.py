@@ -13,7 +13,7 @@ import torch
 from audio_alignment_eval_common import (
     add_common_eval_args,
     collect_audio_embeddings_from_dataloader,
-    compute_reference_caption_embeddings,
+    compute_grouped_reference_caption_embeddings,
     create_eval_dataloader,
     GroupedClothoEvalDataset,
     load_eval_components,
@@ -142,18 +142,20 @@ def evaluate_checkpoint(args: argparse.Namespace, checkpoint_dir: str, chosen_in
         device=device,
         precision=args.precision,
     )
-    text_embeddings = compute_reference_caption_embeddings(
+    text_embeddings, text_embedding_mask = compute_grouped_reference_caption_embeddings(
         model=model,
         tokenizer=tokenizer,
         reference_groups=references,
         device=device,
         max_length=args.max_text_length,
         batch_size=args.text_batch_size,
-    ).float()
+    )
 
     audio_embeddings = normalize_rows(audio_embeddings)
-    text_embeddings = normalize_rows(text_embeddings)
-    similarity_matrix = torch.matmul(audio_embeddings, text_embeddings.t()).cpu()
+    text_embeddings = normalize_rows(text_embeddings.float())
+    similarity_per_reference = torch.einsum("nd,mrd->nmr", audio_embeddings, text_embeddings)
+    masked_similarity = similarity_per_reference.masked_fill(~text_embedding_mask.unsqueeze(0), float("-inf"))
+    similarity_matrix = masked_similarity.max(dim=-1).values.cpu()
     metrics = compute_retrieval_metrics(similarity_matrix)
     failures = collect_failure_examples(
         similarity_matrix=similarity_matrix,

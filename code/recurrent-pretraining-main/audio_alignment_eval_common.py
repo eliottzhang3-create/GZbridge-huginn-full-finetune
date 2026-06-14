@@ -368,6 +368,62 @@ def compute_reference_caption_embeddings(
     return grouped / counts.clamp_min(1.0)
 
 
+def compute_grouped_reference_caption_embeddings(
+    model,
+    tokenizer,
+    reference_groups: list[list[str]],
+    device: torch.device,
+    max_length: int = 192,
+    batch_size: int = 64,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    flat_texts: list[str] = []
+    owners: list[int] = []
+    positions: list[int] = []
+    max_refs = max((len(refs) for refs in reference_groups), default=0)
+    if max_refs == 0:
+        raise ValueError("No references available to encode.")
+
+    for group_idx, refs in enumerate(reference_groups):
+        for ref_idx, ref in enumerate(refs):
+            flat_texts.append(ensure_non_empty_text(ref, tokenizer))
+            owners.append(group_idx)
+            positions.append(ref_idx)
+
+    per_ref_embeddings = []
+    with torch.inference_mode():
+        for start in range(0, len(flat_texts), batch_size):
+            chunk = flat_texts[start : start + batch_size]
+            batch = tokenizer(
+                chunk,
+                padding=True,
+                truncation=True,
+                max_length=max_length,
+                return_tensors="pt",
+                add_special_tokens=False,
+            )
+            input_ids = batch["input_ids"].to(device)
+            attention_mask = batch["attention_mask"].to(device)
+            text_embeds = model.get_input_embeddings()(input_ids)
+            pooled = mean_pool_embeddings(text_embeds, attention_mask)
+            per_ref_embeddings.append(pooled)
+
+    all_ref_embeddings = torch.cat(per_ref_embeddings, dim=0)
+    hidden_dim = all_ref_embeddings.shape[1]
+    grouped = torch.zeros(
+        (len(reference_groups), max_refs, hidden_dim),
+        device=device,
+        dtype=all_ref_embeddings.dtype,
+    )
+    mask = torch.zeros((len(reference_groups), max_refs), device=device, dtype=torch.bool)
+
+    for idx, embedding in enumerate(all_ref_embeddings):
+        owner = owners[idx]
+        pos = positions[idx]
+        grouped[owner, pos] = embedding
+        mask[owner, pos] = True
+    return grouped, mask
+
+
 def collect_audio_embeddings_from_dataloader(
     model,
     dataloader: DataLoader,
