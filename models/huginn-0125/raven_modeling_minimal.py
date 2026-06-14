@@ -600,6 +600,10 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         pad_token_id=65509,
     ) -> Optional[BlockMask]:
         batch_size, seq_len = input_ids.shape[0], input_ids.shape[1]
+        if attention_mask is not None and attention_mask.dim() not in (2, 3):
+            raise ValueError(
+                f"Expected attention_mask to have rank 2 or 3, got shape={tuple(attention_mask.shape)}"
+            )
 
         # If no padding and no attention mask, no need for a mask
         if attention_mask is None and (input_ids == pad_token_id).sum() == 0:
@@ -615,11 +619,19 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         if attention_mask is None:
 
             def mask_mod(b, h, q_idx, kv_idx):
-                return q_idx >= kv_idx & (input_ids[b, kv_idx] != pad_token_id)
+                return (q_idx >= kv_idx) & (input_ids[b, kv_idx] != pad_token_id)
+        elif attention_mask.dim() == 2:
+
+            def mask_mod(b, h, q_idx, kv_idx):
+                return (q_idx >= kv_idx) & (input_ids[b, kv_idx] != pad_token_id) & (attention_mask[b, kv_idx] != 0)
         else:
 
             def mask_mod(b, h, q_idx, kv_idx):
-                return (q_idx >= kv_idx) & (input_ids[b, kv_idx] != pad_token_id) & attention_mask[b, q_idx, kv_idx]
+                return (
+                    (q_idx >= kv_idx)
+                    & (input_ids[b, kv_idx] != pad_token_id)
+                    & (attention_mask[b, q_idx, kv_idx] != 0)
+                )
 
         kv_length = past_key_values.get_seq_length() if past_key_values is not None else seq_len
         if kv_length == 0:
@@ -673,7 +685,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         if use_cache and past_key_values is None:
             past_key_values = HuginnDynamicCache()
 
-        prepared_attn_mask = None  # self.compile_mask(input_ids, attention_mask, past_key_values)
+        prepared_attn_mask = self.compile_mask(input_ids, attention_mask, past_key_values)
         block_idx = torch.tensor(-1, device=torch.device("cpu"), dtype=torch.long)  # count in tensors for compile
         # Non-recurrent prelude
         for block in self.transformer.prelude:  # type: ignore # types broken in 2.6+
