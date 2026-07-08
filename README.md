@@ -1,141 +1,211 @@
 # GUIZHOU_codex
-Just for convenience, want to refine the code frome the remote server via codex.
+
+Just for convenience, this repo is used to refine code locally with Codex and sync it to the remote HPC side through GitHub.
 
 # Huginn Full Finetuning Sync Repo
 
 ## Purpose
 
-This repository is a **code-sync workspace** for Huginn full-parameter finetuning experiments on GSM8K.
+This repository is a **code-sync workspace**, not the full runtime environment.
 
-It is **not** intended to store:
+It is used to:
+
+1. edit code comfortably on the local Windows machine with Codex
+2. `git push` the code to GitHub
+3. `git pull` on the remote Linux HPC machine
+4. keep experiment code, shell scripts, small configs, and documentation synchronized
+
+This repository is **not** intended to store:
 
 - model weights
 - checkpoints
 - output directories
 - cached datasets
-- long training logs
+- large logs
+- remote-only temporary artifacts
 
-Its main purpose is:
+---
 
-1. let local Codex edit code comfortably
-2. let the user `git push` locally
-3. let the remote HPC machine `git pull`
-4. keep experiment code, scripts, and debugging state synchronized
+## Project Scope
+
+This repo now contains **two active experiment lines**:
+
+1. **Huginn full-parameter GSM8K finetuning**
+   - based on FSDP
+   - mainly for multi-GPU remote training
+   - currently adapted for **8x RTX 5090**
+
+2. **Huginn audio-modality experiment branch**
+   - based on the **original Huginn backbone**, not the GSM8K-finetuned checkpoint
+   - architecture: **Whisper-small encoder + temporal compressor + audio projector + Huginn text backbone**
+   - current focus is **audio-to-text understanding/alignment**, not speech generation
+
+---
+
+## Local / GitHub / Remote Workflow
+
+This project uses **GitHub as the transport layer** between local editing and remote execution.
+
+### Machines
+
+- **Local machine**
+  - Windows
+  - Codex edits code here
+  - local paths use Windows style
+
+- **Remote machine**
+  - Linux HPC cluster
+  - actual training / evaluation jobs run here
+  - remote paths use Linux style
+
+### Required workflow
+
+1. edit locally in this repo
+2. run local static checks when needed, mainly `python -m py_compile`
+3. `git add/commit/push`
+4. on remote, `git pull`
+5. submit jobs remotely with the provided submit scripts
+6. inspect remote logs and paste important output back into chat when debugging
+
+Codex **cannot directly operate on the remote server**. Any remote command must be executed by the user.
 
 ---
 
 ## Remote Environment
 
-Primary remote paths currently in use:
+### Main remote code roots currently in use
 
-- Model code directory:
+- Remote sync repo code root:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/code/recurrent-pretraining-main`
+
+- Remote model root:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/models/huginn-0125`
-- Training code directory:
-  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/recurrent-pretraining-main`
 
-Important remote files currently under active modification:
+- Remote audio experiment model root:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/models/huginn-audio-whisper-v1`
 
-- `/hpc_stor03/sjtu_home/jinwei.zhang/models/huginn-0125/raven_modeling_minimal.py`
-- `/hpc_stor03/sjtu_home/jinwei.zhang/code/recurrent-pretraining-main/finetuning_test_gsm8k_fsdp.py`
-- `/hpc_stor03/sjtu_home/jinwei.zhang/code/recurrent-pretraining-main/run_train_huginn_full_gsm8k_fsdp.sh`
-- `/hpc_stor03/sjtu_home/jinwei.zhang/code/recurrent-pretraining-main/local_scripts/train_huginn_full_gsm8k_fsdp.sh`
+- Remote Whisper encoder root:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-small`
+
+### Main remote conda environments
+
+- Training / most evaluation:
+  - `swift_huginn`
+
+- AAC caption metric evaluation:
+  - `audio_eval`
+  - used for `aac_metrics`-based caption benchmark scripts
+
+### Fixed remote container
+
+- `docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1`
+
+Do not casually change the container unless the user explicitly asks.
 
 ---
 
-## Recommended Repo Layout
+## Queue / Submission Constraints
 
-Mirror only the code and small config structure that matters:
+The current queue in use is:
+
+- `pdgpu-5090`
+
+Important queue rule from the user:
+
+- for **1 GPU** jobs:
+  - CPU cores must be `<= 8`
+  - memory must be `<= 32G`
+
+Therefore the standard single-GPU submit shape is:
+
+- `-c 8 -m 32G -g 1 -n 1`
+
+For **8 GPU** jobs, the current full-training submit script uses:
+
+- `-c 32 -m 256G -g 8 -n 1`
+
+which satisfies the per-GPU rule.
+
+Remote jobs should be launched through the provided `vc submit` shell scripts, not by directly starting long training commands manually.
+
+---
+
+## Repository Layout
+
+Current important structure:
 
 ```text
 repo-root/
-  README_HUGINN_FULL_FINETUNE.md
+  README.md
   .gitignore
   models/
     huginn-0125/
       raven_modeling_minimal.py
       raven_config_minimal.py
       config.json
-      README.md
+      ...
+    huginn-audio-whisper-v1/
+      _base.py
+      raven_config_minimal.py
+      raven_modeling_minimal.py
+      config.json
+      __init__.py
   code/
     recurrent-pretraining-main/
       finetuning_test_gsm8k_fsdp.py
-      run_train_huginn_full_gsm8k_fsdp.sh
+      finetuning_test_gsm8k_fsdp_5090.py
+      finetuning_audio_whisper_smoke.py
+      finetuning_audio_whisper_tiny_overfit.py
+      finetuning_audio_whisper_clotho_aqa.py
+      finetuning_audio_whisper_clotho_caption.py
+      prepare_clotho_caption_expand.py
+      analyze_audio_whisper_clotho_aqa.py
+      audio_alignment_eval_common.py
+      eval_vocab_retrieval.py
+      eval_audio_text_retrieval.py
+      eval_visualization.py
+      eval_audio_whisper_clotho_caption_aac_metrics.py
+      run_*.sh
       local_scripts/
-        train_huginn_full_gsm8k_fsdp.sh
+        train_*.sh
+        eval_*.sh
 ```
-
-If additional small Python/config files are modified, add them too.
-
-Do **not** add the large weight shards from `models/huginn-0125/`.
 
 ---
 
-## What `.gitignore` Is
+## `.gitignore` Policy
 
-`.gitignore` is a file that tells Git:
+This repo should track:
 
-> "These files/directories should not be tracked or committed."
+- source code
+- shell scripts
+- small config files
+- documentation
 
-For this project, it is critical because the remote Huginn model directory may contain:
+This repo should not track:
 
-- `model-00001-of-00004.safetensors`
-- other `*.safetensors`
+- model shards
+- `outputs/`
 - checkpoints
-- logs
-- generated outputs
+- cached datasets
+- temporary logs
 
-Without a proper `.gitignore`, these can accidentally be committed to GitHub.
+The current `.gitignore` already excludes the main large artifacts such as:
 
----
+- `outputs/`
+- `*.pt`
+- `*.pth`
+- `*.bin`
+- `*.npy`
+- `*.pkl`
+- `*.safetensors`
+- `model-*.safetensors`
 
-## Suggested `.gitignore`
-
-```gitignore
-# Python
-__pycache__/
-*.pyc
-*.pyo
-
-# Logs
-*.log
-logs/
-
-# Outputs / checkpoints
-outputs/
-checkpoints/
-**/outputs/
-**/checkpoints/
-
-# Dataset caches
-dataset/
-datasets/
-cache/
-**/dataset/
-
-# Torch / numpy / pickle
-*.pt
-*.pth
-*.bin
-*.npy
-*.npz
-*.pkl
-
-# Hugging Face / model weights
-*.safetensors
-model-*.safetensors
-
-# OS/editor
-.DS_Store
-Thumbs.db
-.idea/
-.vscode/
-```
-
-If the repo mirrors the Huginn directory structure, this is usually enough to keep all large weights out of Git.
+If a new dataset-preprocessing step creates local artifacts, check whether they should also be ignored before committing.
 
 ---
 
-## Project Background
+## Huginn Background
 
 The training target is **Huginn**, a recurrent language model architecture with three main structural parts:
 
@@ -143,281 +213,414 @@ The training target is **Huginn**, a recurrent language model architecture with 
 - `core_block`
 - `coda`
 
-Unlike a standard decoder-only Transformer with a simple one-pass stack of blocks, Huginn uses recurrent computation in the `core_block` section.
+Unlike a standard decoder-only Transformer, Huginn uses recurrent computation inside `core_block`. This affects:
 
-This matters a lot for distributed training.
-
----
-
-## Goal
-
-Run **full-parameter finetuning** of Huginn on **GSM8K** using **8x V100** with FSDP, while preserving Huginn's training characteristic of **random long-tail recurrent iteration counts**.
-
-There is also a LoRA line of work, but this repository and debugging context are focused on the **full finetuning path**.
+- distributed wrapping strategy
+- recurrence sampling logic
+- numerical stability debugging
+- masking behavior
+- multimodal prefix injection design
 
 ---
 
-## Current Training Strategy
+## GSM8K Full-Finetuning Line
 
-### 1. Manual Fine-Grained FSDP
+### Main goal
 
-The current working wrapping strategy is:
+Run **full-parameter finetuning** of Huginn on **GSM8K** with FSDP, preserving Huginn's characteristic of **random long-tail recurrent iteration counts**.
 
-- wrap every real block inside:
-  - `transformer.prelude`
-  - `transformer.core_block`
-  - `transformer.coda`
-- then wrap the whole model once more with an outer/root FSDP
+### Important scripts
 
-This was chosen instead of `auto_wrap_policy`.
+- Main 5090 training script:
+  - `code/recurrent-pretraining-main/finetuning_test_gsm8k_fsdp_5090.py`
 
-Reason:
+- Main 5090 submit script:
+  - `code/recurrent-pretraining-main/run_train_huginn_full_gsm8k_fsdp_5090.sh`
 
-- Huginn uses `ModuleList` containers plus recurrent execution
-- naive auto-wrap caused deadlocks and container-related wrap confusion
-- manual wrapping is more controllable
+- Main 5090 local script:
+  - `code/recurrent-pretraining-main/local_scripts/train_huginn_full_gsm8k_fsdp_5090.sh`
 
-### 2. Cross-Rank Shared Recurrent Step Sampling
+- GSM8K evaluation without system prompt:
+  - `code/recurrent-pretraining-main/eval_huginn_full_checkpoint_gsm8k_5090.sh`
 
-Fine-grained FSDP only became stable after synchronizing recurrent step counts across ranks.
+- GSM8K evaluation with system prompt:
+  - `code/recurrent-pretraining-main/eval_huginn_full_checkpoint_gsm8k_5090_with_sys.sh`
 
-Current idea:
+### Known design choices
 
-- rank 0 samples `(num_steps_no_grad, num_steps_with_grad)` once per global step
-- this pair is broadcast to all ranks
-- every rank runs the same recurrence depth for that step
+1. **Manual fine-grained FSDP**
+   - wrap real blocks in `prelude`, `core_block`, `coda`
+   - then root-wrap the whole model
+   - avoid naive `auto_wrap_policy`
 
-This preserves:
+2. **Shared recurrent step counts across ranks**
+   - rank 0 samples recurrence settings
+   - broadcast to all ranks
+   - preserves randomness across steps while preventing cross-rank mismatches within one distributed step
 
-- randomness **between** training steps
+3. **8x5090 adaptation**
+   - dedicated 5090 script exists
+   - queue name is already wired to `pdgpu-5090`
 
-while enforcing:
+4. **Checkpoint behavior**
+   - intermediate checkpoint frequency was adjusted during debugging
+   - training scripts and save logic should always be checked before restarting long runs
 
-- consistency **within** a distributed step
+### Current status
 
-This was necessary to avoid FSDP collective mismatches and hangs.
+- The 8x5090 full-training path has already been brought to a runnable state.
+- Earlier issues included:
+  - dynamic module import problems
+  - Huginn remote-code file mismatch
+  - torchvision `VideoReader` import issue from dataset formatting
+  - non-finite grad norm
+  - OOM / precision-related instability
+- A complete run was later achieved successfully.
 
-### 3. Current Label Construction
-
-The current script uses manual next-token shifting:
-
-- `input_ids = raw[:, :-1]`
-- `labels = masked raw[:, 1:]`
-
-The Huginn forward path does **not** apply another internal shift before CE loss.
-
-Debugging so far strongly suggests:
-
-- the current full-finetuning path is **not** suffering from the earlier LoRA-style double-shift issue
-- the supervised region starts at the Huginn answer tokens, not the system/user prompt
-
----
-
-## Important Debugging History (Up to date)
-
-### Phase 1: Root-Only FSDP
-
-Root-only FSDP could run, but memory pressure remained high.
-
-### Phase 2: Auto-Wrap Attempt
-
-An `auto_wrap_policy` approach was tried and failed.
-
-Main issues:
-
-- Huginn `core_block` is a `ModuleList`
-- recurrent execution means different ranks can enter child FSDP modules different numbers of times if recurrence is sampled independently
-- this caused deadlocks / hangs
-
-### Phase 3: Manual Fine-Grained FSDP + Shared Step Counts
-
-This combination resolved the earlier distributed hang problem.
-
-### Phase 4: Current Main Issue = Numerical Instability
-
-The current blocker is no longer FSDP deadlock.
-
-The current blocker is:
-
-- first real optimizer update triggers non-finite grad norm
-- often at `data_step=5`, `optimizer_step=0`
-
-This means:
-
-- gradients blow up during or before the first true update
-- parameters themselves usually remain finite at that moment
+This means the GSM8K line is **no longer at the "cannot run" stage**; the current repo already contains the stabilized code path that got the job to finish.
 
 ---
 
-## What the Current Debug Logs Suggest
+## Huginn Audio Experiment Line
 
-Current evidence indicates:
+### High-level objective
 
-- parameters are usually still finite
-- gradients become non-finite before optimizer step
-- the problem appears before or around the first true update
-- suspicious layers frequently include:
-  - `transformer.adapter.weight`
-  - `transformer.core_block.*.mlp.proj.weight`
-  - sometimes `transformer.wte.weight`
+Build an **independent audio experiment branch on top of the original Huginn backbone**, without modifying the already GSM8K-finetuned model.
 
-The working hypothesis is:
+### V1 architecture
 
-- the issue is a **numerical stability problem in the forward/backward path**
-- not primarily a label-shift bug
-- not primarily an optimizer-step corruption bug
+Current experiment branch:
 
-Current next-step debugging direction:
+- audio encoder:
+  - **Whisper-small**
+- temporal compressor:
+  - Conv1d downsampling + normalization + activation + adaptive pooling
+- audio projector:
+  - project Whisper-side features into Huginn text hidden space
+- Huginn text backbone:
+  - frozen in V1
 
-- inspect activations around:
-  - adapter input/output
-  - recurrent core block outputs
-  - especially MLP projection path
+Current V1 training policy:
 
----
+- freeze **Huginn backbone**
+- freeze **Whisper encoder**
+- train only:
+  - `temporal_compressor`
+  - `audio_projector`
+  - optional `audio_bos`
+  - optional `audio_eos`
 
-## Current User Requirements
+### Important model files
 
-The user explicitly wants to preserve Huginn's defining training property:
+- `models/huginn-audio-whisper-v1/raven_modeling_minimal.py`
+- `models/huginn-audio-whisper-v1/raven_config_minimal.py`
+- `models/huginn-audio-whisper-v1/_base.py`
 
-- random long-tail recurrent training depth
+### Important training scripts
 
-Temporary fixed-depth experiments were only used for diagnosis, not as a final training design.
+- smoke test:
+  - `code/recurrent-pretraining-main/finetuning_audio_whisper_smoke.py`
 
-So any future solution should aim to keep:
+- tiny overfit:
+  - `code/recurrent-pretraining-main/finetuning_audio_whisper_tiny_overfit.py`
 
-- random recurrence across steps
-- synchronized recurrence across ranks within each step
+- full ClothoAQA training:
+  - `code/recurrent-pretraining-main/finetuning_audio_whisper_clotho_aqa.py`
 
----
+- Clotho caption continuation training:
+  - `code/recurrent-pretraining-main/finetuning_audio_whisper_clotho_caption.py`
 
-## How Codex Should Help In Future Chats
+### Current data roots used on remote
 
-When a new Codex thread starts, it should understand:
+- ClothoAQA:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_aqa_huginn`
 
-1. This project is about Huginn **full finetuning**, not only LoRA.
-2. The key active files are:
-   - `models/huginn-0125/raven_modeling_minimal.py`
-   - `code/recurrent-pretraining-main/finetuning_test_gsm8k_fsdp.py`
-   - training shell scripts
-3. Fine-grained FSDP must be **manual**, not naive auto-wrap.
-4. Recurrent step counts must be shared across ranks per global step.
-5. Current main blocker is **non-finite gradients near the first optimizer update**.
-6. Current debugging focus is **activation / numerical stability**, especially around adapter and recurrent MLP projection paths.
+- tiny ClothoAQA subset:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_aqa_huginn_tiny_train32`
 
-### Operating Rules For Future Codex Chats
+- Clotho caption:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_caption_huginn`
 
-Codex should follow these rules strictly in future chats:
+### Current data assumptions
 
-1. **Codex is local-only and cannot directly operate on the remote HPC server.**
-   - Codex runs on the local machine. Codex can only modify or execute commands or programs on the local machine and of course in the sandbox.
-   - Any remote command must be executed by the user.
-   - The user will copy command output back into the chat. 
-   - Therefore, Codex must give commands in a form the user can run directly on the remote machine.
+#### ClothoAQA-style training data
 
-2. **The remote machine is Linux, while the local machine is Windows.**
-   - When discussing paths or commands, Codex must not mix Windows and Linux paths.
-   - Remote runtime paths use Linux style, such as:
-     - `/hpc_stor03/sjtu_home/jinwei.zhang/...`
-   - Local editing paths use Windows style.
-   - Codex must always be explicit about which machine a path or command belongs to.
+Each record contains:
 
-3. **Codex must not pretend to know the remote state.**
-   - Codex cannot see the live remote filesystem, installed packages, job queue, container state, logs, or current file contents unless the user provides them.
-   - Before making a strong claim or giving a precise remote fix, Codex must first confirm missing remote facts by asking for:
-     - command output
-     - file snippets
-     - logs
-     - directory listings
-     - scheduler status
-   - Codex must not guess remote details when those details are important for correctness.
+- `audio_path`
+- question / instruction text
+- answer text
 
-4. **Remote jobs must never be launched directly.**
-   - Directly running long training tasks on the remote server is strictly forbidden.
-   - The required workflow is:
-     1. `vc info` to inspect available resources
-     2. `bash <submit_script>.sh` or the approved `vc submit` submission flow
-     3. `vc list` to inspect job status
-     4. `tail -f <log_file>` to monitor runtime logs
-   - Codex must not suggest directly launching training with raw `python`, `torchrun`, or similar commands on the remote server unless the user explicitly says it is for a short, safe, non-training diagnostic and it is allowed.
+#### Clotho caption training data
 
-5. **Container choice is fixed and should not be changed casually.**
-   - The user already has Miniconda locally.
-   - The training container currently used on the remote side is fixed:
-     - `docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1`
-   - Codex should assume this container remains unchanged unless the user explicitly says otherwise.
-   - The focus should be environment setup and code behavior, not replacing the container.
+The caption data was expanded so that one audio with multiple references becomes multiple training samples.
 
-6. **The current repository is a sync repository, not the full runtime environment.**
-   - The sync repo is mainly used to move code between local editing and remote execution.
-   - It should contain:
-     - source code
-     - shell scripts
-     - small configs
-     - documentation
-   - It should not contain:
-     - model weights
-     - checkpoints
-     - outputs
-     - dataset caches
-     - large logs
+Current helper script:
 
-7. **Codex should help the user by producing precise, minimal, executable remote instructions.**
-   - Good outputs include:
-     - exact shell commands
-     - exact file snippets to replace
-     - exact grep/sed/nl commands to inspect code
-     - exact interpretation of returned logs
-   - Bad outputs include:
-     - vague speculation
-     - long generic theory with no next action
-     - instructions that assume remote access Codex does not have
+- `code/recurrent-pretraining-main/prepare_clotho_caption_expand.py`
 
-8. **Codex should preserve Huginn’s core training property.**
-   - Huginn’s random long-tail recurrent depth is important and should not be removed as a final solution.
-   - Temporary simplifications such as fixed recurrence depth are allowed only as diagnostics.
-   - Final recommendations should preserve:
-     - random recurrence across global training steps
-     - synchronized recurrence across ranks within a step
+Current caption training manifest:
 
-9. **Codex should be careful with file synchronization advice.**
-   - The user may have:
-     - the remote runtime copy of the code
-     - the local sync repository copy
-     - GitHub as the transport layer
-   - Codex must be explicit about the source of truth for each step:
-     - whether the user is syncing from remote to repo
-     - from repo to local
-     - or from local back to remote
-   - Codex should not casually suggest overwriting remote runtime files unless the user confirms that the repository version is the desired newer version.
+- `train_expand.json`
 
-10. **Codex should always optimize for reducing user copy-paste burden.**
-    - The user is using Git/GitHub precisely to avoid fragile manual copy-paste editing between local and remote.
-    - Codex should favor workflows that let the user:
-      - edit locally
-      - commit/push cleanly
-      - pull or sync predictably
-    - If a suggested workflow would increase manual duplication, Codex should reconsider it.
+Current evaluation manifest convention:
+
+- `test_expand.jsonl`
+
+### Current progress
+
+The audio branch has already passed several stages:
+
+1. **smoke test passed**
+   - random / synthetic path can forward + backward + save
+
+2. **tiny overfit passed**
+   - tiny ClothoAQA subset can train and save checkpoints
+
+3. **full ClothoAQA training completed**
+   - current notable checkpoint lineage includes:
+     - `huginn-audio-whisper-clotho-aqa-v2/checkpoint-7029`
+
+4. **Clotho caption continuation training implemented and run**
+   - initialized from the ClothoAQA adapter checkpoint
+   - uses expanded caption training manifest
+
+5. **audio alignment analysis tooling implemented**
+   - retrieval / visualization / vocab probing scripts are now in repo
+
+This means the audio line is already beyond the "just wire projector and pray" phase; there is now an actual trainable branch, checkpoints, and post-training analysis tooling.
 
 ---
 
-## Suggested Local-to-Remote Workflow
+## Current Audio Training Defaults
 
-1. Keep this repository locally.
-2. Use Codex locally to edit code files.
-3. Commit and push to GitHub.
-4. On the remote server, pull the repo.
-5. Copy synced code files into the real runtime paths if needed.
-6. Submit jobs remotely through the existing training workflow.
+### `finetuning_audio_whisper_clotho_aqa.py`
 
-If possible, keep the repo directory structure close to remote paths to make syncing simpler.
+- run name:
+  - `huginn-audio-whisper-clotho-aqa-v2`
+- dataset:
+  - `clotho_aqa_huginn`
+- micro batch size:
+  - `3`
+- optimizer:
+  - `AdamW`
+- learning rate:
+  - `1e-4`
+- scheduler:
+  - `cosine with warmup`
+- warmup ratio:
+  - `0.05`
+
+### `finetuning_audio_whisper_clotho_caption.py`
+
+- run name:
+  - `huginn-audio-whisper-clotho-caption-v1`
+- init checkpoint:
+  - from ClothoAQA adapter checkpoint
+- dataset:
+  - `clotho_caption_huginn`
+- train manifest:
+  - `train_expand.json`
+- micro batch size:
+  - `5`
+- optimizer:
+  - `AdamW`
+- learning rate:
+  - `5e-5`
+- scheduler:
+  - `cosine with warmup`
+- warmup ratio:
+  - `0.05`
+
+Note:
+
+- current audio training is **single-GPU**, not distributed
+- `optimizer_update_every=1_micro_step` in the current scripts
 
 ---
 
-## Last Known Practical Reminder
+## Audio Evaluation / Analysis Tooling
 
-Before remote training runs:
+There are now **two different audio-eval directions** in this repo.
 
-- run `python -m py_compile` on modified Python files
-- verify duplicated debug helper functions have not been accidentally introduced
-- verify `.gitignore` is keeping out large artifacts
+### 1. Caption benchmark evaluation
+
+Script:
+
+- `code/recurrent-pretraining-main/eval_audio_whisper_clotho_caption_aac_metrics.py`
+
+Purpose:
+
+- generate captions on Clotho test
+- evaluate caption metrics such as CIDEr / SPICE / SPIDEr through `aac_metrics`
+
+Environment notes:
+
+- typically intended for the remote `audio_eval` env
+- may require extra handling because `torchmetrics` can trigger implicit `torchvision` imports
+
+### 2. Modality-alignment evaluation suite
+
+Shared helper:
+
+- `code/recurrent-pretraining-main/audio_alignment_eval_common.py`
+
+Scripts:
+
+- `code/recurrent-pretraining-main/eval_vocab_retrieval.py`
+- `code/recurrent-pretraining-main/eval_audio_text_retrieval.py`
+- `code/recurrent-pretraining-main/eval_visualization.py`
+
+Purpose:
+
+1. **Vocabulary retrieval**
+   - inspect which text tokens the pooled audio embedding is closest to
+
+2. **Audio-text retrieval**
+   - quantify whether the adapter pulls matched audio and caption embeddings closer in text embedding space
+   - supports comparing checkpoints
+
+3. **Visualization**
+   - UMAP-based 2D projection of audio embeddings and caption embeddings
+
+Current important convention:
+
+- these scripts use **Clotho `test_expand.jsonl`**
+- references are grouped by `audio_path`
+- checkpoint input means a directory containing:
+  - `trainable_state.pt`
+
+---
+
+## Important Masking / Attention Fix Already Landed
+
+One important bugfix already made in this repo:
+
+- `models/huginn-0125/raven_modeling_minimal.py` was updated so external `attention_mask` is actually compiled into Huginn's real attention path instead of being ignored.
+
+This matters because previously:
+
+- labels were masking pad positions correctly
+- but Huginn self-attention was not using the external mask
+
+Current fix:
+
+- `compile_mask(...)` supports 2D and 3D masks
+- causal masking and external valid-token masking are both respected
+- Huginn `forward(...)` now uses the compiled mask instead of forcing `prepared_attn_mask = None`
+
+This is important context if later training behavior changes after the mask fix.
+
+---
+
+## Current Active Files
+
+If a new Codex / AI agent chat needs to start working immediately, the most relevant files are usually:
+
+### Backbone / model logic
+
+- `models/huginn-0125/raven_modeling_minimal.py`
+- `models/huginn-audio-whisper-v1/raven_modeling_minimal.py`
+- `models/huginn-audio-whisper-v1/raven_config_minimal.py`
+- `models/huginn-audio-whisper-v1/_base.py`
+
+### GSM8K full finetuning
+
+- `code/recurrent-pretraining-main/finetuning_test_gsm8k_fsdp_5090.py`
+- `code/recurrent-pretraining-main/local_scripts/train_huginn_full_gsm8k_fsdp_5090.sh`
+- `code/recurrent-pretraining-main/run_train_huginn_full_gsm8k_fsdp_5090.sh`
+
+### Audio training
+
+- `code/recurrent-pretraining-main/finetuning_audio_whisper_smoke.py`
+- `code/recurrent-pretraining-main/finetuning_audio_whisper_tiny_overfit.py`
+- `code/recurrent-pretraining-main/finetuning_audio_whisper_clotho_aqa.py`
+- `code/recurrent-pretraining-main/finetuning_audio_whisper_clotho_caption.py`
+- `code/recurrent-pretraining-main/prepare_clotho_caption_expand.py`
+
+### Audio evaluation
+
+- `code/recurrent-pretraining-main/audio_alignment_eval_common.py`
+- `code/recurrent-pretraining-main/eval_vocab_retrieval.py`
+- `code/recurrent-pretraining-main/eval_audio_text_retrieval.py`
+- `code/recurrent-pretraining-main/eval_visualization.py`
+- `code/recurrent-pretraining-main/eval_audio_whisper_clotho_caption_aac_metrics.py`
+
+---
+
+## How New Codex / AI Chats Should Behave
+
+Any new chat should assume the following:
+
+1. This repo is a **sync repo**, not the full remote runtime filesystem.
+2. Codex is **local-only** unless the user explicitly pastes remote outputs back.
+3. Remote Linux facts must not be guessed if they are important.
+4. Long remote jobs should be launched through the existing `run_*.sh` submit scripts.
+5. Windows local paths and Linux remote paths must never be mixed up.
+6. The project is no longer only about GSM8K:
+   - there is now a substantial **audio branch**
+7. The current audio branch is:
+   - original Huginn backbone
+   - Whisper-small encoder
+   - frozen backbone + frozen encoder
+   - trainable compressor/projector
+8. The current audio project already has:
+   - smoke training
+   - tiny overfit
+   - full AQA training
+   - caption continuation training
+   - alignment evaluation scripts
+
+---
+
+## Suggested Operating Rules For Future Chats
+
+1. Be explicit about whether a path/command is **local Windows** or **remote Linux**.
+2. Prefer giving the user exact remote commands instead of vague instructions.
+3. Do not assume remote file contents unless the user has synced or shown them.
+4. Do not suggest committing weights, checkpoints, or outputs into Git.
+5. When editing scripts, keep the queue rule in mind:
+   - single GPU jobs must stay within `8 CPU / 32G MEM`
+6. For local work, prefer:
+   - code edits
+   - static syntax checks
+   - README / script maintenance
+7. If debugging remote runtime behavior, ask for:
+   - log snippets
+   - `grep` results
+   - file listings
+   - exact traceback lines
+
+---
+
+## Suggested Local-to-Remote Routine
+
+1. edit locally in this repo
+2. run `python -m py_compile` on changed Python files
+3. `git status`
+4. `git add/commit/push`
+5. remote side: `git pull`
+6. remote side: submit the corresponding `run_*.sh`
+7. inspect `log/*.log`
+8. if something fails, paste back:
+   - traceback
+   - related grep output
+   - the exact checkpoint / dataset / script path used
+
+---
+
+## Last Known Practical Notes
+
+- Current audio and GSM8K branches coexist in the same sync repo.
+- The repo already contains both training and evaluation entrypoints for each line.
+- The most likely future work is:
+  - continue improving audio alignment / caption quality
+  - evaluate checkpoints with retrieval / visualization / caption metrics
+  - possibly add new audio datasets or unfreeze more modules in later stages
+
+Before any long remote run:
+
+- confirm the intended script is the latest synced version
+- confirm the checkpoint path is the one you actually want
+- confirm the output `run_name` will not collide with old runs
+- confirm the queue resource request still follows the current rules
