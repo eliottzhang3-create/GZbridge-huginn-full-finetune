@@ -6,7 +6,10 @@
   ],
   "audio_encoder_hidden_size": 768,
   "audio_encoder_name": "/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-small",
-  "audio_pooling_type": "conv1d_avg",
+  "audio_compressor_kernel_size": 7,
+  "audio_compressor_stride": 12,
+  "audio_compressor_intermediate_size": 1536,
+  "audio_pooling_type": "conv_gmlp_residual_avg32",
   "audio_projector_hidden_size": 2048,
   "audio_target_token_count": 32,
   "auto_map": {

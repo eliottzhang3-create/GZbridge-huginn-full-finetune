@@ -10,8 +10,11 @@ class HuginnAudioConfig(RavenConfig):
         self,
         audio_encoder_name: str = "/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-small",
         audio_encoder_hidden_size: int = 768,
-        audio_pooling_type: str = "conv1d_avg",
+        audio_pooling_type: str = "conv_gmlp_residual_avg32",
         audio_target_token_count: int = 32,
+        audio_compressor_intermediate_size: int | None = None,
+        audio_compressor_kernel_size: int = 7,
+        audio_compressor_stride: int = 12,
         audio_projector_hidden_size: int = 2048,
         freeze_audio_encoder: bool = True,
         freeze_text_backbone: bool = True,
@@ -22,6 +25,9 @@ class HuginnAudioConfig(RavenConfig):
         self.audio_encoder_hidden_size = audio_encoder_hidden_size
         self.audio_pooling_type = audio_pooling_type
         self.audio_target_token_count = audio_target_token_count
+        self.audio_compressor_intermediate_size = audio_compressor_intermediate_size
+        self.audio_compressor_kernel_size = audio_compressor_kernel_size
+        self.audio_compressor_stride = audio_compressor_stride
         self.audio_projector_hidden_size = audio_projector_hidden_size
         self.freeze_audio_encoder = freeze_audio_encoder
         self.freeze_text_backbone = freeze_text_backbone

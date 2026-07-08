@@ -15,21 +15,55 @@ from .raven_config_minimal import HuginnAudioConfig
 
 
 class TrainableTemporalCompressor(nn.Module):
-    def __init__(self, hidden_size: int, target_token_count: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        target_token_count: int,
+        intermediate_size: int | None = None,
+        kernel_size: int = 7,
+        stride: int = 12,
+    ):
         super().__init__()
-        self.conv = nn.Conv1d(hidden_size, hidden_size, kernel_size=3, stride=2, padding=1)
-        self.norm = nn.LayerNorm(hidden_size)
-        self.act = nn.GELU()
-        self.pool = nn.AdaptiveAvgPool1d(target_token_count)
+        intermediate_size = intermediate_size or hidden_size * 2
+        padding = kernel_size // 2
+        self.target_token_count = target_token_count
+        self.stride = stride
+
+        self.gate_proj = nn.Conv1d(
+            hidden_size,
+            intermediate_size,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+        self.up_proj = nn.Conv1d(
+            hidden_size,
+            intermediate_size,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+        self.down_proj = nn.Conv1d(intermediate_size, hidden_size, kernel_size=1)
+
+        self.shortcut_pool = nn.AvgPool1d(kernel_size=stride, stride=stride, ceil_mode=True)
+        self.shortcut_proj = nn.Conv1d(hidden_size, hidden_size, kernel_size=1)
+        self.output_pool = nn.AdaptiveAvgPool1d(target_token_count)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x.transpose(1, 2)
-        x = self.conv(x)
-        x = x.transpose(1, 2)
-        x = self.norm(x)
-        x = self.act(x)
-        x = x.transpose(1, 2)
-        x = self.pool(x)
+        gate = torch.sigmoid(self.gate_proj(x))
+        value = self.up_proj(x)
+        x_conv = self.down_proj(value * gate)
+
+        x_shortcut = self.shortcut_proj(self.shortcut_pool(x))
+
+        if x_conv.size(-1) != x_shortcut.size(-1):
+            target_len = min(x_conv.size(-1), x_shortcut.size(-1))
+            x_conv = x_conv[..., :target_len]
+            x_shortcut = x_shortcut[..., :target_len]
+
+        x = x_conv + x_shortcut
+        x = self.output_pool(x)
         return x.transpose(1, 2)
 
 
@@ -65,6 +99,9 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         self.temporal_compressor = TrainableTemporalCompressor(
             hidden_size=config.audio_encoder_hidden_size,
             target_token_count=config.audio_target_token_count,
+            intermediate_size=config.audio_compressor_intermediate_size,
+            kernel_size=config.audio_compressor_kernel_size,
+            stride=config.audio_compressor_stride,
         )
         self.audio_projector = AudioProjector(
             input_dim=config.audio_encoder_hidden_size,
