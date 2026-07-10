@@ -53,6 +53,8 @@ ALIGNER_PREFIXES = (
     "audio_eos",
 )
 
+MODEL_ARCH_NAME = "huginn_audio_whisper"
+
 
 def patch_huginn_audio_shift_loss(model):
     if getattr(model, "_huginn_audio_shift_loss_patched", False):
@@ -327,14 +329,30 @@ class HuginnAudioLoader(ModelLoader):
         return model
 
 
-register_model_arch(
-    MultiModelKeys(
-        model_arch="huginn_audio_whisper",
-        language_model=["transformer", "lm_head"],
-        aligner=["temporal_compressor", "audio_projector", "audio_bos", "audio_eos"],
-        vision_tower=["audio_encoder"],
-    )
-)
+def register_huginn_audio_model_arch():
+    multi_model_kwargs = {
+        "language_model": ["transformer", "lm_head"],
+        "aligner": ["temporal_compressor", "audio_projector", "audio_bos", "audio_eos"],
+        "vision_tower": ["audio_encoder"],
+    }
+    try:
+        multi_model_keys = MultiModelKeys(
+            model_arch=MODEL_ARCH_NAME,
+            **multi_model_kwargs,
+        )
+        print("[HuginnAudioSwift] registered model arch using keyword-style MultiModelKeys(model_arch=...)")
+    except TypeError as exc:
+        if "model_arch" not in str(exc):
+            raise
+        print("[HuginnAudioSwift] MultiModelKeys lacks `model_arch=`; retrying positional model arch registration")
+        multi_model_keys = MultiModelKeys(
+            MODEL_ARCH_NAME,
+            **multi_model_kwargs,
+        )
+    register_model_arch(multi_model_keys)
+
+
+register_huginn_audio_model_arch()
 
 register_model(
     ModelMeta(
@@ -348,7 +366,7 @@ register_model(
         ],
         HuginnAudioLoader,
         template="huginn_audio_text",
-        model_arch="huginn_audio_whisper",
+        model_arch=MODEL_ARCH_NAME,
         architectures=["HuginnAudioForConditionalGeneration"],
         is_multimodal=True,
         requires=["transformers>=4.53.3"],

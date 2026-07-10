@@ -24,6 +24,14 @@ This repository is **not** intended to store:
 - large logs
 - remote-only temporary artifacts
 
+It is also the **authoritative project memory** for future Codex / AI-agent chats:
+
+- local-vs-remote path conventions
+- active experiment goals
+- current remote runtime assumptions
+- what has already been debugged
+- what is historical vs what is the current mainline
+
 ---
 
 ## Project Scope
@@ -37,8 +45,28 @@ This repo now contains **two active experiment lines**:
 
 2. **Huginn audio-modality experiment branch**
    - based on the **original Huginn backbone**, not the GSM8K-finetuned checkpoint
-   - architecture: **Whisper-small encoder + temporal compressor + audio projector + Huginn text backbone**
+   - current codebase now contains **two sub-lines**:
+     - the earlier standalone audio-training line in `code/recurrent-pretraining-main`
+     - the newer **Swift-based LoRA multimodal line** in `code/huginn_lora`
    - current focus is **audio-to-text understanding/alignment**, not speech generation
+
+### Current highest-priority task
+
+The current main active task is:
+
+- keep using the **original Huginn backbone**
+- move the audio experiment toward a **Swift-based training pipeline**
+- connect:
+  - **Whisper-large encoder**
+  - **adapter = temporal compressor + projector**
+  - **Huginn text backbone**
+- training policy for the new Swift line:
+  - freeze `audio_encoder`
+  - train `aligner` (`temporal_compressor`, `audio_projector`, optional audio boundary embeddings)
+  - train **LoRA on Huginn backbone only**
+  - do **not** LoRA-wrap or full-train the Whisper encoder
+
+This Swift LoRA multimodal route is the current forward path for new audio-model work.
 
 ---
 
@@ -78,6 +106,9 @@ Codex **cannot directly operate on the remote server**. Any remote command must 
 - Remote sync repo code root:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/code/recurrent-pretraining-main`
 
+- Remote Swift/LoRA code root:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/code/huginn_lora`
+
 - Remote model root:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/models/huginn-0125`
 
@@ -85,7 +116,10 @@ Codex **cannot directly operate on the remote server**. Any remote command must 
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/models/huginn-audio-whisper-v1`
 
 - Remote Whisper encoder root:
-  - `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-small`
+  - current mainline:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large`
+  - historical / earlier audio branch:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-small`
 
 ### Main remote conda environments
 
@@ -169,6 +203,17 @@ repo-root/
       local_scripts/
         train_*.sh
         eval_*.sh
+    huginn_lora/
+      plugins/
+        huginn_swift.py
+        huginn_audio_swift.py
+      scripts/
+        train_huginn_sft_lora.sh
+        train_huginn_scienceqa_lora.sh
+        prepare_huginn_audio_dataset.py
+        smoke_huginn_audio_swift.py
+        smoke_huginn_audio_swift.sh
+      run_smoke_huginn_audio_swift_5090.sh
 ```
 
 ---
@@ -287,18 +332,55 @@ This means the GSM8K line is **no longer at the "cannot run" stage**; the curren
 
 Build an **independent audio experiment branch on top of the original Huginn backbone**, without modifying the already GSM8K-finetuned model.
 
+### Important historical split
+
+The audio work now has **two stages** that must not be confused:
+
+1. **Earlier standalone audio branch**
+   - lives mainly in `code/recurrent-pretraining-main`
+   - directly trains the custom Huginn-audio model with ordinary PyTorch scripts
+   - was used to validate that:
+     - audio prefix injection works
+     - smoke test works
+     - tiny overfit works
+     - full ClothoAQA and caption continuation can run
+
+2. **Current Swift multimodal LoRA branch**
+   - lives mainly in `code/huginn_lora`
+   - goal is to move to a more reusable **ms-swift training path**
+   - current requirement is:
+     - original Huginn backbone
+     - Whisper-large encoder
+     - adapter trainable
+     - Huginn backbone LoRA trainable
+     - audio encoder frozen
+
+When the user says "current audio task", prefer to interpret it as the **Swift multimodal LoRA branch**, unless they explicitly refer to the older standalone training scripts.
+
 ### V1 architecture
 
 Current experiment branch:
 
 - audio encoder:
-  - **Whisper-small**
+  - historical standalone branch:
+    - **Whisper-small**
+  - current Swift mainline target:
+    - **Whisper-large**
 - temporal compressor:
-  - Conv1d downsampling + normalization + activation + adaptive pooling
+  - historical version:
+    - Conv1d downsampling + normalization + activation + adaptive pooling
+  - current updated design:
+    - **Conv-GMLP-style compressor with shortcut path**
+    - downsample with strided 1D conv branches
+    - gate branch + feature branch
+    - residual shortcut branch
+    - final adaptive pool back to fixed token count
 - audio projector:
-  - project Whisper-side features into Huginn text hidden space
+  - project audio-side features into Huginn text hidden space
+  - current implementation uses a **SwiGLU-style gated MLP projector**
 - Huginn text backbone:
-  - frozen in V1
+  - frozen in earlier V1 standalone branch
+  - in the current Swift LoRA branch, backbone stays frozen at base weights but receives **LoRA adapters**
 
 Current V1 training policy:
 
@@ -310,11 +392,49 @@ Current V1 training policy:
   - optional `audio_bos`
   - optional `audio_eos`
 
+### Current architecture details that matter
+
+For the current `models/huginn-audio-whisper-v1` implementation:
+
+- Whisper output:
+  - `last_hidden_state: [B, T_audio, hidden_audio]`
+- compressor:
+  - Conv-GMLP style temporal compression
+  - current config target:
+    - kernel size `7`
+    - stride `12`
+    - residual shortcut enabled
+    - final `AdaptiveAvgPool1d(32)`
+- projector:
+  - LayerNorm
+  - `w1`, `w2`
+  - gated activation `w1(x) * SiLU(w2(x))`
+  - `c_proj`
+  - output LayerNorm
+- boundary embeddings:
+  - optional `audio_bos`
+  - optional `audio_eos`
+- final audio prefix:
+  - prepended before text embeddings
+
 ### Important model files
 
 - `models/huginn-audio-whisper-v1/raven_modeling_minimal.py`
 - `models/huginn-audio-whisper-v1/raven_config_minimal.py`
 - `models/huginn-audio-whisper-v1/_base.py`
+
+### Important Swift LoRA files
+
+- plugin:
+  - `code/huginn_lora/plugins/huginn_audio_swift.py`
+- data conversion helper:
+  - `code/huginn_lora/scripts/prepare_huginn_audio_dataset.py`
+- lightweight manifest sanity check:
+  - `code/huginn_lora/scripts/smoke_huginn_audio_swift.py`
+- actual Swift smoke training launcher:
+  - `code/huginn_lora/scripts/smoke_huginn_audio_swift.sh`
+- 5090 submit script:
+  - `code/huginn_lora/run_smoke_huginn_audio_swift_5090.sh`
 
 ### Important training scripts
 
@@ -390,6 +510,43 @@ The audio branch has already passed several stages:
 
 This means the audio line is already beyond the "just wire projector and pray" phase; there is now an actual trainable branch, checkpoints, and post-training analysis tooling.
 
+### Newest progress: Swift multimodal LoRA branch
+
+On top of the earlier standalone audio branch, the repo has now entered a **new integration stage**:
+
+1. **LoRA baseline code was synced into `code/huginn_lora`**
+   - this provides the prior Huginn text-only Swift/LoRA baseline context
+
+2. **A new multimodal Swift plugin was added**
+   - file:
+     - `code/huginn_lora/plugins/huginn_audio_swift.py`
+   - purpose:
+     - register the Huginn-audio model as a Swift multimodal model
+     - register model arch split:
+       - language model
+       - aligner
+       - audio tower
+     - define a multimodal template that reads local audio and produces `audio_input_features`
+
+3. **The new Swift route now targets `swift sft`, not ad-hoc manual forward loops**
+   - this is important:
+     - earlier intermediate attempts looked Swift-like but were not yet a true Swift multimodal training path
+     - current code was rewritten specifically to align with the official Swift multimodal registration pattern
+
+4. **Smoke-training entrypoints now exist for the Swift route**
+   - prepare dataset into Swift JSONL
+   - sanity print first sample
+   - run a tiny `swift sft` smoke job on 5090
+
+### Important current status of the Swift branch
+
+- Local code and Python static syntax checks are done.
+- Remote runtime validation is still required.
+- Therefore, the Swift multimodal LoRA path should currently be treated as:
+  - **implemented locally**
+  - **ready for remote smoke verification**
+  - **not yet declared fully runtime-verified until remote logs confirm it**
+
 ---
 
 ## Current Audio Training Defaults
@@ -436,6 +593,24 @@ Note:
 
 - current audio training is **single-GPU**, not distributed
 - `optimizer_update_every=1_micro_step` in the current scripts
+
+### Current Swift multimodal LoRA training intent
+
+For the new `code/huginn_lora` path, the intended training split is:
+
+- `audio_encoder`
+  - frozen
+- `aligner`
+  - trainable full params
+  - includes:
+    - `temporal_compressor`
+    - `audio_projector`
+    - optional boundary embeddings
+- `language_model`
+  - base weights frozen
+  - train **LoRA only**
+
+This is the most important high-level requirement for any future edit on the Swift branch.
 
 ---
 
@@ -538,6 +713,14 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/recurrent-pretraining-main/finetuning_audio_whisper_clotho_caption.py`
 - `code/recurrent-pretraining-main/prepare_clotho_caption_expand.py`
 
+### Swift multimodal LoRA path
+
+- `code/huginn_lora/plugins/huginn_audio_swift.py`
+- `code/huginn_lora/scripts/prepare_huginn_audio_dataset.py`
+- `code/huginn_lora/scripts/smoke_huginn_audio_swift.py`
+- `code/huginn_lora/scripts/smoke_huginn_audio_swift.sh`
+- `code/huginn_lora/run_smoke_huginn_audio_swift_5090.sh`
+
 ### Audio evaluation
 
 - `code/recurrent-pretraining-main/audio_alignment_eval_common.py`
@@ -560,16 +743,27 @@ Any new chat should assume the following:
 6. The project is no longer only about GSM8K:
    - there is now a substantial **audio branch**
 7. The current audio branch is:
-   - original Huginn backbone
-   - Whisper-small encoder
-   - frozen backbone + frozen encoder
-   - trainable compressor/projector
+   - historical standalone branch:
+     - original Huginn backbone
+     - Whisper-small encoder
+     - frozen backbone + frozen encoder
+     - trainable compressor/projector
+   - current forward branch:
+     - original Huginn backbone
+     - Whisper-large encoder
+     - trainable adapter
+     - Huginn backbone LoRA
+     - Swift multimodal training path
 8. The current audio project already has:
    - smoke training
    - tiny overfit
    - full AQA training
    - caption continuation training
    - alignment evaluation scripts
+   - and now also:
+     - Swift multimodal plugin code
+     - Swift-format dataset conversion helper
+     - Swift smoke-training submit path
 
 ---
 
@@ -590,6 +784,11 @@ Any new chat should assume the following:
    - `grep` results
    - file listings
    - exact traceback lines
+8. Distinguish carefully between:
+   - the older standalone audio scripts in `code/recurrent-pretraining-main`
+   - the newer Swift multimodal LoRA route in `code/huginn_lora`
+9. Do not claim the Swift branch is fully validated unless remote smoke logs have actually confirmed it.
+10. For current audio development requests, default to the **Swift multimodal LoRA path** unless the user explicitly asks to modify the older standalone scripts.
 
 ---
 
@@ -613,10 +812,34 @@ Any new chat should assume the following:
 
 - Current audio and GSM8K branches coexist in the same sync repo.
 - The repo already contains both training and evaluation entrypoints for each line.
+- The audio line itself now contains both:
+  - a historical standalone PyTorch training route
+  - a current Swift multimodal LoRA route
 - The most likely future work is:
+  - finish remote validation of the Swift multimodal LoRA route
   - continue improving audio alignment / caption quality
   - evaluate checkpoints with retrieval / visualization / caption metrics
+  - compare finetuning strategies:
+    - LoRA
+    - broader finetuning if needed later
+  - compare audio encoders:
+    - Whisper-large
+    - future alternatives such as LoSAtok if the project moves there
   - possibly add new audio datasets or unfreeze more modules in later stages
+
+### Current immediate next-step expectation
+
+If a new agent is asked "what should we do now", the best default interpretation is:
+
+1. work on the **Swift multimodal LoRA audio branch**
+2. keep:
+   - original Huginn backbone
+   - Whisper-large encoder
+   - adapter trainable
+   - Huginn LoRA trainable
+   - audio encoder frozen
+3. do local code edits only
+4. let the user run all remote jobs and bring logs back
 
 Before any long remote run:
 

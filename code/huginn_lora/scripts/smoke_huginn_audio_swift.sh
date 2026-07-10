@@ -31,6 +31,7 @@ python code/huginn_lora/scripts/prepare_huginn_audio_dataset.py \
   --task aqa
 
 python code/huginn_lora/scripts/smoke_huginn_audio_swift.py
+python code/huginn_lora/scripts/debug_huginn_audio_swift_env.py
 
 swift sft \
   --model "$MODEL_PATH" \
