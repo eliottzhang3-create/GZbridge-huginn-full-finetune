@@ -337,18 +337,27 @@ def register_huginn_audio_model_arch():
     }
     try:
         multi_model_keys = MultiModelKeys(
-            model_arch=MODEL_ARCH_NAME,
+            arch_name=MODEL_ARCH_NAME,
             **multi_model_kwargs,
         )
-        print("[HuginnAudioSwift] registered model arch using keyword-style MultiModelKeys(model_arch=...)")
+        print("[HuginnAudioSwift] registered model arch using MultiModelKeys(arch_name=...)")
     except TypeError as exc:
-        if "model_arch" not in str(exc):
+        if "arch_name" not in str(exc):
             raise
-        print("[HuginnAudioSwift] MultiModelKeys lacks `model_arch=`; retrying positional model arch registration")
-        multi_model_keys = MultiModelKeys(
-            MODEL_ARCH_NAME,
-            **multi_model_kwargs,
-        )
+        try:
+            multi_model_keys = MultiModelKeys(
+                model_arch=MODEL_ARCH_NAME,
+                **multi_model_kwargs,
+            )
+            print("[HuginnAudioSwift] registered model arch using MultiModelKeys(model_arch=...)")
+        except TypeError as inner_exc:
+            if "model_arch" not in str(inner_exc):
+                raise
+            print("[HuginnAudioSwift] MultiModelKeys lacks keyword arch field; retrying positional model arch registration")
+            multi_model_keys = MultiModelKeys(
+                MODEL_ARCH_NAME,
+                **multi_model_kwargs,
+            )
     register_model_arch(multi_model_keys)
 
 
