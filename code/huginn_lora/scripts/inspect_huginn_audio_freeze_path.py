@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import importlib.util
 import platform
 import sys
 from collections import defaultdict
@@ -46,15 +47,30 @@ def summarize(model: torch.nn.Module, stage: str):
         print("[stage] audio_encoder_trainables=0")
 
 
+def load_plugin_module(repo_root: Path):
+    plugin_path = repo_root / "code" / "huginn_lora" / "plugins" / "huginn_audio_swift.py"
+    module_name = "huginn_audio_swift_inspect_plugin"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+
+    spec = importlib.util.spec_from_file_location(module_name, plugin_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Failed to load plugin module from {plugin_path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def inspect_direct_model(repo_root: Path):
-    from code.huginn_lora.plugins import huginn_audio_swift as plugin
+    plugin = load_plugin_module(repo_root)
 
     model = plugin.build_huginn_audio_model(str(repo_root / "models" / "huginn-audio-whisper-v1"))
     summarize(model, "DIRECT_BUILD_MODEL")
 
 
 def inspect_loader_model(repo_root: Path):
-    from code.huginn_lora.plugins import huginn_audio_swift as plugin
+    plugin = load_plugin_module(repo_root)
 
     loader = plugin.HuginnAudioLoader()
     model_dir = str(repo_root / "models" / "huginn-audio-whisper-v1")
@@ -140,8 +156,6 @@ def main():
     print(f"python={sys.version.split()[0]}")
     print(f"platform={platform.platform()}")
     print(f"repo_root={repo_root}")
-
-    sys.path.insert(0, str(repo_root))
 
     inspect_direct_model(repo_root)
     inspect_loader_model(repo_root)
