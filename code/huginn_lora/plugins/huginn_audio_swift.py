@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import io
+import os
+import tarfile
 import wave
+from collections import OrderedDict
 from pathlib import Path
 from types import MethodType
 from typing import Any, Optional
@@ -45,6 +49,7 @@ WHISPER_MODEL_DIR = Path("/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-larg
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio and respond accurately."
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_MAX_AUDIO_SECONDS = 30.0
+TARFILE_CACHE_LIMIT = 4
 
 ALIGNER_PREFIXES = (
     "temporal_compressor",
@@ -54,6 +59,7 @@ ALIGNER_PREFIXES = (
 )
 
 MODEL_ARCH_NAME = "huginn_audio_whisper"
+_TARFILE_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
 
 
 def patch_huginn_audio_shift_loss(model):
@@ -162,6 +168,25 @@ def resample_waveform(audio: np.ndarray, source_sr: int, target_sr: int) -> np.n
     return np.interp(tgt_positions, src_positions, audio).astype(np.float32)
 
 
+def normalize_audio_array(audio: np.ndarray) -> np.ndarray:
+    if audio.ndim == 1:
+        return audio.astype(np.float32, copy=False)
+    if audio.ndim == 2:
+        if audio.shape[0] <= 8 and audio.shape[1] > audio.shape[0]:
+            audio = audio.mean(axis=0)
+        else:
+            audio = audio.mean(axis=1)
+        return audio.astype(np.float32, copy=False)
+    raise ValueError(f"Unsupported audio ndim={audio.ndim}")
+
+
+def trim_audio(audio: np.ndarray, target_sr: int, max_audio_seconds: float) -> np.ndarray:
+    max_samples = int(round(max_audio_seconds * target_sr))
+    if audio.shape[0] > max_samples:
+        audio = audio[:max_samples]
+    return audio.astype(np.float32, copy=False)
+
+
 def load_wav_mono(path: Path, target_sr: int, max_audio_seconds: float) -> np.ndarray:
     with wave.open(str(path), "rb") as wf:
         num_channels = wf.getnchannels()
@@ -178,10 +203,97 @@ def load_wav_mono(path: Path, target_sr: int, max_audio_seconds: float) -> np.nd
         audio = audio.reshape(-1, num_channels).mean(axis=1)
 
     audio = resample_waveform(audio, source_sr, target_sr)
-    max_samples = int(round(max_audio_seconds * target_sr))
-    if audio.shape[0] > max_samples:
-        audio = audio[:max_samples]
-    return audio
+    return trim_audio(audio, target_sr, max_audio_seconds)
+
+
+def _decode_audio_with_soundfile(source: str | io.BytesIO) -> tuple[np.ndarray, int]:
+    try:
+        import soundfile as sf
+    except ImportError as exc:  # pragma: no cover - depends on remote env
+        raise RuntimeError("soundfile is not available") from exc
+
+    audio, source_sr = sf.read(source, dtype="float32", always_2d=False)
+    return normalize_audio_array(np.asarray(audio)), int(source_sr)
+
+
+def _decode_audio_with_torchaudio(source: str | io.BytesIO) -> tuple[np.ndarray, int]:
+    try:
+        import torchaudio
+    except ImportError as exc:  # pragma: no cover - depends on remote env
+        raise RuntimeError("torchaudio is not available") from exc
+
+    waveform, source_sr = torchaudio.load(source)
+    audio = waveform.mean(dim=0).cpu().numpy().astype(np.float32, copy=False)
+    return audio, int(source_sr)
+
+
+def decode_audio_bytes(audio_bytes: bytes, source_label: str) -> tuple[np.ndarray, int]:
+    errors: list[str] = []
+    buffer = io.BytesIO(audio_bytes)
+    for backend_name, backend in (
+        ("soundfile", _decode_audio_with_soundfile),
+        ("torchaudio", _decode_audio_with_torchaudio),
+    ):
+        try:
+            buffer.seek(0)
+            return backend(buffer)
+        except Exception as exc:  # pragma: no cover - backend dependent
+            errors.append(f"{backend_name}={type(exc).__name__}: {exc}")
+
+    joined = "; ".join(errors) if errors else "no backend attempted"
+    raise RuntimeError(f"Failed to decode audio bytes from {source_label}. Tried: {joined}")
+
+
+def load_audio_file(path: Path, target_sr: int, max_audio_seconds: float) -> np.ndarray:
+    suffix = path.suffix.lower()
+    if suffix == ".wav":
+        return load_wav_mono(path, target_sr, max_audio_seconds)
+    if suffix in {".flac", ".ogg", ".mp3", ".m4a"}:
+        errors: list[str] = []
+        for backend_name, backend in (
+            ("soundfile", _decode_audio_with_soundfile),
+            ("torchaudio", _decode_audio_with_torchaudio),
+        ):
+            try:
+                audio, source_sr = backend(str(path))
+                audio = resample_waveform(audio, source_sr, target_sr)
+                return trim_audio(audio, target_sr, max_audio_seconds)
+            except Exception as exc:  # pragma: no cover - backend dependent
+                errors.append(f"{backend_name}={type(exc).__name__}: {exc}")
+        joined = "; ".join(errors)
+        raise RuntimeError(f"Failed to decode audio file {path}. Tried: {joined}")
+    raise ValueError(f"Unsupported audio suffix for {path}")
+
+
+def get_cached_tarfile(tar_path: Path) -> tarfile.TarFile:
+    cache_key = os.fspath(tar_path)
+    cached = _TARFILE_CACHE.get(cache_key)
+    if cached is not None:
+        _TARFILE_CACHE.move_to_end(cache_key)
+        return cached
+
+    tar_obj = tarfile.open(cache_key, mode="r:*")
+    _TARFILE_CACHE[cache_key] = tar_obj
+    while len(_TARFILE_CACHE) > TARFILE_CACHE_LIMIT:
+        _, old_tar = _TARFILE_CACHE.popitem(last=False)
+        old_tar.close()
+    return tar_obj
+
+
+def load_audio_from_tar(
+    tar_path: Path,
+    member_name: str,
+    target_sr: int,
+    max_audio_seconds: float,
+) -> np.ndarray:
+    tar_obj = get_cached_tarfile(tar_path)
+    extracted = tar_obj.extractfile(member_name)
+    if extracted is None:
+        raise FileNotFoundError(f"Member {member_name} not found in tar archive {tar_path}")
+    audio_bytes = extracted.read()
+    audio, source_sr = decode_audio_bytes(audio_bytes, f"{tar_path}:{member_name}")
+    audio = resample_waveform(audio, source_sr, target_sr)
+    return trim_audio(audio, target_sr, max_audio_seconds)
 
 
 class HuginnAudioProcessor:
@@ -265,6 +377,24 @@ class HuginnAudioTemplate(Template):
                 return Path(audio_item["path"])
         raise TypeError(f"Unsupported audio source type: {type(audio_item)}")
 
+    def _load_audio_item(self, audio_item: Any) -> np.ndarray:
+        if isinstance(audio_item, dict) and "tar_path" in audio_item and "audio_member" in audio_item:
+            tar_path = Path(str(audio_item["tar_path"]))
+            audio_member = str(audio_item["audio_member"])
+            return load_audio_from_tar(
+                tar_path,
+                audio_member,
+                target_sr=self.audio_sampling_rate,
+                max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
+            )
+
+        audio_path = self._resolve_audio_path(audio_item)
+        return load_audio_file(
+            audio_path,
+            target_sr=self.audio_sampling_rate,
+            max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
+        )
+
     def _encode(self, inputs: StdTemplateInputs) -> dict[str, Any]:
         encoded = super()._encode(inputs)
         if not getattr(inputs, "audios", None):
@@ -272,12 +402,7 @@ class HuginnAudioTemplate(Template):
         if len(inputs.audios) != 1:
             raise ValueError("Huginn audio Swift template currently supports exactly one audio clip per sample.")
 
-        audio_path = self._resolve_audio_path(inputs.audios[0])
-        waveform = load_wav_mono(
-            audio_path,
-            target_sr=self.audio_sampling_rate,
-            max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
-        )
+        waveform = self._load_audio_item(inputs.audios[0])
         media_inputs = self.audio_feature_extractor(
             [waveform],
             sampling_rate=self.audio_sampling_rate,
