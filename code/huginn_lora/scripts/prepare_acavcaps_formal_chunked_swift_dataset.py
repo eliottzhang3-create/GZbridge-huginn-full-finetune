@@ -24,6 +24,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--expand_all_texts", action="store_true")
     parser.add_argument("--samples_per_tar", type=int, default=None)
     parser.add_argument("--chunk_size_tars", type=int, default=8)
+    parser.add_argument("--start_chunk", type=int, default=None)
+    parser.add_argument("--end_chunk", type=int, default=None)
+    parser.add_argument("--skip_existing", action="store_true")
     return parser.parse_args()
 
 
@@ -31,6 +34,25 @@ def chunk_list(items: list[tuple[str, Path]], chunk_size: int) -> list[list[tupl
     if chunk_size <= 0:
         raise ValueError(f"chunk_size_tars must be positive, got {chunk_size}")
     return [items[idx:idx + chunk_size] for idx in range(0, len(items), chunk_size)]
+
+
+def summarize_existing_manifest(manifest_path: Path) -> tuple[int, int, dict | None]:
+    manifest_records = 0
+    audio_source_ids: set[str] = set()
+    first_record = None
+    with manifest_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            payload = json.loads(line)
+            if first_record is None:
+                first_record = payload
+            manifest_records += 1
+            sample_id = payload.get("metadata", {}).get("sample_id")
+            if sample_id:
+                audio_source_ids.add(sample_id)
+    return manifest_records, len(audio_source_ids), first_record
 
 
 def main():
@@ -48,6 +70,17 @@ def main():
     category_limits = parse_category_limits(args.category_limits)
     selected_tar_files = list_selected_tar_files(dataset_root, category_limits)
     chunks = chunk_list(selected_tar_files, args.chunk_size_tars)
+    if not chunks:
+        raise ValueError("No chunks were generated from the selected tar files")
+
+    start_chunk = 0 if args.start_chunk is None else args.start_chunk
+    end_chunk = len(chunks) - 1 if args.end_chunk is None else args.end_chunk
+    if start_chunk < 0 or start_chunk >= len(chunks):
+        raise ValueError(f"start_chunk out of range: {start_chunk}, valid range is 0..{len(chunks) - 1}")
+    if end_chunk < 0 or end_chunk >= len(chunks):
+        raise ValueError(f"end_chunk out of range: {end_chunk}, valid range is 0..{len(chunks) - 1}")
+    if start_chunk > end_chunk:
+        raise ValueError(f"start_chunk ({start_chunk}) must be <= end_chunk ({end_chunk})")
 
     print("========== ACAVCAPS FORMAL CHUNK PREP START ==========")
     print(f"[chunk] dataset_root={dataset_root}")
@@ -60,18 +93,19 @@ def main():
     print(f"[chunk] chunk_size_tars={args.chunk_size_tars}")
     print(f"[chunk] selected_tar_count={len(selected_tar_files)}")
     print(f"[chunk] chunk_count={len(chunks)}")
+    print(f"[chunk] start_chunk={start_chunk}")
+    print(f"[chunk] end_chunk={end_chunk}")
+    print(f"[chunk] skip_existing={args.skip_existing}")
 
     index_records: list[dict] = []
     total_manifest_records = 0
     total_audio_source_records = 0
 
-    for chunk_idx, chunk_tar_files in enumerate(chunks):
+    for chunk_idx in range(start_chunk, end_chunk + 1):
+        chunk_tar_files = chunks[chunk_idx]
         chunk_name = f"acavcaps_caption_long_formal_chunk_{chunk_idx:03d}.jsonl"
         output_manifest = output_dir / chunk_name
         tmp_output_manifest = output_manifest.with_name(f"{output_manifest.name}.tmp")
-        chunk_manifest_records = 0
-        chunk_audio_source_records = 0
-        first_manifest_record = None
         categories_in_chunk = sorted({category for category, _ in chunk_tar_files})
 
         print(
@@ -80,6 +114,33 @@ def main():
             f"categories={categories_in_chunk}"
         )
 
+        if args.skip_existing and output_manifest.exists() and output_manifest.stat().st_size > 0:
+            chunk_manifest_records, chunk_audio_source_records, first_manifest_record = summarize_existing_manifest(
+                output_manifest
+            )
+            total_manifest_records += chunk_manifest_records
+            total_audio_source_records += chunk_audio_source_records
+            index_records.append(
+                {
+                    "chunk_index": chunk_idx,
+                    "manifest_path": str(output_manifest),
+                    "tar_count": len(chunk_tar_files),
+                    "categories": categories_in_chunk,
+                    "audio_source_records": chunk_audio_source_records,
+                    "manifest_records": chunk_manifest_records,
+                    "first_record": first_manifest_record,
+                    "skipped_existing": True,
+                }
+            )
+            print(
+                f"[chunk] idx={chunk_idx:03d} skip_existing manifest_path={output_manifest} "
+                f"manifest_records={chunk_manifest_records} audio_source_records={chunk_audio_source_records}"
+            )
+            continue
+
+        chunk_manifest_records = 0
+        chunk_audio_source_records = 0
+        first_manifest_record = None
         with tmp_output_manifest.open("w", encoding="utf-8") as f:
             for category, tar_path in chunk_tar_files:
                 tar_source_records = 0
@@ -136,6 +197,7 @@ def main():
             "audio_source_records": chunk_audio_source_records,
             "manifest_records": chunk_manifest_records,
             "first_record": first_manifest_record,
+            "skipped_existing": False,
         }
         index_records.append(index_record)
         print(
