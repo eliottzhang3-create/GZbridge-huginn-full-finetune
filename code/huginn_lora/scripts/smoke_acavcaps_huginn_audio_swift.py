@@ -41,12 +41,12 @@ def main():
     manifest_path = (
         Path(args.manifest)
         if args.manifest is not None
-        else repo_root / "data" / "audio_swift" / "acavcaps" / "acavcaps_caption_long_pilot_swift.jsonl"
+        else repo_root / "data" / "audio_swift" / "acavcaps" / "acavcaps_caption_long_smoke_swift.jsonl"
     )
     if not manifest_path.exists():
-        raise FileNotFoundError(f"ACAVCAPS pilot manifest is missing: {manifest_path}")
+        raise FileNotFoundError(f"ACAVCAPS smoke manifest is missing: {manifest_path}")
     if manifest_path.stat().st_size <= 0:
-        raise ValueError(f"ACAVCAPS pilot manifest is empty: {manifest_path}")
+        raise ValueError(f"ACAVCAPS smoke manifest is empty: {manifest_path}")
 
     plugin_dir = repo_root / "code" / "huginn_lora" / "plugins"
     sys.path.insert(0, str(plugin_dir))
