@@ -69,15 +69,42 @@ def inspect_direct_model(repo_root: Path):
     summarize(model, "DIRECT_BUILD_MODEL")
 
 
-def inspect_loader_model(repo_root: Path):
-    plugin = load_plugin_module(repo_root)
+def patch_peft_debug():
+    try:
+        import peft.mapping
+    except ImportError:
+        peft_mapping = None
+    else:
+        peft_mapping = peft.mapping
 
-    loader = plugin.HuginnAudioLoader()
-    model_dir = str(repo_root / "models" / "huginn-audio-whisper-v1")
-    config = loader.get_config(model_dir)
-    processor = loader.get_processor(model_dir, config)
-    model = loader.get_model(model_dir, config, processor, {})
-    summarize(model, "LOADER_GET_MODEL")
+    try:
+        import peft.mapping_func
+    except ImportError:
+        peft_mapping_func = None
+    else:
+        peft_mapping_func = peft.mapping_func
+
+    def wrap_get_peft_model(module, module_name: str):
+        if module is None or not hasattr(module, "get_peft_model"):
+            return
+        original = module.get_peft_model
+        if getattr(original, "_huginn_audio_freeze_debug_wrapped", False):
+            return
+
+        def wrapped_get_peft_model(*args, **kwargs):
+            model = args[0] if args else kwargs.get("model")
+            if isinstance(model, torch.nn.Module):
+                summarize(model, f"BEFORE_PEFT_WRAP[{module_name}]")
+            wrapped_model = original(*args, **kwargs)
+            if isinstance(wrapped_model, torch.nn.Module):
+                summarize(wrapped_model, f"AFTER_PEFT_WRAP[{module_name}]")
+            return wrapped_model
+
+        wrapped_get_peft_model._huginn_audio_freeze_debug_wrapped = True  # type: ignore[attr-defined]
+        module.get_peft_model = wrapped_get_peft_model
+
+    wrap_get_peft_model(peft_mapping, "peft.mapping")
+    wrap_get_peft_model(peft_mapping_func, "peft.mapping_func")
 
 
 def build_swift_argv(repo_root: Path) -> list[str]:
@@ -142,6 +169,8 @@ def build_swift_argv(repo_root: Path) -> list[str]:
 def inspect_swift_final(repo_root: Path):
     from swift.pipelines.train.sft import SwiftSft
 
+    patch_peft_debug()
+
     class _InspectSwiftSft(SwiftSft):
         def train(self, trainer):
             summarize(trainer.model, "SWIFT_FINAL_TRAINER_MODEL")
@@ -158,7 +187,6 @@ def main():
     print(f"repo_root={repo_root}")
 
     inspect_direct_model(repo_root)
-    inspect_loader_model(repo_root)
     inspect_swift_final(repo_root)
 
 
