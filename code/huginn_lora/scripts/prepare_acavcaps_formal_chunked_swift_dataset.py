@@ -9,7 +9,7 @@ from acavcaps_common import (
     DEFAULT_ACAVCAPS_ROOT,
     iter_tar_records,
     list_selected_tar_files,
-    parse_category_limits,
+    resolve_category_limits,
 )
 from prepare_acavcaps_swift_dataset import build_manifest_record, extract_texts
 
@@ -67,7 +67,7 @@ def main():
     dataset_root = Path(args.dataset_root)
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    category_limits = parse_category_limits(args.category_limits)
+    category_limits = resolve_category_limits(dataset_root, args.category_limits)
     selected_tar_files = list_selected_tar_files(dataset_root, category_limits)
     chunks = chunk_list(selected_tar_files, args.chunk_size_tars)
     if not chunks:

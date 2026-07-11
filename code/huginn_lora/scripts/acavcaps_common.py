@@ -21,9 +21,23 @@ DEFAULT_CAPTION_SYSTEM = "You are a helpful assistant that can understand audio 
 DEFAULT_CAPTION_USER = "Listen to the audio and describe it."
 
 
+def get_all_category_limits(dataset_root: Path) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for category_dir in sorted(path for path in dataset_root.iterdir() if path.is_dir()):
+        tar_count = len(sorted(category_dir.glob("*.tar.gz")))
+        if tar_count == 0:
+            continue
+        result[category_dir.name] = tar_count
+    if not result:
+        raise ValueError(f"No ACAVCAPS tar directories found under {dataset_root}")
+    return result
+
+
 def parse_category_limits(spec: str | None) -> dict[str, int]:
     if spec is None or not spec.strip():
         return dict(DEFAULT_CATEGORY_LIMITS)
+    if spec.strip().lower() in {"all", "__all__", "*"}:
+        raise ValueError("Special category limit token requires dataset-aware resolution")
 
     result: dict[str, int] = {}
     for item in spec.split(","):
@@ -39,6 +53,14 @@ def parse_category_limits(spec: str | None) -> dict[str, int]:
     if not result:
         raise ValueError("No valid category limits parsed")
     return result
+
+
+def resolve_category_limits(dataset_root: Path, spec: str | None) -> dict[str, int]:
+    if spec is None or not spec.strip():
+        return dict(DEFAULT_CATEGORY_LIMITS)
+    if spec.strip().lower() in {"all", "__all__", "*"}:
+        return get_all_category_limits(dataset_root)
+    return parse_category_limits(spec)
 
 
 def list_selected_tar_files(dataset_root: Path, category_limits: dict[str, int]) -> list[tuple[str, Path]]:
@@ -134,4 +156,3 @@ def collect_schema_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
         "list_len_counter": list_len_counter,
         "value_type_counter": value_type_counter,
     }
-
