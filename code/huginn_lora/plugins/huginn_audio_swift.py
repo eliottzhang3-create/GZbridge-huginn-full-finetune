@@ -333,7 +333,7 @@ def register_huginn_audio_model_arch():
     multi_model_kwargs = {
         "language_model": ["transformer", "lm_head"],
         "aligner": ["temporal_compressor", "audio_projector", "audio_bos", "audio_eos"],
-        "vision_tower": ["audio_encoder"],
+        "generator": ["audio_encoder"],
     }
     try:
         multi_model_keys = MultiModelKeys(
@@ -358,7 +358,13 @@ def register_huginn_audio_model_arch():
                 MODEL_ARCH_NAME,
                 **multi_model_kwargs,
             )
-    register_model_arch(multi_model_keys)
+    try:
+        register_model_arch(multi_model_keys)
+    except ValueError as exc:
+        duplicate_msg = f"The `{MODEL_ARCH_NAME}` has already been registered"
+        if duplicate_msg not in str(exc):
+            raise
+        print(f"[HuginnAudioSwift] model arch `{MODEL_ARCH_NAME}` already registered; skip duplicate registration")
 
 
 register_huginn_audio_model_arch()

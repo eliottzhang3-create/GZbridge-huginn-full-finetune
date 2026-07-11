@@ -16,7 +16,7 @@ python -V || true
 export CUDA_VISIBLE_DEVICES=0
 
 mkdir -p data/audio_swift
-mkdir -p outputs/huginn_audio_swift_inspect
+mkdir -p outputs/huginn_audio_swift_inspect_generator
 
 DATASET_DIR=/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_aqa_huginn_tiny_train32
 RAW_MANIFEST=train.jsonl
@@ -27,5 +27,8 @@ python code/huginn_lora/scripts/prepare_huginn_audio_dataset.py \
   --input_manifest "$RAW_MANIFEST" \
   --output_manifest "$SWIFT_MANIFEST" \
   --task aqa
+
+echo "========== HUGINN AUDIO SWIFT INSPECT =========="
+echo "mode=lora_llm generator_frozen_audio_encoder aligner_trainable"
 
 python code/huginn_lora/scripts/inspect_huginn_audio_swift_trainables.py

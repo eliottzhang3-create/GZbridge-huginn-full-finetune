@@ -30,6 +30,38 @@ def format_millions(num_params: int) -> str:
     return f"{num_params / 1_000_000:.4f}M"
 
 
+def collect_parameter_summary(model):
+    total_params = 0
+    trainable_params = 0
+    trainable_by_group = defaultdict(int)
+    trainable_entries: list[tuple[str, int, str, str]] = []
+    frozen_examples: list[str] = []
+    frozen_audio_examples: list[str] = []
+
+    for name, param in model.named_parameters():
+        param_count = param.numel()
+        total_params += param_count
+        if param.requires_grad:
+            trainable_params += param_count
+            group = classify_param(name)
+            trainable_by_group[group] += param_count
+            trainable_entries.append((name, param_count, str(param.dtype), str(param.device)))
+        else:
+            if len(frozen_examples) < 20:
+                frozen_examples.append(name)
+            if "audio_encoder" in name and len(frozen_audio_examples) < 20:
+                frozen_audio_examples.append(name)
+
+    return {
+        "total_params": total_params,
+        "trainable_params": trainable_params,
+        "trainable_by_group": dict(trainable_by_group),
+        "trainable_entries": trainable_entries,
+        "frozen_examples": frozen_examples,
+        "frozen_audio_examples": frozen_audio_examples,
+    }
+
+
 def print_model_chain(model):
     print("========== MODEL CHAIN ==========")
     visited = set()
@@ -67,22 +99,13 @@ def print_grad_checkpointing_state(model):
 
 
 def summarize_parameters(model):
-    total_params = 0
-    trainable_params = 0
-    trainable_by_group = defaultdict(int)
-    trainable_entries: list[tuple[str, int, str, str]] = []
-    frozen_examples: list[str] = []
-
-    for name, param in model.named_parameters():
-        param_count = param.numel()
-        total_params += param_count
-        if param.requires_grad:
-            trainable_params += param_count
-            group = classify_param(name)
-            trainable_by_group[group] += param_count
-            trainable_entries.append((name, param_count, str(param.dtype), str(param.device)))
-        elif len(frozen_examples) < 20:
-            frozen_examples.append(name)
+    summary = collect_parameter_summary(model)
+    total_params = summary["total_params"]
+    trainable_params = summary["trainable_params"]
+    trainable_by_group = summary["trainable_by_group"]
+    trainable_entries = summary["trainable_entries"]
+    frozen_examples = summary["frozen_examples"]
+    frozen_audio_examples = summary["frozen_audio_examples"]
 
     print("========== PARAMETER SUMMARY ==========")
     print(f"[params] total={total_params} ({format_millions(total_params)})")
@@ -102,6 +125,49 @@ def summarize_parameters(model):
     print("========== FIRST FROZEN PARAMETERS ==========")
     for name in frozen_examples:
         print(f"[frozen] {name}")
+
+    print("========== FIRST FROZEN AUDIO PARAMETERS ==========")
+    for name in frozen_audio_examples:
+        print(f"[frozen-audio] {name}")
+
+    return summary
+
+
+def validate_expected_trainables(summary: dict[str, object]):
+    trainable_by_group = summary["trainable_by_group"]
+    total_params = int(summary["total_params"])
+    trainable_params = int(summary["trainable_params"])
+
+    audio_encoder_trainable = int(trainable_by_group.get("audio_encoder", 0))
+    aligner_trainable = int(trainable_by_group.get("aligner", 0))
+    llm_lora_trainable = int(trainable_by_group.get("llm_lora", 0))
+    llm_base_trainable = int(trainable_by_group.get("llm_base_other", 0))
+
+    print("========== EXPECTATION CHECKS ==========")
+    print(f"[check] total_params={total_params}")
+    print(f"[check] trainable_params={trainable_params}")
+    print(f"[check] audio_encoder_trainable={audio_encoder_trainable}")
+    print(f"[check] aligner_trainable={aligner_trainable}")
+    print(f"[check] llm_lora_trainable={llm_lora_trainable}")
+    print(f"[check] llm_base_other_trainable={llm_base_trainable}")
+
+    failures: list[str] = []
+    if audio_encoder_trainable != 0:
+        failures.append(f"audio_encoder should be frozen, but found {audio_encoder_trainable} trainable params")
+    if aligner_trainable <= 0:
+        failures.append("aligner should remain trainable, but found no trainable aligner params")
+    if llm_lora_trainable <= 0:
+        failures.append("LoRA params should exist on the language model, but found none")
+    if llm_base_trainable != 0:
+        failures.append(f"language model base weights should stay frozen, but found {llm_base_trainable} trainable params")
+
+    if failures:
+        print("[check] status=FAIL")
+        for message in failures:
+            print(f"[check] failure={message}")
+        raise RuntimeError("Huginn audio Swift trainable-parameter validation failed")
+
+    print("[check] status=PASS")
 
 
 def print_cuda_memory():
@@ -131,7 +197,8 @@ class InspectSwiftSft:
                 print(f"[inspect] output_dir={self.args.output_dir}")
                 print_model_chain(trainer.model)
                 print_grad_checkpointing_state(trainer.model)
-                summarize_parameters(trainer.model)
+                summary = summarize_parameters(trainer.model)
+                validate_expected_trainables(summary)
                 print_cuda_memory()
                 print("========== INSPECT DONE ==========")
                 return {"status": "inspected"}
@@ -146,7 +213,7 @@ def build_smoke_like_argv(repo_root: Path) -> list[str]:
     model_path = repo_root / "models" / "huginn-audio-whisper-v1"
     plugin_path = repo_root / "code" / "huginn_lora" / "plugins" / "huginn_audio_swift.py"
     swift_manifest = repo_root / "data" / "audio_swift" / "clotho_aqa_tiny_train32_swift.jsonl"
-    output_dir = repo_root / "outputs" / "huginn_audio_swift_inspect"
+    output_dir = repo_root / "outputs" / "huginn_audio_swift_inspect_generator"
 
     return [
         "--model",
@@ -165,8 +232,6 @@ def build_smoke_like_argv(repo_root: Path) -> list[str]:
         str(output_dir),
         "--tuner_type",
         "lora_llm",
-        "--freeze_vit",
-        "true",
         "--freeze_aligner",
         "false",
         "--learning_rate",

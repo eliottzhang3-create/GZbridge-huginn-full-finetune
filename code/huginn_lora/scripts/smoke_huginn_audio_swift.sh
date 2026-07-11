@@ -16,7 +16,7 @@ python -V || true
 export CUDA_VISIBLE_DEVICES=0
 
 mkdir -p data/audio_swift
-mkdir -p outputs/huginn_audio_swift_smoke
+mkdir -p outputs/huginn_audio_swift_smoke_generator
 
 DATASET_DIR=/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_aqa_huginn_tiny_train32
 RAW_MANIFEST=train.jsonl
@@ -33,6 +33,9 @@ python code/huginn_lora/scripts/prepare_huginn_audio_dataset.py \
 python code/huginn_lora/scripts/smoke_huginn_audio_swift.py
 python code/huginn_lora/scripts/debug_huginn_audio_swift_env.py
 
+echo "========== HUGINN AUDIO SWIFT SMOKE =========="
+echo "mode=lora_llm generator_frozen_audio_encoder aligner_trainable"
+
 swift sft \
   --model "$MODEL_PATH" \
   --model_type huginn_audio_raven \
@@ -40,9 +43,8 @@ swift sft \
   --external_plugins "$PLUGIN_PATH" \
   --dataset "$SWIFT_MANIFEST" \
   --max_length 192 \
-  --output_dir outputs/huginn_audio_swift_smoke \
+  --output_dir outputs/huginn_audio_swift_smoke_generator \
   --tuner_type lora_llm \
-  --freeze_vit true \
   --freeze_aligner false \
   --learning_rate 1e-4 \
   --aligner_lr 1e-4 \
