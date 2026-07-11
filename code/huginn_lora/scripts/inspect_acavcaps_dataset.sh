@@ -13,6 +13,9 @@ echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 which python || true
 python -V || true
 
-python code/huginn_lora/scripts/inspect_acavcaps_dataset.py \
+export PYTHONUNBUFFERED=1
+echo "PYTHONUNBUFFERED=$PYTHONUNBUFFERED"
+
+python -u code/huginn_lora/scripts/inspect_acavcaps_dataset.py \
   --samples_per_tar 32 \
   --preview_count 4

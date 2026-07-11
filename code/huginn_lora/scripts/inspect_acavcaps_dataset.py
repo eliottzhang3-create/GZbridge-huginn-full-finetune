@@ -26,7 +26,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def print_header(title: str):
-    print(f"========== {title} ==========")
+    print(f"========== {title} ==========", flush=True)
 
 
 def try_import_audio_backends():
@@ -89,6 +89,11 @@ def try_decode_first_audio(selected_tar_files: list[tuple[str, Path]], backends:
 
 
 def main():
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
+
     args = parse_args()
     dataset_root = Path(args.dataset_root)
     category_limits = parse_category_limits(args.category_limits)
