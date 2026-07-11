@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
 import platform
 import sys
 from collections import defaultdict
@@ -47,29 +46,14 @@ def summarize(model: torch.nn.Module, stage: str):
         print("[stage] audio_encoder_trainables=0")
 
 
-def load_plugin_module(repo_root: Path):
-    plugin_path = repo_root / "code" / "huginn_lora" / "plugins" / "huginn_audio_swift.py"
-    module_name = "huginn_audio_swift_inspect_plugin"
-    if module_name in sys.modules:
-        return sys.modules[module_name]
-
-    spec = importlib.util.spec_from_file_location(module_name, plugin_path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"Failed to load plugin module from {plugin_path}")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-    return module
-
-
-def inspect_direct_model(repo_root: Path):
-    plugin = load_plugin_module(repo_root)
-
-    model = plugin.build_huginn_audio_model(str(repo_root / "models" / "huginn-audio-whisper-v1"))
-    summarize(model, "DIRECT_BUILD_MODEL")
-
-
 def patch_peft_debug():
+    try:
+        import peft
+    except ImportError:
+        peft_root = None
+    else:
+        peft_root = peft
+
     try:
         import peft.mapping
     except ImportError:
@@ -103,6 +87,7 @@ def patch_peft_debug():
         wrapped_get_peft_model._huginn_audio_freeze_debug_wrapped = True  # type: ignore[attr-defined]
         module.get_peft_model = wrapped_get_peft_model
 
+    wrap_get_peft_model(peft_root, "peft")
     wrap_get_peft_model(peft_mapping, "peft.mapping")
     wrap_get_peft_model(peft_mapping_func, "peft.mapping_func")
 
@@ -173,6 +158,7 @@ def inspect_swift_final(repo_root: Path):
 
     class _InspectSwiftSft(SwiftSft):
         def train(self, trainer):
+            print("========== TRAIN_HOOK ==========")
             summarize(trainer.model, "SWIFT_FINAL_TRAINER_MODEL")
             return {"status": "inspected"}
 
@@ -186,7 +172,6 @@ def main():
     print(f"platform={platform.platform()}")
     print(f"repo_root={repo_root}")
 
-    inspect_direct_model(repo_root)
     inspect_swift_final(repo_root)
 
 
