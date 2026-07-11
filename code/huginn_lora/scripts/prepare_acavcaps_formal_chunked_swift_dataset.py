@@ -74,10 +74,20 @@ def main():
         first_manifest_record = None
         categories_in_chunk = sorted({category for category, _ in chunk_tar_files})
 
+        print(
+            f"[chunk] idx={chunk_idx:03d} start "
+            f"manifest_path={output_manifest} tar_count={len(chunk_tar_files)} "
+            f"categories={categories_in_chunk}"
+        )
+
         with tmp_output_manifest.open("w", encoding="utf-8") as f:
             for category, tar_path in chunk_tar_files:
                 tar_source_records = 0
                 tar_manifest_records = 0
+                print(
+                    f"[chunk] idx={chunk_idx:03d} tar_start "
+                    f"category={category} tar={tar_path.name}"
+                )
                 tar_records = iter_tar_records(tar_path, samples_per_tar=args.samples_per_tar)
                 for record in tar_records:
                     payload = record["payload"]
