@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 
 from acavcaps_common import (
@@ -75,19 +76,41 @@ def build_manifest_record(
 
 
 def main():
+    import sys
+
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(line_buffering=True)
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(line_buffering=True)
+
     args = parse_args()
     dataset_root = Path(args.dataset_root)
     output_manifest = Path(args.output_manifest)
     output_manifest.parent.mkdir(parents=True, exist_ok=True)
     category_limits = parse_category_limits(args.category_limits)
+    tmp_output_manifest = output_manifest.with_name(f"{output_manifest.name}.tmp")
 
     total_manifest_records = 0
     audio_source_records = 0
     selected_tar_files = list_selected_tar_files(dataset_root, category_limits)
     first_manifest_record = None
 
-    with output_manifest.open("w", encoding="utf-8") as f:
+    print("========== ACAVCAPS PREP START ==========")
+    print(f"[manifest] dataset_root={dataset_root}")
+    print(f"[manifest] output_manifest={output_manifest}")
+    print(f"[manifest] tmp_output_manifest={tmp_output_manifest}")
+    print(f"[manifest] category_limits={category_limits}")
+    print(f"[manifest] text_field={args.text_field}")
+    print(f"[manifest] text_index={args.text_index}")
+    print(f"[manifest] expand_all_texts={args.expand_all_texts}")
+    print(f"[manifest] samples_per_tar={args.samples_per_tar}")
+    print(f"[manifest] limit_total_records={args.limit_total_records}")
+    print(f"[manifest] selected_tar_count={len(selected_tar_files)}")
+
+    with tmp_output_manifest.open("w", encoding="utf-8") as f:
         for category, tar_path in selected_tar_files:
+            tar_source_records = 0
+            tar_manifest_records = 0
             tar_records = iter_tar_records(tar_path, samples_per_tar=args.samples_per_tar)
             for record in tar_records:
                 payload = record["payload"]
@@ -95,6 +118,7 @@ def main():
                 if not texts:
                     continue
                 audio_source_records += 1
+                tar_source_records += 1
                 for assistant_content in texts:
                     manifest_record = build_manifest_record(
                         tar_path=tar_path,
@@ -109,15 +133,28 @@ def main():
                         first_manifest_record = manifest_record
                     f.write(json.dumps(manifest_record, ensure_ascii=False) + "\n")
                     total_manifest_records += 1
+                    tar_manifest_records += 1
                     if args.limit_total_records is not None and total_manifest_records >= args.limit_total_records:
                         break
                 if args.limit_total_records is not None and total_manifest_records >= args.limit_total_records:
                     break
+            f.flush()
+            print(
+                f"[manifest] category={category} tar={tar_path.name} "
+                f"audio_source_records={tar_source_records} emitted_records={tar_manifest_records} "
+                f"total_manifest_records={total_manifest_records}"
+            )
             if args.limit_total_records is not None and total_manifest_records >= args.limit_total_records:
                 break
 
     if total_manifest_records == 0:
+        try:
+            tmp_output_manifest.unlink()
+        except FileNotFoundError:
+            pass
         raise ValueError("No manifest records were generated")
+
+    os.replace(tmp_output_manifest, output_manifest)
 
     print("========== ACAVCAPS SWIFT MANIFEST ==========")
     print(f"[manifest] dataset_root={dataset_root}")

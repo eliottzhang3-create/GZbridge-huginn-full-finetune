@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import io
 import os
+import shutil
+import subprocess
 import tarfile
 import wave
 from collections import OrderedDict
@@ -187,6 +189,10 @@ def trim_audio(audio: np.ndarray, target_sr: int, max_audio_seconds: float) -> n
     return audio.astype(np.float32, copy=False)
 
 
+def get_ffmpeg_path() -> str | None:
+    return shutil.which("ffmpeg")
+
+
 def load_wav_mono(path: Path, target_sr: int, max_audio_seconds: float) -> np.ndarray:
     with wave.open(str(path), "rb") as wf:
         num_channels = wf.getnchannels()
@@ -244,6 +250,77 @@ def decode_audio_bytes(audio_bytes: bytes, source_label: str) -> tuple[np.ndarra
     raise RuntimeError(f"Failed to decode audio bytes from {source_label}. Tried: {joined}")
 
 
+def decode_audio_with_ffmpeg_bytes(audio_bytes: bytes, source_label: str, target_sr: int) -> np.ndarray:
+    ffmpeg_path = get_ffmpeg_path()
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is not available")
+
+    cmd = [
+        ffmpeg_path,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        "pipe:0",
+        "-f",
+        "f32le",
+        "-ac",
+        "1",
+        "-ar",
+        str(target_sr),
+        "pipe:1",
+    ]
+    result = subprocess.run(
+        cmd,
+        input=audio_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"ffmpeg decode failed for {source_label}: {stderr or 'unknown error'}")
+    if not result.stdout:
+        raise RuntimeError(f"ffmpeg decode produced empty output for {source_label}")
+    return np.frombuffer(result.stdout, dtype=np.float32).astype(np.float32, copy=False)
+
+
+def decode_audio_with_ffmpeg_file(path: Path, target_sr: int) -> np.ndarray:
+    ffmpeg_path = get_ffmpeg_path()
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is not available")
+
+    cmd = [
+        ffmpeg_path,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path),
+        "-f",
+        "f32le",
+        "-ac",
+        "1",
+        "-ar",
+        str(target_sr),
+        "pipe:1",
+    ]
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+    )
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"ffmpeg decode failed for {path}: {stderr or 'unknown error'}")
+    if not result.stdout:
+        raise RuntimeError(f"ffmpeg decode produced empty output for {path}")
+    return np.frombuffer(result.stdout, dtype=np.float32).astype(np.float32, copy=False)
+
+
 def load_audio_file(path: Path, target_sr: int, max_audio_seconds: float) -> np.ndarray:
     suffix = path.suffix.lower()
     if suffix == ".wav":
@@ -260,6 +337,11 @@ def load_audio_file(path: Path, target_sr: int, max_audio_seconds: float) -> np.
                 return trim_audio(audio, target_sr, max_audio_seconds)
             except Exception as exc:  # pragma: no cover - backend dependent
                 errors.append(f"{backend_name}={type(exc).__name__}: {exc}")
+        try:
+            audio = decode_audio_with_ffmpeg_file(path, target_sr)
+            return trim_audio(audio, target_sr, max_audio_seconds)
+        except Exception as exc:  # pragma: no cover - backend dependent
+            errors.append(f"ffmpeg={type(exc).__name__}: {exc}")
         joined = "; ".join(errors)
         raise RuntimeError(f"Failed to decode audio file {path}. Tried: {joined}")
     raise ValueError(f"Unsupported audio suffix for {path}")
@@ -291,9 +373,19 @@ def load_audio_from_tar(
     if extracted is None:
         raise FileNotFoundError(f"Member {member_name} not found in tar archive {tar_path}")
     audio_bytes = extracted.read()
-    audio, source_sr = decode_audio_bytes(audio_bytes, f"{tar_path}:{member_name}")
-    audio = resample_waveform(audio, source_sr, target_sr)
-    return trim_audio(audio, target_sr, max_audio_seconds)
+    source_label = f"{tar_path}:{member_name}"
+    try:
+        audio, source_sr = decode_audio_bytes(audio_bytes, source_label)
+        audio = resample_waveform(audio, source_sr, target_sr)
+        return trim_audio(audio, target_sr, max_audio_seconds)
+    except Exception as exc:
+        ffmpeg_errors = [f"python_backends={type(exc).__name__}: {exc}"]
+        try:
+            audio = decode_audio_with_ffmpeg_bytes(audio_bytes, source_label, target_sr)
+            return trim_audio(audio, target_sr, max_audio_seconds)
+        except Exception as ffmpeg_exc:
+            ffmpeg_errors.append(f"ffmpeg={type(ffmpeg_exc).__name__}: {ffmpeg_exc}")
+            raise RuntimeError(f"Failed to decode tar audio {source_label}. Tried: {'; '.join(ffmpeg_errors)}")
 
 
 class HuginnAudioProcessor:

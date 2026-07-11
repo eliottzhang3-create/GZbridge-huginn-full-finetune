@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import io
 import platform
+import shutil
+import subprocess
 import sys
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -43,7 +45,24 @@ def try_import_audio_backends():
     return backends
 
 
-def try_decode_first_audio(selected_tar_files: list[tuple[str, Path]], backends: dict[str, object]):
+def try_command_backends():
+    print_header("COMMAND BACKENDS")
+    tools = {}
+    for tool_name in ("ffmpeg", "ffprobe", "sox", "flac"):
+        path = shutil.which(tool_name)
+        if path is None:
+            print(f"[tool] {tool_name}=MISSING")
+            continue
+        print(f"[tool] {tool_name}=OK path={path}")
+        tools[tool_name] = path
+    return tools
+
+
+def try_decode_first_audio(
+    selected_tar_files: list[tuple[str, Path]],
+    backends: dict[str, object],
+    command_backends: dict[str, str],
+):
     print_header("DECODE TEST")
     if not selected_tar_files:
         print("[decode] no selected tar files")
@@ -87,6 +106,39 @@ def try_decode_first_audio(selected_tar_files: list[tuple[str, Path]], backends:
         except Exception as exc:
             print(f"[decode] torchaudio=FAIL {type(exc).__name__}: {exc}")
 
+    if "ffmpeg" in command_backends:
+        try:
+            result = subprocess.run(
+                [
+                    command_backends["ffmpeg"],
+                    "-nostdin",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-i",
+                    "pipe:0",
+                    "-f",
+                    "f32le",
+                    "-ac",
+                    "1",
+                    "-ar",
+                    "16000",
+                    "pipe:1",
+                ],
+                input=audio_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            if result.returncode != 0:
+                stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+                print(f"[decode] ffmpeg=FAIL returncode={result.returncode} stderr={stderr}")
+            else:
+                sample_count = len(result.stdout) // 4
+                print(f"[decode] ffmpeg=OK target_sr=16000 float32_samples={sample_count}")
+        except Exception as exc:
+            print(f"[decode] ffmpeg=FAIL {type(exc).__name__}: {exc}")
+
 
 def main():
     if hasattr(sys.stdout, "reconfigure"):
@@ -114,7 +166,8 @@ def main():
         print(f"[selected] category={category} tar_count={len(tar_paths)} first_tar={tar_paths[0].name}")
 
     backends = try_import_audio_backends()
-    try_decode_first_audio(selected_tar_files, backends)
+    command_backends = try_command_backends()
+    try_decode_first_audio(selected_tar_files, backends, command_backends)
 
     print_header("SCHEMA SUMMARY")
     total_records = 0
