@@ -66,6 +66,32 @@ def summarize_existing_manifest(manifest_path: Path) -> tuple[int, int, dict | N
     return manifest_records, len(audio_source_ids), first_record
 
 
+def rebuild_completed_chunk_index(
+    chunks: list[list[tuple[str, Path]]],
+    output_dir: Path,
+) -> list[dict]:
+    """Build the index from all atomically committed manifests in the output directory."""
+    index_records: list[dict] = []
+    for chunk_idx, chunk_tar_files in enumerate(chunks):
+        output_manifest = output_dir / f"acavcaps_caption_long_formal_chunk_{chunk_idx:03d}.jsonl"
+        if not output_manifest.exists() or output_manifest.stat().st_size == 0:
+            continue
+        manifest_records, audio_source_records, first_manifest_record = summarize_existing_manifest(output_manifest)
+        index_records.append(
+            {
+                "chunk_index": chunk_idx,
+                "manifest_path": str(output_manifest),
+                "tar_count": len(chunk_tar_files),
+                "categories": sorted({category for category, _ in chunk_tar_files}),
+                "audio_source_records": audio_source_records,
+                "manifest_records": manifest_records,
+                "first_record": first_manifest_record,
+                "available_on_disk": True,
+            }
+        )
+    return index_records
+
+
 def main():
     import sys
 
@@ -227,14 +253,16 @@ def main():
         )
         ACTIVE_STAGE = f"chunk={chunk_idx:03d} complete"
 
+    completed_index_records = rebuild_completed_chunk_index(chunks, output_dir)
     index_path = output_dir / "acavcaps_caption_long_formal_chunks_index.json"
     with index_path.open("w", encoding="utf-8") as f:
-        json.dump(index_records, f, ensure_ascii=False, indent=2)
+        json.dump(completed_index_records, f, ensure_ascii=False, indent=2)
 
     print("========== ACAVCAPS FORMAL CHUNK PREP DONE ==========")
     print(f"[chunk] output_dir={output_dir}")
     print(f"[chunk] index_path={index_path}")
-    print(f"[chunk] chunk_count={len(index_records)}")
+    print(f"[chunk] processed_chunk_count={len(index_records)}")
+    print(f"[chunk] completed_chunk_count={len(completed_index_records)}")
     print(f"[chunk] total_audio_source_records={total_audio_source_records}")
     print(f"[chunk] total_manifest_records={total_manifest_records}")
     ACTIVE_STAGE = "complete"

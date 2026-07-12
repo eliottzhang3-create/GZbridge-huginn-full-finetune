@@ -796,6 +796,19 @@ Current formal chunk entrypoints:
 - submit wrapper:
   - `code/huginn_lora/run_prepare_acavcaps_formal_full_chunked_swift_dataset_3090.sh`
 
+Separate smaller formal-scale validation route:
+
+- select 56 tar shards:
+  - `00A=12,0M0=8,S00=10,S0A=12,SMA=8,0MA=3,SM0=3`
+- use the complete JSON sample set from every selected tar
+- use one tar per chunk
+- output directory:
+  - `data/audio_swift/acavcaps/subset_56_full_1tar_chunks`
+- runtime wrapper:
+  - `code/huginn_lora/scripts/prepare_acavcaps_subset_full_1tar_chunked_swift_dataset.sh`
+- submit wrapper:
+  - `code/huginn_lora/run_prepare_acavcaps_subset_full_1tar_chunked_swift_dataset_3090.sh`
+
 Current formal chunk behavior:
 
 - default category scope:
