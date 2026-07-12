@@ -9,6 +9,7 @@ export FORMAL_CHUNK_DIR="${FORMAL_CHUNK_DIR:-$REPO_ROOT/data/audio_swift/acavcap
 export FORMAL_CATEGORY_LIMITS="${FORMAL_CATEGORY_LIMITS:-00A=12,0M0=8,S00=10,S0A=12,SMA=8,0MA=3,SM0=3}"
 export FORMAL_CHUNK_SIZE_TARS="${FORMAL_CHUNK_SIZE_TARS:-1}"
 export FORMAL_SKIP_EXISTING="${FORMAL_SKIP_EXISTING:-1}"
+export FORMAL_VERIFY_AUDIO_PAIRS="${FORMAL_VERIFY_AUDIO_PAIRS:-1}"
 
 # This variant must not silently inherit a cap from an earlier submission shell.
 if [ -n "${FORMAL_SAMPLES_PER_TAR:-}" ]; then

@@ -38,6 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start_chunk", type=int, default=None)
     parser.add_argument("--end_chunk", type=int, default=None)
     parser.add_argument("--skip_existing", action="store_true")
+    parser.add_argument("--verify_audio_pairs", action="store_true")
     return parser.parse_args()
 
 
@@ -137,6 +138,7 @@ def main():
     print(f"[chunk] start_chunk={start_chunk}")
     print(f"[chunk] end_chunk={end_chunk}")
     print(f"[chunk] skip_existing={args.skip_existing}")
+    print(f"[chunk] verify_audio_pairs={args.verify_audio_pairs}")
 
     index_records: list[dict] = []
     total_manifest_records = 0
@@ -192,7 +194,11 @@ def main():
                     f"[chunk] idx={chunk_idx:03d} tar_start "
                     f"category={category} tar={tar_path.name}"
                 )
-                tar_records = iter_tar_records(tar_path, samples_per_tar=args.samples_per_tar)
+                tar_records = iter_tar_records(
+                    tar_path,
+                    samples_per_tar=args.samples_per_tar,
+                    verify_audio_pairs=args.verify_audio_pairs,
+                )
                 for record in tar_records:
                     payload = record["payload"]
                     texts = extract_texts(payload, args.text_field, args.text_index, args.expand_all_texts)
@@ -221,10 +227,12 @@ def main():
                 os.fsync(f.fileno())
                 elapsed_s = time.monotonic() - tar_started_at
                 ACTIVE_STAGE = f"chunk={chunk_idx:03d} tar={tar_path.name} complete"
+                pair_status = "passed" if args.verify_audio_pairs else "not_requested"
                 print(
                     f"[chunk] idx={chunk_idx:03d} category={category} tar={tar_path.name} "
                     f"audio_source_records={tar_source_records} emitted_records={tar_manifest_records} "
-                    f"chunk_manifest_records={chunk_manifest_records} elapsed_s={elapsed_s:.2f}"
+                    f"chunk_manifest_records={chunk_manifest_records} "
+                    f"audio_pair_verification={pair_status} elapsed_s={elapsed_s:.2f}"
                 )
 
         if chunk_manifest_records == 0:

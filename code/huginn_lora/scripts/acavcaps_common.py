@@ -96,15 +96,23 @@ def build_audio_member_from_json_name(json_member: str) -> str:
 def iter_tar_records(
     tar_path: Path,
     samples_per_tar: int | None = None,
+    verify_audio_pairs: bool = False,
 ) -> list[dict[str, Any]]:
     if samples_per_tar is not None and samples_per_tar <= 0:
         raise ValueError(f"samples_per_tar must be positive when set, got {samples_per_tar}")
+    if verify_audio_pairs and samples_per_tar is not None:
+        raise ValueError("verify_audio_pairs requires samples_per_tar=None so the complete tar is scanned")
 
     # ACAVCAPS shards are gzip-compressed. Sequential mode avoids repeatedly
     # seeking through the compressed stream for JSON members selected by name.
     output: list[dict[str, Any]] = []
+    audio_members: set[str] = set()
     with tarfile.open(tar_path, mode="r|*") as tar_obj:
         for member in tar_obj:
+            if member.isfile() and member.name.endswith(".flac"):
+                if verify_audio_pairs:
+                    audio_members.add(member.name)
+                continue
             if not member.isfile() or not member.name.endswith(".json"):
                 continue
             extracted = tar_obj.extractfile(member)
@@ -120,6 +128,17 @@ def iter_tar_records(
             )
             if samples_per_tar is not None and len(output) >= samples_per_tar:
                 break
+
+    if verify_audio_pairs:
+        missing_audio_members = [
+            record["audio_member"] for record in output if record["audio_member"] not in audio_members
+        ]
+        if missing_audio_members:
+            preview = ", ".join(missing_audio_members[:3])
+            raise FileNotFoundError(
+                f"Tar {tar_path} has {len(missing_audio_members)} JSON records without matching FLAC members. "
+                f"Examples: {preview}"
+            )
     return output
 
 
