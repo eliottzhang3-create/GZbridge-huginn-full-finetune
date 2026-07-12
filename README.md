@@ -913,6 +913,10 @@ As of 2026-07-12, the correct assumption is:
   - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_mid.sh`
 - ACAVCAPS formal chunk generation:
   - `code/huginn_lora/scripts/prepare_acavcaps_formal_full_chunked_swift_dataset.sh`
+- ACAVCAPS subset full-tar duration inspection:
+  - `code/huginn_lora/scripts/inspect_acavcaps_subset_full_1tar_durations.sh`
+- ACAVCAPS formal-manifest train probe:
+  - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_formal_probe.sh`
 
 ---
 
