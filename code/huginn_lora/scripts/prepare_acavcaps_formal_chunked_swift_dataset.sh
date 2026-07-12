@@ -16,6 +16,14 @@ python -V || true
 export PYTHONUNBUFFERED=1
 echo "PYTHONUNBUFFERED=$PYTHONUNBUFFERED"
 
+on_exit() {
+  status=$?
+  echo "========== PREPARE ACAVCAPS FORMAL CHUNKS EXIT =========="
+  echo "exit_status=$status"
+  echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
+}
+trap on_exit EXIT
+
 mkdir -p data/audio_swift/acavcaps/formal_chunks
 
 FORMAL_CHUNK_DIR="${FORMAL_CHUNK_DIR:-$REPO_ROOT/data/audio_swift/acavcaps/formal_chunks}"

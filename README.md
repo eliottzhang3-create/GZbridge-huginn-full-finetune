@@ -68,6 +68,39 @@ The current main active task is:
 
 This Swift LoRA multimodal route is the current forward path for new audio-model work.
 
+### Current highest-priority execution status (updated 2026-07-12)
+
+The newest confirmed mainline is now:
+
+- model family:
+  - original Huginn backbone
+  - multimodal model package in `models/huginn-audio-whisper-v1`
+- audio encoder:
+  - `whisper-large`
+  - remote path:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large`
+- framework:
+  - **ms-swift / `swift sft`**
+  - remote env version observed in logs:
+    - `swift==4.1.3`
+- training split that has been debugged and verified:
+  - `audio_encoder` must stay **frozen**
+  - `aligner` stays **full-trainable**
+  - Huginn language model base weights stay **frozen**
+  - Huginn language model gets **LoRA only**
+- current dataset mainline for Swift audio work:
+  - **ACAVCAPS**
+  - loaded from shared public remote storage
+  - training data is read from `.tar.gz` shards without copying the whole dataset into the personal workspace
+
+The immediate practical mainline is no longer "just make Swift run once". It is now:
+
+1. maintain the verified Swift audio training path
+2. keep `audio_encoder` frozen under Swift multimodal registration
+3. generate / maintain ACAVCAPS training manifests and chunked manifests
+4. move toward formal training on ACAVCAPS using the verified chunked-manifest route
+5. only let the user execute remote jobs through `vc submit`
+
 ---
 
 ## Local / GitHub / Remote Workflow
@@ -136,11 +169,41 @@ Codex **cannot directly operate on the remote server**. Any remote command must 
 
 Do not casually change the container unless the user explicitly asks.
 
+### Current remote dataset / artifact roots that matter for the Swift audio line
+
+- Public ACAVCAPS tar-shard root:
+  - `/hpc_stor03/public/shared/data/raa/ACAVCAPS`
+- Remote repo-side generated Swift dataset artifacts:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps`
+- Current formal chunk output directory mainline:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/formal_chunks_all_4tar_256`
+
+### Current remote tool assumptions already checked by logs / manual commands
+
+- `python=3.10.20`
+- system audio tools available:
+  - `/usr/bin/ffmpeg`
+  - `/usr/bin/ffprobe`
+  - `/usr/bin/sox`
+  - `/usr/bin/flac`
+- Python TensorBoard package is available in `swift_huginn`:
+  - `tensorboard==2.20.0`
+
+Important note:
+
+- the Swift audio plugin was extended to support **tar-backed FLAC decoding**
+- Python audio backends such as `soundfile` / `torchaudio` were not assumed available
+- current robust fallback path uses **`ffmpeg`** on the remote side
+
 ---
 
 ## Queue / Submission Constraints
 
-The current queue in use is:
+The current queue in active use for the Swift audio line is:
+
+- `pdgpu-3090`
+
+Historical / sometimes used queue:
 
 - `pdgpu-5090`
 
@@ -161,6 +224,14 @@ For **8 GPU** jobs, the current full-training submit script uses:
 which satisfies the per-GPU rule.
 
 Remote jobs should be launched through the provided `vc submit` shell scripts, not by directly starting long training commands manually.
+
+Important operational rule from the user:
+
+- on the remote side, do **not** assume you can freely run arbitrary long commands interactively
+- for practical work, always prepare:
+  - a runtime shell script
+  - a matching `vc submit` wrapper
+- then let the user submit that job on the cluster
 
 ---
 
@@ -207,13 +278,42 @@ repo-root/
       plugins/
         huginn_swift.py
         huginn_audio_swift.py
+        huginn_swift_39.py
       scripts/
         train_huginn_sft_lora.sh
         train_huginn_scienceqa_lora.sh
         prepare_huginn_audio_dataset.py
+        acavcaps_common.py
+        inspect_swift_mllm_registration.py
+        inspect_huginn_audio_swift_trainables.py
+        inspect_huginn_audio_freeze_path.py
+        inspect_acavcaps_dataset.py
         smoke_huginn_audio_swift.py
         smoke_huginn_audio_swift.sh
+        smoke_acavcaps_huginn_audio_swift.py
+        smoke_acavcaps_huginn_audio_swift.sh
+        prepare_acavcaps_swift_dataset.py
+        prepare_acavcaps_smoke_swift_dataset.sh
+        prepare_acavcaps_pilot_swift_dataset.sh
+        prepare_acavcaps_mid_swift_dataset.sh
+        prepare_acavcaps_formal_chunked_swift_dataset.py
+        prepare_acavcaps_formal_chunked_swift_dataset.sh
+        prepare_acavcaps_formal_chunked_swift_dataset_limited.sh
+        prepare_acavcaps_formal_full_chunked_swift_dataset.sh
+        train_acavcaps_huginn_audio_swift_mid.sh
       run_smoke_huginn_audio_swift_5090.sh
+      run_smoke_huginn_audio_swift_3090.sh
+      run_inspect_swift_mllm_registration_5090.sh
+      run_inspect_huginn_audio_swift_trainables_3090.sh
+      run_inspect_huginn_audio_freeze_path_4090.sh
+      run_inspect_acavcaps_dataset_3090.sh
+      run_prepare_acavcaps_smoke_swift_dataset_3090.sh
+      run_prepare_acavcaps_pilot_swift_dataset_3090.sh
+      run_prepare_acavcaps_mid_swift_dataset_3090.sh
+      run_prepare_acavcaps_formal_chunked_swift_dataset_limited_3090.sh
+      run_prepare_acavcaps_formal_full_chunked_swift_dataset_3090.sh
+      run_smoke_acavcaps_huginn_audio_swift_3090.sh
+      run_train_acavcaps_huginn_audio_swift_mid_3090.sh
 ```
 
 ---
@@ -382,7 +482,7 @@ Current experiment branch:
   - frozen in earlier V1 standalone branch
   - in the current Swift LoRA branch, backbone stays frozen at base weights but receives **LoRA adapters**
 
-Current V1 training policy:
+Historical standalone V1 training policy:
 
 - freeze **Huginn backbone**
 - freeze **Whisper encoder**
@@ -391,6 +491,15 @@ Current V1 training policy:
   - `audio_projector`
   - optional `audio_bos`
   - optional `audio_eos`
+
+Important clarification:
+
+- the policy above describes the **earlier standalone adapter-only branch**
+- it is **not** the current Swift mainline policy
+- the current Swift mainline policy is:
+  - freeze `audio_encoder`
+  - full-train `aligner`
+  - LoRA-train Huginn language model only
 
 ### Current architecture details that matter
 
@@ -433,7 +542,8 @@ For the current `models/huginn-audio-whisper-v1` implementation:
   - `code/huginn_lora/scripts/smoke_huginn_audio_swift.py`
 - actual Swift smoke training launcher:
   - `code/huginn_lora/scripts/smoke_huginn_audio_swift.sh`
-- 5090 submit script:
+- current smoke submit scripts:
+  - `code/huginn_lora/run_smoke_huginn_audio_swift_3090.sh`
   - `code/huginn_lora/run_smoke_huginn_audio_swift_5090.sh`
 
 ### Important training scripts
@@ -460,6 +570,12 @@ For the current `models/huginn-audio-whisper-v1` implementation:
 
 - Clotho caption:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_caption_huginn`
+
+- ACAVCAPS shared public tar dataset:
+  - `/hpc_stor03/public/shared/data/raa/ACAVCAPS`
+
+- ACAVCAPS repo-side generated Swift manifests / chunk outputs:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps`
 
 ### Current data assumptions
 
@@ -525,7 +641,7 @@ On top of the earlier standalone audio branch, the repo has now entered a **new 
      - register model arch split:
        - language model
        - aligner
-       - audio tower
+       - frozen audio tower path
      - define a multimodal template that reads local audio and produces `audio_input_features`
 
 3. **The new Swift route now targets `swift sft`, not ad-hoc manual forward loops**
@@ -536,16 +652,162 @@ On top of the earlier standalone audio branch, the repo has now entered a **new 
 4. **Smoke-training entrypoints now exist for the Swift route**
    - prepare dataset into Swift JSONL
    - sanity print first sample
-   - run a tiny `swift sft` smoke job on 5090
+   - run a tiny `swift sft` smoke job through `vc submit`
+   - current active single-GPU queue is mainly 3090
 
 ### Important current status of the Swift branch
 
-- Local code and Python static syntax checks are done.
-- Remote runtime validation is still required.
+- This branch is no longer only "implemented locally".
+- Multiple remote validation stages have already succeeded.
 - Therefore, the Swift multimodal LoRA path should currently be treated as:
   - **implemented locally**
-  - **ready for remote smoke verification**
-  - **not yet declared fully runtime-verified until remote logs confirm it**
+  - **remote smoke-verified**
+  - **remote trainability-verified on single 3090**
+  - **still under active iteration for larger-scale formal ACAVCAPS training**
+
+### Newest verified Swift progress (updated 2026-07-12)
+
+The following points are already important confirmed project memory:
+
+1. **Swift MLLM registration compatibility was debugged for the installed remote Swift version**
+   - remote Swift version from logs:
+     - `4.1.3`
+   - `MultiModelKeys` registration path required compatibility handling
+   - duplicate registration handling was added so repeated imports do not crash the pipeline
+
+2. **The critical audio-encoder-freezing bug was found and fixed**
+   - earlier logs showed the final Swift trainer model had:
+     - `audio_encoder` trainable
+     - total trainable params around `696M`
+     - of which around `636M` wrongly came from the Whisper audio encoder
+   - root cause:
+     - the Swift multimodal model-arch split did not originally map our custom audio tower in the same way Swift expects frozen "generator/vision-tower-like" modules to be treated
+   - fix:
+     - the plugin now registers `audio_encoder` under the **`generator`** branch in the Swift model-arch split
+   - result:
+     - final validated route keeps `audio_encoder` frozen
+     - aligner remains trainable
+     - Huginn LoRA remains trainable
+
+3. **The shift-loss patch remains important and is still in use**
+   - `code/huginn_lora/plugins/huginn_audio_swift.py`
+   - this patch is needed for the multimodal SFT label-shift behavior
+   - an earlier monkey-patch debug hook did not intercept the exact internal Swift call path, but that did **not** mean the real shift-loss patch was unused
+
+4. **Remote inspect / validation scripts were added and used**
+   - Swift registration inspection
+   - freeze-path inspection
+   - final trainable-parameter inspection
+   - ACAVCAPS tar / schema / decode inspection
+   - these are now part of the active project memory and should be reused before future large changes
+
+5. **Single-GPU smoke training now runs successfully**
+   - Huginn audio Swift smoke route completed on remote
+   - ACAVCAPS smoke route also completed
+   - this proves:
+     - plugin registration works
+     - multimodal forward path works
+     - loss path works
+     - LoRA path works
+     - tar-backed audio decode works
+
+6. **Single-GPU mid-scale ACAVCAPS training also completed successfully**
+   - a mid training run on 3090 finished successfully
+   - observed memory was around `21.7 GiB`
+   - this is important because it means the current mainline is no longer blocked at the runtime-validation stage
+
+7. **OOM still matters for larger runs**
+   - earlier attempts could OOM when the wrong parameter split left the audio encoder trainable
+   - current formal-data work therefore uses manifest chunking and controlled sample counts per tar
+   - the user currently prefers to stay on **single 3090** rather than immediately moving to multi-GPU / FSDP for this audio Swift line
+
+### Current ACAVCAPS status and design
+
+The current Swift audio mainline has moved from Clotho-only smoke work to **ACAVCAPS**.
+
+Important ACAVCAPS facts:
+
+- dataset is stored in the **public remote shared area**
+- data is organized as category directories containing `.tar.gz` shards
+- each shard contains paired:
+  - `.flac`
+  - `.json`
+- the repo must **not** copy or rewrite the shared dataset in place
+- the current training-data route reads those tar shards directly
+
+Current implementation strategy:
+
+1. inspect tar shard structure and decode support
+2. build Swift JSONL records that reference:
+   - `tar_path`
+   - `audio_member`
+   - `json_member`
+3. let the plugin open tar members and decode FLAC on the fly
+4. train through ordinary `swift sft`
+
+This means:
+
+- audio files are **not** eagerly copied into the repo workspace
+- the manifest stores **tar-backed metadata**, not duplicated audio payloads
+- decoding happens at training time
+
+### Current ACAVCAPS manifest / chunk pipeline
+
+There are now several different ACAVCAPS preparation layers and they must not be confused:
+
+1. **Smoke manifest**
+   - very small
+   - used only to prove the full route runs end-to-end
+
+2. **Pilot manifest**
+   - larger than smoke
+   - still for validation / sanity checks
+
+3. **Mid manifest**
+   - moderate-size training manifest
+   - used to verify longer single-GPU training stability
+
+4. **Formal chunk manifests**
+   - used for the current mainline large-scale ACAVCAPS preparation
+   - chunking exists to keep preparation resumable and easier to debug
+
+### Current formal chunk mainline (updated 2026-07-12)
+
+The current intended formal-manifest configuration is:
+
+- use **all ACAVCAPS tar shards**
+  - currently around `1071` tar files total across categories
+- put **4 tar files per chunk**
+- take the **first 256 samples per tar**
+- generate one Swift JSONL file per chunk
+- support resume / partial regeneration through:
+  - `start_chunk`
+  - `end_chunk`
+  - `skip_existing`
+
+Current default formal chunk output directory:
+
+- `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/formal_chunks_all_4tar_256`
+
+Current formal chunk entrypoints:
+
+- runtime wrapper:
+  - `code/huginn_lora/scripts/prepare_acavcaps_formal_full_chunked_swift_dataset.sh`
+- submit wrapper:
+  - `code/huginn_lora/run_prepare_acavcaps_formal_full_chunked_swift_dataset_3090.sh`
+
+Current formal chunk behavior:
+
+- default category scope:
+  - `ALL`
+- default chunk size:
+  - `4 tar / chunk`
+- default sample cap:
+  - `256 records / tar`
+- default resume behavior:
+  - `skip existing`
+
+This is the current mainline dataset-preparation route for the Swift ACAVCAPS project.
 
 ---
 
@@ -611,6 +873,31 @@ For the new `code/huginn_lora` path, the intended training split is:
   - train **LoRA only**
 
 This is the most important high-level requirement for any future edit on the Swift branch.
+
+### Current Swift audio training status that should be assumed by new agents
+
+As of 2026-07-12, the correct assumption is:
+
+- the Huginn Swift audio route is **already runnable**
+- the frozen-audio-encoder policy is **already enforced in the current mainline**
+- the main unresolved work is **not** basic registration anymore
+- the main unresolved work is:
+  - scaling from smoke / mid training toward formal ACAVCAPS training
+  - keeping dataset preparation resumable
+  - managing larger training jobs carefully on single-GPU resources
+
+### Current useful Swift training entrypoints
+
+- Huginn/Clotho-style smoke:
+  - `code/huginn_lora/scripts/smoke_huginn_audio_swift.sh`
+- trainable-parameter validation:
+  - `code/huginn_lora/scripts/inspect_huginn_audio_swift_trainables.sh`
+- ACAVCAPS smoke:
+  - `code/huginn_lora/scripts/smoke_acavcaps_huginn_audio_swift.sh`
+- ACAVCAPS mid training:
+  - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_mid.sh`
+- ACAVCAPS formal chunk generation:
+  - `code/huginn_lora/scripts/prepare_acavcaps_formal_full_chunked_swift_dataset.sh`
 
 ---
 
@@ -720,6 +1007,16 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/scripts/smoke_huginn_audio_swift.py`
 - `code/huginn_lora/scripts/smoke_huginn_audio_swift.sh`
 - `code/huginn_lora/run_smoke_huginn_audio_swift_5090.sh`
+- `code/huginn_lora/run_smoke_huginn_audio_swift_3090.sh`
+- `code/huginn_lora/scripts/inspect_huginn_audio_swift_trainables.py`
+- `code/huginn_lora/scripts/inspect_huginn_audio_freeze_path.py`
+- `code/huginn_lora/scripts/inspect_acavcaps_dataset.py`
+- `code/huginn_lora/scripts/prepare_acavcaps_swift_dataset.py`
+- `code/huginn_lora/scripts/smoke_acavcaps_huginn_audio_swift.py`
+- `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_mid.sh`
+- `code/huginn_lora/scripts/prepare_acavcaps_formal_chunked_swift_dataset.py`
+- `code/huginn_lora/scripts/prepare_acavcaps_formal_full_chunked_swift_dataset.sh`
+- `code/huginn_lora/run_prepare_acavcaps_formal_full_chunked_swift_dataset_3090.sh`
 
 ### Audio evaluation
 
@@ -764,6 +1061,11 @@ Any new chat should assume the following:
      - Swift multimodal plugin code
      - Swift-format dataset conversion helper
      - Swift smoke-training submit path
+     - Swift freeze-path inspection scripts
+     - Swift trainable-parameter validation scripts
+     - ACAVCAPS tar-backed dataset path
+     - ACAVCAPS smoke + mid training scripts
+     - ACAVCAPS formal chunk generation scripts
 
 ---
 
@@ -787,8 +1089,10 @@ Any new chat should assume the following:
 8. Distinguish carefully between:
    - the older standalone audio scripts in `code/recurrent-pretraining-main`
    - the newer Swift multimodal LoRA route in `code/huginn_lora`
-9. Do not claim the Swift branch is fully validated unless remote smoke logs have actually confirmed it.
+9. Do not forget that the Swift branch has already passed remote smoke and mid training; do not regress it back into an "unverified" mental model.
 10. For current audio development requests, default to the **Swift multimodal LoRA path** unless the user explicitly asks to modify the older standalone scripts.
+11. For the Swift audio line, prefer `pdgpu-3090` single-GPU submission scripts unless the user explicitly asks to move elsewhere.
+12. For ACAVCAPS, remember that the current formal-data mainline is tar-backed chunk generation, not copying raw audio into the repo.
 
 ---
 
@@ -816,7 +1120,7 @@ Any new chat should assume the following:
   - a historical standalone PyTorch training route
   - a current Swift multimodal LoRA route
 - The most likely future work is:
-  - finish remote validation of the Swift multimodal LoRA route
+  - continue scaling the already-validated Swift multimodal LoRA route
   - continue improving audio alignment / caption quality
   - evaluate checkpoints with retrieval / visualization / caption metrics
   - compare finetuning strategies:
@@ -838,8 +1142,14 @@ If a new agent is asked "what should we do now", the best default interpretation
    - adapter trainable
    - Huginn LoRA trainable
    - audio encoder frozen
-3. do local code edits only
-4. let the user run all remote jobs and bring logs back
+3. assume the current dataset mainline is **ACAVCAPS**
+4. assume the current formal data-prep mainline is:
+   - all tar shards
+   - 4 tar per chunk
+   - 256 samples per tar
+   - resumable chunk generation
+5. do local code edits only
+6. let the user run all remote jobs and bring logs back
 
 Before any long remote run:
 
@@ -847,3 +1157,8 @@ Before any long remote run:
 - confirm the checkpoint path is the one you actually want
 - confirm the output `run_name` will not collide with old runs
 - confirm the queue resource request still follows the current rules
+- confirm whether the job is:
+  - smoke
+  - mid
+  - formal chunk generation
+  - actual formal training

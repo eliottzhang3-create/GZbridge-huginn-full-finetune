@@ -97,28 +97,30 @@ def iter_tar_records(
     tar_path: Path,
     samples_per_tar: int | None = None,
 ) -> list[dict[str, Any]]:
-    json_members: list[str] = []
-    with tarfile.open(tar_path, mode="r:*") as tar_obj:
-        for member in tar_obj.getmembers():
+    if samples_per_tar is not None and samples_per_tar <= 0:
+        raise ValueError(f"samples_per_tar must be positive when set, got {samples_per_tar}")
+
+    # ACAVCAPS shards are gzip-compressed. Sequential mode avoids repeatedly
+    # seeking through the compressed stream for JSON members selected by name.
+    output: list[dict[str, Any]] = []
+    with tarfile.open(tar_path, mode="r|*") as tar_obj:
+        for member in tar_obj:
             if not member.isfile() or not member.name.endswith(".json"):
                 continue
-            json_members.append(member.name)
-
-        json_members.sort()
-        if samples_per_tar is not None:
-            json_members = json_members[:samples_per_tar]
-
-        output: list[dict[str, Any]] = []
-        for json_member in json_members:
-            payload = load_json_bytes_from_tar(tar_obj, json_member)
+            extracted = tar_obj.extractfile(member)
+            if extracted is None:
+                raise FileNotFoundError(f"Missing json member {member.name} in {tar_path}")
+            payload = json.loads(extracted.read().decode("utf-8"))
             output.append(
                 {
-                    "json_member": json_member,
-                    "audio_member": build_audio_member_from_json_name(json_member),
+                    "json_member": member.name,
+                    "audio_member": build_audio_member_from_json_name(member.name),
                     "payload": payload,
                 }
             )
-        return output
+            if samples_per_tar is not None and len(output) >= samples_per_tar:
+                break
+    return output
 
 
 def maybe_text_list(value: Any) -> list[str]:

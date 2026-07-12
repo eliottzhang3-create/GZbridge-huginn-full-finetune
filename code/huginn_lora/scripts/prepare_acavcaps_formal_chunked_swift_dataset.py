@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
+import time
 from pathlib import Path
 
 from acavcaps_common import (
@@ -12,6 +14,15 @@ from acavcaps_common import (
     resolve_category_limits,
 )
 from prepare_acavcaps_swift_dataset import build_manifest_record, extract_texts
+
+
+ACTIVE_STAGE = "initializing"
+
+
+def log_signal_and_exit(signum, _frame):
+    signal_name = signal.Signals(signum).name
+    print(f"[chunk] received_signal={signal_name} active_stage={ACTIVE_STAGE}", flush=True)
+    raise SystemExit(128 + signum)
 
 
 def parse_args() -> argparse.Namespace:
@@ -58,10 +69,14 @@ def summarize_existing_manifest(manifest_path: Path) -> tuple[int, int, dict | N
 def main():
     import sys
 
+    global ACTIVE_STAGE
+
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(line_buffering=True)
     if hasattr(sys.stderr, "reconfigure"):
         sys.stderr.reconfigure(line_buffering=True)
+    signal.signal(signal.SIGTERM, log_signal_and_exit)
+    signal.signal(signal.SIGINT, log_signal_and_exit)
 
     args = parse_args()
     dataset_root = Path(args.dataset_root)
@@ -145,6 +160,8 @@ def main():
             for category, tar_path in chunk_tar_files:
                 tar_source_records = 0
                 tar_manifest_records = 0
+                tar_started_at = time.monotonic()
+                ACTIVE_STAGE = f"chunk={chunk_idx:03d} tar={tar_path.name} reading_metadata"
                 print(
                     f"[chunk] idx={chunk_idx:03d} tar_start "
                     f"category={category} tar={tar_path.name}"
@@ -175,10 +192,13 @@ def main():
                         total_manifest_records += 1
                         tar_manifest_records += 1
                 f.flush()
+                os.fsync(f.fileno())
+                elapsed_s = time.monotonic() - tar_started_at
+                ACTIVE_STAGE = f"chunk={chunk_idx:03d} tar={tar_path.name} complete"
                 print(
                     f"[chunk] idx={chunk_idx:03d} category={category} tar={tar_path.name} "
                     f"audio_source_records={tar_source_records} emitted_records={tar_manifest_records} "
-                    f"chunk_manifest_records={chunk_manifest_records}"
+                    f"chunk_manifest_records={chunk_manifest_records} elapsed_s={elapsed_s:.2f}"
                 )
 
         if chunk_manifest_records == 0:
@@ -188,6 +208,7 @@ def main():
                 pass
             raise ValueError(f"Chunk {chunk_idx} produced zero records")
 
+        ACTIVE_STAGE = f"chunk={chunk_idx:03d} committing_manifest"
         os.replace(tmp_output_manifest, output_manifest)
         index_record = {
             "chunk_index": chunk_idx,
@@ -204,6 +225,7 @@ def main():
             f"[chunk] idx={chunk_idx:03d} manifest_path={output_manifest} "
             f"tar_count={len(chunk_tar_files)} manifest_records={chunk_manifest_records}"
         )
+        ACTIVE_STAGE = f"chunk={chunk_idx:03d} complete"
 
     index_path = output_dir / "acavcaps_caption_long_formal_chunks_index.json"
     with index_path.open("w", encoding="utf-8") as f:
@@ -215,6 +237,7 @@ def main():
     print(f"[chunk] chunk_count={len(index_records)}")
     print(f"[chunk] total_audio_source_records={total_audio_source_records}")
     print(f"[chunk] total_manifest_records={total_manifest_records}")
+    ACTIVE_STAGE = "complete"
 
 
 if __name__ == "__main__":
