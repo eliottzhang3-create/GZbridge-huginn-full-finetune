@@ -804,6 +804,9 @@ Separate smaller formal-scale validation route:
 - use one tar per chunk
 - require a full sequential scan and verify every JSON has a same-stem `.flac` member
 - do not set `FORMAL_SAMPLES_PER_TAR` for this route
+- full 56-chunk record count:
+  - `239854`
+  - note: a later resumable job reported `235333` only because it processed chunk `001..055`; chunk `000` was completed separately with `4521` records
 - output directory:
   - `data/audio_swift/acavcaps/subset_56_full_1tar_chunks`
 - runtime wrapper:

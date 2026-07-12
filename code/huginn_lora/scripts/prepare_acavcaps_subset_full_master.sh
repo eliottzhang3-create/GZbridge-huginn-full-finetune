@@ -22,4 +22,4 @@ python -u code/huginn_lora/scripts/prepare_acavcaps_subset_full_master.py \
   --output_manifest "$MASTER_MANIFEST" \
   --seed 42 \
   --expected_chunk_count 56 \
-  --expected_record_count 235333
+  --expected_record_count 239854
