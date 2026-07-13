@@ -948,7 +948,7 @@ As of 2026-07-13, the correct assumption is:
 - AudioCaps v2 was copied into the user's personal remote storage, so this route uses ordinary local WAV paths rather than ACAVCAPS tar references.
 - New scripts provide, in order:
   - CSV/WAV/Swift-argument inspection on `pdgpu-5090`
-  - full train-split metadata-only JSONL preparation with CSV-to-WAV and 16-bit PCM WAV verification
+  - full train-split metadata-only JSONL preparation with CSV-to-WAV and 16-bit PCM WAV verification; unavailable or malformed rows are explicitly excluded and recorded in stats
   - a 20-step B8/GA4 smoke on `pdgpu-5090`
   - a five-epoch B8/GA4 formal run on `pdgpu-5090`, checkpointed once per epoch and retaining five full checkpoints
 - Do not treat this route as runnable until the inspection and manifest jobs have passed. The Huginn audio model and Swift plugin are intentionally reused unchanged unless the WAV inspection finds an unsupported format.

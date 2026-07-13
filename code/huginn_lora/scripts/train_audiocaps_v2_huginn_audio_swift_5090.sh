@@ -55,6 +55,14 @@ if stats.get("audio_path_verification") != "passed":
     raise SystemExit("AudioCaps audio-path verification is not marked passed")
 if stats.get("wav_readability_verification") != "passed":
     raise SystemExit("AudioCaps WAV readability verification is not marked passed")
+source_rows = stats.get("source_csv_row_count")
+excluded_rows = stats.get("excluded_row_count")
+if not isinstance(source_rows, int) or not isinstance(excluded_rows, int):
+    raise SystemExit("AudioCaps stats are missing source_csv_row_count or excluded_row_count")
+if stats.get("limit_records") is None and source_rows != stats["record_count"] + excluded_rows:
+    raise SystemExit(
+        f"AudioCaps stats accounting mismatch: source={source_rows} "
+        f"record_count={stats['record_count']} excluded={excluded_rows}")
 
 from swift.arguments.sft_args import SftArguments
 available_fields = {field.name for field in fields(SftArguments)}
@@ -76,6 +84,7 @@ echo "max_steps=${MAX_STEPS:-<unset>}"
 echo "per_device_train_batch_size=8"
 echo "gradient_accumulation_steps=4"
 echo "effective_batch_size=32"
+echo "invalid_rows_are_filtered_in_manifest=true"
 echo "dataset_shuffle=true"
 echo "train_dataloader_shuffle=true"
 echo "save_strategy=$SAVE_STRATEGY"

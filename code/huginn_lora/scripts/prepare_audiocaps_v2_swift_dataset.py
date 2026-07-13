@@ -25,6 +25,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--caption_column', default='caption')
     parser.add_argument('--audio_filename_prefix', default='Y')
     parser.add_argument('--limit_records', type=int, default=None)
+    parser.add_argument(
+        '--invalid_row_policy',
+        choices=('error', 'skip'),
+        default='skip',
+        help='Whether malformed CSV rows, missing WAV files, and unreadable WAV files stop preparation or are excluded.',
+    )
     return parser.parse_args()
 
 
@@ -117,8 +123,10 @@ def main() -> None:
     print(f'[manifest] caption_column={args.caption_column}')
     print(f'[manifest] audio_filename_prefix={args.audio_filename_prefix!r}')
     print(f'[manifest] limit_records={args.limit_records}')
+    print(f'[manifest] invalid_row_policy={args.invalid_row_policy}')
 
     validated_rows: list[tuple[Path, str, dict[str, str]]] = []
+    source_csv_row_count = 0
     unique_audio_paths: set[str] = set()
     audio_path_counts: Counter[str] = Counter()
     wav_format_counts: Counter[tuple[int | str, ...]] = Counter()
@@ -140,6 +148,7 @@ def main() -> None:
             raise ValueError(f'CSV missing required columns {missing_columns}; headers={headers}')
 
         for row_number, row in enumerate(reader, start=2):
+            source_csv_row_count += 1
             raw_id = (row.get(args.audio_id_column) or '').strip()
             caption = (row.get(args.caption_column) or '').strip()
             if not raw_id:
@@ -176,7 +185,9 @@ def main() -> None:
     if validation_error_counts:
         for kind, count in sorted(validation_error_counts.items()):
             print(f'[manifest] validation_error[{kind}]={count} examples={validation_error_examples[kind]}')
-        raise ValueError('AudioCaps validation failed; no manifest was committed')
+        if args.invalid_row_policy == 'error':
+            raise ValueError('AudioCaps validation failed; no manifest was committed')
+        print(f'[manifest] excluded_invalid_rows={sum(validation_error_counts.values())}')
 
     record_count = len(validated_rows)
     if record_count == 0:
@@ -203,7 +214,12 @@ def main() -> None:
         'audio_id_column': args.audio_id_column,
         'caption_column': args.caption_column,
         'audio_filename_prefix': args.audio_filename_prefix,
+        'source_csv_row_count': source_csv_row_count,
         'record_count': record_count,
+        'excluded_row_count': sum(validation_error_counts.values()),
+        'excluded_row_counts': dict(sorted(validation_error_counts.items())),
+        'excluded_row_examples': validation_error_examples,
+        'invalid_row_policy': args.invalid_row_policy,
         'unique_audio_path_count': len(unique_audio_paths),
         'duplicate_audio_path_count': sum(count > 1 for count in audio_path_counts.values()),
         'audio_path_verification': 'passed',
@@ -224,6 +240,9 @@ def main() -> None:
     print(f'[manifest] output_manifest={output_manifest}')
     print(f'[manifest] stats_path={stats_path}')
     print(f'[manifest] record_count={record_count}')
+    print(f'[manifest] source_csv_row_count={source_csv_row_count}')
+    print(f'[manifest] excluded_row_count={sum(validation_error_counts.values())}')
+    print(f'[manifest] excluded_row_counts={dict(sorted(validation_error_counts.items()))}')
     print(f'[manifest] unique_audio_path_count={len(unique_audio_paths)}')
     print(f'[manifest] duplicate_audio_path_count={sum(count > 1 for count in audio_path_counts.values())}')
     print('[manifest] audio_path_verification=passed')

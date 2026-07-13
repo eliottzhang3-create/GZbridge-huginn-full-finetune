@@ -12,13 +12,16 @@ cd "$REPO_ROOT"
 export PYTHONUNBUFFERED=1
 DATASET_ROOT="${AUDIOCAPS_DATASET_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/audiocaps_v2}"
 OUTPUT_MANIFEST="${AUDIOCAPS_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
+INVALID_ROW_POLICY="${AUDIOCAPS_INVALID_ROW_POLICY:-skip}"
 
 echo "========== PREPARE AUDIOCAPS V2 TRAIN MANIFEST =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "dataset_root=$DATASET_ROOT"
 echo "output_manifest=$OUTPUT_MANIFEST"
+echo "invalid_row_policy=$INVALID_ROW_POLICY"
 
 python -u code/huginn_lora/scripts/prepare_audiocaps_v2_swift_dataset.py \
   --dataset_root "$DATASET_ROOT" \
   --split train \
-  --output_manifest "$OUTPUT_MANIFEST"
+  --output_manifest "$OUTPUT_MANIFEST" \
+  --invalid_row_policy "$INVALID_ROW_POLICY"
