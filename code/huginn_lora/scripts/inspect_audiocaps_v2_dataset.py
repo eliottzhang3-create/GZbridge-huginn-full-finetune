@@ -88,16 +88,18 @@ def main() -> None:
         raise ValueError(f'CSV missing required columns {missing_columns}; headers={headers}')
 
     missing_audio: list[str] = []
-    empty_captions = 0
+    empty_audio_id_rows: list[int] = []
+    empty_caption_rows: list[int] = []
     audio_paths: list[Path] = []
     caption_counter: Counter[str] = Counter()
     for row_number, row in enumerate(rows, start=2):
         raw_id = (row.get(args.audio_id_column) or '').strip()
         caption = (row.get(args.caption_column) or '').strip()
         if not raw_id:
-            raise ValueError(f'Empty {args.audio_id_column} at CSV row {row_number}')
+            empty_audio_id_rows.append(row_number)
+            continue
         if not caption:
-            empty_captions += 1
+            empty_caption_rows.append(row_number)
         else:
             caption_counter[caption] += 1
         audio_path = audio_path_for_id(audio_dir, raw_id, args.audio_filename_prefix)
@@ -122,7 +124,8 @@ def main() -> None:
     print(f'[inspect] csv_rows={len(rows)}')
     print(f'[inspect] unique_audio_paths={len(set(audio_paths))}')
     print(f'[inspect] missing_audio_paths={len(missing_audio)}')
-    print(f'[inspect] empty_captions={empty_captions}')
+    print(f'[inspect] empty_{args.audio_id_column}_rows={len(empty_audio_id_rows)} examples={empty_audio_id_rows[:10]}')
+    print(f'[inspect] empty_{args.caption_column}_rows={len(empty_caption_rows)} examples={empty_caption_rows[:10]}')
     print(f'[inspect] duplicate_nonempty_captions={sum(count > 1 for count in caption_counter.values())}')
     print(f'[inspect] first_rows={json.dumps(rows[:3], ensure_ascii=False)}')
     for sample in wave_samples:
@@ -142,7 +145,10 @@ def main() -> None:
         'unique_audio_paths': len(set(audio_paths)),
         'missing_audio_paths': len(missing_audio),
         'missing_audio_examples': missing_audio[:10],
-        'empty_captions': empty_captions,
+        'empty_audio_id_rows': len(empty_audio_id_rows),
+        'empty_audio_id_examples': empty_audio_id_rows[:100],
+        'empty_caption_rows': len(empty_caption_rows),
+        'empty_caption_examples': empty_caption_rows[:100],
         'wave_samples': wave_samples,
         'swift_sft_fields': inspect_swift_fields(),
     }
@@ -155,7 +161,7 @@ def main() -> None:
     tmp_report.replace(output_report)
     print(f'[inspect] output_report={output_report}')
 
-    if missing_audio or empty_captions:
+    if missing_audio or empty_audio_id_rows or empty_caption_rows:
         raise SystemExit('AudioCaps layout inspection failed; see counts above before manifest generation.')
 
 

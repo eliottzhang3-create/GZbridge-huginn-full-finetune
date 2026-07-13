@@ -118,14 +118,21 @@ def main() -> None:
     print(f'[manifest] audio_filename_prefix={args.audio_filename_prefix!r}')
     print(f'[manifest] limit_records={args.limit_records}')
 
-    record_count = 0
+    validated_rows: list[tuple[Path, str, dict[str, str]]] = []
     unique_audio_paths: set[str] = set()
     audio_path_counts: Counter[str] = Counter()
     wav_format_counts: Counter[tuple[int | str, ...]] = Counter()
-    first_record = None
+    validation_error_counts: Counter[str] = Counter()
+    validation_error_examples: dict[str, list[str]] = {}
+
+    def record_validation_error(kind: str, detail: str) -> None:
+        validation_error_counts[kind] += 1
+        validation_error_examples.setdefault(kind, [])
+        if len(validation_error_examples[kind]) < 10:
+            validation_error_examples[kind].append(detail)
 
     ACTIVE_STAGE = 'reading_csv_and_verifying_wav_files'
-    with csv_path.open('r', encoding='utf-8-sig', newline='') as input_file, tmp_manifest.open('w', encoding='utf-8') as output_file:
+    with csv_path.open('r', encoding='utf-8-sig', newline='') as input_file:
         reader = csv.DictReader(input_file)
         headers = list(reader.fieldnames or [])
         missing_columns = [name for name in (args.audio_id_column, args.caption_column) if name not in headers]
@@ -136,14 +143,21 @@ def main() -> None:
             raw_id = (row.get(args.audio_id_column) or '').strip()
             caption = (row.get(args.caption_column) or '').strip()
             if not raw_id:
-                raise ValueError(f'Empty {args.audio_id_column} at CSV row {row_number}')
+                record_validation_error('empty_audio_id', f'row={row_number}')
+                continue
             if not caption:
-                raise ValueError(f'Empty {args.caption_column} at CSV row {row_number}')
+                record_validation_error('empty_caption', f'row={row_number} audio_id={raw_id}')
+                continue
 
             audio_path = audio_path_for_id(audio_dir, raw_id, args.audio_filename_prefix)
             if not audio_path.is_file():
-                raise FileNotFoundError(f'CSV row {row_number} maps to missing WAV: {audio_path}')
-            wav_metadata = verify_wav_readable(audio_path)
+                record_validation_error('missing_wav', f'row={row_number} path={audio_path}')
+                continue
+            try:
+                wav_metadata = verify_wav_readable(audio_path)
+            except (OSError, ValueError, wave.Error) as exc:
+                record_validation_error('unreadable_wav', f'row={row_number} path={audio_path} error={exc}')
+                continue
             wav_format_counts[
                 (
                     wav_metadata['channels'],
@@ -152,24 +166,32 @@ def main() -> None:
                     wav_metadata['compression_type'],
                 )
             ] += 1
+            validated_rows.append((audio_path, caption, row))
+            unique_audio_paths.add(str(audio_path))
+            audio_path_counts[str(audio_path)] += 1
 
+            if args.limit_records is not None and len(validated_rows) >= args.limit_records:
+                break
+
+    if validation_error_counts:
+        for kind, count in sorted(validation_error_counts.items()):
+            print(f'[manifest] validation_error[{kind}]={count} examples={validation_error_examples[kind]}')
+        raise ValueError('AudioCaps validation failed; no manifest was committed')
+
+    record_count = len(validated_rows)
+    if record_count == 0:
+        raise ValueError('No AudioCaps records were emitted')
+
+    ACTIVE_STAGE = 'writing_manifest'
+    first_record = None
+    with tmp_manifest.open('w', encoding='utf-8') as output_file:
+        for audio_path, caption, row in validated_rows:
             manifest_record = build_manifest_record(audio_path, caption, row, args.split)
             if first_record is None:
                 first_record = manifest_record
             output_file.write(json.dumps(manifest_record, ensure_ascii=False) + '\n')
-            record_count += 1
-            unique_audio_paths.add(str(audio_path))
-            audio_path_counts[str(audio_path)] += 1
-
-            if args.limit_records is not None and record_count >= args.limit_records:
-                break
-
         output_file.flush()
         os.fsync(output_file.fileno())
-
-    if record_count == 0:
-        tmp_manifest.unlink(missing_ok=True)
-        raise ValueError('No AudioCaps records were emitted')
 
     ACTIVE_STAGE = 'writing_manifest_and_stats'
     stats = {

@@ -947,7 +947,7 @@ As of 2026-07-13, the correct assumption is:
 
 - AudioCaps v2 was copied into the user's personal remote storage, so this route uses ordinary local WAV paths rather than ACAVCAPS tar references.
 - New scripts provide, in order:
-  - CSV/WAV/Swift-argument inspection on `pdgpu-3090`
+  - CSV/WAV/Swift-argument inspection on `pdgpu-5090`
   - full train-split metadata-only JSONL preparation with CSV-to-WAV and 16-bit PCM WAV verification
   - a 20-step B8/GA4 smoke on `pdgpu-5090`
   - a five-epoch B8/GA4 formal run on `pdgpu-5090`, checkpointed once per epoch and retaining five full checkpoints
@@ -1112,8 +1112,8 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/scripts/inspect_audiocaps_v2_dataset.py`
 - `code/huginn_lora/scripts/prepare_audiocaps_v2_swift_dataset.py`
 - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_5090.sh`
-- `code/huginn_lora/run_inspect_audiocaps_v2_dataset_3090.sh`
-- `code/huginn_lora/run_prepare_audiocaps_v2_swift_dataset_3090.sh`
+- `code/huginn_lora/run_inspect_audiocaps_v2_dataset_5090.sh`
+- `code/huginn_lora/run_prepare_audiocaps_v2_swift_dataset_5090.sh`
 - `code/huginn_lora/run_smoke_audiocaps_v2_huginn_audio_swift_5090.sh`
 - `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_5090.sh`
 
