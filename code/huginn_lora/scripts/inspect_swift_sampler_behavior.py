@@ -40,6 +40,14 @@ def inspect_sft_argument_fields() -> None:
                 default = "<missing>"
             print(f"[args] name={field.name} default={default} type={field.type}")
 
+    print_header("SFT ARGUMENT FIELD ORIGIN")
+    for field_name in ("dataset_shuffle", "train_dataloader_shuffle", "sortish_sampler"):
+        for cls in SftArguments.__mro__:
+            dataclass_fields = getattr(cls, "__dataclass_fields__", {})
+            if field_name in dataclass_fields:
+                print(f"[args-origin] field={field_name} class={cls} module={inspect.getfile(cls)}")
+                break
+
 
 def inspect_swift_sources() -> None:
     import swift
@@ -71,9 +79,49 @@ def inspect_pipeline_source() -> None:
     print(f"[pipeline] class={SwiftSft}")
     print(f"[pipeline] module={inspect.getfile(SwiftSft)}")
     source = inspect.getsource(SwiftSft)
+    pipeline_keywords = KEYWORDS + ("trainer", "Trainer", "get_trainer", "trainer_cls", "build_trainer")
     for line_number, line in enumerate(source.splitlines(), start=1):
-        if any(keyword in line for keyword in KEYWORDS):
+        if any(keyword in line for keyword in pipeline_keywords):
             print(f"[pipeline-match] {line_number}: {line}")
+
+
+def inspect_transformers_trainer() -> None:
+    import transformers
+    from transformers import Trainer, TrainingArguments
+
+    print_header("TRANSFORMERS TRAINER SAMPLER")
+    print(f"[transformers] version={transformers.__version__}")
+    print(f"[transformers] trainer_file={inspect.getfile(Trainer)}")
+    training_arguments_fields = getattr(TrainingArguments, "__dataclass_fields__", {})
+    for field_name in ("train_dataloader_shuffle", "data_seed", "dataloader_num_workers", "sortish_sampler"):
+        field = training_arguments_fields.get(field_name)
+        if field is None:
+            print(f"[transformers-args] name={field_name} present=False")
+        else:
+            print(f"[transformers-args] name={field_name} present=True default={field.default}")
+
+    for method_name in ("_get_train_sampler", "get_train_dataloader"):
+        method = getattr(Trainer, method_name)
+        print(f"[transformers-method] name={method_name}")
+        print(inspect.getsource(method))
+
+
+def inspect_exact_field_references() -> None:
+    import swift
+    import transformers
+
+    print_header("EXACT FIELD REFERENCES")
+    roots = (Path(swift.__file__).resolve().parent, Path(transformers.__file__).resolve().parent)
+    for root in roots:
+        for source_path in sorted(root.rglob("*.py")):
+            try:
+                lines = source_path.read_text(encoding="utf-8").splitlines()
+            except UnicodeDecodeError:
+                continue
+            for line_number, line in enumerate(lines, start=1):
+                if "train_dataloader_shuffle" in line or "dataset_shuffle" in line:
+                    print(f"[field-reference] {source_path}:{line_number}: {line.strip()}")
+                    print_context(source_path, line_number)
 
 
 def main() -> None:
@@ -92,6 +140,8 @@ def main() -> None:
 
     inspect_sft_argument_fields()
     inspect_pipeline_source()
+    inspect_transformers_trainer()
+    inspect_exact_field_references()
     inspect_swift_sources()
     print_header("INSPECT DONE")
 
