@@ -89,17 +89,24 @@ def main() -> None:
 
     missing_audio: list[str] = []
     empty_audio_id_rows: list[int] = []
+    empty_audio_id_examples: list[dict[str, Any]] = []
     empty_caption_rows: list[int] = []
+    empty_caption_examples: list[dict[str, Any]] = []
     audio_paths: list[Path] = []
     caption_counter: Counter[str] = Counter()
+    available_wav_paths = {path for path in audio_dir.glob('*.wav') if path.is_file()}
     for row_number, row in enumerate(rows, start=2):
         raw_id = (row.get(args.audio_id_column) or '').strip()
         caption = (row.get(args.caption_column) or '').strip()
         if not raw_id:
             empty_audio_id_rows.append(row_number)
+            if len(empty_audio_id_examples) < 10:
+                empty_audio_id_examples.append({'row_number': row_number, 'row': row})
             continue
         if not caption:
             empty_caption_rows.append(row_number)
+            if len(empty_caption_examples) < 10:
+                empty_caption_examples.append({'row_number': row_number, 'row': row})
         else:
             caption_counter[caption] += 1
         audio_path = audio_path_for_id(audio_dir, raw_id, args.audio_filename_prefix)
@@ -108,6 +115,8 @@ def main() -> None:
             missing_audio.append(str(audio_path))
 
     existing_audio = [path for path in audio_paths if path.is_file()]
+    referenced_existing_audio_paths = set(existing_audio)
+    unreferenced_wav_paths = available_wav_paths - referenced_existing_audio_paths
     rng = random.Random(42)
     sample_paths = existing_audio[: min(5, len(existing_audio))]
     remaining = existing_audio[len(sample_paths):]
@@ -123,9 +132,15 @@ def main() -> None:
     print(f'[inspect] csv_headers={headers}')
     print(f'[inspect] csv_rows={len(rows)}')
     print(f'[inspect] unique_audio_paths={len(set(audio_paths))}')
+    print(f'[inspect] wav_files_in_audio_dir={len(available_wav_paths)}')
     print(f'[inspect] missing_audio_paths={len(missing_audio)}')
-    print(f'[inspect] empty_{args.audio_id_column}_rows={len(empty_audio_id_rows)} examples={empty_audio_id_rows[:10]}')
-    print(f'[inspect] empty_{args.caption_column}_rows={len(empty_caption_rows)} examples={empty_caption_rows[:10]}')
+    print(f'[inspect] missing_audio_examples={missing_audio[:10]}')
+    print(f'[inspect] unreferenced_wav_files={len(unreferenced_wav_paths)}')
+    print(f'[inspect] unreferenced_wav_examples={[str(path) for path in sorted(unreferenced_wav_paths)[:10]]}')
+    print(f'[inspect] empty_{args.audio_id_column}_rows={len(empty_audio_id_rows)} rows={empty_audio_id_rows[:10]}')
+    print(f'[inspect] empty_{args.audio_id_column}_examples={json.dumps(empty_audio_id_examples, ensure_ascii=False)}')
+    print(f'[inspect] empty_{args.caption_column}_rows={len(empty_caption_rows)} rows={empty_caption_rows[:10]}')
+    print(f'[inspect] empty_{args.caption_column}_examples={json.dumps(empty_caption_examples, ensure_ascii=False)}')
     print(f'[inspect] duplicate_nonempty_captions={sum(count > 1 for count in caption_counter.values())}')
     print(f'[inspect] first_rows={json.dumps(rows[:3], ensure_ascii=False)}')
     for sample in wave_samples:
@@ -143,12 +158,15 @@ def main() -> None:
         'caption_column': args.caption_column,
         'audio_filename_prefix': args.audio_filename_prefix,
         'unique_audio_paths': len(set(audio_paths)),
+        'wav_files_in_audio_dir': len(available_wav_paths),
         'missing_audio_paths': len(missing_audio),
         'missing_audio_examples': missing_audio[:10],
+        'unreferenced_wav_files': len(unreferenced_wav_paths),
+        'unreferenced_wav_examples': [str(path) for path in sorted(unreferenced_wav_paths)[:100]],
         'empty_audio_id_rows': len(empty_audio_id_rows),
-        'empty_audio_id_examples': empty_audio_id_rows[:100],
+        'empty_audio_id_examples': empty_audio_id_examples,
         'empty_caption_rows': len(empty_caption_rows),
-        'empty_caption_examples': empty_caption_rows[:100],
+        'empty_caption_examples': empty_caption_examples,
         'wave_samples': wave_samples,
         'swift_sft_fields': inspect_swift_fields(),
     }
