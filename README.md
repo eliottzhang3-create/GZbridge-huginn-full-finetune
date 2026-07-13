@@ -955,8 +955,14 @@ As of 2026-07-12, the correct assumption is:
   - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_formal_probe.sh`
 - ACAVCAPS subset full-tar master manifest preparation:
   - `code/huginn_lora/scripts/prepare_acavcaps_subset_full_master.sh`
+- ACAVCAPS tar-local curriculum master preparation:
+  - `code/huginn_lora/scripts/prepare_acavcaps_subset_full_curriculum_master.sh`
+  - category order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
+  - this master keeps each tar's records contiguous; it must only be used for training after Swift sampler inspection confirms sequential sampling can be enforced
 - ACAVCAPS formal 100-step B4/GA4 stress test:
   - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_formal_stress100.sh`
+- Swift Trainer sampler/shuffle source inspection:
+  - `code/huginn_lora/scripts/inspect_swift_sampler_behavior.sh`
 
 ---
 

@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output_manifest", required=True)
     parser.add_argument("--chunk_pattern", default="acavcaps_caption_long_formal_chunk_*.jsonl")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--order_mode", choices=("global_shuffle", "curriculum"), default="global_shuffle")
+    parser.add_argument(
+        "--category_order",
+        default=None,
+        help="Required for curriculum mode, e.g. 00A,0M0,S00,S0A,0MA,SM0,SMA",
+    )
     parser.add_argument("--expected_chunk_count", type=int, default=None)
     parser.add_argument("--expected_record_count", type=int, default=None)
     return parser.parse_args()
@@ -98,6 +104,7 @@ def main() -> None:
     records: list[dict] = []
     records_by_tar: dict[Path, dict[str, dict]] = defaultdict(dict)
     category_counts: Counter[str] = Counter()
+    records_by_category: dict[str, list[dict]] = defaultdict(list)
     seen_audio_keys: set[tuple[str, str]] = set()
 
     print("========== ACAVCAPS MASTER PREP START ==========")
@@ -106,6 +113,7 @@ def main() -> None:
     print(f"[master] chunk_pattern={args.chunk_pattern}")
     print(f"[master] source_chunk_count={len(manifest_paths)}")
     print(f"[master] shuffle_seed={args.seed}")
+    print(f"[master] order_mode={args.order_mode}")
 
     for manifest_path in manifest_paths:
         manifest_records = 0
@@ -142,6 +150,7 @@ def main() -> None:
                 }
                 category_counts[category] += 1
                 records.append(record)
+                records_by_category[category].append(record)
                 manifest_records += 1
         print(f"[master] source_manifest={manifest_path.name} records={manifest_records}")
 
@@ -153,7 +162,30 @@ def main() -> None:
         verify_tar_pairs(tar_path, expected_records)
         print(f"[master] verified_tar={tar_path.name} records={len(expected_records)}")
 
-    random.Random(args.seed).shuffle(records)
+    category_order: list[str] | None = None
+    if args.order_mode == "global_shuffle":
+        random.Random(args.seed).shuffle(records)
+    else:
+        if not args.category_order:
+            raise ValueError("--category_order is required when --order_mode=curriculum")
+        category_order = [category.strip() for category in args.category_order.split(",") if category.strip()]
+        if not category_order:
+            raise ValueError("--category_order did not contain any categories")
+        if len(category_order) != len(set(category_order)):
+            raise ValueError(f"--category_order contains duplicates: {category_order}")
+        observed_categories = set(records_by_category)
+        unexpected_categories = observed_categories - set(category_order)
+        missing_categories = set(category_order) - observed_categories
+        if unexpected_categories or missing_categories:
+            raise ValueError(
+                f"Curriculum category mismatch: unexpected={sorted(unexpected_categories)} "
+                f"missing={sorted(missing_categories)}"
+            )
+        records = []
+        for category in category_order:
+            category_records = records_by_category[category]
+            records.extend(category_records)
+            print(f"[master] curriculum_segment category={category} records={len(category_records)}")
     output_manifest.parent.mkdir(parents=True, exist_ok=True)
     tmp_output_manifest = output_manifest.with_name(f"{output_manifest.name}.tmp")
     with tmp_output_manifest.open("w", encoding="utf-8") as f:
@@ -171,6 +203,8 @@ def main() -> None:
         "unique_tar_count": len(records_by_tar),
         "category_counts": dict(sorted(category_counts.items())),
         "shuffle_seed": args.seed,
+        "order_mode": args.order_mode,
+        "category_order": category_order,
         "audio_caption_pair_verification": "passed",
     }
     tmp_stats_path = stats_path.with_name(f"{stats_path.name}.tmp")
