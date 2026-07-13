@@ -825,6 +825,38 @@ Current formal chunk behavior:
 - default resume behavior:
   - `skip existing`
 
+### Current formal-training configuration (updated 2026-07-13)
+
+The formal ACAVCAPS training route uses the verified metadata-only master manifest:
+
+- master manifest:
+  - `data/audio_swift/acavcaps/acavcaps_subset_56_full_master_shuffled.jsonl`
+- source records:
+  - `239854` samples from the 56 full-tar subset chunks
+- audio/caption integrity:
+  - the master builder verifies each JSON caption, same-stem FLAC member, and tar membership before writing the master manifest
+- active queue:
+  - `pdgpu-5090`
+- single-GPU formal configuration:
+  - micro-batch: `8`
+  - gradient accumulation: `4`
+  - effective batch: `32`
+  - `bf16=true`
+  - audio encoder frozen
+  - aligner full-trainable
+  - Huginn language model LoRA-only
+- data I/O configuration:
+  - `HUGINN_AUDIO_TARFILE_CACHE_LIMIT=64`
+  - this keeps all 56 gzip-tar indexes available in the single-worker loader and avoids the severe cache-thrashing observed with the old cache limit of four
+- observability and recovery:
+  - `report_to=tensorboard`
+  - `logging_steps=10`
+  - `save_steps=200`
+  - `save_total_limit=2`
+  - `save_only_model=false` so optimizer/scheduler/RNG state is available for resume
+- first complete-run target:
+  - `max_steps=7500`, approximately one epoch at effective batch 32
+
 This is the current mainline dataset-preparation route for the Swift ACAVCAPS project.
 
 ---

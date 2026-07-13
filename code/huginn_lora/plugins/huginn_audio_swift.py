@@ -51,7 +51,20 @@ WHISPER_MODEL_DIR = Path("/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-larg
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio and respond accurately."
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_MAX_AUDIO_SECONDS = 30.0
-TARFILE_CACHE_LIMIT = 4
+
+
+def get_tarfile_cache_limit() -> int:
+    value = os.environ.get("HUGINN_AUDIO_TARFILE_CACHE_LIMIT", "4")
+    try:
+        cache_limit = int(value)
+    except ValueError as exc:
+        raise ValueError(f"HUGINN_AUDIO_TARFILE_CACHE_LIMIT must be an integer, got {value!r}") from exc
+    if cache_limit <= 0:
+        raise ValueError(f"HUGINN_AUDIO_TARFILE_CACHE_LIMIT must be positive, got {cache_limit}")
+    return cache_limit
+
+
+TARFILE_CACHE_LIMIT = get_tarfile_cache_limit()
 
 ALIGNER_PREFIXES = (
     "temporal_compressor",
@@ -62,6 +75,7 @@ ALIGNER_PREFIXES = (
 
 MODEL_ARCH_NAME = "huginn_audio_whisper"
 _TARFILE_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
+print(f"[HuginnAudioSwift] tarfile_cache_limit={TARFILE_CACHE_LIMIT}")
 
 
 def patch_huginn_audio_shift_loss(model):
