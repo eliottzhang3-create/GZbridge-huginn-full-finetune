@@ -846,8 +846,13 @@ The formal ACAVCAPS training route uses the verified metadata-only master manife
   - aligner full-trainable
   - Huginn language model LoRA-only
 - data I/O configuration:
-  - `HUGINN_AUDIO_TARFILE_CACHE_LIMIT=64`
-  - this keeps all 56 gzip-tar indexes available in the single-worker loader and avoids the severe cache-thrashing observed with the old cache limit of four
+  - curriculum master category order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
+  - `dataset_shuffle=false`
+  - `train_dataloader_shuffle=false`
+  - `sortish_sampler=false`
+  - `group_by_length=false`
+  - these preserve tar-local order from the curriculum master so gzip tar members are read sequentially instead of randomly across shards
+  - `HUGINN_AUDIO_TARFILE_CACHE_LIMIT=4` is sufficient because each tar is consumed contiguously
 - observability and recovery:
   - `report_to=tensorboard`
   - `logging_steps=10`

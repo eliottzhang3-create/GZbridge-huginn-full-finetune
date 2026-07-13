@@ -12,7 +12,7 @@ cd "$REPO_ROOT"
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0
 
-MASTER_MANIFEST="${FORMAL_MASTER_MANIFEST:-$REPO_ROOT/data/audio_swift/acavcaps/acavcaps_subset_56_full_master_shuffled.jsonl}"
+MASTER_MANIFEST="${FORMAL_MASTER_MANIFEST:-$REPO_ROOT/data/audio_swift/acavcaps/acavcaps_subset_56_full_curriculum_ordered.jsonl}"
 MASTER_STATS="$MASTER_MANIFEST.stats.json"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_swift.py"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-v1"
@@ -23,9 +23,9 @@ FORMAL_SAVE_STEPS="${FORMAL_SAVE_STEPS:-200}"
 FORMAL_LOGGING_STEPS="${FORMAL_LOGGING_STEPS:-10}"
 FORMAL_RESUME_FROM_CHECKPOINT="${FORMAL_RESUME_FROM_CHECKPOINT:-}"
 
-# The master manifest samples all 56 tar shards globally. Keep every tar index
-# open in the single-worker loader to avoid repeatedly indexing gzip archives.
-export HUGINN_AUDIO_TARFILE_CACHE_LIMIT="${HUGINN_AUDIO_TARFILE_CACHE_LIMIT:-64}"
+# Curriculum sampling consumes one tar's records contiguously. A small LRU cache
+# is sufficient and avoids keeping all gzip-tar indexes open unnecessarily.
+export HUGINN_AUDIO_TARFILE_CACHE_LIMIT="${HUGINN_AUDIO_TARFILE_CACHE_LIMIT:-4}"
 
 if [ ! -s "$MASTER_MANIFEST" ]; then
   echo "Formal master manifest is missing or empty: $MASTER_MANIFEST" >&2
@@ -47,6 +47,13 @@ if record_count != 239854:
     raise SystemExit(f"Unexpected master record_count: {record_count}")
 if stats.get("audio_caption_pair_verification") != "passed":
     raise SystemExit("Master audio/caption pair verification is not marked passed")
+if stats.get("order_mode") != "curriculum":
+    raise SystemExit(f"Formal training requires a curriculum master, got order_mode={stats.get('order_mode')!r}")
+expected_category_order = ["00A", "0M0", "S00", "S0A", "0MA", "SM0", "SMA"]
+if stats.get("category_order") != expected_category_order:
+    raise SystemExit(
+        f"Unexpected curriculum category order: {stats.get('category_order')!r}; "
+        f"expected={expected_category_order!r}")
 ' "$MASTER_STATS"
 
 mkdir -p "$FORMAL_OUTPUT_DIR" "$FORMAL_LOGGING_DIR"
@@ -61,6 +68,10 @@ echo "per_device_train_batch_size=8"
 echo "gradient_accumulation_steps=4"
 echo "effective_batch_size=32"
 echo "tarfile_cache_limit=$HUGINN_AUDIO_TARFILE_CACHE_LIMIT"
+echo "dataset_shuffle=false"
+echo "train_dataloader_shuffle=false"
+echo "sortish_sampler=false"
+echo "group_by_length=false"
 echo "save_steps=$FORMAL_SAVE_STEPS"
 echo "save_total_limit=2"
 echo "logging_steps=$FORMAL_LOGGING_STEPS"
@@ -145,6 +156,10 @@ swift sft \
   --template huginn_audio_text \
   --external_plugins "$PLUGIN_PATH" \
   --dataset "$MASTER_MANIFEST" \
+  --dataset_shuffle false \
+  --train_dataloader_shuffle false \
+  --sortish_sampler false \
+  --group_by_length false \
   --max_length 192 \
   --output_dir "$FORMAL_OUTPUT_DIR" \
   --logging_dir "$FORMAL_LOGGING_DIR" \
