@@ -854,6 +854,7 @@ The formal ACAVCAPS training route uses the verified metadata-only master manife
   - `save_steps=200`
   - `save_total_limit=2`
   - `save_only_model=false` so optimizer/scheduler/RNG state is available for resume
+  - the runtime script prints a 30-second CPU RSS, cgroup-memory, and GPU-memory snapshot while training; this is required to diagnose external job termination without a Python traceback
 - first complete-run target:
   - `max_steps=7500`, approximately one epoch at effective batch 32
 

@@ -79,6 +79,66 @@ if [ -n "$FORMAL_RESUME_FROM_CHECKPOINT" ]; then
   RESUME_ARGS+=(--resume_from_checkpoint "$FORMAL_RESUME_FROM_CHECKPOINT")
 fi
 
+TRAIN_PID=""
+MONITOR_PID=""
+
+print_resource_snapshot() {
+  echo "========== FORMAL TRAIN RESOURCE SNAPSHOT =========="
+  echo "snapshot_time=$(date '+%Y-%m-%d %H:%M:%S')"
+  if [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null; then
+    ps -o pid,ppid,rss,vsz,%mem,etime,stat,cmd -p "$TRAIN_PID" || true
+  fi
+  nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader || true
+  for cgroup_file in \
+    /sys/fs/cgroup/memory.current \
+    /sys/fs/cgroup/memory.max \
+    /sys/fs/cgroup/memory/memory.usage_in_bytes \
+    /sys/fs/cgroup/memory/memory.limit_in_bytes; do
+    if [ -r "$cgroup_file" ]; then
+      echo "[cgroup] $(basename "$cgroup_file")=$(tr -d '\n' < "$cgroup_file")"
+    fi
+  done
+}
+
+resource_monitor() {
+  while kill -0 "$TRAIN_PID" 2>/dev/null; do
+    print_resource_snapshot
+    sleep 30
+  done
+}
+
+stop_resource_monitor() {
+  if [ -n "$MONITOR_PID" ] && kill -0 "$MONITOR_PID" 2>/dev/null; then
+    kill "$MONITOR_PID" 2>/dev/null || true
+    wait "$MONITOR_PID" 2>/dev/null || true
+  fi
+}
+
+on_exit() {
+  status=$?
+  trap - EXIT
+  stop_resource_monitor
+  echo "========== ACAVCAPS FORMAL TRAIN EXIT =========="
+  echo "exit_status=$status"
+  echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
+  exit "$status"
+}
+
+on_signal() {
+  signal_name=$1
+  echo "========== ACAVCAPS FORMAL TRAIN SIGNAL =========="
+  echo "received_signal=$signal_name"
+  echo "signal_time=$(date '+%Y-%m-%d %H:%M:%S')"
+  if [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null; then
+    kill -TERM "$TRAIN_PID" 2>/dev/null || true
+  fi
+  exit 143
+}
+
+trap on_exit EXIT
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
+
 swift sft \
   --model "$MODEL_PATH" \
   --model_type huginn_audio_raven \
@@ -106,4 +166,13 @@ swift sft \
   --dataset_num_proc 1 \
   --save_only_model false \
   --report_to tensorboard \
-  --bf16 true "${RESUME_ARGS[@]}"
+  --bf16 true "${RESUME_ARGS[@]}" &
+TRAIN_PID=$!
+resource_monitor &
+MONITOR_PID=$!
+
+set +e
+wait "$TRAIN_PID"
+TRAIN_STATUS=$?
+set -e
+exit "$TRAIN_STATUS"
