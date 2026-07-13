@@ -68,7 +68,7 @@ The current main active task is:
 
 This Swift LoRA multimodal route is the current forward path for new audio-model work.
 
-### Current highest-priority execution status (updated 2026-07-12)
+### Current highest-priority execution status (updated 2026-07-13)
 
 The newest confirmed mainline is now:
 
@@ -92,13 +92,25 @@ The newest confirmed mainline is now:
   - **ACAVCAPS**
   - loaded from shared public remote storage
   - training data is read from `.tar.gz` shards without copying the whole dataset into the personal workspace
+- current formal-data scope:
+  - a verified 56-tar subset, using every paired FLAC/JSON record in each selected tar
+  - `239854` verified audio-caption pairs total
+  - tar-local curriculum order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
+- newest completed formal-path validation:
+  - 20 optimizer steps on one RTX 5090 with micro-batch `8` and gradient accumulation `4`
+  - completed with `exit_status=0`
+  - observed `6.2 s/step` and `24.14 GiB` GPU memory
+  - this replaced the earlier globally shuffled master path, which was I/O-bound at roughly `140 s/step`
+- full formal run status:
+  - the `7500`-step, approximately one-epoch 5090 launch script is prepared and validated by the 20-step I/O check
+  - no full-run completion should be assumed until its remote log is available
 
 The immediate practical mainline is no longer "just make Swift run once". It is now:
 
 1. maintain the verified Swift audio training path
 2. keep `audio_encoder` frozen under Swift multimodal registration
 3. generate / maintain ACAVCAPS training manifests and chunked manifests
-4. move toward formal training on ACAVCAPS using the verified chunked-manifest route
+4. launch and monitor formal ACAVCAPS curriculum training using the verified master manifest route
 5. only let the user execute remote jobs through `vc submit`
 
 ---
@@ -175,8 +187,13 @@ Do not casually change the container unless the user explicitly asks.
   - `/hpc_stor03/public/shared/data/raa/ACAVCAPS`
 - Remote repo-side generated Swift dataset artifacts:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps`
-- Current formal chunk output directory mainline:
-  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/formal_chunks_all_4tar_256`
+- Current formal subset chunk directory:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/subset_56_full_1tar_chunks`
+- Current formal curriculum master:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/acavcaps_subset_56_full_curriculum_ordered.jsonl`
+- Personal AudioCaps v2 root (new route, pending first remote inspection):
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/data/audiocaps_v2`
+  - expected layout: `train.csv` plus `train/*.wav`; `val` and `test` remain reserved for later evaluation
 
 ### Current remote tool assumptions already checked by logs / manual commands
 
@@ -199,13 +216,13 @@ Important note:
 
 ## Queue / Submission Constraints
 
-The current queue in active use for the Swift audio line is:
-
-- `pdgpu-3090`
-
-Historical / sometimes used queue:
+The current queue in active use for the Swift audio **formal-training** line is:
 
 - `pdgpu-5090`
+
+Historical / smoke / preparation queue:
+
+- `pdgpu-3090`
 
 Important queue rule from the user:
 
@@ -662,10 +679,11 @@ On top of the earlier standalone audio branch, the repo has now entered a **new 
 - Therefore, the Swift multimodal LoRA path should currently be treated as:
   - **implemented locally**
   - **remote smoke-verified**
-  - **remote trainability-verified on single 3090**
-  - **still under active iteration for larger-scale formal ACAVCAPS training**
+  - **remote trainability-verified on single 3090** for smoke and mid runs
+  - **remote formal I/O-verified on single 5090** for B8/GA4 curriculum training
+  - **ready for the 7500-step formal ACAVCAPS run**
 
-### Newest verified Swift progress (updated 2026-07-12)
+### Newest verified Swift progress (updated 2026-07-13)
 
 The following points are already important confirmed project memory:
 
@@ -716,10 +734,12 @@ The following points are already important confirmed project memory:
    - observed memory was around `21.7 GiB`
    - this is important because it means the current mainline is no longer blocked at the runtime-validation stage
 
-7. **OOM still matters for larger runs**
-   - earlier attempts could OOM when the wrong parameter split left the audio encoder trainable
-   - current formal-data work therefore uses manifest chunking and controlled sample counts per tar
-   - the user currently prefers to stay on **single 3090** rather than immediately moving to multi-GPU / FSDP for this audio Swift line
+7. **Formal 5090 memory and I/O behavior are now characterized**
+   - earlier attempts could OOM when the wrong parameter split left the audio encoder trainable; that split is no longer the current route
+   - the correct frozen-audio-encoder configuration uses about `24.14 GiB` on a 32-GiB RTX 5090 at micro-batch `8`, gradient accumulation `4`
+   - a globally shuffled formal master caused severe gzip-tar cache thrashing and about `140 s/step`
+   - the replacement curriculum master keeps records from each tar contiguous and disables Swift dataset/DataLoader shuffling
+   - its 20-step 5090 validation completed normally at about `6.2 s/step`
 
 ### Current ACAVCAPS status and design
 
@@ -771,32 +791,9 @@ There are now several different ACAVCAPS preparation layers and they must not be
    - used for the current mainline large-scale ACAVCAPS preparation
    - chunking exists to keep preparation resumable and easier to debug
 
-### Current formal chunk mainline (updated 2026-07-12)
+### Current formal chunk and master-manifest mainline (updated 2026-07-13)
 
-The current intended formal-manifest configuration is:
-
-- use **all ACAVCAPS tar shards**
-  - currently around `1071` tar files total across categories
-- put **4 tar files per chunk**
-- take the **first 256 samples per tar**
-- generate one Swift JSONL file per chunk
-- support resume / partial regeneration through:
-  - `start_chunk`
-  - `end_chunk`
-  - `skip_existing`
-
-Current default formal chunk output directory:
-
-- `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/formal_chunks_all_4tar_256`
-
-Current formal chunk entrypoints:
-
-- runtime wrapper:
-  - `code/huginn_lora/scripts/prepare_acavcaps_formal_full_chunked_swift_dataset.sh`
-- submit wrapper:
-  - `code/huginn_lora/run_prepare_acavcaps_formal_full_chunked_swift_dataset_3090.sh`
-
-Separate smaller formal-scale validation route:
+The **current training mainline** is the verified 56-tar full-record subset:
 
 - select 56 tar shards:
   - `00A=12,0M0=8,S00=10,S0A=12,SMA=8,0MA=3,SM0=3`
@@ -807,30 +804,28 @@ Separate smaller formal-scale validation route:
 - full 56-chunk record count:
   - `239854`
   - note: a later resumable job reported `235333` only because it processed chunk `001..055`; chunk `000` was completed separately with `4521` records
-- output directory:
-  - `data/audio_swift/acavcaps/subset_56_full_1tar_chunks`
+- remote chunk output directory:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/subset_56_full_1tar_chunks`
 - runtime wrapper:
   - `code/huginn_lora/scripts/prepare_acavcaps_subset_full_1tar_chunked_swift_dataset.sh`
 - submit wrapper:
   - `code/huginn_lora/run_prepare_acavcaps_subset_full_1tar_chunked_swift_dataset_3090.sh`
 
-Current formal chunk behavior:
+The chunks are preparation artifacts, not audio copies. Each JSONL row retains tar path, FLAC member name, JSON member name, category, and the selected caption. The public tar archives remain unchanged.
 
-- default category scope:
-  - `ALL`
-- default chunk size:
-  - `4 tar / chunk`
-- default sample cap:
-  - `256 records / tar`
-- default resume behavior:
-  - `skip existing`
+Historical note:
+
+- an all-ACAVCAPS experimental route (`1071` tars, `4` tars/chunk, first `256` records/tar) exists in the repository for resumable preprocessing experiments
+- it is **not** the current formal-training dataset and must not be substituted for the 56-tar curriculum master without an explicit new experiment decision
 
 ### Current formal-training configuration (updated 2026-07-13)
 
 The formal ACAVCAPS training route uses the verified metadata-only master manifest:
 
-- master manifest:
-  - `data/audio_swift/acavcaps/acavcaps_subset_56_full_master_shuffled.jsonl`
+- active curriculum master manifest:
+  - `data/audio_swift/acavcaps/acavcaps_subset_56_full_curriculum_ordered.jsonl`
+- companion stats file:
+  - `data/audio_swift/acavcaps/acavcaps_subset_56_full_curriculum_ordered.jsonl.stats.json`
 - source records:
   - `239854` samples from the 56 full-tar subset chunks
 - audio/caption integrity:
@@ -853,6 +848,11 @@ The formal ACAVCAPS training route uses the verified metadata-only master manife
   - `group_by_length=false`
   - these preserve tar-local order from the curriculum master so gzip tar members are read sequentially instead of randomly across shards
   - `HUGINN_AUDIO_TARFILE_CACHE_LIMIT=4` is sufficient because each tar is consumed contiguously
+- exact sampler conclusion from remote Swift `4.1.3` source inspection:
+  - `dataset_shuffle` is passed by `SwiftSft` to dataset loading
+  - `train_dataloader_shuffle` is consumed by Swift Trainer's DataLoader construction
+  - without the Swift override, the base Transformers Trainer would choose `RandomSampler` for a length-known dataset
+  - all four ordering flags above are therefore required for this single-rank curriculum run
 - observability and recovery:
   - `report_to=tensorboard`
   - `logging_steps=10`
@@ -860,10 +860,12 @@ The formal ACAVCAPS training route uses the verified metadata-only master manife
   - `save_total_limit=2`
   - `save_only_model=false` so optimizer/scheduler/RNG state is available for resume
   - the runtime script prints a 30-second CPU RSS, cgroup-memory, and GPU-memory snapshot while training; this is required to diagnose external job termination without a Python traceback
-- first complete-run target:
+- completed I/O validation:
+  - `20` steps at B8/GA4, `exit_status=0`, `6.2 s/step`, `24.14 GiB`
+- next full-run target:
   - `max_steps=7500`, approximately one epoch at effective batch 32
 
-This is the current mainline dataset-preparation route for the Swift ACAVCAPS project.
+This is the current mainline formal-training route for the Swift ACAVCAPS project.
 
 ---
 
@@ -932,15 +934,24 @@ This is the most important high-level requirement for any future edit on the Swi
 
 ### Current Swift audio training status that should be assumed by new agents
 
-As of 2026-07-12, the correct assumption is:
+As of 2026-07-13, the correct assumption is:
 
 - the Huginn Swift audio route is **already runnable**
 - the frozen-audio-encoder policy is **already enforced in the current mainline**
 - the main unresolved work is **not** basic registration anymore
-- the main unresolved work is:
-  - scaling from smoke / mid training toward formal ACAVCAPS training
-  - keeping dataset preparation resumable
-  - managing larger training jobs carefully on single-GPU resources
+- formal curriculum I/O has passed on a single 5090; do not regress to the old globally shuffled master
+- the immediate task is to launch or monitor the formal 7500-step run, then evaluate the produced checkpoint
+- all remote work must still be submitted through `vc submit`; Codex edits only this local sync repository
+
+### New AudioCaps v2 route (added 2026-07-13; not yet remote-verified)
+
+- AudioCaps v2 was copied into the user's personal remote storage, so this route uses ordinary local WAV paths rather than ACAVCAPS tar references.
+- New scripts provide, in order:
+  - CSV/WAV/Swift-argument inspection on `pdgpu-3090`
+  - full train-split metadata-only JSONL preparation with CSV-to-WAV and 16-bit PCM WAV verification
+  - a 20-step B8/GA4 smoke on `pdgpu-5090`
+  - a five-epoch B8/GA4 formal run on `pdgpu-5090`, checkpointed once per epoch and retaining five full checkpoints
+- Do not treat this route as runnable until the inspection and manifest jobs have passed. The Huginn audio model and Swift plugin are intentionally reused unchanged unless the WAV inspection finds an unsupported format.
 
 ### Current useful Swift training entrypoints
 
@@ -963,11 +974,15 @@ As of 2026-07-12, the correct assumption is:
 - ACAVCAPS tar-local curriculum master preparation:
   - `code/huginn_lora/scripts/prepare_acavcaps_subset_full_curriculum_master.sh`
   - category order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
-  - this master keeps each tar's records contiguous; it must only be used for training after Swift sampler inspection confirms sequential sampling can be enforced
+  - this master keeps each tar's records contiguous and its pair verification passed
 - ACAVCAPS formal 100-step B4/GA4 stress test:
   - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_formal_stress100.sh`
 - Swift Trainer sampler/shuffle source inspection:
   - `code/huginn_lora/scripts/inspect_swift_sampler_behavior.sh`
+- current formal 5090 runtime script:
+  - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_formal_5090.sh`
+- current formal 5090 submit wrapper:
+  - `code/huginn_lora/run_train_acavcaps_huginn_audio_swift_formal_5090.sh`
 
 ---
 
@@ -1073,6 +1088,7 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 ### Swift multimodal LoRA path
 
 - `code/huginn_lora/plugins/huginn_audio_swift.py`
+- `code/huginn_lora/scripts/acavcaps_common.py`
 - `code/huginn_lora/scripts/prepare_huginn_audio_dataset.py`
 - `code/huginn_lora/scripts/smoke_huginn_audio_swift.py`
 - `code/huginn_lora/scripts/smoke_huginn_audio_swift.sh`
@@ -1087,6 +1103,19 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/scripts/prepare_acavcaps_formal_chunked_swift_dataset.py`
 - `code/huginn_lora/scripts/prepare_acavcaps_formal_full_chunked_swift_dataset.sh`
 - `code/huginn_lora/run_prepare_acavcaps_formal_full_chunked_swift_dataset_3090.sh`
+- `code/huginn_lora/scripts/prepare_acavcaps_subset_full_1tar_chunked_swift_dataset.sh`
+- `code/huginn_lora/scripts/prepare_acavcaps_subset_full_master.py`
+- `code/huginn_lora/scripts/prepare_acavcaps_subset_full_curriculum_master.sh`
+- `code/huginn_lora/scripts/inspect_swift_sampler_behavior.py`
+- `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_formal_5090.sh`
+- `code/huginn_lora/run_train_acavcaps_huginn_audio_swift_formal_5090.sh`
+- `code/huginn_lora/scripts/inspect_audiocaps_v2_dataset.py`
+- `code/huginn_lora/scripts/prepare_audiocaps_v2_swift_dataset.py`
+- `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_5090.sh`
+- `code/huginn_lora/run_inspect_audiocaps_v2_dataset_3090.sh`
+- `code/huginn_lora/run_prepare_audiocaps_v2_swift_dataset_3090.sh`
+- `code/huginn_lora/run_smoke_audiocaps_v2_huginn_audio_swift_5090.sh`
+- `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_5090.sh`
 
 ### Audio evaluation
 
@@ -1161,8 +1190,8 @@ Any new chat should assume the following:
    - the newer Swift multimodal LoRA route in `code/huginn_lora`
 9. Do not forget that the Swift branch has already passed remote smoke and mid training; do not regress it back into an "unverified" mental model.
 10. For current audio development requests, default to the **Swift multimodal LoRA path** unless the user explicitly asks to modify the older standalone scripts.
-11. For the Swift audio line, prefer `pdgpu-3090` single-GPU submission scripts unless the user explicitly asks to move elsewhere.
-12. For ACAVCAPS, remember that the current formal-data mainline is tar-backed chunk generation, not copying raw audio into the repo.
+11. For the current Swift formal audio line, use the `pdgpu-5090` submit wrapper; `pdgpu-3090` remains appropriate for smoke, inspection, and preparation jobs.
+12. For ACAVCAPS, remember that the current formal route is the pair-verified tar-backed curriculum master, not raw-audio copying and not the old globally shuffled master.
 
 ---
 
@@ -1213,11 +1242,13 @@ If a new agent is asked "what should we do now", the best default interpretation
    - Huginn LoRA trainable
    - audio encoder frozen
 3. assume the current dataset mainline is **ACAVCAPS**
-4. assume the current formal data-prep mainline is:
-   - all tar shards
-   - 4 tar per chunk
-   - 256 samples per tar
-   - resumable chunk generation
+4. assume the current formal data/training mainline is:
+   - 56 selected tars, all records per tar, one tar per preparation chunk
+   - `239854` pair-verified records
+   - curriculum master order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
+   - no dataset, dataloader, sortish, or length-group shuffle
+   - direct tar-backed FLAC decode at training time; no raw-audio copying
+   - single RTX 5090 B8/GA4 formal configuration
 5. do local code edits only
 6. let the user run all remote jobs and bring logs back
 
