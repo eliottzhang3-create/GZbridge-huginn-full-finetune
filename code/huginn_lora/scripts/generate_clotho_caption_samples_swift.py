@@ -39,11 +39,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-count", type=int, default=3)
     parser.add_argument("--seed", type=int, default=74)
     parser.add_argument("--max-new-tokens", type=int, default=64)
-    parser.add_argument(
-        "--use-cache",
-        action="store_true",
-        help="Use Huginn KV cache. Disabled by default for this audio-conditioning diagnostic.",
-    )
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -242,7 +237,6 @@ def generate_caption(
     processor: Any,
     audio_path: Path,
     max_new_tokens: int,
-    use_cache: bool,
     device: torch.device,
 ) -> dict[str, Any]:
     feature_extractor = processor.feature_extractor
@@ -255,23 +249,66 @@ def generate_caption(
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
     audio_features = features.to(device=device, dtype=torch.bfloat16)
+
+    stop_token_ids = {
+        token_id
+        for token_id in (getattr(tokenizer, "eos_token_id", None), getattr(model.config, "eos_token_id", None))
+        if token_id is not None
+    }
+    # These are the Huginn generation stop tokens used by the base model.
+    stop_token_ids.update({65504, 65505, 65508})
+
     with torch.inference_mode():
-        generated_ids = model.generate(
+        # Audio is injected exactly once into this prefill. The base forward creates
+        # a cache whose length includes the 34-token audio prefix and the text prompt.
+        outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
             audio_input_features=audio_features,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            use_cache=use_cache,
-            eos_token_id=tokenizer.eos_token_id,
-            pad_token_id=tokenizer.pad_token_id,
+            use_cache=True,
         )
-    new_token_ids = generated_ids[0, input_ids.shape[1]:]
+        if outputs.logits is None or outputs.past_key_values is None:
+            raise RuntimeError("Audio prefill did not return logits and a Huginn KV cache")
+        cache = outputs.past_key_values
+        prefill_cache_length = int(cache.get_seq_length())
+        new_token_ids: list[int] = []
+        stop_reason = "max_new_tokens"
+
+        for _ in range(max_new_tokens):
+            next_token = torch.argmax(outputs.logits[:, -1, :], dim=-1, keepdim=True)
+            token_id = int(next_token.item())
+            if token_id in stop_token_ids:
+                stop_reason = f"stop_token:{token_id}"
+                break
+            new_token_ids.append(token_id)
+            if len(new_token_ids) == max_new_tokens:
+                break
+
+            # The next token's RoPE position is the actual cache length, including
+            # audio prefix tokens, rather than the text-only position maintained by
+            # Transformers' generic generate loop.
+            cache_position = torch.tensor([cache.get_seq_length()], device=device, dtype=torch.long)
+            outputs = model(
+                input_ids=next_token,
+                past_key_values=cache,
+                use_cache=True,
+                cache_position=cache_position,
+            )
+            if outputs.logits is None or outputs.past_key_values is None:
+                raise RuntimeError("Cached Huginn decode did not return logits and cache")
+            cache = outputs.past_key_values
+
+    new_token_tensor = torch.tensor(new_token_ids, device=device, dtype=torch.long)
     return {
         "prompt": prompt,
         "audio_seconds_after_truncation": len(waveform) / float(sample_rate),
-        "generated_token_count": int(new_token_ids.numel()),
-        "generated_caption": tokenizer.decode(new_token_ids, skip_special_tokens=True).strip(),
+        "text_prompt_token_count": int(input_ids.shape[1]),
+        "audio_prefix_token_count": prefill_cache_length - int(input_ids.shape[1]),
+        "prefill_cache_length": prefill_cache_length,
+        "final_cache_length": int(cache.get_seq_length()),
+        "stop_reason": stop_reason,
+        "generated_token_count": len(new_token_ids),
+        "generated_caption": tokenizer.decode(new_token_tensor, skip_special_tokens=True).strip(),
     }
 
 
@@ -298,7 +335,7 @@ def main() -> None:
     print(f"[config] dataset_dir={args.dataset_dir}")
     print(f"[config] eval_manifest={args.eval_manifest}")
     print(f"[config] available_audio_groups={len(groups)} selected_indices={selected_indices}")
-    print(f"[config] max_new_tokens={args.max_new_tokens} use_cache={args.use_cache} seed={args.seed}")
+    print(f"[config] max_new_tokens={args.max_new_tokens} generation_path=audio_manual_cache seed={args.seed}")
     plugin = import_plugin(args.plugin_path)
     model, processor, restore = load_generation_model(plugin, args.checkpoint, device)
     print(f"[restore] {json.dumps(restore, ensure_ascii=False)}")
@@ -308,7 +345,7 @@ def main() -> None:
     samples: list[dict[str, Any]] = []
     for sample_number, (audio_path, references) in enumerate(selected_groups, start=1):
         generated = generate_caption(
-            plugin, model, processor, audio_path, args.max_new_tokens, args.use_cache, device
+            plugin, model, processor, audio_path, args.max_new_tokens, device
         )
         sample = {
             "sample_number": sample_number,
@@ -321,6 +358,13 @@ def main() -> None:
         print(f"========== SAMPLE {sample_number} ==========")
         print(f"[audio] path={audio_path}")
         print(f"[audio] seconds_after_truncation={generated['audio_seconds_after_truncation']:.3f}")
+        print(
+            "[generation] "
+            f"prompt_tokens={generated['text_prompt_token_count']} "
+            f"audio_prefix_tokens={generated['audio_prefix_token_count']} "
+            f"cache={generated['prefill_cache_length']}->{generated['final_cache_length']} "
+            f"stop_reason={generated['stop_reason']}"
+        )
         print(f"[generation] token_count={generated['generated_token_count']}")
         print(f"[generation] caption={generated['generated_caption']}")
         for reference_number, reference in enumerate(references, start=1):
@@ -329,7 +373,7 @@ def main() -> None:
     payload = {
         "checkpoint": args.checkpoint,
         "max_new_tokens": args.max_new_tokens,
-        "use_cache": args.use_cache,
+        "generation_path": "audio_manual_cache",
         "restore": restore,
         "samples": samples,
     }

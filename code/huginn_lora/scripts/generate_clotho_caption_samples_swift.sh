@@ -16,14 +16,6 @@ CHECKPOINT="${CLOTHO_CAPTION_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code
 OUTPUT_DIR="${CLOTHO_CAPTION_OUTPUT_DIR:-$REPO_ROOT/outputs/huginn_audio_clotho_caption_samples}"
 SAMPLE_COUNT="${CLOTHO_CAPTION_SAMPLE_COUNT:-3}"
 MAX_NEW_TOKENS="${CLOTHO_CAPTION_MAX_NEW_TOKENS:-64}"
-USE_CACHE="${CLOTHO_CAPTION_USE_CACHE:-0}"
-USE_CACHE_ARG=()
-if [ "$USE_CACHE" = "1" ]; then
-  USE_CACHE_ARG=(--use-cache)
-elif [ "$USE_CACHE" != "0" ]; then
-  echo "CLOTHO_CAPTION_USE_CACHE must be 0 or 1, got: $USE_CACHE" >&2
-  exit 2
-fi
 
 echo "========== GENERATE CLOTHO CAPTION SAMPLES =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
@@ -31,11 +23,10 @@ echo "checkpoint=$CHECKPOINT"
 echo "output_dir=$OUTPUT_DIR"
 echo "sample_count=$SAMPLE_COUNT"
 echo "max_new_tokens=$MAX_NEW_TOKENS"
-echo "use_cache=$USE_CACHE"
+echo "generation_path=audio_manual_cache"
 
 python -u code/huginn_lora/scripts/generate_clotho_caption_samples_swift.py \
   --checkpoint "$CHECKPOINT" \
   --output-dir "$OUTPUT_DIR" \
   --sample-count "$SAMPLE_COUNT" \
-  --max-new-tokens "$MAX_NEW_TOKENS" \
-  "${USE_CACHE_ARG[@]}"
+  --max-new-tokens "$MAX_NEW_TOKENS"
