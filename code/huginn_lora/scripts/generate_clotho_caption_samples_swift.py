@@ -141,15 +141,26 @@ def load_generation_model(plugin: ModuleType, checkpoint_dir: str, device: torch
 
     from peft import PeftModel
 
-    model = PeftModel.from_pretrained(base_model, str(checkpoint_path), is_trainable=False)
-    model.to(device=device, dtype=torch.bfloat16)
+    peft_model = PeftModel.from_pretrained(base_model, str(checkpoint_path), is_trainable=False)
+    peft_model.to(device=device, dtype=torch.bfloat16)
+    peft_model.eval()
+    # PEFT injects LoRA layers into this underlying model. Calling its generate
+    # method directly preserves those layers while exposing audio_input_features
+    # to Transformers' generation-kwargs validator.
+    model = peft_model.base_model.model
+    if not hasattr(model, "audio_encoder") or not hasattr(model, "audio_projector"):
+        raise TypeError(f"Unexpected PEFT base model type: {type(model)}")
     model.eval()
     processor = plugin.build_huginn_audio_processor()
     lora_tensor_count = len(state_dict_from_file(adapter_path))
+    injected_lora_module_count = sum(1 for name, _ in model.named_modules() if "lora_A" in name)
+    if injected_lora_module_count == 0:
+        raise RuntimeError("LoRA restoration produced no injected lora_A modules in the generation model")
     return model, processor, {
         "checkpoint_dir": str(checkpoint_path),
         "lora_restored": True,
         "lora_tensor_count": lora_tensor_count,
+        "injected_lora_module_count": injected_lora_module_count,
         "audio_encoder_trainable_parameter_count": sum(
             parameter.numel() for parameter in base_model.audio_encoder.parameters() if parameter.requires_grad
         ),
