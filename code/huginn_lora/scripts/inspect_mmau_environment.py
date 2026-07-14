@@ -160,6 +160,23 @@ def inspect_parquet(path: Path) -> dict[str, Any]:
         result["row_group_count"] = parquet_file.metadata.num_row_groups
         result["schema"] = str(parquet_file.schema_arrow)
         result["column_names"] = parquet_file.schema_arrow.names
+        first_batch = next(parquet_file.iter_batches(batch_size=1))
+        first_row = first_batch.to_pylist()[0]
+        sample_summary: dict[str, Any] = {}
+        for key, value in first_row.items():
+            if isinstance(value, bytes):
+                sample_summary[key] = {"type": "bytes", "length": len(value)}
+            elif isinstance(value, dict):
+                summarized_value: dict[str, Any] = {}
+                for nested_key, nested_value in value.items():
+                    if isinstance(nested_value, bytes):
+                        summarized_value[nested_key] = {"type": "bytes", "length": len(nested_value)}
+                    else:
+                        summarized_value[nested_key] = nested_value
+                sample_summary[key] = summarized_value
+            else:
+                sample_summary[key] = value
+        result["first_row_summary"] = sample_summary
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
