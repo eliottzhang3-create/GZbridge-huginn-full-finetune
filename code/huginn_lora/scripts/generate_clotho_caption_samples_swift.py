@@ -39,6 +39,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-count", type=int, default=3)
     parser.add_argument("--seed", type=int, default=74)
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--use-cache",
+        action="store_true",
+        help="Use Huginn KV cache. Disabled by default for this audio-conditioning diagnostic.",
+    )
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -231,7 +236,15 @@ def build_prompt(plugin: ModuleType) -> str:
     )
 
 
-def generate_caption(plugin: ModuleType, model: torch.nn.Module, processor: Any, audio_path: Path, max_new_tokens: int, device: torch.device) -> dict[str, Any]:
+def generate_caption(
+    plugin: ModuleType,
+    model: torch.nn.Module,
+    processor: Any,
+    audio_path: Path,
+    max_new_tokens: int,
+    use_cache: bool,
+    device: torch.device,
+) -> dict[str, Any]:
     feature_extractor = processor.feature_extractor
     tokenizer = processor.tokenizer
     sample_rate = int(getattr(feature_extractor, "sampling_rate", plugin.DEFAULT_SAMPLE_RATE))
@@ -249,7 +262,7 @@ def generate_caption(plugin: ModuleType, model: torch.nn.Module, processor: Any,
             audio_input_features=audio_features,
             max_new_tokens=max_new_tokens,
             do_sample=False,
-            use_cache=True,
+            use_cache=use_cache,
             eos_token_id=tokenizer.eos_token_id,
             pad_token_id=tokenizer.pad_token_id,
         )
@@ -285,7 +298,7 @@ def main() -> None:
     print(f"[config] dataset_dir={args.dataset_dir}")
     print(f"[config] eval_manifest={args.eval_manifest}")
     print(f"[config] available_audio_groups={len(groups)} selected_indices={selected_indices}")
-    print(f"[config] max_new_tokens={args.max_new_tokens} seed={args.seed}")
+    print(f"[config] max_new_tokens={args.max_new_tokens} use_cache={args.use_cache} seed={args.seed}")
     plugin = import_plugin(args.plugin_path)
     model, processor, restore = load_generation_model(plugin, args.checkpoint, device)
     print(f"[restore] {json.dumps(restore, ensure_ascii=False)}")
@@ -295,7 +308,7 @@ def main() -> None:
     samples: list[dict[str, Any]] = []
     for sample_number, (audio_path, references) in enumerate(selected_groups, start=1):
         generated = generate_caption(
-            plugin, model, processor, audio_path, args.max_new_tokens, device
+            plugin, model, processor, audio_path, args.max_new_tokens, args.use_cache, device
         )
         sample = {
             "sample_number": sample_number,
@@ -313,7 +326,13 @@ def main() -> None:
         for reference_number, reference in enumerate(references, start=1):
             print(f"[reference {reference_number}] {reference}")
 
-    payload = {"restore": restore, "samples": samples}
+    payload = {
+        "checkpoint": args.checkpoint,
+        "max_new_tokens": args.max_new_tokens,
+        "use_cache": args.use_cache,
+        "restore": restore,
+        "samples": samples,
+    }
     output_path = output_dir / "clotho_caption_samples.json"
     output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print("========== HUGINN CLOTHO CAPTION GENERATION DONE ==========")
