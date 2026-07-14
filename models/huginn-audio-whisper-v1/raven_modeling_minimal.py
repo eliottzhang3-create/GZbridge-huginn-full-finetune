@@ -178,6 +178,34 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
             (trainable if param.requires_grad else frozen).append(name)
         return {"trainable": trainable, "frozen_count": len(frozen), "trainable_count": len(trainable)}
 
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.Tensor,
+        past_key_values=None,
+        attention_mask: Optional[torch.Tensor] = None,
+        inputs_embeds: Optional[torch.Tensor] = None,
+        cache_position: Optional[torch.Tensor] = None,
+        cache_lookup_strategy: str = "full",
+        audio_input_features: Optional[torch.Tensor] = None,
+        audio_attention_mask: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        """Expose custom audio inputs to Transformers generation validation."""
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            cache_position=cache_position,
+            cache_lookup_strategy=cache_lookup_strategy,
+            **kwargs,
+        )
+        if audio_input_features is not None:
+            model_inputs["audio_input_features"] = audio_input_features
+        if audio_attention_mask is not None:
+            model_inputs["audio_attention_mask"] = audio_attention_mask
+        return model_inputs
+
     def forward(
         self,
         input_ids: torch.Tensor,
