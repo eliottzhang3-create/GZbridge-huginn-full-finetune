@@ -126,30 +126,6 @@ def choose_groups(groups: list[tuple[str, list[str]]], sample_count: str, seed: 
     return [groups[index] for index in indices]
 
 
-def unwrap_audio_model(model: torch.nn.Module) -> torch.nn.Module:
-    visited: set[int] = set()
-    current = model
-    while id(current) not in visited:
-        visited.add(id(current))
-        if hasattr(current, 'audio_encoder') and hasattr(current, 'audio_projector'):
-            return current
-        next_model = None
-        if hasattr(current, 'get_base_model'):
-            candidate = current.get_base_model()
-            if isinstance(candidate, torch.nn.Module) and candidate is not current:
-                next_model = candidate
-        if next_model is None:
-            for attr_name in ('model', 'base_model'):
-                candidate = getattr(current, attr_name, None)
-                if isinstance(candidate, torch.nn.Module) and candidate is not current:
-                    next_model = candidate
-                    break
-        if next_model is None:
-            break
-        current = next_model
-    raise RuntimeError(f'Unable to locate Huginn audio model inside {type(model)}')
-
-
 def state_dict_from_file(path: Path) -> dict[str, torch.Tensor]:
     if path.suffix == '.safetensors':
         from safetensors.torch import load_file
@@ -221,39 +197,27 @@ def load_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str
     }
 
 
-def load_checkpoint(plugin: ModuleType, checkpoint_dir: str, device: torch.device) -> tuple[torch.nn.Module, torch.nn.Module, Any, dict[str, Any]]:
+def load_checkpoint(plugin: ModuleType, checkpoint_dir: str, device: torch.device) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
     checkpoint_path = Path(checkpoint_dir)
     if not checkpoint_path.is_dir():
         raise FileNotFoundError(f'Checkpoint directory not found: {checkpoint_path}')
-    adapter_config = checkpoint_path / 'adapter_config.json'
-    if not adapter_config.is_file():
-        raise FileNotFoundError(f'PEFT adapter_config.json not found: {adapter_config}')
-
     base_model = plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
-    try:
-        from peft import PeftModel
-    except ImportError as exc:  # pragma: no cover - remote environment dependent
-        raise RuntimeError('PEFT is required to restore Swift LoRA checkpoints') from exc
-    # Swift saves the full aligner separately as vit.safetensors. Restore it on
-    # the unwrapped model before PEFT changes the model's state-dict namespace.
+    # This retrieval definition never runs Huginn recurrent blocks. It uses only
+    # the projector-side audio tokens and the frozen raw text embedding table, so
+    # LoRA weights cannot affect its result and are deliberately not restored.
     aligner_report = load_aligner_state(base_model, checkpoint_path)
-    peft_model = PeftModel.from_pretrained(base_model, str(checkpoint_path), is_trainable=False)
-    audio_model = base_model
-
-    lora_parameter_count = sum(parameter.numel() for name, parameter in peft_model.named_parameters() if 'lora_' in name)
-    if lora_parameter_count == 0:
-        raise RuntimeError(f'No LoRA parameters found after restoring {checkpoint_path}')
-    if any(parameter.requires_grad for parameter in audio_model.audio_encoder.parameters()):
+    if any(parameter.requires_grad for parameter in base_model.audio_encoder.parameters()):
         raise RuntimeError('Audio encoder unexpectedly became trainable during evaluation restore')
 
     processor = plugin.build_huginn_audio_processor()
-    peft_model.to(device=device, dtype=torch.bfloat16)
-    peft_model.eval()
-    return peft_model, audio_model, processor, {
+    base_model.to(device=device, dtype=torch.bfloat16)
+    base_model.eval()
+    return base_model, processor, {
         'checkpoint_dir': str(checkpoint_path),
-        'lora_parameter_count': lora_parameter_count,
+        'lora_restored': False,
+        'lora_restore_reason': 'raw token embeddings and projector-side audio embeddings do not traverse LoRA modules',
         'audio_encoder_trainable_parameter_count': sum(
-            parameter.numel() for parameter in audio_model.audio_encoder.parameters() if parameter.requires_grad
+            parameter.numel() for parameter in base_model.audio_encoder.parameters() if parameter.requires_grad
         ),
         'aligner_restore': aligner_report,
     }
@@ -401,7 +365,7 @@ def evaluate_one_checkpoint(
     device: torch.device,
     output_dir: Path,
 ) -> dict[str, Any]:
-    peft_model, audio_model, processor, restore = load_checkpoint(plugin, checkpoint_dir, device)
+    audio_model, processor, restore = load_checkpoint(plugin, checkpoint_dir, device)
     audio_embeddings = F.normalize(
         compute_audio_embeddings(plugin, audio_model, processor, groups, device, args.audio_batch_size), dim=-1
     )
@@ -424,7 +388,7 @@ def evaluate_one_checkpoint(
         json.dumps(examples, ensure_ascii=False, indent=2) + '\n', encoding='utf-8'
     )
 
-    del peft_model, audio_model
+    del audio_model
     gc.collect()
     torch.cuda.empty_cache()
     return {'checkpoint_dir': checkpoint_dir, 'restore': restore, 'metrics': metrics}

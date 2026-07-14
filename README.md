@@ -966,7 +966,7 @@ As of 2026-07-13, the correct assumption is:
   - audio: mean pool of `Whisper -> temporal_compressor -> audio_projector` tokens, excluding audio boundary embeddings
   - text: masked mean of raw Huginn input token embeddings for each caption, without recurrent hidden states
   - metric: cosine-similarity audio-to-text and text-to-audio Recall@1/5/10, MRR, positive/negative similarity gap, and failure examples
-- The Swift evaluator must first inspect the PEFT checkpoint file layout to verify restoration of both aligner and LoRA state; it must never evaluate with a randomly initialized aligner.
+- This is an adapter-alignment metric: LoRA is intentionally not restored because neither side traverses LoRA-modified Huginn blocks. The evaluator restores and verifies the aligner state from `vit.safetensors`; it must never evaluate with a randomly initialized aligner.
 
 ### Current useful Swift training entrypoints
 
