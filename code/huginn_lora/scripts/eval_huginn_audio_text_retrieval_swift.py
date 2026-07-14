@@ -186,6 +186,11 @@ def candidate_target_keys(source_key: str) -> list[str]:
 
 def load_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str, Any]:
     target_state = model.state_dict()
+    canonical_target_keys: dict[str, str] = {}
+    for target_key in target_state:
+        for candidate in candidate_target_keys(target_key):
+            if candidate.startswith(ALIGNER_PREFIXES):
+                canonical_target_keys.setdefault(candidate, target_key)
     selected: dict[str, torch.Tensor] = {}
     source_keys: list[str] = []
     for path in sorted(checkpoint_dir.rglob('*')):
@@ -195,16 +200,17 @@ def load_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str
             continue
         for source_key, tensor in state_dict_from_file(path).items():
             for target_key in candidate_target_keys(source_key):
-                if target_key.startswith(ALIGNER_PREFIXES) and target_key in target_state:
-                    if target_state[target_key].shape != tensor.shape:
+                actual_target_key = canonical_target_keys.get(target_key)
+                if actual_target_key is not None:
+                    if target_state[actual_target_key].shape != tensor.shape:
                         continue
-                    selected[target_key] = tensor
+                    selected[actual_target_key] = tensor
                     source_keys.append(source_key)
                     break
     if not selected:
         raise RuntimeError(
             f'No aligner tensors could be recovered from {checkpoint_dir}. '
-            'Run the checkpoint inspect script and adapt the loader before evaluating.'
+            f'Available target aligner aliases include: {sorted(canonical_target_keys)[:20]}'
         )
     load_result = model.load_state_dict(selected, strict=False)
     return {
@@ -228,9 +234,11 @@ def load_checkpoint(plugin: ModuleType, checkpoint_dir: str, device: torch.devic
         from peft import PeftModel
     except ImportError as exc:  # pragma: no cover - remote environment dependent
         raise RuntimeError('PEFT is required to restore Swift LoRA checkpoints') from exc
+    # Swift saves the full aligner separately as vit.safetensors. Restore it on
+    # the unwrapped model before PEFT changes the model's state-dict namespace.
+    aligner_report = load_aligner_state(base_model, checkpoint_path)
     peft_model = PeftModel.from_pretrained(base_model, str(checkpoint_path), is_trainable=False)
-    audio_model = unwrap_audio_model(peft_model)
-    aligner_report = load_aligner_state(audio_model, checkpoint_path)
+    audio_model = base_model
 
     lora_parameter_count = sum(parameter.numel() for name, parameter in peft_model.named_parameters() if 'lora_' in name)
     if lora_parameter_count == 0:
