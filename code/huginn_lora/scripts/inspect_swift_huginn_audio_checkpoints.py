@@ -12,9 +12,9 @@ import torch
 
 DEFAULT_CHECKPOINTS = [
     '/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/'
-    'outputs/huginn_audio_acavcaps_formal_curriculum_b8ga4_5090/v0-20260713-060712/checkpoint-7500',
+    'outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-5604',
     '/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/'
-    'outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-2802',
+    'outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-8406',
 ]
 SKIP_TORCH_FILES = ('optimizer', 'scheduler', 'rng', 'trainer_state', 'training_args')
 

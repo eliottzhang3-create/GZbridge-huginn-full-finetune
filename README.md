@@ -961,7 +961,7 @@ As of 2026-07-13, the correct assumption is:
 
 ### Swift Clotho Retrieval Evaluation (added 2026-07-14; pending checkpoint-layout inspect)
 
-- Purpose: compare the ACAVCAPS `checkpoint-7500` and AudioCaps epoch-1 `checkpoint-2802` on grouped Clotho caption retrieval.
+- Purpose: compare AudioCaps epoch-2 `checkpoint-5604` and epoch-3 `checkpoint-8406` on grouped Clotho caption retrieval.
 - Embedding definition follows the earlier standalone retrieval implementation:
   - audio: mean pool of `Whisper -> temporal_compressor -> audio_projector` tokens, excluding audio boundary embeddings
   - text: masked mean of raw Huginn input token embeddings for each caption, without recurrent hidden states
