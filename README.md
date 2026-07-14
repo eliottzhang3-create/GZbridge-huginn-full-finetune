@@ -943,7 +943,7 @@ As of 2026-07-13, the correct assumption is:
 - the immediate task is to launch or monitor the formal 7500-step run, then evaluate the produced checkpoint
 - all remote work must still be submitted through `vc submit`; Codex edits only this local sync repository
 
-### New AudioCaps v2 route (added 2026-07-13; not yet remote-verified)
+### AudioCaps v2 route (updated 2026-07-14)
 
 - AudioCaps v2 was copied into the user's personal remote storage, so this route uses ordinary local WAV paths rather than ACAVCAPS tar references.
 - New scripts provide, in order:
@@ -951,7 +951,22 @@ As of 2026-07-13, the correct assumption is:
   - full train-split metadata-only JSONL preparation with CSV-to-WAV and 16-bit PCM WAV verification; unavailable or malformed rows are explicitly excluded and recorded in stats
   - a 20-step B8/GA4 smoke on `pdgpu-5090`
   - a five-epoch B8/GA4 formal run on `pdgpu-5090`, checkpointed once per epoch and retaining five full checkpoints
-- Do not treat this route as runnable until the inspection and manifest jobs have passed. The Huginn audio model and Swift plugin are intentionally reused unchanged unless the WAV inspection finds an unsupported format.
+- Inspection and manifest preparation passed:
+  - `91257` source CSV rows
+  - `89658` valid, unique WAV-caption training records
+  - `1599` excluded rows: `3` malformed rows with empty audio ID and `1596` rows whose WAV is unavailable
+  - every included WAV is mono, 32 kHz, 16-bit PCM and verified readable
+- The five-epoch formal training run is active on 5090. Its epoch-1 checkpoint is `checkpoint-2802`; do not assume the five-epoch run has completed until its final remote log is available.
+- The Huginn audio model and Swift plugin are reused unchanged.
+
+### Swift Clotho Retrieval Evaluation (added 2026-07-14; pending checkpoint-layout inspect)
+
+- Purpose: compare the ACAVCAPS `checkpoint-7500` and AudioCaps epoch-1 `checkpoint-2802` on grouped Clotho caption retrieval.
+- Embedding definition follows the earlier standalone retrieval implementation:
+  - audio: mean pool of `Whisper -> temporal_compressor -> audio_projector` tokens, excluding audio boundary embeddings
+  - text: masked mean of raw Huginn input token embeddings for each caption, without recurrent hidden states
+  - metric: cosine-similarity audio-to-text and text-to-audio Recall@1/5/10, MRR, positive/negative similarity gap, and failure examples
+- The Swift evaluator must first inspect the PEFT checkpoint file layout to verify restoration of both aligner and LoRA state; it must never evaluate with a randomly initialized aligner.
 
 ### Current useful Swift training entrypoints
 
@@ -1116,6 +1131,10 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/run_prepare_audiocaps_v2_swift_dataset_5090.sh`
 - `code/huginn_lora/run_smoke_audiocaps_v2_huginn_audio_swift_5090.sh`
 - `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_5090.sh`
+- `code/huginn_lora/scripts/inspect_swift_huginn_audio_checkpoints.py`
+- `code/huginn_lora/scripts/eval_huginn_audio_text_retrieval_swift.py`
+- `code/huginn_lora/run_inspect_swift_huginn_audio_checkpoints_5090.sh`
+- `code/huginn_lora/run_eval_huginn_audio_text_retrieval_swift_5090.sh`
 
 ### Audio evaluation
 
