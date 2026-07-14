@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -179,15 +178,14 @@ def main() -> None:
     processed_now = 0
     skipped = 0
     requested_count = end_offset - args.start_offset
-    with tempfile.TemporaryDirectory(prefix="mmau_test_mini_full_") as temp_name, results_path.open("a", encoding="utf-8") as handle:
-        temp_dir = Path(temp_name)
+    with results_path.open("a", encoding="utf-8") as handle:
         for row_index, row in iter_rows(parquet_path, args.start_offset, end_offset):
             attributes = json.loads(row["other_attributes"])
             sample_id = attributes["id"]
             if sample_id in completed_ids:
                 skipped += 1
                 continue
-            result = evaluate_row(row, temp_dir, plugin, model, processor, device)
+            result = evaluate_row(row, plugin, model, processor, device)
             result["dataset_row_index"] = row_index
             result["official_match"] = official_string_match(result["answer"], result["prediction"], result["choices"])
             append_jsonl(handle, result)

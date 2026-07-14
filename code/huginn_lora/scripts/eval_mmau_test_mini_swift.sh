@@ -14,7 +14,7 @@ export CUDA_VISIBLE_DEVICES=0
 
 CHECKPOINT="${MMAU_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-8406}"
 DATASET_PATH="${MMAU_TEST_MINI_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/data/MMAU test_mini/test_mini.parquet}"
-OUTPUT_DIR="${MMAU_OUTPUT_DIR:-$REPO_ROOT/outputs/mmau_test_mini_full_checkpoint_8406}"
+OUTPUT_DIR="${MMAU_OUTPUT_DIR:-$REPO_ROOT/outputs/mmau_test_mini_full_checkpoint_8406_ffmpeg_bytes_v2}"
 START_OFFSET="${MMAU_START_OFFSET:-0}"
 MAX_SAMPLES="${MMAU_MAX_SAMPLES:-}"
 LOG_EVERY="${MMAU_LOG_EVERY:-10}"

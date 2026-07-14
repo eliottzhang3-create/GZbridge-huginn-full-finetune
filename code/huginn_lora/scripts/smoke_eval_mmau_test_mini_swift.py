@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import tempfile
-import wave
 from pathlib import Path
 from typing import Any
 
@@ -67,7 +65,7 @@ def parse_attributes(row: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
-def write_embedded_wav(row: dict[str, Any], temp_dir: Path) -> tuple[Path, dict[str, Any]]:
+def extract_embedded_audio(row: dict[str, Any]) -> tuple[bytes, dict[str, Any]]:
     attributes = parse_attributes(row)
     sample_id = attributes.get("id")
     if not isinstance(sample_id, str) or not sample_id:
@@ -76,19 +74,12 @@ def write_embedded_wav(row: dict[str, Any], temp_dir: Path) -> tuple[Path, dict[
     if not isinstance(context, dict) or not isinstance(context.get("bytes"), bytes):
         raise TypeError("MMAU context must contain embedded audio bytes")
     wav_bytes = context["bytes"]
-    if not wav_bytes.startswith(b"RIFF"):
-        raise ValueError(f"MMAU sample {sample_id} does not start with a RIFF WAV header")
-    audio_path = temp_dir / f"{sample_id}.wav"
-    audio_path.write_bytes(wav_bytes)
-    with wave.open(str(audio_path), "rb") as handle:
-        wave_metadata = {
-            "channels": handle.getnchannels(),
-            "sample_width_bytes": handle.getsampwidth(),
-            "sample_rate": handle.getframerate(),
-            "frame_count": handle.getnframes(),
-            "duration_seconds": handle.getnframes() / float(handle.getframerate()),
-        }
-    return audio_path, {"id": sample_id, **attributes, "embedded_audio_bytes": len(wav_bytes), "wav": wave_metadata}
+    return wav_bytes, {
+        "id": sample_id,
+        **attributes,
+        "embedded_audio_bytes": len(wav_bytes),
+        "embedded_audio_magic_hex": wav_bytes[:12].hex(),
+    }
 
 
 def build_prompt(plugin: Any, instruction: str, choices: list[str]) -> str:
@@ -117,10 +108,17 @@ def tokenize_candidate(tokenizer: Any, prompt: str, choice: str) -> tuple[torch.
     return prompt_ids, full_ids[prompt_ids.shape[0]:]
 
 
-def prepare_audio_features(plugin: Any, processor: Any, audio_path: Path, device: torch.device) -> tuple[torch.Tensor, float]:
+def prepare_audio_features(
+    plugin: Any,
+    processor: Any,
+    audio_bytes: bytes,
+    source_label: str,
+    device: torch.device,
+) -> tuple[torch.Tensor, float]:
     feature_extractor = processor.feature_extractor
     sample_rate = int(getattr(feature_extractor, "sampling_rate", plugin.DEFAULT_SAMPLE_RATE))
-    waveform = plugin.load_audio_file(audio_path, sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
+    waveform = plugin.decode_audio_with_ffmpeg_bytes(audio_bytes, source_label, sample_rate)
+    waveform = plugin.trim_audio(waveform, sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
     features = feature_extractor([waveform], sampling_rate=sample_rate, return_tensors="pt")["input_features"]
     return features.to(device=device, dtype=torch.bfloat16), len(waveform) / float(sample_rate)
 
@@ -174,7 +172,6 @@ def score_choice(
 
 def evaluate_row(
     row: dict[str, Any],
-    temp_dir: Path,
     plugin: Any,
     model: torch.nn.Module,
     processor: Any,
@@ -190,19 +187,16 @@ def evaluate_row(
     if not isinstance(answer, str) or not answer.strip():
         raise ValueError("MMAU test-mini answer is empty")
 
-    audio_path, metadata = write_embedded_wav(row, temp_dir)
-    try:
-        audio_features, used_seconds = prepare_audio_features(plugin, processor, audio_path, device)
-        prompt = build_prompt(plugin, instruction, choices)
-        tokenizer = processor.tokenizer
-        prompt_ids, _ = tokenize_candidate(tokenizer, prompt, choices[0])
-        choice_scores = []
-        for choice in choices:
-            _, candidate_ids = tokenize_candidate(tokenizer, prompt, choice)
-            score = score_choice(model, prompt_ids, candidate_ids, audio_features, device)
-            choice_scores.append({"choice": choice, **score})
-    finally:
-        audio_path.unlink(missing_ok=True)
+    audio_bytes, metadata = extract_embedded_audio(row)
+    audio_features, used_seconds = prepare_audio_features(plugin, processor, audio_bytes, metadata["id"], device)
+    prompt = build_prompt(plugin, instruction, choices)
+    tokenizer = processor.tokenizer
+    prompt_ids, _ = tokenize_candidate(tokenizer, prompt, choices[0])
+    choice_scores = []
+    for choice in choices:
+        _, candidate_ids = tokenize_candidate(tokenizer, prompt, choice)
+        score = score_choice(model, prompt_ids, candidate_ids, audio_features, device)
+        choice_scores.append({"choice": choice, **score})
 
     predicted_index = max(range(len(choice_scores)), key=lambda index: choice_scores[index]["mean_logprob"])
     prediction = choices[predicted_index]
@@ -242,21 +236,19 @@ def main() -> None:
         print("[warning] audio_bos/audio_eos were not found in the checkpoint; model initialization values are in use.")
 
     results: list[dict[str, Any]] = []
-    with tempfile.TemporaryDirectory(prefix="mmau_test_mini_") as temp_name:
-        temp_dir = Path(temp_name)
-        for row_index, row in enumerate(rows, start=args.sample_offset):
-            result = evaluate_row(row, temp_dir, plugin, model, processor, device)
-            results.append(result)
-            print(f"========== MMAU SAMPLE {row_index} ==========")
-            print(f"[sample] id={result['metadata']['id']} task={result['metadata'].get('task')} difficulty={result['metadata'].get('difficulty')}")
-            print(f"[sample] audio_seconds_after_truncation={result['audio_seconds_after_truncation']:.3f} prompt_tokens={result['prompt_token_count']}")
-            print(f"[sample] question={result['instruction']}")
-            for choice_index, score in enumerate(result["choice_scores"]):
-                print(
-                    f"[choice {choice_index}] text={score['choice']!r} token_count={score['token_count']} "
-                    f"mean_logprob={score['mean_logprob']:.6f} total_logprob={score['total_logprob']:.6f}"
-                )
-            print(f"[sample] prediction={result['prediction']!r} answer={result['answer']!r} exact_correct={result['correct_exact_choice']}")
+    for row_index, row in enumerate(rows, start=args.sample_offset):
+        result = evaluate_row(row, plugin, model, processor, device)
+        results.append(result)
+        print(f"========== MMAU SAMPLE {row_index} ==========")
+        print(f"[sample] id={result['metadata']['id']} task={result['metadata'].get('task')} difficulty={result['metadata'].get('difficulty')}")
+        print(f"[sample] audio_seconds_after_truncation={result['audio_seconds_after_truncation']:.3f} prompt_tokens={result['prompt_token_count']}")
+        print(f"[sample] question={result['instruction']}")
+        for choice_index, score in enumerate(result["choice_scores"]):
+            print(
+                f"[choice {choice_index}] text={score['choice']!r} token_count={score['token_count']} "
+                f"mean_logprob={score['mean_logprob']:.6f} total_logprob={score['total_logprob']:.6f}"
+            )
+        print(f"[sample] prediction={result['prediction']!r} answer={result['answer']!r} exact_correct={result['correct_exact_choice']}")
 
     correct_count = sum(result["correct_exact_choice"] for result in results)
     payload = {
