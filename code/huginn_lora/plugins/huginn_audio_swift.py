@@ -69,6 +69,7 @@ TARFILE_CACHE_LIMIT = get_tarfile_cache_limit()
 ALIGNER_PREFIXES = (
     "temporal_compressor",
     "audio_projector",
+    "audio_boundary_embeddings",
     "audio_bos",
     "audio_eos",
 )
@@ -563,7 +564,7 @@ class HuginnAudioLoader(ModelLoader):
 def register_huginn_audio_model_arch():
     multi_model_kwargs = {
         "language_model": ["transformer", "lm_head"],
-        "aligner": ["temporal_compressor", "audio_projector", "audio_bos", "audio_eos"],
+        "aligner": ["temporal_compressor", "audio_projector", "audio_boundary_embeddings"],
         "generator": ["audio_encoder"],
     }
     try:

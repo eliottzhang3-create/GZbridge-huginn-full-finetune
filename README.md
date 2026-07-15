@@ -68,9 +68,9 @@ The current main active task is:
 
 This Swift LoRA multimodal route is the current forward path for new audio-model work.
 
-### Current highest-priority execution status (updated 2026-07-13)
+### Current highest-priority execution status (updated 2026-07-15)
 
-The newest confirmed mainline is now:
+The stable training route and the current evaluation route are now:
 
 - model family:
   - original Huginn backbone
@@ -88,11 +88,8 @@ The newest confirmed mainline is now:
   - `aligner` stays **full-trainable**
   - Huginn language model base weights stay **frozen**
   - Huginn language model gets **LoRA only**
-- current dataset mainline for Swift audio work:
-  - **ACAVCAPS**
-  - loaded from shared public remote storage
-  - training data is read from `.tar.gz` shards without copying the whole dataset into the personal workspace
-- current formal-data scope:
+- validated ACAVCAPS training route:
+  - loaded from shared public storage and read from `.tar.gz` shards without copying raw audio into the personal workspace
   - a verified 56-tar subset, using every paired FLAC/JSON record in each selected tar
   - `239854` verified audio-caption pairs total
   - tar-local curriculum order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
@@ -101,17 +98,21 @@ The newest confirmed mainline is now:
   - completed with `exit_status=0`
   - observed `6.2 s/step` and `24.14 GiB` GPU memory
   - this replaced the earlier globally shuffled master path, which was I/O-bound at roughly `140 s/step`
-- full formal run status:
-  - the `7500`-step, approximately one-epoch 5090 launch script is prepared and validated by the 20-step I/O check
-  - no full-run completion should be assumed until its remote log is available
+- AudioCaps v2 training route:
+  - ordinary personal-storage WAV paths, not tar-backed input
+  - valid train manifest: `89658` unique WAV-caption pairs after excluding `1599` unavailable/malformed CSV rows
+  - five-epoch B8/GA4 5090 run has produced at least `checkpoint-5604` and `checkpoint-8406`; do not infer final completion without the final remote log
+- current immediate work is **evaluation**, not basic Swift registration:
+  - Clotho audio-text retrieval for adapter alignment
+  - direct audio-conditioned caption generation from checkpoints
+  - MMAU `test_mini` multiple-choice evaluation, including recurrence comparisons for AudioCaps `checkpoint-5604` at `r=1`, `r=8`, and `r=16`
 
-The immediate practical mainline is no longer "just make Swift run once". It is now:
+The practical mainline is therefore:
 
-1. maintain the verified Swift audio training path
-2. keep `audio_encoder` frozen under Swift multimodal registration
-3. generate / maintain ACAVCAPS training manifests and chunked manifests
-4. launch and monitor formal ACAVCAPS curriculum training using the verified master manifest route
-5. only let the user execute remote jobs through `vc submit`
+1. preserve the verified Swift training split and frozen `audio_encoder`
+2. evaluate the existing AudioCaps checkpoints before changing the model or unfreezing modules
+3. use manual cache-aware multimodal decoding for generation/evaluation; do not rely on generic Hugging Face `generate()` for this model
+4. submit all remote jobs through the matching `vc submit` wrapper
 
 ---
 
@@ -191,25 +192,30 @@ Do not casually change the container unless the user explicitly asks.
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/subset_56_full_1tar_chunks`
 - Current formal curriculum master:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/acavcaps_subset_56_full_curriculum_ordered.jsonl`
-- Personal AudioCaps v2 root (new route, pending first remote inspection):
+- Personal AudioCaps v2 root (inspected and manifest-prepared):
   - `/hpc_stor03/sjtu_home/jinwei.zhang/data/audiocaps_v2`
-  - expected layout: `train.csv` plus `train/*.wav`; `val` and `test` remain reserved for later evaluation
+  - layout: `train.csv` plus `train/*.wav`; `val` and `test` remain reserved for later evaluation
+  - prepared train manifest:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl`
+  - valid records: `89658`; excluded source rows: `1599`
+- MMAU local development dataset root:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/data/MMAU test_mini`
+  - file: `test_mini.parquet` (`1000` labeled samples)
+  - this is the local development subset, not the hidden-answer formal test set
 
 ### Current remote tool assumptions already checked by logs / manual commands
 
 - `python=3.10.20`
-- system audio tools available:
-  - `/usr/bin/ffmpeg`
-  - `/usr/bin/ffprobe`
-  - `/usr/bin/sox`
-  - `/usr/bin/flac`
+- system audio tools:
+  - the active container has working `ffmpeg` and `ffprobe` (observed as `/opt/conda/bin/ffmpeg` and `/opt/conda/bin/ffprobe`)
+  - the login host also exposed `/usr/bin/ffmpeg`, `/usr/bin/ffprobe`, `/usr/bin/sox`, and `/usr/bin/flac`
 - Python TensorBoard package is available in `swift_huginn`:
   - `tensorboard==2.20.0`
 
 Important note:
 
 - the Swift audio plugin was extended to support **tar-backed FLAC decoding**
-- Python audio backends such as `soundfile` / `torchaudio` were not assumed available
+- Python audio backends such as `soundfile` / `torchaudio` are not installed in the active `swift_huginn` environment and must not be required by new scripts
 - current robust fallback path uses **`ffmpeg`** on the remote side
 
 ---
@@ -681,7 +687,7 @@ On top of the earlier standalone audio branch, the repo has now entered a **new 
   - **remote smoke-verified**
   - **remote trainability-verified on single 3090** for smoke and mid runs
   - **remote formal I/O-verified on single 5090** for B8/GA4 curriculum training
-  - **ready for the 7500-step formal ACAVCAPS run**
+  - **usable as a stable historical training route; current work has moved to checkpoint evaluation**
 
 ### Newest verified Swift progress (updated 2026-07-13)
 
@@ -934,16 +940,17 @@ This is the most important high-level requirement for any future edit on the Swi
 
 ### Current Swift audio training status that should be assumed by new agents
 
-As of 2026-07-13, the correct assumption is:
+As of 2026-07-15, the correct assumption is:
 
 - the Huginn Swift audio route is **already runnable**
 - the frozen-audio-encoder policy is **already enforced in the current mainline**
 - the main unresolved work is **not** basic registration anymore
 - formal curriculum I/O has passed on a single 5090; do not regress to the old globally shuffled master
-- the immediate task is to launch or monitor the formal 7500-step run, then evaluate the produced checkpoint
+- AudioCaps v2 has become the latest training dataset route and supplied checkpoints for evaluation
+- the immediate task is to evaluate checkpoints, not to revisit basic data loading or Swift registration
 - all remote work must still be submitted through `vc submit`; Codex edits only this local sync repository
 
-### AudioCaps v2 route (updated 2026-07-14)
+### AudioCaps v2 route (updated 2026-07-15)
 
 - AudioCaps v2 was copied into the user's personal remote storage, so this route uses ordinary local WAV paths rather than ACAVCAPS tar references.
 - New scripts provide, in order:
@@ -956,17 +963,78 @@ As of 2026-07-13, the correct assumption is:
   - `89658` valid, unique WAV-caption training records
   - `1599` excluded rows: `3` malformed rows with empty audio ID and `1596` rows whose WAV is unavailable
   - every included WAV is mono, 32 kHz, 16-bit PCM and verified readable
-- The five-epoch formal training run is active on 5090. Its epoch-1 checkpoint is `checkpoint-2802`; do not assume the five-epoch run has completed until its final remote log is available.
+- The five-epoch formal training run was launched on 5090 and has at least these verified checkpoint directories:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-5604`
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-8406`
+- Do not state that all five epochs finished unless a final remote training log is supplied.
 - The Huginn audio model and Swift plugin are reused unchanged.
 
-### Swift Clotho Retrieval Evaluation (added 2026-07-14; pending checkpoint-layout inspect)
+### Swift Clotho Retrieval Evaluation (updated 2026-07-15)
 
 - Purpose: compare AudioCaps epoch-2 `checkpoint-5604` and epoch-3 `checkpoint-8406` on grouped Clotho caption retrieval.
 - Embedding definition follows the earlier standalone retrieval implementation:
   - audio: mean pool of `Whisper -> temporal_compressor -> audio_projector` tokens, excluding audio boundary embeddings
   - text: masked mean of raw Huginn input token embeddings for each caption, without recurrent hidden states
   - metric: cosine-similarity audio-to-text and text-to-audio Recall@1/5/10, MRR, positive/negative similarity gap, and failure examples
-- This is an adapter-alignment metric: LoRA is intentionally not restored because neither side traverses LoRA-modified Huginn blocks. The evaluator restores and verifies the aligner state from `vit.safetensors`; it must never evaluate with a randomly initialized aligner.
+- This is an adapter-alignment metric: LoRA is intentionally not restored because neither side traverses LoRA-modified Huginn blocks. The evaluator restores and verifies the `18` projector/compressor tensors from `vit.safetensors`; it must never evaluate with a randomly initialized aligner.
+- Checkpoint-layout inspection is complete. A checkpoint also contains `66` LoRA tensors in `adapter_model.safetensors`, but these are deliberately irrelevant to this embedding-only retrieval metric.
+- Important unresolved checkpoint limitation:
+  - `audio_bos` / `audio_eos` are absent from the observed checkpoint files
+  - evaluators and generators warn and retain model-initialized values for them
+  - this means current restore is not a mathematically complete restoration of the trainable state; resolve the save path before making strict final benchmark claims
+
+### Current Evaluation Mainline (added 2026-07-15)
+
+#### Direct audio-conditioned caption generation
+
+- scripts:
+  - `code/huginn_lora/scripts/generate_clotho_caption_samples_swift.py`
+  - `code/huginn_lora/scripts/generate_clotho_caption_samples_swift.sh`
+  - `code/huginn_lora/run_generate_clotho_caption_samples_swift_5090.sh`
+- task:
+  - load one AudioCaps checkpoint, sample Clotho audio, generate a caption, and print its five reference captions for manual comparison
+- generation must use the custom manual decoder, not `model.generate()`:
+  1. audio-prefill the direct Huginn-audio model with `use_cache=True`
+  2. select the next token
+  3. feed each later token with the cache's current sequence position
+  4. stop at EOS (`65505`) or the configured token limit
+- reason:
+  - generic Hugging Face generation creates text-only positions before the audio prefix is injected, producing a RoPE length mismatch; manual prefill observes the true combined audio-plus-text length
+- validated facts:
+  - normal prefix length is `34` (`audio_bos + 32` compressed audio tokens `+ audio_eos`)
+  - a prefill with `38` text prompt tokens correctly produced a cache length of `72`
+  - cached next-token forward correctly advanced `72 -> 73`
+  - two different audios produced non-identical next-token logits, confirming audio reaches the model
+  - a successful sample from `checkpoint-8406` generated `a stream of water flows and splashes` for a water reference
+- recurrence:
+  - default generation uses the model configuration `mean_recurrence=32`
+  - do not add a hard-coded lower recurrence value unless the user explicitly requests an experiment
+
+#### MMAU `test_mini` evaluation
+
+- dataset:
+  - local labeled development split, `1000` rows in `test_mini.parquet`
+  - rows contain embedded encoded-audio bytes, instruction, choices, reference answer, and `other_attributes` JSON metadata
+  - embedded bytes are not always RIFF WAV; the evaluator decodes all rows through the plugin's ffmpeg-byte route rather than assuming WAV headers
+- scripts:
+  - environment inspect: `scripts/inspect_mmau_environment.py` and `run_inspect_mmau_environment_5090.sh`
+  - five-sample smoke: `scripts/smoke_eval_mmau_test_mini_swift.py` and `run_smoke_eval_mmau_test_mini_swift_5090.sh`
+  - resumable full mini evaluation: `scripts/eval_mmau_test_mini_swift.py`, `scripts/eval_mmau_test_mini_swift.sh`, and `run_eval_mmau_test_mini_swift_5090.sh`
+- scoring protocol:
+  - this is multiple-choice evaluation, not free caption generation
+  - for every complete answer choice, the custom evaluator computes its mean teacher-forced token log-probability conditioned on audio and prompt
+  - it selects the highest-scoring complete choice and compares it against the labeled answer
+  - metadata fields (`task`, `difficulty`, `sub-category`, etc.) are used for result aggregation, never passed to the model as answer hints
+- runtime behavior:
+  - full evaluation appends and `fsync`s a JSONL result per sample, then skips already completed IDs only when the saved run configuration matches
+  - use distinct output directories for different checkpoints or recurrence values
+  - `MMAU_NUM_STEPS` maps to the evaluator's `--num-steps`; unset means the default model recurrence
+- current requested comparison:
+  - AudioCaps `checkpoint-5604` at `r=1`, `r=8`, and `r=16` on the full mini set
+  - scores have not yet been supplied, so README must not claim a winner
+- formal MMAU note:
+  - mini is for local development and has answers
+  - the formal hidden-answer set is a separate acquisition/submission step; final predictions must preserve the selected complete option text in the official submission JSON format
 
 ### Current useful Swift training entrypoints
 
@@ -1135,6 +1203,18 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/scripts/eval_huginn_audio_text_retrieval_swift.py`
 - `code/huginn_lora/run_inspect_swift_huginn_audio_checkpoints_5090.sh`
 - `code/huginn_lora/run_eval_huginn_audio_text_retrieval_swift_5090.sh`
+- `code/huginn_lora/scripts/generate_clotho_caption_samples_swift.py`
+- `code/huginn_lora/scripts/generate_clotho_caption_samples_swift.sh`
+- `code/huginn_lora/run_generate_clotho_caption_samples_swift_5090.sh`
+- `code/huginn_lora/scripts/inspect_mmau_environment.py`
+- `code/huginn_lora/scripts/inspect_mmau_environment.sh`
+- `code/huginn_lora/run_inspect_mmau_environment_5090.sh`
+- `code/huginn_lora/scripts/smoke_eval_mmau_test_mini_swift.py`
+- `code/huginn_lora/scripts/smoke_eval_mmau_test_mini_swift.sh`
+- `code/huginn_lora/run_smoke_eval_mmau_test_mini_swift_5090.sh`
+- `code/huginn_lora/scripts/eval_mmau_test_mini_swift.py`
+- `code/huginn_lora/scripts/eval_mmau_test_mini_swift.sh`
+- `code/huginn_lora/run_eval_mmau_test_mini_swift_5090.sh`
 
 ### Audio evaluation
 
@@ -1184,6 +1264,10 @@ Any new chat should assume the following:
      - ACAVCAPS tar-backed dataset path
      - ACAVCAPS smoke + mid training scripts
      - ACAVCAPS formal chunk generation scripts
+     - AudioCaps v2 manifest preparation and formal training scripts
+     - direct cache-aware Clotho caption generation scripts
+     - Clotho embedding-retrieval evaluation scripts
+     - MMAU environment inspection, smoke, and resumable full-mini evaluation scripts
 
 ---
 
@@ -1209,8 +1293,9 @@ Any new chat should assume the following:
    - the newer Swift multimodal LoRA route in `code/huginn_lora`
 9. Do not forget that the Swift branch has already passed remote smoke and mid training; do not regress it back into an "unverified" mental model.
 10. For current audio development requests, default to the **Swift multimodal LoRA path** unless the user explicitly asks to modify the older standalone scripts.
-11. For the current Swift formal audio line, use the `pdgpu-5090` submit wrapper; `pdgpu-3090` remains appropriate for smoke, inspection, and preparation jobs.
+11. For current Swift audio training and evaluation, use the `pdgpu-5090` submit wrappers unless an existing legacy smoke/preparation wrapper explicitly targets `pdgpu-3090`.
 12. For ACAVCAPS, remember that the current formal route is the pair-verified tar-backed curriculum master, not raw-audio copying and not the old globally shuffled master.
+13. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
 
 ---
 
@@ -1260,25 +1345,30 @@ If a new agent is asked "what should we do now", the best default interpretation
    - adapter trainable
    - Huginn LoRA trainable
    - audio encoder frozen
-3. assume the current dataset mainline is **ACAVCAPS**
-4. assume the current formal data/training mainline is:
-   - 56 selected tars, all records per tar, one tar per preparation chunk
-   - `239854` pair-verified records
-   - curriculum master order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
-   - no dataset, dataloader, sortish, or length-group shuffle
-   - direct tar-backed FLAC decode at training time; no raw-audio copying
-   - single RTX 5090 B8/GA4 formal configuration
-5. do local code edits only
-6. let the user run all remote jobs and bring logs back
+3. treat ACAVCAPS as a validated historical training route:
+   - 56 selected tars, `239854` pair-verified records
+   - curriculum order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
+   - tar-backed FLAC decode with shuffle disabled for sequential shard access
+4. treat AudioCaps v2 as the latest checkpoint-producing route:
+   - `89658` valid WAV-caption samples
+   - evaluation checkpoints currently known: `checkpoint-5604`, `checkpoint-8406`
+5. default to evaluation work unless the user explicitly requests another training run:
+   - Clotho retrieval checks adapter alignment
+   - manual cached decoding checks qualitative caption behavior
+   - MMAU mini scores multiple-choice audio understanding
+6. for the current MMAU experiment, compare `checkpoint-5604` at `r=1`, `r=8`, and `r=16` using distinct output directories; no result should be assumed before logs are supplied
+7. do local code edits only; let the user run all remote jobs and bring logs back
 
 Before any long remote run:
 
 - confirm the intended script is the latest synced version
 - confirm the checkpoint path is the one you actually want
 - confirm the output `run_name` will not collide with old runs
+- for resumable evaluation, confirm the output directory has the intended matching run configuration
 - confirm the queue resource request still follows the current rules
 - confirm whether the job is:
   - smoke
   - mid
   - formal chunk generation
   - actual formal training
+  - retrieval / generation / benchmark evaluation

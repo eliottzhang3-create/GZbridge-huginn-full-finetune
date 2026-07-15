@@ -85,6 +85,17 @@ class AudioProjector(nn.Module):
         return self.output_norm(x)
 
 
+class AudioBoundaryEmbeddings(nn.Module):
+    """Keep boundary parameters in a named module so Swift saves them with the aligner."""
+
+    def __init__(self, hidden_size: int, init_std: float):
+        super().__init__()
+        self.audio_bos = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        self.audio_eos = nn.Parameter(torch.zeros(1, 1, hidden_size))
+        nn.init.normal_(self.audio_bos, mean=0.0, std=init_std)
+        nn.init.normal_(self.audio_eos, mean=0.0, std=init_std)
+
+
 class HuginnAudioForConditionalGeneration(RavenForCausalLM):
     config_class = HuginnAudioConfig
 
@@ -109,16 +120,51 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
             output_dim=config.n_embd,
         )
 
-        if config.use_audio_boundary_embeddings:
-            self.audio_bos = nn.Parameter(torch.zeros(1, 1, config.n_embd))
-            self.audio_eos = nn.Parameter(torch.zeros(1, 1, config.n_embd))
-            nn.init.normal_(self.audio_bos, mean=0.0, std=config.init_values["std"])
-            nn.init.normal_(self.audio_eos, mean=0.0, std=config.init_values["std"])
-        else:
-            self.audio_bos = None
-            self.audio_eos = None
+        self.audio_boundary_embeddings = (
+            AudioBoundaryEmbeddings(config.n_embd, config.init_values["std"])
+            if config.use_audio_boundary_embeddings
+            else None
+        )
 
         self._freeze_requested_modules()
+
+    @property
+    def audio_bos(self):
+        if self.audio_boundary_embeddings is None:
+            return None
+        return self.audio_boundary_embeddings.audio_bos
+
+    @property
+    def audio_eos(self):
+        if self.audio_boundary_embeddings is None:
+            return None
+        return self.audio_boundary_embeddings.audio_eos
+
+    def _load_from_state_dict(
+        self,
+        state_dict,
+        prefix,
+        local_metadata,
+        strict,
+        missing_keys,
+        unexpected_keys,
+        error_msgs,
+    ):
+        # Accept any legacy checkpoint that stored the boundary parameters at model root.
+        for name in ("audio_bos", "audio_eos"):
+            legacy_key = f"{prefix}{name}"
+            current_key = f"{prefix}audio_boundary_embeddings.{name}"
+            if legacy_key in state_dict and current_key not in state_dict:
+                state_dict[current_key] = state_dict.pop(legacy_key)
+        super()._load_from_state_dict(
+            state_dict,
+            prefix,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_msgs,
+        )
 
     def _freeze_requested_modules(self):
         if self.config.freeze_text_backbone:

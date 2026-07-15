@@ -28,7 +28,13 @@ DEFAULT_PLUGIN_PATH = (
     '/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/'
     'code/huginn_lora/plugins/huginn_audio_swift.py'
 )
-ALIGNER_PREFIXES = ('temporal_compressor.', 'audio_projector.', 'audio_bos', 'audio_eos')
+ALIGNER_PREFIXES = (
+    'temporal_compressor.',
+    'audio_projector.',
+    'audio_boundary_embeddings.',
+    'audio_bos',
+    'audio_eos',
+)
 SKIP_STATE_TOKENS = ('optimizer', 'scheduler', 'rng', 'trainer_state', 'training_args')
 
 

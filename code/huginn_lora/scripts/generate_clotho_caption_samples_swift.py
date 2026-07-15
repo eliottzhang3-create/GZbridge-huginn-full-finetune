@@ -25,7 +25,13 @@ DEFAULT_PLUGIN_PATH = (
     "/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/"
     "code/huginn_lora/plugins/huginn_audio_swift.py"
 )
-ALIGNER_PREFIXES = ("temporal_compressor.", "audio_projector.", "audio_bos", "audio_eos")
+ALIGNER_PREFIXES = (
+    "temporal_compressor.",
+    "audio_projector.",
+    "audio_boundary_embeddings.",
+    "audio_bos",
+    "audio_eos",
+)
 SKIP_STATE_TOKENS = ("optimizer", "scheduler", "rng", "trainer_state", "training_args")
 
 
@@ -116,7 +122,7 @@ def load_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str
         raise RuntimeError(f"No aligner tensors could be recovered from checkpoint: {checkpoint_dir}")
 
     load_result = model.load_state_dict(selected, strict=False)
-    boundary_targets = [key for key in selected if key in {"audio_bos", "audio_eos"}]
+    boundary_targets = [key for key in selected if key.endswith((".audio_bos", ".audio_eos")) or key in {"audio_bos", "audio_eos"}]
     return {
         "loaded_aligner_tensor_count": len(selected),
         "source_key_preview": source_keys[:20],
