@@ -9,7 +9,12 @@ from pathlib import Path
 
 
 FIELD_PATTERN = re.compile(r'adapter|resume|checkpoint|ignore_data|tuner', re.IGNORECASE)
-SOURCE_PATTERN = re.compile(r'adapters|resume_from_checkpoint|load_adapter|from_pretrained|ignore_data_skip', re.IGNORECASE)
+SOURCE_SYMBOLS = (
+    'resume_only_model',
+    'resume_from_checkpoint',
+    'restore_callback_states_from_checkpoint',
+    'ignore_data_skip',
+)
 
 
 def print_context(path: Path, line_number: int, radius: int = 3) -> None:
@@ -39,24 +44,22 @@ def inspect_sources() -> None:
     print('========== SWIFT WARM-START SOURCE MATCHES ==========')
     print(f'[swift] version={swift.__version__}')
     print(f'[swift] root={swift_root}')
-    match_count = 0
-    printed_count = 0
+    match_counts = {symbol: 0 for symbol in SOURCE_SYMBOLS}
     for source_path in sorted(swift_root.rglob('*.py')):
+        relative_path = source_path.relative_to(swift_root)
+        if not any(part in {'arguments', 'pipelines', 'trainers'} for part in relative_path.parts):
+            continue
         try:
             lines = source_path.read_text(encoding='utf-8').splitlines()
         except UnicodeDecodeError:
             continue
         for line_number, line in enumerate(lines, start=1):
-            if not SOURCE_PATTERN.search(line):
-                continue
-            match_count += 1
-            if printed_count >= 100:
-                continue
-            print(f'[match] {source_path}:{line_number}: {line.strip()}')
-            print_context(source_path, line_number)
-            printed_count += 1
-    print(f'[swift] source_match_count={match_count}')
-    print(f'[swift] printed_match_count={printed_count}')
+            matched_symbols = [symbol for symbol in SOURCE_SYMBOLS if symbol in line]
+            for symbol in matched_symbols:
+                match_counts[symbol] += 1
+                print(f'[match:{symbol}] {source_path}:{line_number}: {line.strip()}')
+                print_context(source_path, line_number)
+    print(f'[swift] source_match_counts={match_counts}')
 
 
 def main() -> None:
