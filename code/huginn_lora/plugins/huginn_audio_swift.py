@@ -52,6 +52,7 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio a
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_MAX_AUDIO_SECONDS = 30.0
 INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_INIT_ALIGNER_CHECKPOINT"
+FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_FORCE_ALIGNER_TRAINABLE"
 
 
 def get_tarfile_cache_limit() -> int:
@@ -224,6 +225,57 @@ def load_initial_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> 
         "missing_key_count": len(load_result.missing_keys),
         "unexpected_key_count": len(load_result.unexpected_keys),
     }
+
+
+def force_audio_aligner_trainable(model: torch.nn.Module) -> None:
+    if os.environ.get(FORCE_ALIGNER_TRAINABLE_ENV) != "1":
+        return
+    audio_model = next(
+        (
+            module
+            for module in model.modules()
+            if all(hasattr(module, name) for name in ("audio_encoder", "temporal_compressor", "audio_projector"))
+        ),
+        None,
+    )
+    if audio_model is None:
+        raise RuntimeError("Unable to locate the Huginn audio model after PEFT adapter loading")
+
+    for module_name in ("temporal_compressor", "audio_projector", "audio_boundary_embeddings"):
+        module = getattr(audio_model, module_name, None)
+        if module is not None:
+            module.requires_grad_(True)
+    if any(parameter.requires_grad for parameter in audio_model.audio_encoder.parameters()):
+        raise RuntimeError("audio_encoder became trainable while restoring the WavCaps adapter")
+
+    aligner_trainable = sum(
+        parameter.numel()
+        for name, parameter in audio_model.named_parameters()
+        if parameter.requires_grad and name.startswith(("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings."))
+    )
+    print(f"[HuginnAudioSwift] forced_aligner_trainable_parameters={aligner_trainable}")
+
+
+def patch_peft_adapter_restore() -> None:
+    """PEFT freezes base modules on adapter load; re-enable our separately trained aligner."""
+    if getattr(patch_peft_adapter_restore, "_patched", False):
+        return
+    try:
+        from peft import PeftModel
+    except ImportError:  # pragma: no cover - depends on Swift runtime
+        return
+
+    original_from_pretrained = PeftModel.from_pretrained
+
+    @classmethod
+    def from_pretrained_with_audio_aligner(cls, *args, **kwargs):
+        restored_model = original_from_pretrained(*args, **kwargs)
+        force_audio_aligner_trainable(restored_model)
+        return restored_model
+
+    PeftModel.from_pretrained = from_pretrained_with_audio_aligner
+    patch_peft_adapter_restore._patched = True
+    print("[HuginnAudioSwift] installed PEFT adapter-restore aligner patch")
 
 
 def classify_missing_keys(missing_keys: list[str]) -> dict[str, list[str]]:
@@ -695,6 +747,7 @@ def register_huginn_audio_model_arch():
 
 
 register_huginn_audio_model_arch()
+patch_peft_adapter_restore()
 
 register_model(
     ModelMeta(

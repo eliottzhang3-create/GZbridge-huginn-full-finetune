@@ -65,15 +65,17 @@ if stats.get('audio_path_verification') != 'passed' or stats.get('metadata_pairi
 
 from swift.arguments.sft_args import SftArguments
 available = {field.name for field in fields(SftArguments)}
-required = {'resume_from_checkpoint', 'resume_only_model', 'ignore_data_skip', 'num_train_epochs', 'save_strategy'}
+required = {'adapters', 'num_train_epochs', 'save_strategy'}
 missing = sorted(required - available)
 if missing:
     raise SystemExit(f'Installed Swift lacks required WavCaps warm-start fields: {missing}')
 PY
 
-# Swift resume_only_model loads LoRA via adapters. The plugin restores vit.safetensors
-# before PEFT wrapping so compressor/projector state is also warm-started.
+# `--adapters` loads only LoRA weights and never passes a checkpoint to Trainer.
+# The plugin restores vit.safetensors before PEFT wrapping so compressor/projector
+# state is also warm-started, then re-enables the separately trained aligner.
 export HUGINN_AUDIO_INIT_ALIGNER_CHECKPOINT="$INIT_CHECKPOINT"
+export HUGINN_AUDIO_FORCE_ALIGNER_TRAINABLE=1
 mkdir -p "$OUTPUT_DIR" "$LOGGING_DIR"
 
 echo "========== WAVCAPS AUDIOSET HUGINN AUDIO SWIFT TRAIN 5090 =========="
@@ -82,7 +84,7 @@ echo "mode=lora_llm frozen_audio_encoder trainable_aligner"
 echo "dataset=$TRAIN_MANIFEST"
 echo "output_dir=$OUTPUT_DIR"
 echo "init_checkpoint=$INIT_CHECKPOINT"
-echo "warm_start=resume_only_model+ignore_data_skip+plugin_aligner_restore"
+echo "warm_start=adapters_only+plugin_aligner_restore+force_aligner_trainable"
 echo "num_train_epochs=$NUM_TRAIN_EPOCHS"
 echo "max_steps=${MAX_STEPS:-<unset>}"
 echo "per_device_train_batch_size=8"
@@ -165,9 +167,7 @@ swift sft \
   --lora_rank 16 \
   --lora_alpha 32 \
   --lora_dropout 0.05 \
-  --resume_from_checkpoint "$INIT_CHECKPOINT" \
-  --resume_only_model true \
-  --ignore_data_skip true \
+  --adapters "$INIT_CHECKPOINT" \
   --load_args false \
   "${TRAIN_LENGTH_ARGS[@]}" \
   --per_device_train_batch_size 8 \

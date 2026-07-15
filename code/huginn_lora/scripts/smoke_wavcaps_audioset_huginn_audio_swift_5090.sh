@@ -9,7 +9,7 @@ export WAVCAPS_SAVE_STRATEGY="${WAVCAPS_SAVE_STRATEGY:-steps}"
 export WAVCAPS_SAVE_STEPS="${WAVCAPS_SAVE_STEPS:-$WAVCAPS_MAX_STEPS}"
 export WAVCAPS_SAVE_TOTAL_LIMIT="${WAVCAPS_SAVE_TOTAL_LIMIT:-1}"
 export WAVCAPS_LOGGING_STEPS="${WAVCAPS_LOGGING_STEPS:-1}"
-export WAVCAPS_OUTPUT_DIR="${WAVCAPS_OUTPUT_DIR:-outputs/huginn_audio_wavcaps_audioset_sl_warmstart5604_smoke20_b8ga4_5090}"
+export WAVCAPS_OUTPUT_DIR="${WAVCAPS_OUTPUT_DIR:-outputs/huginn_audio_wavcaps_audioset_sl_warmstart5604_smoke20_b8ga4_5090_v2}"
 
 echo "========== WAVCAPS WARM-START SMOKE =========="
 echo "max_steps=$WAVCAPS_MAX_STEPS"
