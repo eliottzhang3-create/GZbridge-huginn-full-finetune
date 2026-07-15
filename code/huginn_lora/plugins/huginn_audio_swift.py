@@ -53,6 +53,7 @@ DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_MAX_AUDIO_SECONDS = 30.0
 INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_INIT_ALIGNER_CHECKPOINT"
 FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_FORCE_ALIGNER_TRAINABLE"
+FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE"
 
 
 def get_tarfile_cache_limit() -> int:
@@ -567,6 +568,23 @@ def build_huginn_audio_processor() -> HuginnAudioProcessor:
     return HuginnAudioProcessor(tokenizer, feature_extractor)
 
 
+def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
+    """Keep deterministic RoPE frequencies out of Accelerate FSDP2's parameter reload.
+
+    Accelerate 1.13's CPU-RAM-efficient FSDP2 loader assumes every ``state_dict``
+    entry is a sharded DTensor. ``freqs_cis`` is a fixed buffer and therefore stays
+    a normal Tensor. Marking it non-persistent lets Accelerate preserve and restore
+    it through its dedicated non-persistent-buffer path instead.
+    """
+    requested = os.environ.get(FSDP2_NONPERSISTENT_ROPE_ENV, "").strip().lower()
+    if requested not in {"1", "true", "yes"}:
+        return
+    if "freqs_cis" not in model._buffers:
+        raise RuntimeError("FSDP2 compatibility requested but Huginn has no freqs_cis buffer")
+    model._non_persistent_buffers_set.add("freqs_cis")
+    print("[HuginnAudioSwift] FSDP2 compatibility: freqs_cis marked non-persistent")
+
+
 def build_huginn_audio_model(model_dir: str):
     whisper_config = AutoConfig.from_pretrained(
         WHISPER_MODEL_DIR,
@@ -587,6 +605,8 @@ def build_huginn_audio_model(model_dir: str):
     )
     if not hasattr(model, "load_huginn_backbone_from_pretrained"):
         raise AttributeError("Audio Huginn model is missing load_huginn_backbone_from_pretrained")
+
+    enable_fsdp2_nonpersistent_rope_buffer(model)
 
     load_result = model.load_huginn_backbone_from_pretrained(
         str(HUGINN_MODEL_DIR),

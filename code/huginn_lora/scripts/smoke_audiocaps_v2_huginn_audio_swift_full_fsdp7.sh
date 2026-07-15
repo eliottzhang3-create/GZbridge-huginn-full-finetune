@@ -13,6 +13,7 @@ export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
 export NPROC_PER_NODE=7
 export OMP_NUM_THREADS=4
+export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
 
 TRAIN_MANIFEST="${AUDIOCAPS_FULL_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
@@ -47,6 +48,7 @@ echo "tuner_type=full"
 echo "freeze_llm=false freeze_vit=true freeze_aligner=false"
 echo "audio_encoder_policy=frozen"
 echo "fsdp=fsdp2"
+echo "fsdp2_rope_buffer=nonpersistent"
 echo "per_device_train_batch_size=1"
 echo "gradient_accumulation_steps=4"
 echo "global_effective_batch_size=28"

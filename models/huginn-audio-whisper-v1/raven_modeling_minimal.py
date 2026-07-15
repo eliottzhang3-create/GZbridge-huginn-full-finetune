@@ -189,7 +189,12 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
             torch_dtype=torch_dtype,
             low_cpu_mem_usage=True,
         )
-        incompatible = self.load_state_dict(base_model.state_dict(), strict=False)
+        backbone_state = base_model.state_dict()
+        if "freqs_cis" in self._non_persistent_buffers_set:
+            # FSDP2 reconstructs this deterministic RoPE table separately. Do not
+            # report the legacy persistent entry from the Huginn checkpoint as unexpected.
+            backbone_state.pop("freqs_cis", None)
+        incompatible = self.load_state_dict(backbone_state, strict=False)
         del base_model
         gc.collect()
         self._freeze_requested_modules()
