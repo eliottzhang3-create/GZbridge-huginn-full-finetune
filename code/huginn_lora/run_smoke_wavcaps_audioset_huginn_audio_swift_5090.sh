@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 mkdir -p log
 
 CMD_PREFIX=""
-for name in SWIFT_AUDIO_CHECKPOINT SWIFT_AUDIO_CHECKPOINT_INSPECT_REPORT; do
+for name in WAVCAPS_INIT_CHECKPOINT WAVCAPS_OUTPUT_DIR WAVCAPS_MAX_STEPS; do
   if [ -n "${!name:-}" ]; then
     CMD_PREFIX="${CMD_PREFIX}${name}=${!name} "
   fi
@@ -17,7 +17,7 @@ vc submit \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 8 -m 32G -g 1 \
   -n 1 \
-  -j inspect-swift-audio-checkpoints-5090-$(date +%m%d%H%M) \
+  -j smoke-wavcaps-audioset-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
-  JOB=1:1 "$SCRIPT_DIR/log/inspect_swift_huginn_audio_checkpoints_5090.JOB.log" \
-  --cmd "${CMD_PREFIX}bash scripts/inspect_swift_huginn_audio_checkpoints.sh"
+  JOB=1:1 "$SCRIPT_DIR/log/smoke_wavcaps_audioset_huginn_audio_swift_5090.JOB.log" \
+  --cmd "${CMD_PREFIX}bash scripts/smoke_wavcaps_audioset_huginn_audio_swift_5090.sh"

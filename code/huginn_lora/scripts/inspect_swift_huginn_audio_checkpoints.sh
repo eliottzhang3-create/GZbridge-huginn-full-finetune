@@ -11,9 +11,17 @@ cd "$REPO_ROOT"
 
 export PYTHONUNBUFFERED=1
 OUTPUT_REPORT="${SWIFT_AUDIO_CHECKPOINT_INSPECT_REPORT:-$REPO_ROOT/outputs/huginn_audio_retrieval_clotho_v2_swift/checkpoint_inspect.json}"
+CHECKPOINT="${SWIFT_AUDIO_CHECKPOINT:-}"
 
 echo "========== INSPECT SWIFT HUGINN AUDIO CHECKPOINTS =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "output_report=$OUTPUT_REPORT"
-python -u code/huginn_lora/scripts/inspect_swift_huginn_audio_checkpoints.py \
-  --output_report "$OUTPUT_REPORT"
+if [ -n "$CHECKPOINT" ]; then
+  echo "checkpoint=$CHECKPOINT"
+  python -u code/huginn_lora/scripts/inspect_swift_huginn_audio_checkpoints.py \
+    --checkpoint "$CHECKPOINT" \
+    --output_report "$OUTPUT_REPORT"
+else
+  python -u code/huginn_lora/scripts/inspect_swift_huginn_audio_checkpoints.py \
+    --output_report "$OUTPUT_REPORT"
+fi

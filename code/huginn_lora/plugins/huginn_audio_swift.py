@@ -51,6 +51,7 @@ WHISPER_MODEL_DIR = Path("/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-larg
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio and respond accurately."
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_MAX_AUDIO_SECONDS = 30.0
+INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_INIT_ALIGNER_CHECKPOINT"
 
 
 def get_tarfile_cache_limit() -> int:
@@ -138,6 +139,91 @@ def patch_huginn_audio_shift_loss(model):
     model._huginn_audio_shift_loss_patched = True
     print("[HuginnAudioSwift] applied shift-loss patch for multimodal SFT")
     return model
+
+
+def checkpoint_key_aliases(key: str) -> list[str]:
+    aliases = {key}
+    changed = True
+    while changed:
+        changed = False
+        for alias in list(aliases):
+            for prefix in ("base_model.model.", "base_model.", "model.", "module."):
+                if alias.startswith(prefix):
+                    stripped = alias[len(prefix):]
+                    if stripped not in aliases:
+                        aliases.add(stripped)
+                        changed = True
+    normalized = set()
+    for alias in aliases:
+        normalized.add(alias)
+        normalized.add(alias.replace(".modules_to_save.default.", "."))
+        normalized.add(alias.replace(".original_module.", "."))
+    return list(normalized)
+
+
+def read_tensor_state_dict(path: Path) -> dict[str, torch.Tensor]:
+    if path.suffix == ".safetensors":
+        from safetensors import safe_open
+
+        with safe_open(str(path), framework="pt", device="cpu") as handle:
+            return {key: handle.get_tensor(key) for key in handle.keys()}
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if isinstance(payload, dict) and isinstance(payload.get("state_dict"), dict):
+        payload = payload["state_dict"]
+    if not isinstance(payload, dict):
+        raise TypeError(f"Checkpoint tensor file is not a state dict: {path}")
+    return {key: value for key, value in payload.items() if isinstance(key, str) and torch.is_tensor(value)}
+
+
+def load_initial_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str, Any]:
+    if not checkpoint_dir.is_dir():
+        raise FileNotFoundError(f"Initial aligner checkpoint directory does not exist: {checkpoint_dir}")
+
+    target_state = model.state_dict()
+    canonical_targets: dict[str, str] = {}
+    for target_key in target_state:
+        for alias in checkpoint_key_aliases(target_key):
+            if alias.startswith(ALIGNER_PREFIXES):
+                canonical_targets.setdefault(alias, target_key)
+
+    preferred_file = checkpoint_dir / "vit.safetensors"
+    state_paths = [preferred_file] if preferred_file.is_file() else sorted(
+        path
+        for path in checkpoint_dir.rglob("*")
+        if path.is_file() and path.suffix in {".safetensors", ".bin", ".pt", ".pth"}
+        and not any(token in path.name.lower() for token in ("adapter", "optimizer", "scheduler", "rng", "trainer_state"))
+    )
+    if not state_paths:
+        raise FileNotFoundError(f"No aligner tensor file found in initial checkpoint: {checkpoint_dir}")
+
+    selected: dict[str, torch.Tensor] = {}
+    source_keys: list[str] = []
+    for state_path in state_paths:
+        for source_key, tensor in read_tensor_state_dict(state_path).items():
+            for alias in checkpoint_key_aliases(source_key):
+                target_key = canonical_targets.get(alias)
+                if target_key is None or target_state[target_key].shape != tensor.shape:
+                    continue
+                selected[target_key] = tensor
+                source_keys.append(source_key)
+                break
+    if not selected:
+        raise RuntimeError(f"No aligner tensors could be restored from initial checkpoint: {checkpoint_dir}")
+
+    load_result = model.load_state_dict(selected, strict=False)
+    boundary_targets = [
+        key
+        for key in selected
+        if key.endswith((".audio_bos", ".audio_eos")) or key in {"audio_bos", "audio_eos"}
+    ]
+    return {
+        "checkpoint_dir": str(checkpoint_dir),
+        "loaded_aligner_tensor_count": len(selected),
+        "restored_boundary_embeddings": boundary_targets,
+        "source_key_preview": source_keys[:20],
+        "missing_key_count": len(load_result.missing_keys),
+        "unexpected_key_count": len(load_result.unexpected_keys),
+    }
 
 
 def classify_missing_keys(missing_keys: list[str]) -> dict[str, list[str]]:
@@ -455,6 +541,15 @@ def build_huginn_audio_model(model_dir: str):
         torch_dtype=torch.float32,
     )
     print_missing_key_summary(load_result.missing_keys, load_result.unexpected_keys)
+    initial_aligner_checkpoint = os.environ.get(INIT_ALIGNER_CHECKPOINT_ENV)
+    if initial_aligner_checkpoint:
+        aligner_report = load_initial_aligner_state(model, Path(initial_aligner_checkpoint))
+        print(f"[HuginnAudioSwift] initial_aligner_restore={aligner_report}")
+        if not aligner_report["restored_boundary_embeddings"]:
+            print(
+                "[HuginnAudioSwift] warning: initial checkpoint lacks audio_bos/audio_eos; "
+                "newly initialized boundary embeddings will be trained and saved by this run."
+            )
     return patch_huginn_audio_shift_loss(model)
 
 
