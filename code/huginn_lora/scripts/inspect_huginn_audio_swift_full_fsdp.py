@@ -45,7 +45,6 @@ def print_argument_support() -> None:
                  'gradient_checkpointing', 'gradient_checkpointing_kwargs')
     fields = {field.name: field for field in dataclasses.fields(SftArguments)}
     rank, _, _ = distributed_context()
-    failure_flag = torch.zeros(1, device=device, dtype=torch.int32)
     if rank == 0:
         print('========== SWIFT FULL FSDP ARGUMENT SUPPORT ==========', flush=True)
         print(f'[swift] version={swift_version}', flush=True)
@@ -65,6 +64,7 @@ def print_final_summary(model: torch.nn.Module) -> None:
     device = torch.device('cuda', torch.cuda.current_device())
     local_tensor = torch.tensor([local_counts.get(group, 0) for group in groups], device=device, dtype=torch.long)
     global_tensor = local_tensor.clone()
+    failure_flag = torch.zeros(1, device=device, dtype=torch.int32)
     if distributed:
         torch.distributed.all_reduce(global_tensor, op=torch.distributed.ReduceOp.SUM)
 
