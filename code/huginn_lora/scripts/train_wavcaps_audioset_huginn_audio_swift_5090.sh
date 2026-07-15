@@ -14,7 +14,8 @@ export CUDA_VISIBLE_DEVICES=0
 
 TRAIN_MANIFEST="${WAVCAPS_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/wavcaps_audioset/wavcaps_audioset_sl_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
-INIT_CHECKPOINT="${WAVCAPS_INIT_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-5604}"
+INIT_CHECKPOINT="${WAVCAPS_INIT_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_wavcaps_audioset_sl_warmstart5604_smoke20_b8ga4_5090_v2/v0-20260715-095031/checkpoint-20}"
+REQUIRE_BOUNDARY_CHECKPOINT="${WAVCAPS_REQUIRE_BOUNDARY_CHECKPOINT:-0}"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_swift.py"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-v1"
 OUTPUT_DIR="${WAVCAPS_OUTPUT_DIR:-outputs/huginn_audio_wavcaps_audioset_sl_e2_warmstart5604_b8ga4_5090}"
@@ -47,6 +48,23 @@ fi
 if [ "$SAVE_STRATEGY" != "epoch" ] && [ "$SAVE_STRATEGY" != "steps" ]; then
   echo "WAVCAPS_SAVE_STRATEGY must be epoch or steps, got: $SAVE_STRATEGY" >&2
   exit 1
+fi
+
+if [ "$REQUIRE_BOUNDARY_CHECKPOINT" = "1" ]; then
+  python - "$INIT_CHECKPOINT/vit.safetensors" <<'PY'
+import sys
+from safetensors import safe_open
+
+expected = {
+    'audio_boundary_embeddings.audio_bos',
+    'audio_boundary_embeddings.audio_eos',
+}
+with safe_open(sys.argv[1], framework='pt', device='cpu') as handle:
+    keys = set(handle.keys())
+missing = sorted(expected - {key.split('base_model.model.', 1)[-1] for key in keys})
+if missing:
+    raise SystemExit(f'Initial WavCaps checkpoint is missing required boundary tensors: {missing}')
+PY
 fi
 
 python - "$TRAIN_STATS" <<'PY'
@@ -84,6 +102,7 @@ echo "mode=lora_llm frozen_audio_encoder trainable_aligner"
 echo "dataset=$TRAIN_MANIFEST"
 echo "output_dir=$OUTPUT_DIR"
 echo "init_checkpoint=$INIT_CHECKPOINT"
+echo "require_boundary_checkpoint=$REQUIRE_BOUNDARY_CHECKPOINT"
 echo "warm_start=adapters_only+plugin_aligner_restore+force_aligner_trainable"
 echo "num_train_epochs=$NUM_TRAIN_EPOCHS"
 echo "max_steps=${MAX_STEPS:-<unset>}"

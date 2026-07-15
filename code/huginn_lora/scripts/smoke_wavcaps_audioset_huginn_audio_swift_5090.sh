@@ -4,6 +4,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 
+export WAVCAPS_INIT_CHECKPOINT="${WAVCAPS_INIT_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-5604}"
+export WAVCAPS_REQUIRE_BOUNDARY_CHECKPOINT=0
 export WAVCAPS_MAX_STEPS="${WAVCAPS_MAX_STEPS:-20}"
 export WAVCAPS_SAVE_STRATEGY="${WAVCAPS_SAVE_STRATEGY:-steps}"
 export WAVCAPS_SAVE_STEPS="${WAVCAPS_SAVE_STEPS:-$WAVCAPS_MAX_STEPS}"
