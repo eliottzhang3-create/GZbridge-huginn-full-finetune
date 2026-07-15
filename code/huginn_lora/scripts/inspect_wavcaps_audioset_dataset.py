@@ -13,8 +13,8 @@ from typing import Any
 
 DEFAULT_DATASET_ROOT = Path('/hpc_stor03/public/shared/data/raa/WavCaps')
 DEFAULT_AUDIO_SUBDIR = 'AudioSet_SL_flac'
-LIKELY_CAPTION_FIELDS = ('caption', 'captions', 'description', 'text', 'sentence')
-LIKELY_ID_FIELDS = ('id', 'audio_id', 'youtube_id', 'uid', 'name')
+LIKELY_CAPTION_FIELDS = ('caption', 'captions', 'description', 'text', 'sentence', 'target')
+LIKELY_ID_FIELDS = ('id', 'audio_id', 'youtube_id', 'uid', 'name', 'key')
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,6 +37,55 @@ def json_record_lists(payload: Any) -> dict[str, list[dict[str, Any]]]:
         key: value
         for key, value in payload.items()
         if isinstance(value, list) and all(isinstance(item, dict) for item in value)
+    }
+
+
+def inspect_jsonl(path: Path, scan_limit: int) -> dict[str, Any]:
+    record_count = 0
+    malformed_line_count = 0
+    first_record = None
+    key_counts: Counter[str] = Counter()
+    value_examples: dict[str, list[str]] = {}
+    malformed_examples: list[str] = []
+
+    with path.open('r', encoding='utf-8') as input_file:
+        for line_number, line in enumerate(input_file, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as exc:
+                malformed_line_count += 1
+                if len(malformed_examples) < 5:
+                    malformed_examples.append(f'line={line_number} error={exc}')
+                continue
+            if not isinstance(record, dict):
+                malformed_line_count += 1
+                if len(malformed_examples) < 5:
+                    malformed_examples.append(f'line={line_number} type={type(record).__name__}')
+                continue
+
+            record_count += 1
+            if first_record is None:
+                first_record = record
+            if record_count > scan_limit:
+                continue
+            for key, value in record.items():
+                key_counts[key] += 1
+                value_examples.setdefault(key, [])
+                if len(value_examples[key]) < 2:
+                    value_examples[key].append(json_value_preview(value))
+
+    return {
+        'record_count': record_count,
+        'scanned_record_count': min(record_count, scan_limit),
+        'malformed_line_count': malformed_line_count,
+        'malformed_line_examples': malformed_examples,
+        'field_presence_counts': dict(sorted(key_counts.items())),
+        'field_examples': {key: value_examples[key] for key in sorted(value_examples)},
+        'likely_caption_fields_present': [field for field in LIKELY_CAPTION_FIELDS if key_counts[field]],
+        'likely_id_fields_present': [field for field in LIKELY_ID_FIELDS if key_counts[field]],
+        'first_record': first_record,
     }
 
 
@@ -111,37 +160,49 @@ def main() -> None:
     if not metadata_root.is_dir():
         raise FileNotFoundError(f'WavCaps metadata directory not found: {metadata_root}')
 
-    json_paths = sorted(path for path in metadata_root.rglob('*.json') if path.is_file())
+    metadata_paths = sorted(
+        path for path in metadata_root.rglob('*') if path.is_file() and path.suffix.lower() in {'.json', '.jsonl'}
+    )
     audio_paths = sorted(path for path in audio_dir.glob('*.flac') if path.is_file())
-    audioset_json_paths = [path for path in json_paths if 'audioset' in str(path).lower()]
+    audioset_metadata_paths = [path for path in metadata_paths if 'audioset' in str(path).lower()]
 
     print('========== WAVCAPS AUDIOSET DATASET INSPECT START ==========')
     print(f'[inspect] dataset_root={dataset_root}')
     print(f'[inspect] metadata_root={metadata_root}')
     print(f'[inspect] audio_dir={audio_dir}')
-    print(f'[inspect] metadata_json_count={len(json_paths)}')
-    print(f'[inspect] audioset_metadata_candidate_count={len(audioset_json_paths)}')
+    print(f'[inspect] metadata_file_count={len(metadata_paths)}')
+    print(f'[inspect] audioset_metadata_candidate_count={len(audioset_metadata_paths)}')
     print(f'[inspect] audio_flac_count={len(audio_paths)}')
     print(f'[inspect] ffprobe={shutil.which("ffprobe")}')
 
     metadata_reports = []
-    for json_path in audioset_json_paths:
-        relative_path = str(json_path.relative_to(dataset_root))
+    for metadata_path in audioset_metadata_paths:
+        relative_path = str(metadata_path.relative_to(dataset_root))
         try:
-            payload = json.loads(json_path.read_text(encoding='utf-8'))
-            record_lists = json_record_lists(payload)
-            list_reports = {
-                name: inspect_record_list(records, args.metadata_schema_records)
-                for name, records in record_lists.items()
-            }
-            report = {
-                'path': str(json_path),
-                'relative_path': relative_path,
-                'size_bytes': json_path.stat().st_size,
-                'top_level_type': type(payload).__name__,
-                'top_level_keys': sorted(payload) if isinstance(payload, dict) else None,
-                'record_lists': list_reports,
-            }
+            if metadata_path.suffix.lower() == '.jsonl':
+                report = {
+                    'path': str(metadata_path),
+                    'relative_path': relative_path,
+                    'size_bytes': metadata_path.stat().st_size,
+                    'format': 'jsonl',
+                    'records': inspect_jsonl(metadata_path, args.metadata_schema_records),
+                }
+            else:
+                payload = json.loads(metadata_path.read_text(encoding='utf-8'))
+                record_lists = json_record_lists(payload)
+                list_reports = {
+                    name: inspect_record_list(records, args.metadata_schema_records)
+                    for name, records in record_lists.items()
+                }
+                report = {
+                    'path': str(metadata_path),
+                    'relative_path': relative_path,
+                    'size_bytes': metadata_path.stat().st_size,
+                    'format': 'json',
+                    'top_level_type': type(payload).__name__,
+                    'top_level_keys': sorted(payload) if isinstance(payload, dict) else None,
+                    'record_lists': list_reports,
+                }
         except Exception as exc:  # pragma: no cover - remote data dependent
             report = {
                 'path': str(json_path),
@@ -151,9 +212,9 @@ def main() -> None:
         metadata_reports.append(report)
         print(f'[metadata] report={json.dumps(report, ensure_ascii=False)}')
 
-    if not audioset_json_paths:
-        print('[metadata] no AudioSet-named JSON was found; inspect the JSON listing in the report.')
-    for path in json_paths:
+    if not audioset_metadata_paths:
+        print('[metadata] no AudioSet-named JSON or JSONL was found; inspect the metadata listing in the report.')
+    for path in metadata_paths:
         print(f'[metadata-file] relative_path={path.relative_to(dataset_root)} size_bytes={path.stat().st_size}')
 
     sample_paths = audio_paths[: args.flac_samples]
@@ -167,10 +228,10 @@ def main() -> None:
         'dataset_root': str(dataset_root),
         'metadata_root': str(metadata_root),
         'audio_dir': str(audio_dir),
-        'metadata_json_count': len(json_paths),
+        'metadata_file_count': len(metadata_paths),
         'metadata_files': [
             {'relative_path': str(path.relative_to(dataset_root)), 'size_bytes': path.stat().st_size}
-            for path in json_paths
+            for path in metadata_paths
         ],
         'audioset_metadata_reports': metadata_reports,
         'audio_flac_count': len(audio_paths),
@@ -183,7 +244,7 @@ def main() -> None:
 
     print('========== WAVCAPS AUDIOSET DATASET INSPECT DONE ==========')
     print(f'[inspect] output_report={output_report}')
-    if not audioset_json_paths:
+    if not audioset_metadata_paths:
         raise SystemExit('No AudioSet metadata candidate was found; do not generate a training manifest yet.')
     if not audio_paths:
         raise SystemExit('No AudioSet FLAC files were found; do not generate a training manifest yet.')
