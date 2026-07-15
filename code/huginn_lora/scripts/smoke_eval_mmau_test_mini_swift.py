@@ -31,6 +31,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", required=True)
     parser.add_argument("--sample-count", type=int, default=5)
     parser.add_argument("--sample-offset", type=int, default=0)
+    parser.add_argument("--num-steps", type=int, default=None, help="Fixed Huginn recurrence count; default uses config.mean_recurrence.")
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -129,17 +130,21 @@ def score_choice(
     candidate_ids: torch.Tensor,
     audio_features: torch.Tensor,
     device: torch.device,
+    num_steps: int | None = None,
 ) -> dict[str, Any]:
     if candidate_ids.numel() == 0:
         raise ValueError("Candidate token sequence is empty")
     attention_mask = torch.ones_like(prompt_ids, device=device)
+    prefill_kwargs: dict[str, Any] = {
+        "input_ids": prompt_ids.unsqueeze(0).to(device),
+        "attention_mask": attention_mask.unsqueeze(0),
+        "audio_input_features": audio_features,
+        "use_cache": True,
+    }
+    if num_steps is not None:
+        prefill_kwargs["num_steps"] = num_steps
     with torch.inference_mode():
-        outputs = model(
-            input_ids=prompt_ids.unsqueeze(0).to(device),
-            attention_mask=attention_mask.unsqueeze(0),
-            audio_input_features=audio_features,
-            use_cache=True,
-        )
+        outputs = model(**prefill_kwargs)
         if outputs.logits is None or outputs.past_key_values is None:
             raise RuntimeError("MMAU audio prefill did not return logits and cache")
         cache = outputs.past_key_values
@@ -152,12 +157,15 @@ def score_choice(
                 break
             token = torch.tensor([[token_id]], device=device, dtype=torch.long)
             cache_position = torch.tensor([cache.get_seq_length()], device=device, dtype=torch.long)
-            outputs = model(
-                input_ids=token,
-                past_key_values=cache,
-                use_cache=True,
-                cache_position=cache_position,
-            )
+            decode_kwargs: dict[str, Any] = {
+                "input_ids": token,
+                "past_key_values": cache,
+                "use_cache": True,
+                "cache_position": cache_position,
+            }
+            if num_steps is not None:
+                decode_kwargs["num_steps"] = num_steps
+            outputs = model(**decode_kwargs)
             if outputs.logits is None or outputs.past_key_values is None:
                 raise RuntimeError("MMAU cached candidate decode did not return logits and cache")
             cache = outputs.past_key_values
@@ -176,6 +184,7 @@ def evaluate_row(
     model: torch.nn.Module,
     processor: Any,
     device: torch.device,
+    num_steps: int | None = None,
 ) -> dict[str, Any]:
     instruction = row.get("instruction")
     choices = row.get("choices")
@@ -195,7 +204,7 @@ def evaluate_row(
     choice_scores = []
     for choice in choices:
         _, candidate_ids = tokenize_candidate(tokenizer, prompt, choice)
-        score = score_choice(model, prompt_ids, candidate_ids, audio_features, device)
+        score = score_choice(model, prompt_ids, candidate_ids, audio_features, device, num_steps=num_steps)
         choice_scores.append({"choice": choice, **score})
 
     predicted_index = max(range(len(choice_scores)), key=lambda index: choice_scores[index]["mean_logprob"])
@@ -217,6 +226,8 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
+    if args.num_steps is not None and args.num_steps <= 0:
+        raise ValueError("num_steps must be positive when provided")
     parquet_path = Path(args.dataset_path)
     if not parquet_path.is_file():
         raise FileNotFoundError(f"MMAU test-mini parquet not found: {parquet_path}")
@@ -229,6 +240,7 @@ def main() -> None:
     print(f"[config] checkpoint={args.checkpoint}")
     print(f"[config] dataset_path={parquet_path}")
     print(f"[config] sample_offset={args.sample_offset} sample_count={len(rows)}")
+    print(f"[config] num_steps={args.num_steps if args.num_steps is not None else 'config.mean_recurrence'}")
     plugin = import_plugin(args.plugin_path)
     model, processor, restore = load_generation_model(plugin, args.checkpoint, device)
     print(f"[restore] {json.dumps(restore, ensure_ascii=False)}")
@@ -237,7 +249,7 @@ def main() -> None:
 
     results: list[dict[str, Any]] = []
     for row_index, row in enumerate(rows, start=args.sample_offset):
-        result = evaluate_row(row, plugin, model, processor, device)
+        result = evaluate_row(row, plugin, model, processor, device, num_steps=args.num_steps)
         results.append(result)
         print(f"========== MMAU SAMPLE {row_index} ==========")
         print(f"[sample] id={result['metadata']['id']} task={result['metadata'].get('task')} difficulty={result['metadata'].get('difficulty')}")
@@ -256,6 +268,7 @@ def main() -> None:
         "dataset_path": str(parquet_path),
         "sample_offset": args.sample_offset,
         "sample_count": len(results),
+        "num_steps": args.num_steps,
         "scoring": "mean per-token conditional log probability of each complete option",
         "accuracy_exact_choice": correct_count / len(results),
         "correct_count": correct_count,

@@ -18,10 +18,15 @@ OUTPUT_DIR="${MMAU_OUTPUT_DIR:-$REPO_ROOT/outputs/mmau_test_mini_full_checkpoint
 START_OFFSET="${MMAU_START_OFFSET:-0}"
 MAX_SAMPLES="${MMAU_MAX_SAMPLES:-}"
 LOG_EVERY="${MMAU_LOG_EVERY:-10}"
+NUM_STEPS="${MMAU_NUM_STEPS:-}"
 
 MAX_SAMPLES_ARGS=()
 if [ -n "$MAX_SAMPLES" ]; then
   MAX_SAMPLES_ARGS=(--max-samples "$MAX_SAMPLES")
+fi
+NUM_STEPS_ARGS=()
+if [ -n "$NUM_STEPS" ]; then
+  NUM_STEPS_ARGS=(--num-steps "$NUM_STEPS")
 fi
 
 echo "========== RUN MMAU TEST-MINI SWIFT FULL EVAL =========="
@@ -30,6 +35,7 @@ echo "checkpoint=$CHECKPOINT"
 echo "dataset_path=$DATASET_PATH"
 echo "output_dir=$OUTPUT_DIR"
 echo "start_offset=$START_OFFSET max_samples=${MAX_SAMPLES:-<all>} log_every=$LOG_EVERY"
+echo "num_steps=${NUM_STEPS:-<config.mean_recurrence>}"
 
 python -u code/huginn_lora/scripts/eval_mmau_test_mini_swift.py \
   --checkpoint "$CHECKPOINT" \
@@ -37,4 +43,5 @@ python -u code/huginn_lora/scripts/eval_mmau_test_mini_swift.py \
   --output-dir "$OUTPUT_DIR" \
   --start-offset "$START_OFFSET" \
   --log-every "$LOG_EVERY" \
-  "${MAX_SAMPLES_ARGS[@]}"
+  "${MAX_SAMPLES_ARGS[@]}" \
+  "${NUM_STEPS_ARGS[@]}"

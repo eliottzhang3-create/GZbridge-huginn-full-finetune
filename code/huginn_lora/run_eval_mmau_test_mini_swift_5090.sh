@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 mkdir -p log
 
 CMD_PREFIX=""
-for name in MMAU_CHECKPOINT MMAU_TEST_MINI_PATH MMAU_OUTPUT_DIR MMAU_START_OFFSET MMAU_MAX_SAMPLES MMAU_LOG_EVERY; do
+for name in MMAU_CHECKPOINT MMAU_TEST_MINI_PATH MMAU_OUTPUT_DIR MMAU_START_OFFSET MMAU_MAX_SAMPLES MMAU_LOG_EVERY MMAU_NUM_STEPS; do
   value="${!name:-}"
   if [ -n "$value" ]; then
     printf -v quoted_value '%q' "$value"
