@@ -689,7 +689,9 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         block_idx = torch.tensor(-1, device=torch.device("cpu"), dtype=torch.long)  # count in tensors for compile
         # Non-recurrent prelude
         for block in self.transformer.prelude:  # type: ignore # types broken in 2.6+
-            block_idx += 1
+            # FSDP activation checkpointing retains this block input for backward.
+            # Do not mutate the prior scalar tensor after it has been passed to a block.
+            block_idx = block_idx + 1
             input_embeds = block(input_embeds, freqs_cis, block_idx, prepared_attn_mask, past_key_values)
 
         # Main recurrence
@@ -708,7 +710,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         # Coda layers
         block_idx = torch.tensor(0, device=torch.device("cpu"), dtype=torch.long)  # use negative indices for head
         for block in self.transformer.coda:  # type: ignore # types broken in 2.6+
-            block_idx -= 1
+            block_idx = block_idx - 1
             x = block(x, freqs_cis, block_idx, prepared_attn_mask, past_key_values)
         x = self.transformer.ln_f(x)  # type: ignore # types broken in 2.6+
 
@@ -849,7 +851,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         self._debug_activation_stats("adapter_out", x, current_step)
 
         for core_block_i, block in enumerate(self.transformer.core_block):  # type: ignore # types broken in 2.6+
-            block_idx += 1
+            block_idx = block_idx + 1
             x = block(x, freqs_cis, block_idx, mask, past_key_values)
             self._debug_activation_stats(f"core_block_{core_block_i}_out", x, current_step)
 
@@ -960,7 +962,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         # Coda layers
         block_idx = torch.tensor(0, device=torch.device("cpu"), dtype=torch.long)  # use negative indices for head
         for block in self.transformer.coda:  # type: ignore # types broken in 2.6+
-            block_idx -= 1
+            block_idx = block_idx - 1
             x = block(x, freqs_cis, block_idx, attention_mask, past_key_values)
         x = self.transformer.ln_f(x)  # type: ignore # types broken in 2.6+
 
@@ -1004,7 +1006,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         block_idx = torch.tensor(-1, device=torch.device("cpu"), dtype=torch.long)  # count in tensors for compile
         # Non-recurrent prelude
         for block in self.transformer.prelude:  # type: ignore # types broken in 2.6+
-            block_idx += 1
+            block_idx = block_idx + 1
             input_embeds = block(input_embeds, freqs_cis, block_idx, prepared_attn_mask, past_key_values)
         return input_embeds, block_idx
 
@@ -1062,7 +1064,7 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
             # Coda layers
             block_idx = torch.tensor(0, device=torch.device("cpu"), dtype=torch.long)  # use negative indices for head
             for block in self.transformer.coda:  # type: ignore # types broken in 2.6+
-                block_idx -= 1
+                block_idx = block_idx - 1
                 x = block(x, freqs_cis, block_idx, attention_mask, past_key_values)
 
             x = self.transformer.ln_f(x)  # type: ignore
