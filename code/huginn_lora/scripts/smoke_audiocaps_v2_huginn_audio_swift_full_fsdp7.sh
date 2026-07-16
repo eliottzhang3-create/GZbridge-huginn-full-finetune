@@ -10,14 +10,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6
-export NPROC_PER_NODE=7
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
+export NPROC_PER_NODE=6
 export OMP_NUM_THREADS=4
 export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
 
 TRAIN_MANIFEST="${AUDIOCAPS_FULL_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
-OUTPUT_DIR="${AUDIOCAPS_FULL_FSDP_OUTPUT_DIR:-outputs/huginn_audio_audiocaps_v2_full_fsdp7_smoke1}"
+OUTPUT_DIR="${AUDIOCAPS_FULL_FSDP_OUTPUT_DIR:-outputs/huginn_audio_audiocaps_v2_full_fsdp6_smoke1}"
 LOGGING_DIR="${AUDIOCAPS_FULL_FSDP_LOGGING_DIR:-$OUTPUT_DIR/tensorboard}"
 
 if [ ! -s "$TRAIN_MANIFEST" ] || [ ! -s "$TRAIN_STATS" ]; then
@@ -37,7 +37,7 @@ if stats.get('audio_path_verification') != 'passed' or stats.get('wav_readabilit
 PY
 
 mkdir -p "$OUTPUT_DIR" "$LOGGING_DIR"
-echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP7 SMOKE =========="
+echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP6 SMOKE =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "launch_mode=swift_cli_internal_torchrun"
 echo "NPROC_PER_NODE=$NPROC_PER_NODE"
@@ -51,7 +51,7 @@ echo "fsdp=fsdp2"
 echo "fsdp2_rope_buffer=nonpersistent"
 echo "per_device_train_batch_size=1"
 echo "gradient_accumulation_steps=4"
-echo "global_effective_batch_size=28"
+echo "global_effective_batch_size=24"
 echo "max_steps=1"
 echo "learning_rate=1e-5 aligner_lr=1e-4"
 echo "gradient_checkpointing=false"
@@ -61,7 +61,7 @@ MONITOR_PID=""
 
 resource_monitor() {
   while kill -0 "$TRAIN_PID" 2>/dev/null; do
-    echo "========== AUDIOCAPS FULL FSDP7 RESOURCE SNAPSHOT =========="
+    echo "========== AUDIOCAPS FULL FSDP6 RESOURCE SNAPSHOT =========="
     echo "snapshot_time=$(date '+%Y-%m-%d %H:%M:%S')"
     nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader || true
     sleep 30
@@ -79,7 +79,7 @@ on_exit() {
   status=$?
   trap - EXIT
   stop_resource_monitor
-  echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP7 SMOKE EXIT =========="
+  echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP6 SMOKE EXIT =========="
   echo "exit_status=$status"
   echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
   exit "$status"

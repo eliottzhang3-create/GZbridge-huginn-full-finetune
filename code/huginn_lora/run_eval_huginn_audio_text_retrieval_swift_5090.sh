@@ -6,12 +6,13 @@ cd "$SCRIPT_DIR"
 mkdir -p log
 
 CMD_PREFIX=""
-if [ -n "${SWIFT_RETRIEVAL_OUTPUT_DIR:-}" ]; then
-  CMD_PREFIX="${CMD_PREFIX}SWIFT_RETRIEVAL_OUTPUT_DIR=${SWIFT_RETRIEVAL_OUTPUT_DIR} "
-fi
-if [ -n "${SWIFT_RETRIEVAL_SAMPLE_COUNT:-}" ]; then
-  CMD_PREFIX="${CMD_PREFIX}SWIFT_RETRIEVAL_SAMPLE_COUNT=${SWIFT_RETRIEVAL_SAMPLE_COUNT} "
-fi
+for name in SWIFT_RETRIEVAL_CHECKPOINTS SWIFT_RETRIEVAL_OUTPUT_DIR SWIFT_RETRIEVAL_SAMPLE_COUNT; do
+  value="${!name:-}"
+  if [ -n "$value" ]; then
+    printf -v quoted_value '%q' "$value"
+    CMD_PREFIX="${CMD_PREFIX}${name}=${quoted_value} "
+  fi
+done
 
 vc submit \
   -p pdgpu-5090 \

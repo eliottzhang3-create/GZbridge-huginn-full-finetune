@@ -16,17 +16,50 @@ CHECKPOINT="${CLOTHO_CAPTION_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code
 OUTPUT_DIR="${CLOTHO_CAPTION_OUTPUT_DIR:-$REPO_ROOT/outputs/huginn_audio_clotho_caption_samples}"
 SAMPLE_COUNT="${CLOTHO_CAPTION_SAMPLE_COUNT:-3}"
 MAX_NEW_TOKENS="${CLOTHO_CAPTION_MAX_NEW_TOKENS:-64}"
+CHECKPOINTS_RAW="${CLOTHO_CAPTION_CHECKPOINTS:-}"
 
-echo "========== GENERATE CLOTHO CAPTION SAMPLES =========="
-echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
-echo "checkpoint=$CHECKPOINT"
-echo "output_dir=$OUTPUT_DIR"
-echo "sample_count=$SAMPLE_COUNT"
-echo "max_new_tokens=$MAX_NEW_TOKENS"
-echo "generation_path=audio_manual_cache"
+checkpoint_slug() {
+  local checkpoint="${1%/}"
+  local run_dir
+  run_dir="$(basename "$(dirname "$checkpoint")")"
+  printf '%s_%s' "$run_dir" "$(basename "$checkpoint")"
+}
 
-python -u code/huginn_lora/scripts/generate_clotho_caption_samples_swift.py \
-  --checkpoint "$CHECKPOINT" \
-  --output-dir "$OUTPUT_DIR" \
-  --sample-count "$SAMPLE_COUNT" \
-  --max-new-tokens "$MAX_NEW_TOKENS"
+generate_one_checkpoint() {
+  local checkpoint="$1"
+  local output_dir="$2"
+  if [ ! -d "$checkpoint" ]; then
+    echo "Clotho generation checkpoint directory does not exist: $checkpoint" >&2
+    exit 1
+  fi
+
+  echo "========== GENERATE CLOTHO CAPTION SAMPLES =========="
+  echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
+  echo "checkpoint=$checkpoint"
+  echo "output_dir=$output_dir"
+  echo "sample_count=$SAMPLE_COUNT"
+  echo "max_new_tokens=$MAX_NEW_TOKENS"
+  echo "generation_path=audio_manual_cache"
+
+  python -u code/huginn_lora/scripts/generate_clotho_caption_samples_swift.py \
+    --checkpoint "$checkpoint" \
+    --output-dir "$output_dir" \
+    --sample-count "$SAMPLE_COUNT" \
+    --max-new-tokens "$MAX_NEW_TOKENS"
+}
+
+if [ -z "$CHECKPOINTS_RAW" ]; then
+  generate_one_checkpoint "$CHECKPOINT" "$OUTPUT_DIR"
+  exit 0
+fi
+
+IFS=';' read -r -a CHECKPOINTS <<< "$CHECKPOINTS_RAW"
+echo "========== GENERATE CLOTHO CAPTION SAMPLES (MULTI-CHECKPOINT) =========="
+echo "checkpoint_count=${#CHECKPOINTS[@]} output_root=$OUTPUT_DIR"
+for checkpoint in "${CHECKPOINTS[@]}"; do
+  if [ -z "$checkpoint" ]; then
+    echo "CLOTHO_CAPTION_CHECKPOINTS contains an empty checkpoint entry" >&2
+    exit 1
+  fi
+  generate_one_checkpoint "$checkpoint" "$OUTPUT_DIR/$(checkpoint_slug "$checkpoint")"
+done

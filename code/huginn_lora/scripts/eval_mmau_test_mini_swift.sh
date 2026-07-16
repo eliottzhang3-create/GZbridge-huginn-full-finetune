@@ -19,6 +19,7 @@ START_OFFSET="${MMAU_START_OFFSET:-0}"
 MAX_SAMPLES="${MMAU_MAX_SAMPLES:-}"
 LOG_EVERY="${MMAU_LOG_EVERY:-10}"
 NUM_STEPS="${MMAU_NUM_STEPS:-}"
+CHECKPOINTS_RAW="${MMAU_CHECKPOINTS:-}"
 
 MAX_SAMPLES_ARGS=()
 if [ -n "$MAX_SAMPLES" ]; then
@@ -29,19 +30,51 @@ if [ -n "$NUM_STEPS" ]; then
   NUM_STEPS_ARGS=(--num-steps "$NUM_STEPS")
 fi
 
-echo "========== RUN MMAU TEST-MINI SWIFT FULL EVAL =========="
-echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
-echo "checkpoint=$CHECKPOINT"
-echo "dataset_path=$DATASET_PATH"
-echo "output_dir=$OUTPUT_DIR"
-echo "start_offset=$START_OFFSET max_samples=${MAX_SAMPLES:-<all>} log_every=$LOG_EVERY"
-echo "num_steps=${NUM_STEPS:-<config.mean_recurrence>}"
+checkpoint_slug() {
+  local checkpoint="${1%/}"
+  local run_dir
+  run_dir="$(basename "$(dirname "$checkpoint")")"
+  printf '%s_%s' "$run_dir" "$(basename "$checkpoint")"
+}
 
-python -u code/huginn_lora/scripts/eval_mmau_test_mini_swift.py \
-  --checkpoint "$CHECKPOINT" \
-  --dataset-path "$DATASET_PATH" \
-  --output-dir "$OUTPUT_DIR" \
-  --start-offset "$START_OFFSET" \
-  --log-every "$LOG_EVERY" \
-  "${MAX_SAMPLES_ARGS[@]}" \
-  "${NUM_STEPS_ARGS[@]}"
+evaluate_one_checkpoint() {
+  local checkpoint="$1"
+  local output_dir="$2"
+  if [ ! -d "$checkpoint" ]; then
+    echo "MMAU checkpoint directory does not exist: $checkpoint" >&2
+    exit 1
+  fi
+
+  echo "========== RUN MMAU TEST-MINI SWIFT FULL EVAL =========="
+  echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
+  echo "checkpoint=$checkpoint"
+  echo "dataset_path=$DATASET_PATH"
+  echo "output_dir=$output_dir"
+  echo "start_offset=$START_OFFSET max_samples=${MAX_SAMPLES:-<all>} log_every=$LOG_EVERY"
+  echo "num_steps=${NUM_STEPS:-<config.mean_recurrence>}"
+
+  python -u code/huginn_lora/scripts/eval_mmau_test_mini_swift.py \
+    --checkpoint "$checkpoint" \
+    --dataset-path "$DATASET_PATH" \
+    --output-dir "$output_dir" \
+    --start-offset "$START_OFFSET" \
+    --log-every "$LOG_EVERY" \
+    "${MAX_SAMPLES_ARGS[@]}" \
+    "${NUM_STEPS_ARGS[@]}"
+}
+
+if [ -z "$CHECKPOINTS_RAW" ]; then
+  evaluate_one_checkpoint "$CHECKPOINT" "$OUTPUT_DIR"
+  exit 0
+fi
+
+IFS=';' read -r -a CHECKPOINTS <<< "$CHECKPOINTS_RAW"
+echo "========== RUN MMAU TEST-MINI SWIFT MULTI-CHECKPOINT EVAL =========="
+echo "checkpoint_count=${#CHECKPOINTS[@]} output_root=$OUTPUT_DIR"
+for checkpoint in "${CHECKPOINTS[@]}"; do
+  if [ -z "$checkpoint" ]; then
+    echo "MMAU_CHECKPOINTS contains an empty checkpoint entry" >&2
+    exit 1
+  fi
+  evaluate_one_checkpoint "$checkpoint" "$OUTPUT_DIR/$(checkpoint_slug "$checkpoint")"
+done
