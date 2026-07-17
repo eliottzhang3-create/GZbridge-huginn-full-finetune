@@ -90,6 +90,14 @@ def patch_huginn_audio_shift_loss(model):
     original_forward = model.forward
 
     def forward_with_shift_loss(self, *args, **kwargs):
+        if self.training and not getattr(self, "_huginn_audio_runtime_checkpoint_state_logged", False):
+            rank = os.environ.get("RANK", "0")
+            print(
+                "[HuginnAudioSwift] runtime_checkpoint_state "
+                f"rank={rank} model_gradient_checkpointing={getattr(self, 'gradient_checkpointing', None)}"
+            )
+            self._huginn_audio_runtime_checkpoint_state_logged = True
+
         labels = kwargs.get("labels")
         audio_input_features = kwargs.get("audio_input_features")
         past_key_values = kwargs.get("past_key_values")

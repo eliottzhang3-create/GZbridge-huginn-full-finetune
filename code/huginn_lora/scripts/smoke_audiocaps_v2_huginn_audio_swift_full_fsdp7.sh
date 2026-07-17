@@ -42,6 +42,8 @@ if stats.get('audio_path_verification') != 'passed' or stats.get('wav_readabilit
 PY
 
 mkdir -p "$OUTPUT_DIR" "$LOGGING_DIR"
+FSDP_CONFIG_PATH="$OUTPUT_DIR/fsdp2_smoke_no_activation_checkpointing.json"
+printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
 echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP6 SMOKE =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "launch_mode=swift_cli_internal_torchrun"
@@ -55,6 +57,7 @@ echo "audio_encoder_policy=frozen"
 echo "fsdp=fsdp2"
 echo "fsdp2_rope_buffer=nonpersistent"
 echo "fsdp_activation_checkpointing=false"
+echo "fsdp_config_path=$FSDP_CONFIG_PATH"
 echo "per_device_train_batch_size=1"
 echo "gradient_accumulation_steps=4"
 echo "global_effective_batch_size=24"
@@ -99,7 +102,7 @@ CMD+=(--external_plugins "$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_swift
 CMD+=(--dataset "$TRAIN_MANIFEST")
 CMD+=(--dataset_shuffle true --train_dataloader_shuffle true --sortish_sampler false --group_by_length false)
 CMD+=(--max_length 192 --output_dir "$OUTPUT_DIR" --logging_dir "$LOGGING_DIR")
-CMD+=(--tuner_type full --freeze_llm false --freeze_vit true --freeze_aligner false --fsdp fsdp2 --fsdp_config "$FSDP_CONFIG")
+CMD+=(--tuner_type full --freeze_llm false --freeze_vit true --freeze_aligner false --fsdp fsdp2 --fsdp_config "$FSDP_CONFIG_PATH")
 CMD+=(--learning_rate 1e-5 --aligner_lr 1e-4 --gradient_checkpointing false)
 CMD+=(--max_steps 1 --per_device_train_batch_size 1 --gradient_accumulation_steps 4)
 CMD+=(--logging_steps 1 --save_strategy no --dataloader_num_workers 0 --dataloader_pin_memory false)
