@@ -18,6 +18,15 @@ def print_context(path: Path, line_number: int, radius: int = 5) -> None:
         print(f'{path}:{index + 1}: {lines[index]}')
 
 
+def print_function_source(function, label: str) -> None:
+    source_path = Path(inspect.getfile(function))
+    lines, start_line = inspect.getsourcelines(function)
+    print(f'========== {label} ==========', flush=True)
+    print(f'[source] name={function.__qualname__} file={source_path} start_line={start_line}', flush=True)
+    for offset, line in enumerate(lines):
+        print(f'{start_line + offset:5}: {line.rstrip()}', flush=True)
+
+
 def main() -> None:
     import swift
     from swift.arguments.sft_args import SftArguments
@@ -31,7 +40,7 @@ def main() -> None:
 
     print('========== FSDP ARGUMENTS ==========', flush=True)
     fields = {field.name: field for field in dataclasses.fields(SftArguments)}
-    for name in ('fsdp', 'deepspeed', 'ddp_backend', 'gradient_checkpointing', 'gradient_checkpointing_kwargs'):
+    for name in ('fsdp', 'fsdp_config', 'deepspeed', 'ddp_backend', 'gradient_checkpointing', 'gradient_checkpointing_kwargs'):
         field = fields.get(name)
         if field is None:
             print(f'[arg] name={name} present=false', flush=True)
@@ -39,23 +48,26 @@ def main() -> None:
             default = '<missing>' if field.default is dataclasses.MISSING else repr(field.default)
             print(f'[arg] name={name} present=true default={default} type={field.type}', flush=True)
 
-    print('========== FSDP SOURCE REFERENCES ==========', flush=True)
-    match_count = 0
+    fsdp_methods = [
+        method for name, method in inspect.getmembers(SftArguments, inspect.isfunction) if 'fsdp' in name.lower()
+    ]
+    if not fsdp_methods:
+        print('========== SFT ARGUMENT FSDP METHODS ==========', flush=True)
+        print('[source] no SftArguments methods with fsdp in their name', flush=True)
+    else:
+        for method in fsdp_methods:
+            print_function_source(method, 'SFT ARGUMENT FSDP METHOD')
+
+    print('========== SWIFT FSDP2 PRESET REFERENCES ==========', flush=True)
     for source_path in sorted(swift_root.rglob('*.py')):
-        relative = source_path.relative_to(swift_root)
-        if not any(part in {'arguments', 'cli', 'pipelines', 'trainers', 'utils'} for part in relative.parts):
+        if source_path.name != 'sft_args.py':
             continue
-        try:
-            lines = source_path.read_text(encoding='utf-8').splitlines()
-        except UnicodeDecodeError:
-            continue
+        lines = source_path.read_text(encoding='utf-8').splitlines()
         for line_number, line in enumerate(lines, start=1):
-            if not any(keyword in line.lower() for keyword in KEYWORDS):
+            if "'fsdp2'" not in line and 'fsdp2.json' not in line:
                 continue
-            match_count += 1
             print(f'[match] {source_path}:{line_number}: {line.strip()}', flush=True)
-            print_context(source_path, line_number)
-    print(f'[swift] fsdp_source_match_count={match_count}', flush=True)
+            print_context(source_path, line_number, radius=12)
     print('========== SWIFT FSDP2 LAUNCH PATH INSPECT DONE ==========', flush=True)
 
 
