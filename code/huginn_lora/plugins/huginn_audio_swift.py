@@ -54,6 +54,7 @@ DEFAULT_MAX_AUDIO_SECONDS = 30.0
 INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_INIT_ALIGNER_CHECKPOINT"
 FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE"
+TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_TRAIN_CHAIN_AUDIT"
 
 
 def get_tarfile_cache_limit() -> int:
@@ -101,6 +102,9 @@ def patch_huginn_audio_shift_loss(model):
         labels = kwargs.get("labels")
         audio_input_features = kwargs.get("audio_input_features")
         past_key_values = kwargs.get("past_key_values")
+        input_ids = kwargs.get("input_ids")
+        if input_ids is None and args:
+            input_ids = args[0]
 
         if labels is None:
             return original_forward(*args, **kwargs)
@@ -130,6 +134,33 @@ def patch_huginn_audio_shift_loss(model):
 
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = full_labels[:, 1:].contiguous()
+
+        audit_requested = os.environ.get(TRAIN_CHAIN_AUDIT_ENV, "").strip().lower() in {"1", "true", "yes"}
+        if audit_requested and os.environ.get("RANK", "0") == "0" and not getattr(
+            self, "_huginn_audio_shift_loss_audit_logged", False
+        ):
+            if shift_logits.shape[:2] != shift_labels.shape:
+                raise RuntimeError(
+                    "NTP shift shape mismatch: "
+                    f"logits={tuple(shift_logits.shape)} labels={tuple(shift_labels.shape)}"
+                )
+            prefix_token_count = int(logits.size(1) - labels.size(1))
+            if prefix_token_count < 0:
+                raise RuntimeError(f"NTP prefix length is negative: {prefix_token_count}")
+            if prefix_token_count and not bool((full_labels[:, :prefix_token_count] == -100).all().item()):
+                raise RuntimeError("Audio prefix labels are not fully ignored by the NTP loss")
+            supervised_token_count = int((shift_labels != -100).sum().item())
+            if supervised_token_count <= 0:
+                raise RuntimeError("NTP shift loss has no supervised target tokens")
+            print(
+                "[HuginnAudioSwift] train_chain_audit_ntp "
+                f"text_input_ids={tuple(input_ids.shape) if torch.is_tensor(input_ids) else None} "
+                f"audio_features={tuple(audio_input_features.shape) if torch.is_tensor(audio_input_features) else None} "
+                f"logits={tuple(logits.shape)} prefix_tokens={prefix_token_count} "
+                f"shift_logits={tuple(shift_logits.shape)} shift_labels={tuple(shift_labels.shape)} "
+                f"supervised_tokens={supervised_token_count}"
+            )
+            self._huginn_audio_shift_loss_audit_logged = True
 
         if shift_labels.ne(-100).any():
             loss = F.cross_entropy(
@@ -593,6 +624,72 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
     print("[HuginnAudioSwift] FSDP2 compatibility: freqs_cis marked non-persistent")
 
 
+def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
+    """Log one actual audio-prefix pass for the distributed stability smoke."""
+    requested = os.environ.get(TRAIN_CHAIN_AUDIT_ENV, "").strip().lower()
+    if requested not in {"1", "true", "yes"}:
+        return
+    if getattr(model, "_huginn_audio_train_chain_audit_patched", False):
+        return
+    original_build_audio_prefix = model.build_audio_prefix
+
+    def audited_build_audio_prefix(self, audio_input_features, audio_attention_mask=None):
+        prefix = original_build_audio_prefix(audio_input_features, audio_attention_mask)
+        if self.training and os.environ.get("RANK", "0") == "0" and not getattr(
+            self, "_huginn_audio_prefix_audit_logged", False
+        ):
+            audio_encoder_trainable = sum(
+                parameter.numel() for parameter in self.audio_encoder.parameters() if parameter.requires_grad
+            )
+            boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
+            expected_prefix_tokens = int(self.config.audio_target_token_count) + boundary_tokens
+            if prefix.size(1) != expected_prefix_tokens:
+                raise RuntimeError(
+                    "Audio prefix token count mismatch: "
+                    f"got={prefix.size(1)} expected={expected_prefix_tokens}"
+                )
+            if audio_encoder_trainable != 0:
+                raise RuntimeError(
+                    f"Audio encoder must remain frozen, found {audio_encoder_trainable} trainable local parameters"
+                )
+            print(
+                "[HuginnAudioSwift] train_chain_audit_audio "
+                f"audio_features={tuple(audio_input_features.shape)} audio_prefix={tuple(prefix.shape)} "
+                f"audio_target_tokens={self.config.audio_target_token_count} "
+                f"boundary_tokens={boundary_tokens} audio_encoder_trainable={audio_encoder_trainable}"
+            )
+            self._huginn_audio_prefix_audit_logged = True
+        return prefix
+
+    model.build_audio_prefix = MethodType(audited_build_audio_prefix, model)
+    model._huginn_audio_train_chain_audit_patched = True
+    print("[HuginnAudioSwift] installed train-chain audit hook")
+
+
+def print_train_chain_parameter_audit(model: torch.nn.Module) -> None:
+    """Assert the requested full-tuning split before Swift wraps the model with FSDP."""
+    requested = os.environ.get(TRAIN_CHAIN_AUDIT_ENV, "").strip().lower()
+    if requested not in {"1", "true", "yes"}:
+        return
+    groups = {"audio_encoder": 0, "aligner": 0, "huginn_backbone": 0, "other": 0}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if name.startswith("audio_encoder."):
+            groups["audio_encoder"] += parameter.numel()
+        elif name.startswith(("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings.")):
+            groups["aligner"] += parameter.numel()
+        elif name.startswith(("transformer.", "lm_head.")):
+            groups["huginn_backbone"] += parameter.numel()
+        else:
+            groups["other"] += parameter.numel()
+    if groups["audio_encoder"] != 0:
+        raise RuntimeError(f"Audio encoder must be frozen before FSDP wrapping: {groups}")
+    if groups["aligner"] <= 0 or groups["huginn_backbone"] <= 0:
+        raise RuntimeError(f"Full-tuning parameter split is incomplete before FSDP wrapping: {groups}")
+    print(f"[HuginnAudioSwift] train_chain_audit_parameters={groups}")
+
+
 def build_huginn_audio_model(model_dir: str):
     whisper_config = AutoConfig.from_pretrained(
         WHISPER_MODEL_DIR,
@@ -615,12 +712,14 @@ def build_huginn_audio_model(model_dir: str):
         raise AttributeError("Audio Huginn model is missing load_huginn_backbone_from_pretrained")
 
     enable_fsdp2_nonpersistent_rope_buffer(model)
+    patch_huginn_audio_train_chain_audit(model)
 
     load_result = model.load_huginn_backbone_from_pretrained(
         str(HUGINN_MODEL_DIR),
         torch_dtype=torch.float32,
     )
     print_missing_key_summary(load_result.missing_keys, load_result.unexpected_keys)
+    print_train_chain_parameter_audit(model)
     initial_aligner_checkpoint = os.environ.get(INIT_ALIGNER_CHECKPOINT_ENV)
     if initial_aligner_checkpoint:
         aligner_report = load_initial_aligner_state(model, Path(initial_aligner_checkpoint))

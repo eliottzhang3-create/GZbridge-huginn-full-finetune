@@ -10,10 +10,11 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5
-export NPROC_PER_NODE=6
+export CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+export NPROC_PER_NODE=8
 export OMP_NUM_THREADS=4
 export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
+export HUGINN_AUDIO_TRAIN_CHAIN_AUDIT=1
 
 # This smoke validates FSDP2 sharding, forward, backward, and optimizer setup.
 # Swift treats `--fsdp fsdp2` as an immutable preset. Passing a complete config
@@ -22,7 +23,7 @@ FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpoin
 
 TRAIN_MANIFEST="${AUDIOCAPS_FULL_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
-OUTPUT_DIR="${AUDIOCAPS_FULL_FSDP_OUTPUT_DIR:-outputs/huginn_audio_audiocaps_v2_full_fsdp6_smoke1}"
+OUTPUT_DIR="${AUDIOCAPS_FULL_FSDP_OUTPUT_DIR:-outputs/huginn_audio_audiocaps_v2_full_fsdp8_stability20}"
 LOGGING_DIR="${AUDIOCAPS_FULL_FSDP_LOGGING_DIR:-$OUTPUT_DIR/tensorboard}"
 
 if [ ! -s "$TRAIN_MANIFEST" ] || [ ! -s "$TRAIN_STATS" ]; then
@@ -44,7 +45,7 @@ PY
 mkdir -p "$OUTPUT_DIR" "$LOGGING_DIR"
 FSDP_CONFIG_PATH="$OUTPUT_DIR/fsdp2_smoke_no_activation_checkpointing.json"
 printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
-echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP6 SMOKE =========="
+echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP8 STABILITY20 =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "launch_mode=swift_cli_internal_torchrun"
 echo "NPROC_PER_NODE=$NPROC_PER_NODE"
@@ -58,10 +59,11 @@ echo "fsdp=custom_fsdp2_json"
 echo "fsdp2_rope_buffer=nonpersistent"
 echo "fsdp_activation_checkpointing=false"
 echo "fsdp_config_path=$FSDP_CONFIG_PATH"
+echo "train_chain_audit=true"
 echo "per_device_train_batch_size=1"
 echo "gradient_accumulation_steps=4"
-echo "global_effective_batch_size=24"
-echo "max_steps=1"
+echo "global_effective_batch_size=32"
+echo "max_steps=20"
 echo "learning_rate=1e-5 aligner_lr=1e-4"
 echo "gradient_checkpointing=false"
 
@@ -70,7 +72,7 @@ MONITOR_PID=""
 
 resource_monitor() {
   while kill -0 "$TRAIN_PID" 2>/dev/null; do
-    echo "========== AUDIOCAPS FULL FSDP6 RESOURCE SNAPSHOT =========="
+    echo "========== AUDIOCAPS FULL FSDP8 RESOURCE SNAPSHOT =========="
     echo "snapshot_time=$(date '+%Y-%m-%d %H:%M:%S')"
     nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader || true
     sleep 30
@@ -88,7 +90,7 @@ on_exit() {
   status=$?
   trap - EXIT
   stop_resource_monitor
-  echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP6 SMOKE EXIT =========="
+  echo "========== HUGINN AUDIOCAPS V2 SWIFT FULL FSDP8 STABILITY20 EXIT =========="
   echo "exit_status=$status"
   echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
   exit "$status"
@@ -104,7 +106,7 @@ CMD+=(--dataset_shuffle true --train_dataloader_shuffle true --sortish_sampler f
 CMD+=(--max_length 192 --output_dir "$OUTPUT_DIR" --logging_dir "$LOGGING_DIR")
 CMD+=(--tuner_type full --freeze_llm false --freeze_vit true --freeze_aligner false --fsdp "$FSDP_CONFIG_PATH")
 CMD+=(--learning_rate 1e-5 --aligner_lr 1e-4 --gradient_checkpointing false)
-CMD+=(--max_steps 1 --per_device_train_batch_size 1 --gradient_accumulation_steps 4)
+CMD+=(--max_steps 20 --per_device_train_batch_size 1 --gradient_accumulation_steps 4)
 CMD+=(--logging_steps 1 --save_strategy no --dataloader_num_workers 0 --dataloader_pin_memory false)
 CMD+=(--dataset_num_proc 1 --save_only_model false --report_to none --bf16 true)
 "${CMD[@]}" &
