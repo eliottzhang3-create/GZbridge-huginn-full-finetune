@@ -23,6 +23,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--checkpoint', action='append', default=None, help='Repeat for each checkpoint directory.')
     parser.add_argument('--output_report', required=True)
+    parser.add_argument('--expected_lora_tensor_count', type=int, default=None)
+    parser.add_argument('--expected_aligner_tensor_count', type=int, default=None)
+    parser.add_argument('--require_boundary_embeddings', action='store_true')
     return parser.parse_args()
 
 
@@ -58,11 +61,16 @@ def inspect_tensor_file(path: Path) -> dict[str, Any]:
     for key in keys:
         group = classify_key(key)
         groups[group] = groups.get(group, 0) + 1
+    normalized_keys = {key.split('base_model.model.', 1)[-1] for key in keys}
     return {
         'path': str(path),
         'kind': 'tensor_state_dict',
         'tensor_key_count': len(keys),
         'group_counts': groups,
+        'boundary_embeddings_present': {
+            'audio_bos': 'audio_boundary_embeddings.audio_bos' in normalized_keys,
+            'audio_eos': 'audio_boundary_embeddings.audio_eos' in normalized_keys,
+        },
         'key_preview': keys[:20],
     }
 
@@ -103,6 +111,34 @@ def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, Any]:
     }
 
 
+def validate_checkpoint_report(
+    report: dict[str, Any],
+    expected_lora_tensor_count: int | None,
+    expected_aligner_tensor_count: int | None,
+    require_boundary_embeddings: bool,
+) -> list[str]:
+    group_counts: dict[str, int] = {}
+    boundary_present = {'audio_bos': False, 'audio_eos': False}
+    for tensor_report in report['tensor_reports']:
+        for group, count in tensor_report.get('group_counts', {}).items():
+            group_counts[group] = group_counts.get(group, 0) + count
+        for name, present in tensor_report.get('boundary_embeddings_present', {}).items():
+            boundary_present[name] = boundary_present[name] or bool(present)
+
+    failures = []
+    if expected_lora_tensor_count is not None and group_counts.get('lora', 0) != expected_lora_tensor_count:
+        failures.append(
+            f"expected {expected_lora_tensor_count} LoRA tensors, found {group_counts.get('lora', 0)}"
+        )
+    if expected_aligner_tensor_count is not None and group_counts.get('aligner', 0) != expected_aligner_tensor_count:
+        failures.append(
+            f"expected {expected_aligner_tensor_count} aligner tensors, found {group_counts.get('aligner', 0)}"
+        )
+    if require_boundary_embeddings and not all(boundary_present.values()):
+        failures.append(f"missing boundary embeddings: {boundary_present}")
+    return failures
+
+
 def main() -> None:
     args = parse_args()
     checkpoints = args.checkpoint or DEFAULT_CHECKPOINTS
@@ -116,12 +152,36 @@ def main() -> None:
             print(f'[checkpoint] tensor_report={json.dumps(tensor_report, ensure_ascii=False)}')
         print(f"[checkpoint] json_files={list(report['json_reports'])}")
 
+    validation_failures = []
+    if (
+        args.expected_lora_tensor_count is not None
+        or args.expected_aligner_tensor_count is not None
+        or args.require_boundary_embeddings
+    ):
+        for report in reports:
+            failures = validate_checkpoint_report(
+                report,
+                args.expected_lora_tensor_count,
+                args.expected_aligner_tensor_count,
+                args.require_boundary_embeddings,
+            )
+            if failures:
+                validation_failures.append({'checkpoint': report['checkpoint_dir'], 'failures': failures})
+            else:
+                print(f"[checkpoint] validation=passed path={report['checkpoint_dir']}")
+
     output_report = Path(args.output_report)
     output_report.parent.mkdir(parents=True, exist_ok=True)
     tmp_output = output_report.with_name(f'{output_report.name}.tmp')
-    tmp_output.write_text(json.dumps({'checkpoints': reports}, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
+    tmp_output.write_text(
+        json.dumps({'checkpoints': reports, 'validation_failures': validation_failures}, ensure_ascii=False, indent=2)
+        + '\n',
+        encoding='utf-8',
+    )
     tmp_output.replace(output_report)
     print(f'[checkpoint] output_report={output_report}')
+    if validation_failures:
+        raise SystemExit(f'Checkpoint validation failed: {validation_failures}')
 
 
 if __name__ == '__main__':

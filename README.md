@@ -36,83 +36,142 @@ It is also the **authoritative project memory** for future Codex / AI-agent chat
 
 ## Project Scope
 
-This repo now contains **two active experiment lines**:
+This repo contains **two major experiment families**:
 
 1. **Huginn full-parameter GSM8K finetuning**
-   - based on FSDP
-   - mainly for multi-GPU remote training
-   - currently adapted for **8x RTX 5090**
+   - historical FSDP work on the text model
+   - adapted for multi-GPU RTX 5090 training
 
 2. **Huginn audio-modality experiment branch**
    - based on the **original Huginn backbone**, not the GSM8K-finetuned checkpoint
-   - current codebase now contains **two sub-lines**:
-     - the earlier standalone audio-training line in `code/recurrent-pretraining-main`
-     - the newer **Swift-based LoRA multimodal line** in `code/huginn_lora`
-   - current focus is **audio-to-text understanding/alignment**, not speech generation
+   - current codebase contains:
+     - earlier standalone PyTorch audio experiments in `code/recurrent-pretraining-main`
+     - the current **Swift multimodal route** in `code/huginn_lora`
+   - objective: audio-to-text understanding and modality alignment, not speech generation
 
-### Current highest-priority task
+### Current highest-priority task (updated 2026-07-17)
 
-The current main active task is:
+The active task is the first formal **Swift FSDP full-parameter AudioCaps-v2 training run** on the original Huginn backbone. It is scripted and validated locally/remotely through smoke jobs, but the multi-day formal job has **not yet been claimed complete** until its remote final log is available.
 
-- keep using the **original Huginn backbone**
-- move the audio experiment toward a **Swift-based training pipeline**
-- connect:
-  - **Whisper-large encoder**
-  - **adapter = temporal compressor + projector**
-  - **Huginn text backbone**
-- training policy for the new Swift line:
-  - freeze `audio_encoder`
-  - train `aligner` (`temporal_compressor`, `audio_projector`, optional audio boundary embeddings)
-  - train **LoRA on Huginn backbone only**
-  - do **not** LoRA-wrap or full-train the Whisper encoder
+The audio architecture is:
 
-This Swift LoRA multimodal route is the current forward path for new audio-model work.
+- frozen Whisper-large audio encoder
+- trainable aligner: temporal compressor, audio projector, and audio boundary embeddings
+- Huginn text backbone
+- audio prefix of `audio_bos + 32 compressed audio tokens + audio_eos`, concatenated before text embeddings
 
-### Current highest-priority execution status (updated 2026-07-15)
+There are two distinct Swift fine-tuning policies; do not confuse them:
 
-The stable training route and the current evaluation route are now:
+- historical/currently usable LoRA route:
+  - audio encoder frozen
+  - aligner full-trainable
+  - Huginn base frozen, Huginn LoRA trainable
+- current FSDP full-training route:
+  - audio encoder frozen
+  - aligner full-trainable
+  - Huginn backbone full-trainable
 
-- model family:
-  - original Huginn backbone
-  - multimodal model package in `models/huginn-audio-whisper-v1`
-- audio encoder:
-  - `whisper-large`
-  - remote path:
-    - `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large`
-- framework:
-  - **ms-swift / `swift sft`**
-  - remote env version observed in logs:
-    - `swift==4.1.3`
-- training split that has been debugged and verified:
-  - `audio_encoder` must stay **frozen**
-  - `aligner` stays **full-trainable**
-  - Huginn language model base weights stay **frozen**
-  - Huginn language model gets **LoRA only**
-- validated ACAVCAPS training route:
-  - loaded from shared public storage and read from `.tar.gz` shards without copying raw audio into the personal workspace
-  - a verified 56-tar subset, using every paired FLAC/JSON record in each selected tar
-  - `239854` verified audio-caption pairs total
-  - tar-local curriculum order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
-- newest completed formal-path validation:
-  - 20 optimizer steps on one RTX 5090 with micro-batch `8` and gradient accumulation `4`
-  - completed with `exit_status=0`
-  - observed `6.2 s/step` and `24.14 GiB` GPU memory
-  - this replaced the earlier globally shuffled master path, which was I/O-bound at roughly `140 s/step`
-- AudioCaps v2 training route:
-  - ordinary personal-storage WAV paths, not tar-backed input
-  - valid train manifest: `89658` unique WAV-caption pairs after excluding `1599` unavailable/malformed CSV rows
-  - five-epoch B8/GA4 5090 run has produced at least `checkpoint-5604` and `checkpoint-8406`; do not infer final completion without the final remote log
-- current immediate work is **evaluation**, not basic Swift registration:
-  - Clotho audio-text retrieval for adapter alignment
-  - direct audio-conditioned caption generation from checkpoints
-  - MMAU `test_mini` multiple-choice evaluation, including recurrence comparisons for AudioCaps `checkpoint-5604` at `r=1`, `r=8`, and `r=16`
+Whisper is never LoRA-wrapped or full-trained in either policy.
 
-The practical mainline is therefore:
+### Current execution status
 
-1. preserve the verified Swift training split and frozen `audio_encoder`
-2. evaluate the existing AudioCaps checkpoints before changing the model or unfreezing modules
-3. use manual cache-aware multimodal decoding for generation/evaluation; do not rely on generic Hugging Face `generate()` for this model
-4. submit all remote jobs through the matching `vc submit` wrapper
+#### Verified end-to-end multimodal chain
+
+- framework: `swift==4.1.3`, using `swift sft`
+- model package: `models/huginn-audio-whisper-v1`
+- Whisper-large: `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large`
+- AudioCaps-v2 manifest:
+  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl`
+  - `89658` verified unique WAV-caption records
+  - `1599` CSV rows excluded (`3` empty IDs, `1596` missing WAVs)
+  - every included WAV was checked as readable mono, 32 kHz, 16-bit PCM
+- actual training path, verified by the plugin audit:
+  1. decode WAV/FLAC and retain at most the first 30 seconds;
+  2. Whisper feature extractor creates `[B, 80, 3000]` features;
+  3. frozen Whisper produces audio hidden states;
+  4. temporal compressor produces `32` audio tokens;
+  5. projector maps them into Huginn's `5280`-dimensional space;
+  6. boundary embeddings form a `34`-token audio prefix;
+  7. prefix plus Huginn text embeddings enter the recurrent Huginn model;
+  8. plugin shift-loss performs next-token prediction with all audio-prefix labels masked as `-100`.
+- Huginn recurrence remains native:
+  - `mean_recurrence=32`
+  - long-tail recurrence sampling remains enabled
+  - only the final at-most `8` recurrent iterations build a gradient graph; earlier iterations use `no_grad`.
+
+#### FSDP full-training route: completed validations
+
+- requested topology: `pdgpu-5090`, `8x RTX 5090`, `-c 32 -m 256G -g 8 -n 1`
+- audit-confirmed trainables:
+  - audio encoder: `0`
+  - aligner: `47,224,608`
+  - Huginn backbone: `3,564,976,800`
+  - full trainable total: approximately `3.612B`
+- required FSDP2 mode:
+  - `full_shard auto_wrap`
+  - `fsdp_version=2`
+  - `SHARDED_STATE_DICT`
+  - FSDP activation checkpointing: `false`
+  - ordinary Trainer/model gradient checkpointing: `false`
+- why FSDP activation checkpointing is disabled:
+  - Swift's FSDP2 preset enables native activation recomputation.
+  - Huginn's recurrent forward path reuses integer step-state; recomputation triggered an autograd LongTensor version-counter error.
+  - disabling FSDP activation checkpointing avoids that recomputation path. This is separate from saving on-disk training checkpoints.
+- FSDP2 compatibility already implemented in `huginn_audio_swift.py`:
+  - `HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1` makes `freqs_cis` non-persistent so Accelerate does not incorrectly load a normal RoPE buffer as a DTensor.
+  - `HUGINN_AUDIO_TRAIN_CHAIN_AUDIT=1` logs parameter groups, audio prefix shape, and shifted-loss evidence on the first batch.
+- completed remote tests:
+  - 1-step backward smoke passed after disabling FSDP activation checkpointing.
+  - 20-step 8-GPU stability smoke passed with `exit_status=0`, around `53.8 s/update`, and about `26.3 GiB` GPU memory.
+  - 8-GPU sharded save/resume passed: a saved `checkpoint-2` resumed in a fresh job and produced `checkpoint-3`, validating FSDP model, optimizer, scheduler, RNG, and Trainer state recovery.
+
+#### Formal FSDP run ready for remote submission
+
+- runtime script:
+  - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_full_fsdp8.sh`
+- submit wrapper:
+  - `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_full_fsdp8_5090.sh`
+- exact training plan:
+  - `2` epochs
+  - `8` GPUs, micro-batch `1` per GPU, gradient accumulation `4`
+  - global effective batch `32`
+  - `2802` optimizer updates per epoch, `5604` total
+  - save every half epoch: expected checkpoints at `1401`, `2802`, `4203`, `5604`
+  - retain exactly `4` sharded checkpoints
+  - Huginn LR `1e-5`; aligner LR `1e-4`
+  - cosine schedule, warmup ratio `0.05`, weight decay `0.01`, max grad norm `1.0`
+  - TensorBoard enabled, logging every `10` updates, resource monitor every `30` seconds
+  - `save_only_model=false` because FSDP resume needs optimizer/scheduler/RNG/Trainer state.
+- the runtime prechecks manifest statistics, Swift argument compatibility, optional resume directory, and at least `200 GB` free storage.
+- any FSDP resume must use the same FSDP configuration and 8-GPU world size. Do not feed FSDP sharded checkpoints to old single-GPU LoRA evaluators; a dedicated FSDP evaluator/export path is still needed.
+
+#### Historical but relevant routes
+
+- ACAVCAPS tar-backed LoRA curriculum route is validated historical infrastructure. It reads shared `.tar.gz` files directly without copying raw audio.
+- AudioCaps-v2 LoRA run produced at least `checkpoint-5604` and `checkpoint-8406`; existing retrieval, caption-generation, and MMAU-mini scripts target this checkpoint format.
+- WavCaps AudioSet-SL LoRA warm-start route:
+  - shared read-only root: `/hpc_stor03/public/shared/data/raa/WavCaps`
+  - `108056` verified FLAC-caption pairs prepared
+  - warm-start source: AudioCaps `checkpoint-5604`
+  - corrected checkpoints save all `20` aligner tensors, including `audio_bos` and `audio_eos`
+  - do not claim its multi-epoch training completed without a final remote log.
+- Planned LoRA continuation after WavCaps (not yet inspected or trained as of this README update):
+  - start checkpoint:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_wavcaps_audioset_sl_e2_warmstart5604_b8ga4_5090/v0-20260715-101351/checkpoint-6754`
+  - stage 1: one epoch of direct full concatenation of AudioCaps-v2 and Clotho-v2 caption records, both learning rates `5e-5`
+  - stage 2: one epoch of ClothoAQA with `20%` caption replay, also both learning rates `5e-5`
+  - mandatory preflight scripts:
+    - `code/huginn_lora/run_inspect_clotho_continuation_inputs_5090.sh`
+    - `code/huginn_lora/run_prepare_audiocaps_clotho_caption_mixture_5090.sh`
+  - these scripts verify the `66` LoRA tensors, all `20` aligner tensors including boundary embeddings, Clotho training records/audio paths, and the resulting metadata-only caption mixture before any continuation training script is added.
+
+The practical mainline is:
+
+1. preserve frozen Whisper and the verified multimodal/NTP chain;
+2. submit and monitor the formal 8-GPU FSDP AudioCaps-v2 run;
+3. use an identical FSDP setup for any resume;
+4. keep older LoRA checkpoint evaluation separate from FSDP checkpoint handling;
+5. submit all remote jobs through matching `vc submit` wrappers.
 
 ---
 
@@ -198,6 +257,15 @@ Do not casually change the container unless the user explicitly asks.
   - prepared train manifest:
     - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl`
   - valid records: `89658`; excluded source rows: `1599`
+- Public WavCaps root (read-only; do not modify it):
+  - `/hpc_stor03/public/shared/data/raa/WavCaps`
+  - active AudioSet-SL FLAC directory:
+    - `/hpc_stor03/public/shared/data/raa/WavCaps/audio/AudioSet_SL_flac`
+  - source metadata:
+    - `/hpc_stor03/public/shared/data/raa/WavCaps/json/AudioSet_SL.jsonl`
+  - prepared Swift manifest:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/wavcaps_audioset/wavcaps_audioset_sl_train_swift.jsonl`
+  - verified records: `108056`
 - MMAU local development dataset root:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/data/MMAU test_mini`
   - file: `test_mini.parquet` (`1000` labeled samples)
@@ -917,57 +985,54 @@ This is the current mainline formal-training route for the Swift ACAVCAPS projec
 
 Note:
 
-- current audio training is **single-GPU**, not distributed
-- `optimizer_update_every=1_micro_step` in the current scripts
+- the standalone Clotho scripts above are historical single-GPU scripts; they do not describe the current Swift FSDP route.
+- current AudioCaps-v2 full training is distributed across eight 5090 GPUs through Swift's internal launch path.
 
-### Current Swift multimodal LoRA training intent
+### Swift multimodal training policies
 
-For the new `code/huginn_lora` path, the intended training split is:
+All current Swift policies keep the same frozen-audio rule:
 
-- `audio_encoder`
-  - frozen
-- `aligner`
-  - trainable full params
-  - includes:
-    - `temporal_compressor`
-    - `audio_projector`
-    - optional boundary embeddings
-- `language_model`
-  - base weights frozen
-  - train **LoRA only**
+- `audio_encoder`: frozen
+- `aligner`: full parameters trainable
+  - `temporal_compressor`
+  - `audio_projector`
+  - `audio_boundary_embeddings`, including `audio_bos` and `audio_eos`
 
-This is the most important high-level requirement for any future edit on the Swift branch.
+The Huginn language-model policy depends on experiment type:
 
-### Current Swift audio training status that should be assumed by new agents
+- LoRA experiments: base Huginn frozen, Huginn LoRA trainable.
+- FSDP full experiments: Huginn base parameters trainable, no LoRA tensors expected.
 
-As of 2026-07-15, the correct assumption is:
+Do not change the audio encoder's policy without an explicit new experiment decision.
 
-- the Huginn Swift audio route is **already runnable**
-- the frozen-audio-encoder policy is **already enforced in the current mainline**
-- the main unresolved work is **not** basic registration anymore
-- formal curriculum I/O has passed on a single 5090; do not regress to the old globally shuffled master
-- AudioCaps v2 has become the latest training dataset route and supplied checkpoints for evaluation
-- the immediate task is to evaluate checkpoints, not to revisit basic data loading or Swift registration
-- all remote work must still be submitted through `vc submit`; Codex edits only this local sync repository
+### Current Swift audio status that new agents must assume
 
-### AudioCaps v2 route (updated 2026-07-15)
+As of 2026-07-17:
 
-- AudioCaps v2 was copied into the user's personal remote storage, so this route uses ordinary local WAV paths rather than ACAVCAPS tar references.
-- New scripts provide, in order:
-  - CSV/WAV/Swift-argument inspection on `pdgpu-5090`
-  - full train-split metadata-only JSONL preparation with CSV-to-WAV and 16-bit PCM WAV verification; unavailable or malformed rows are explicitly excluded and recorded in stats
-  - a 20-step B8/GA4 smoke on `pdgpu-5090`
-  - a five-epoch B8/GA4 formal run on `pdgpu-5090`, checkpointed once per epoch and retaining five full checkpoints
-- Inspection and manifest preparation passed:
+- Swift registration, tar/WAV decoding, audio-prefix insertion, shifted NTP loss, and audio-encoder freezing have all been remote-verified.
+- single-GPU LoRA routes on ACAVCAPS/AudioCaps are historical validated baselines, not the only current path.
+- 8-GPU Swift FSDP2 initialization, one-step backward, 20-step stability, and sharded checkpoint resume have passed.
+- the current operational task is to run the new two-epoch AudioCaps-v2 FSDP full-training script, then inspect its checkpoints/evaluation path.
+- all remote work is still launched through `vc submit`; Codex edits only this local sync repository.
+
+### AudioCaps v2 route (updated 2026-07-17)
+
+- AudioCaps v2 is in personal remote storage, so it uses ordinary WAV paths rather than ACAVCAPS tar references.
+- data preparation passed:
   - `91257` source CSV rows
-  - `89658` valid, unique WAV-caption training records
-  - `1599` excluded rows: `3` malformed rows with empty audio ID and `1596` rows whose WAV is unavailable
-  - every included WAV is mono, 32 kHz, 16-bit PCM and verified readable
-- The five-epoch formal training run was launched on 5090 and has at least these verified checkpoint directories:
-  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-5604`
-  - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-8406`
-- Do not state that all five epochs finished unless a final remote training log is supplied.
-- The Huginn audio model and Swift plugin are reused unchanged.
+  - `89658` valid unique WAV-caption records
+  - `1599` excluded rows: `3` empty audio IDs and `1596` unavailable WAVs
+  - every included WAV is verified as readable mono, 32 kHz, 16-bit PCM.
+- historical LoRA baseline:
+  - a five-epoch B8/GA4 5090 run produced at least:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-5604`
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-8406`
+  - do not infer final five-epoch completion without its final remote log.
+- current full-parameter route:
+  - starts from the original audio model, not a LoRA checkpoint
+  - uses FSDP2 across eight 5090 GPUs
+  - trains Huginn plus aligner while keeping Whisper frozen
+  - formal schedule and scripts are defined in the top-level current-status section.
 
 ### Swift Clotho Retrieval Evaluation (updated 2026-07-15)
 
@@ -1173,6 +1238,12 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/plugins/huginn_audio_swift.py`
 - `code/huginn_lora/scripts/acavcaps_common.py`
 - `code/huginn_lora/scripts/prepare_huginn_audio_dataset.py`
+- `code/huginn_lora/scripts/inspect_clotho_huginn_continuation_inputs.py`
+- `code/huginn_lora/scripts/inspect_clotho_continuation_inputs.sh`
+- `code/huginn_lora/run_inspect_clotho_continuation_inputs_5090.sh`
+- `code/huginn_lora/scripts/prepare_audio_caption_mixture.py`
+- `code/huginn_lora/scripts/prepare_audiocaps_clotho_caption_mixture.sh`
+- `code/huginn_lora/run_prepare_audiocaps_clotho_caption_mixture_5090.sh`
 - `code/huginn_lora/scripts/smoke_huginn_audio_swift.py`
 - `code/huginn_lora/scripts/smoke_huginn_audio_swift.sh`
 - `code/huginn_lora/run_smoke_huginn_audio_swift_5090.sh`
@@ -1199,6 +1270,25 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/run_prepare_audiocaps_v2_swift_dataset_5090.sh`
 - `code/huginn_lora/run_smoke_audiocaps_v2_huginn_audio_swift_5090.sh`
 - `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_5090.sh`
+- `code/huginn_lora/scripts/inspect_huginn_audio_swift_full_fsdp.py`
+- `code/huginn_lora/scripts/inspect_huginn_audio_swift_full_fsdp7.sh`
+- `code/huginn_lora/run_inspect_huginn_audio_swift_full_fsdp7_5090.sh`
+- `code/huginn_lora/scripts/inspect_swift_fsdp2_launch_path.py`
+- `code/huginn_lora/run_inspect_swift_fsdp2_launch_path_5090.sh`
+- `code/huginn_lora/scripts/inspect_accelerate_fsdp2_huginn_compat.py`
+- `code/huginn_lora/run_inspect_accelerate_fsdp2_huginn_compat_5090.sh`
+- `code/huginn_lora/scripts/smoke_audiocaps_v2_huginn_audio_swift_full_fsdp7.sh`
+- `code/huginn_lora/run_smoke_audiocaps_v2_huginn_audio_swift_full_fsdp7_5090.sh`
+- `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_full_fsdp8.sh`
+- `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_full_fsdp8_5090.sh`
+- `code/huginn_lora/scripts/inspect_wavcaps_audioset_dataset.py`
+- `code/huginn_lora/scripts/prepare_wavcaps_audioset_swift_dataset.py`
+- `code/huginn_lora/scripts/smoke_wavcaps_audioset_huginn_audio_swift_5090.sh`
+- `code/huginn_lora/scripts/train_wavcaps_audioset_huginn_audio_swift_5090.sh`
+- `code/huginn_lora/run_inspect_wavcaps_audioset_dataset_5090.sh`
+- `code/huginn_lora/run_prepare_wavcaps_audioset_swift_dataset_5090.sh`
+- `code/huginn_lora/run_smoke_wavcaps_audioset_huginn_audio_swift_5090.sh`
+- `code/huginn_lora/run_train_wavcaps_audioset_huginn_audio_swift_5090.sh`
 - `code/huginn_lora/scripts/inspect_swift_huginn_audio_checkpoints.py`
 - `code/huginn_lora/scripts/eval_huginn_audio_text_retrieval_swift.py`
 - `code/huginn_lora/run_inspect_swift_huginn_audio_checkpoints_5090.sh`
@@ -1246,9 +1336,9 @@ Any new chat should assume the following:
    - current forward branch:
      - original Huginn backbone
      - Whisper-large encoder
-     - trainable adapter
-     - Huginn backbone LoRA
      - Swift multimodal training path
+     - frozen audio encoder and full-trainable aligner
+     - both a historical LoRA mode and the currently active FSDP full-parameter mode
 8. The current audio project already has:
    - smoke training
    - tiny overfit
@@ -1265,6 +1355,9 @@ Any new chat should assume the following:
      - ACAVCAPS smoke + mid training scripts
      - ACAVCAPS formal chunk generation scripts
      - AudioCaps v2 manifest preparation and formal training scripts
+     - Swift FSDP2 launch/configuration compatibility inspection scripts
+     - 8-GPU FSDP smoke, sharded-checkpoint resume validation, and formal-training submit scripts
+     - WavCaps AudioSet-SL inspection, manifest-preparation, smoke, and warm-start training scripts
      - direct cache-aware Clotho caption generation scripts
      - Clotho embedding-retrieval evaluation scripts
      - MMAU environment inspection, smoke, and resumable full-mini evaluation scripts
@@ -1290,9 +1383,9 @@ Any new chat should assume the following:
    - exact traceback lines
 8. Distinguish carefully between:
    - the older standalone audio scripts in `code/recurrent-pretraining-main`
-   - the newer Swift multimodal LoRA route in `code/huginn_lora`
+   - the newer Swift multimodal LoRA and FSDP route in `code/huginn_lora`
 9. Do not forget that the Swift branch has already passed remote smoke and mid training; do not regress it back into an "unverified" mental model.
-10. For current audio development requests, default to the **Swift multimodal LoRA path** unless the user explicitly asks to modify the older standalone scripts.
+10. For current audio development requests, default to the **Swift multimodal FSDP full-training path** when the task concerns the current formal AudioCaps-v2 run. Use the older Swift LoRA path only for its explicit checkpoint/evaluation/warm-start tasks.
 11. For current Swift audio training and evaluation, use the `pdgpu-5090` submit wrappers unless an existing legacy smoke/preparation wrapper explicitly targets `pdgpu-3090`.
 12. For ACAVCAPS, remember that the current formal route is the pair-verified tar-backed curriculum master, not raw-audio copying and not the old globally shuffled master.
 13. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
@@ -1319,11 +1412,14 @@ Any new chat should assume the following:
 
 - Current audio and GSM8K branches coexist in the same sync repo.
 - The repo already contains both training and evaluation entrypoints for each line.
-- The audio line itself now contains both:
+- The audio line itself now contains:
   - a historical standalone PyTorch training route
-  - a current Swift multimodal LoRA route
-- The most likely future work is:
-  - continue scaling the already-validated Swift multimodal LoRA route
+  - a validated Swift multimodal LoRA route
+  - a validated Swift FSDP2 full-parameter route whose formal two-epoch AudioCaps-v2 run is ready for submission
+- The most likely immediate work is:
+  - submit and monitor the formal eight-GPU Swift FSDP2 AudioCaps-v2 run
+  - after it completes, implement or validate a matching FSDP checkpoint evaluation/export path
+  - continue using the validated Swift LoRA route for its existing checkpoint comparisons
   - continue improving audio alignment / caption quality
   - evaluate checkpoints with retrieval / visualization / caption metrics
   - compare finetuning strategies:
@@ -1338,21 +1434,22 @@ Any new chat should assume the following:
 
 If a new agent is asked "what should we do now", the best default interpretation is:
 
-1. work on the **Swift multimodal LoRA audio branch**
+1. work on the **Swift multimodal FSDP full-training audio branch**, unless the user specifically requests historical LoRA evaluation/training
 2. keep:
    - original Huginn backbone
    - Whisper-large encoder
-   - adapter trainable
-   - Huginn LoRA trainable
+   - aligner trainable
+   - Huginn full-trainable under FSDP
    - audio encoder frozen
 3. treat ACAVCAPS as a validated historical training route:
    - 56 selected tars, `239854` pair-verified records
    - curriculum order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
    - tar-backed FLAC decode with shuffle disabled for sequential shard access
-4. treat AudioCaps v2 as the latest checkpoint-producing route:
+4. treat AudioCaps v2 as both the latest LoRA checkpoint-producing route and the current FSDP formal-training dataset:
    - `89658` valid WAV-caption samples
    - evaluation checkpoints currently known: `checkpoint-5604`, `checkpoint-8406`
-5. default to evaluation work unless the user explicitly requests another training run:
+   - pending formal FSDP checkpoints expected at steps `1401`, `2802`, `4203`, `5604`
+5. retain the evaluation routes as separate historical/parallel work:
    - Clotho retrieval checks adapter alignment
    - manual cached decoding checks qualitative caption behavior
    - MMAU mini scores multiple-choice audio understanding
