@@ -16,6 +16,11 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from generate_clotho_caption_samples_swift import (
+    is_fsdp_sharded_checkpoint,
+    load_full_fsdp_base_model,
+)
+
 
 DEFAULT_CHECKPOINTS = [
     '/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/'
@@ -51,6 +56,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument('--max_text_length', type=int, default=192)
     parser.add_argument('--failure_sample_count', type=int, default=10)
     parser.add_argument('--seed', type=int, default=74)
+    parser.add_argument(
+        '--fsdp_export_dir',
+        default=None,
+        help='Optional shared cache directory for one merged FSDP SHARDED_STATE_DICT checkpoint.',
+    )
     parser.add_argument('--device', default='cuda:0')
     return parser.parse_args()
 
@@ -152,7 +162,7 @@ def candidate_target_keys(source_key: str) -> list[str]:
     while changed:
         changed = False
         for key in list(candidates):
-            for prefix in ('base_model.model.', 'base_model.', 'model.', 'module.'):
+            for prefix in ('base_model.model.', 'base_model.', 'model.', 'module.', '_fsdp_wrapped_module.'):
                 if key.startswith(prefix):
                     stripped = key[len(prefix):]
                     if stripped not in candidates:
@@ -203,10 +213,20 @@ def load_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str
     }
 
 
-def load_checkpoint(plugin: ModuleType, checkpoint_dir: str, device: torch.device) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
+def load_checkpoint(
+    plugin: ModuleType,
+    checkpoint_dir: str,
+    device: torch.device,
+    fsdp_export_dir: str | None = None,
+) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
     checkpoint_path = Path(checkpoint_dir)
     if not checkpoint_path.is_dir():
         raise FileNotFoundError(f'Checkpoint directory not found: {checkpoint_path}')
+    if is_fsdp_sharded_checkpoint(checkpoint_path):
+        # Full FSDP updates both the projector path and Huginn's text embedding table.
+        # It must therefore restore the complete model, unlike the LoRA-only path below.
+        return load_full_fsdp_base_model(plugin, checkpoint_path, device, fsdp_export_dir)
+
     base_model = plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
     # This retrieval definition never runs Huginn recurrent blocks. It uses only
     # the projector-side audio tokens and the frozen raw text embedding table, so
@@ -371,7 +391,7 @@ def evaluate_one_checkpoint(
     device: torch.device,
     output_dir: Path,
 ) -> dict[str, Any]:
-    audio_model, processor, restore = load_checkpoint(plugin, checkpoint_dir, device)
+    audio_model, processor, restore = load_checkpoint(plugin, checkpoint_dir, device, args.fsdp_export_dir)
     audio_embeddings = F.normalize(
         compute_audio_embeddings(plugin, audio_model, processor, groups, device, args.audio_batch_size), dim=-1
     )

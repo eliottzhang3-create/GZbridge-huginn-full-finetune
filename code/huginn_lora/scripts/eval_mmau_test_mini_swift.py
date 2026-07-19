@@ -36,6 +36,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-steps", type=int, default=None, help="Fixed Huginn recurrence count; default uses config.mean_recurrence.")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--print-samples", action="store_true")
+    parser.add_argument(
+        "--fsdp-export-dir",
+        default=None,
+        help="Optional shared cache directory for a merged FSDP SHARDED_STATE_DICT checkpoint.",
+    )
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -183,7 +188,12 @@ def main() -> None:
     print(f"[config] num_steps={args.num_steps if args.num_steps is not None else 'config.mean_recurrence'}")
     print(f"[config] output_dir={output_dir} resumed_completed={len(completed_ids)}")
     plugin = import_plugin(args.plugin_path)
-    model, processor, restore = load_generation_model(plugin, args.checkpoint, device)
+    model, processor, restore = load_generation_model(
+        plugin,
+        args.checkpoint,
+        device,
+        args.fsdp_export_dir,
+    )
     print(f"[restore] {json.dumps(restore, ensure_ascii=False)}")
     if not restore["aligner_restore"]["restored_boundary_embeddings"]:
         print("[warning] audio_bos/audio_eos were not found in the checkpoint; model initialization values are in use.")

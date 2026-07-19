@@ -49,9 +49,9 @@ This repo contains **two major experiment families**:
      - the current **Swift multimodal route** in `code/huginn_lora`
    - objective: audio-to-text understanding and modality alignment, not speech generation
 
-### Current highest-priority task (updated 2026-07-17)
+### Current highest-priority task (updated 2026-07-19)
 
-The active task is the first formal **Swift FSDP full-parameter AudioCaps-v2 training run** on the original Huginn backbone. It is scripted and validated locally/remotely through smoke jobs, but the multi-day formal job has **not yet been claimed complete** until its remote final log is available.
+The active task is the formal **Swift FSDP full-parameter AudioCaps-v2 training run** on the original Huginn backbone. Its 8-GPU run has produced the first-epoch FSDP checkpoint at `checkpoint-2802`; it is not complete. The next planned run resumes that checkpoint on 7 GPUs to leave one 5090 available for evaluation.
 
 The audio architecture is:
 
@@ -125,25 +125,30 @@ Whisper is never LoRA-wrapped or full-trained in either policy.
   - 20-step 8-GPU stability smoke passed with `exit_status=0`, around `53.8 s/update`, and about `26.3 GiB` GPU memory.
   - 8-GPU sharded save/resume passed: a saved `checkpoint-2` resumed in a fresh job and produced `checkpoint-3`, validating FSDP model, optimizer, scheduler, RNG, and Trainer state recovery.
 
-#### Formal FSDP run ready for remote submission
+#### Formal FSDP run and current resume plan
 
 - runtime script:
   - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_full_fsdp8.sh`
 - submit wrapper:
   - `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_full_fsdp8_5090.sh`
-- exact training plan:
-  - `2` epochs
-  - `8` GPUs, micro-batch `1` per GPU, gradient accumulation `4`
-  - global effective batch `32`
-  - `2802` optimizer updates per epoch, `5604` total
-  - save every half epoch: expected checkpoints at `1401`, `2802`, `4203`, `5604`
-  - retain exactly `4` sharded checkpoints
+- completed first stage:
+  - the formal 8-GPU run used micro-batch `1` per GPU and gradient accumulation `4`, global effective batch `32`
+  - `2802` updates make one 8-GPU epoch
+  - completed checkpoint:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_full_fsdp8_e2_b1ga4/v0-20260717-084419/checkpoint-2802`
+- planned 7-GPU resume:
+  - preserves the same model, FSDP2 configuration, micro-batch `1`, and gradient accumulation `4`; global effective batch becomes `28`
+  - it restores the full FSDP model, optimizer, scheduler, and Trainer state from `checkpoint-2802`
+  - it uses `ignore_data_skip=true`, then processes one fresh complete 7-rank data epoch rather than applying an invalid old 8-rank sample skip
+  - `89658` samples produce `3203` 7-GPU optimizer updates per fresh epoch; target global step is `2802 + 3203 = 6005`
+  - it saves only the new terminal FSDP checkpoint `checkpoint-6005`, via epoch-end saving and a post-run existence assertion
   - Huginn LR `1e-5`; aligner LR `1e-4`
   - cosine schedule, warmup ratio `0.05`, weight decay `0.01`, max grad norm `1.0`
   - TensorBoard enabled, logging every `10` updates, resource monitor every `30` seconds
   - `save_only_model=false` because FSDP resume needs optimizer/scheduler/RNG/Trainer state.
-- the runtime prechecks manifest statistics, Swift argument compatibility, optional resume directory, and at least `200 GB` free storage.
-- any FSDP resume must use the same FSDP configuration and 8-GPU world size. Do not feed FSDP sharded checkpoints to old single-GPU LoRA evaluators; a dedicated FSDP evaluator/export path is still needed.
+- the runtime prechecks manifest statistics, Swift argument compatibility, the exact expected `global_step=2802`, non-empty FSDP model/optimizer shard directories, a clean output directory, and at least `200 GB` free storage.
+- same-world-size FSDP save/resume is remote-verified. The intended 8-to-7-world-size resume relies on PyTorch distributed-checkpoint resharding and is a new operation: inspect its initial loading and first-step logs before treating it as validated.
+- FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators first merge `pytorch_model_fsdp_0` into a reusable full safetensors export and then load an ordinary one-GPU model; this new path is code-verified locally but awaits its first remote run.
 
 #### Historical but relevant routes
 
@@ -168,8 +173,8 @@ Whisper is never LoRA-wrapped or full-trained in either policy.
 The practical mainline is:
 
 1. preserve frozen Whisper and the verified multimodal/NTP chain;
-2. submit and monitor the formal 8-GPU FSDP AudioCaps-v2 run;
-3. use an identical FSDP setup for any resume;
+2. evaluate FSDP `checkpoint-2802` through the dedicated merge-and-load path;
+3. resume the formal run from 8 to 7 GPUs, then inspect the first restore/training logs;
 4. keep older LoRA checkpoint evaluation separate from FSDP checkpoint handling;
 5. submit all remote jobs through matching `vc submit` wrappers.
 
@@ -1007,12 +1012,13 @@ Do not change the audio encoder's policy without an explicit new experiment deci
 
 ### Current Swift audio status that new agents must assume
 
-As of 2026-07-17:
+As of 2026-07-19:
 
 - Swift registration, tar/WAV decoding, audio-prefix insertion, shifted NTP loss, and audio-encoder freezing have all been remote-verified.
 - single-GPU LoRA routes on ACAVCAPS/AudioCaps are historical validated baselines, not the only current path.
 - 8-GPU Swift FSDP2 initialization, one-step backward, 20-step stability, and sharded checkpoint resume have passed.
-- the current operational task is to run the new two-epoch AudioCaps-v2 FSDP full-training script, then inspect its checkpoints/evaluation path.
+- the formal 8-GPU run reached `checkpoint-2802` (epoch 1); the active operation is 7-GPU resume to target `checkpoint-6005`.
+- FSDP checkpoint evaluation is implemented in the existing Clotho retrieval, Clotho sample-generation, and MMAU-mini scripts. They merge the model DCP shards once to `checkpoint-2802_merged_full_state/model.safetensors`, then reuse that cache. Submit these one-GPU 5090 jobs sequentially, each with `64G` CPU memory.
 - all remote work is still launched through `vc submit`; Codex edits only this local sync repository.
 
 ### AudioCaps v2 route (updated 2026-07-17)
@@ -1448,7 +1454,7 @@ If a new agent is asked "what should we do now", the best default interpretation
 4. treat AudioCaps v2 as both the latest LoRA checkpoint-producing route and the current FSDP formal-training dataset:
    - `89658` valid WAV-caption samples
    - evaluation checkpoints currently known: `checkpoint-5604`, `checkpoint-8406`
-   - pending formal FSDP checkpoints expected at steps `1401`, `2802`, `4203`, `5604`
+   - formal FSDP epoch-1 checkpoint exists at `checkpoint-2802`; the active 7-GPU resume target is a new `checkpoint-6005`
 5. retain the evaluation routes as separate historical/parallel work:
    - Clotho retrieval checks adapter alignment
    - manual cached decoding checks qualitative caption behavior

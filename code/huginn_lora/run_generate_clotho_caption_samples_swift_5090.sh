@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 mkdir -p log
 
 CMD_PREFIX=""
-for name in CLOTHO_CAPTION_CHECKPOINT CLOTHO_CAPTION_CHECKPOINTS CLOTHO_CAPTION_OUTPUT_DIR CLOTHO_CAPTION_SAMPLE_COUNT CLOTHO_CAPTION_MAX_NEW_TOKENS; do
+for name in CLOTHO_CAPTION_CHECKPOINT CLOTHO_CAPTION_CHECKPOINTS CLOTHO_CAPTION_OUTPUT_DIR CLOTHO_CAPTION_SAMPLE_COUNT CLOTHO_CAPTION_MAX_NEW_TOKENS HUGINN_AUDIO_FSDP_EVAL_EXPORT_DIR; do
   value="${!name:-}"
   if [ -n "$value" ]; then
     printf -v quoted_value '%q' "$value"
@@ -17,7 +17,7 @@ done
 vc submit \
   -p pdgpu-5090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
-  -c 8 -m 32G -g 1 \
+  -c 8 -m 64G -g 1 \
   -n 1 \
   -j generate-clotho-caption-samples-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \

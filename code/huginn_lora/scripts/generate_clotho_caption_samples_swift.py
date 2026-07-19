@@ -33,6 +33,15 @@ ALIGNER_PREFIXES = (
     "audio_eos",
 )
 SKIP_STATE_TOKENS = ("optimizer", "scheduler", "rng", "trainer_state", "training_args")
+FSDP_MODEL_DIR_NAME = "pytorch_model_fsdp_0"
+FSDP_MERGED_WEIGHTS_NAME = "model.safetensors"
+FULL_TRAINED_PREFIXES = (
+    "transformer.",
+    "lm_head.",
+    "temporal_compressor.",
+    "audio_projector.",
+    "audio_boundary_embeddings.",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -45,6 +54,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sample-count", type=int, default=3)
     parser.add_argument("--seed", type=int, default=74)
     parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument(
+        "--fsdp-export-dir",
+        default=None,
+        help="Optional shared cache directory for a merged FSDP SHARDED_STATE_DICT checkpoint.",
+    )
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
 
@@ -81,7 +95,13 @@ def candidate_target_keys(source_key: str) -> list[str]:
     while changed:
         changed = False
         for key in list(candidates):
-            for prefix in ("base_model.model.", "base_model.", "model.", "module."):
+            for prefix in (
+                "base_model.model.",
+                "base_model.",
+                "model.",
+                "module.",
+                "_fsdp_wrapped_module.",
+            ):
                 if key.startswith(prefix):
                     stripped = key[len(prefix):]
                     if stripped not in candidates:
@@ -132,10 +152,130 @@ def load_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> dict[str
     }
 
 
-def load_generation_model(plugin: ModuleType, checkpoint_dir: str, device: torch.device) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
+def is_fsdp_sharded_checkpoint(checkpoint_path: Path) -> bool:
+    return (checkpoint_path / FSDP_MODEL_DIR_NAME).is_dir()
+
+
+def resolve_fsdp_export_dir(checkpoint_path: Path, fsdp_export_dir: str | None) -> Path:
+    if fsdp_export_dir:
+        return Path(fsdp_export_dir)
+    return checkpoint_path.parent / f"{checkpoint_path.name}_merged_full_state"
+
+
+def merge_fsdp_model_weights(checkpoint_path: Path, fsdp_export_dir: str | None) -> Path:
+    export_dir = resolve_fsdp_export_dir(checkpoint_path, fsdp_export_dir)
+    merged_weights_path = export_dir / FSDP_MERGED_WEIGHTS_NAME
+    if merged_weights_path.is_file() and merged_weights_path.stat().st_size > 0:
+        print(f"[fsdp-export] reusing_merged_weights={merged_weights_path}")
+        return merged_weights_path
+
+    source_dir = checkpoint_path / FSDP_MODEL_DIR_NAME
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"FSDP model checkpoint directory not found: {source_dir}")
+    export_dir.mkdir(parents=True, exist_ok=True)
+    print(f"[fsdp-export] source_dir={source_dir}")
+    print(f"[fsdp-export] export_dir={export_dir}")
+    try:
+        from accelerate.utils import merge_fsdp_weights
+    except ImportError as exc:
+        raise RuntimeError("Accelerate merge_fsdp_weights is required for FSDP checkpoint evaluation") from exc
+
+    # FSDP SHARDED_STATE_DICT is converted on CPU before the direct single-GPU model is built.
+    merge_fsdp_weights(str(source_dir), str(export_dir), safe_serialization=True)
+    if not merged_weights_path.is_file() or merged_weights_path.stat().st_size == 0:
+        raise RuntimeError(f"FSDP merge completed without a non-empty weights file: {merged_weights_path}")
+    print(f"[fsdp-export] merged_weights={merged_weights_path} bytes={merged_weights_path.stat().st_size}")
+    return merged_weights_path
+
+
+def load_full_fsdp_base_model(
+    plugin: ModuleType,
+    checkpoint_path: Path,
+    device: torch.device,
+    fsdp_export_dir: str | None = None,
+) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
+    merged_weights_path = merge_fsdp_model_weights(checkpoint_path, fsdp_export_dir)
+    # Build first: plugin construction transiently loads the fp32 Huginn backbone.
+    # Keeping the merged state dict out of memory during that operation reduces the
+    # CPU peak substantially on the one-GPU evaluation job.
+    base_model = plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
+    target_state = base_model.state_dict()
+    merged_state = state_dict_from_file(merged_weights_path)
+    if not merged_state:
+        raise RuntimeError(f"Merged FSDP state dict is empty: {merged_weights_path}")
+    selected: dict[str, torch.Tensor] = {}
+    source_key_preview: list[str] = []
+    for source_key, tensor in merged_state.items():
+        for target_key in candidate_target_keys(source_key):
+            if target_key in target_state and target_state[target_key].shape == tensor.shape:
+                selected[target_key] = tensor
+                if len(source_key_preview) < 20:
+                    source_key_preview.append(source_key)
+                break
+
+    load_result = base_model.load_state_dict(selected, strict=False)
+    missing_critical = [key for key in load_result.missing_keys if key.startswith(FULL_TRAINED_PREFIXES)]
+    # Huginn ties lm_head.weight to transformer.wte.weight. Some FSDP state-dict
+    # exports retain only one side of this alias, which is still a complete restore.
+    if (
+        "lm_head.weight" in missing_critical
+        and "transformer.wte.weight" in selected
+        and bool(getattr(base_model.config, "tie_embeddings", False))
+    ):
+        missing_critical.remove("lm_head.weight")
+    if missing_critical:
+        raise RuntimeError(
+            f"Merged FSDP state did not restore critical trained tensors: {missing_critical[:20]} "
+            f"(total={len(missing_critical)})"
+        )
+    if any(parameter.requires_grad for parameter in base_model.audio_encoder.parameters()):
+        raise RuntimeError("Audio encoder unexpectedly became trainable during FSDP generation restore")
+
+    base_model.to(device=device, dtype=torch.bfloat16)
+    base_model.eval()
+    processor = plugin.build_huginn_audio_processor()
+    aligner_loaded = sum(
+        1 for key in selected if key.startswith(ALIGNER_PREFIXES)
+    )
+    boundary_loaded = [
+        key
+        for key in selected
+        if key.endswith((".audio_bos", ".audio_eos")) or key in {"audio_bos", "audio_eos"}
+    ]
+    return base_model, processor, {
+        "checkpoint_dir": str(checkpoint_path),
+        "checkpoint_format": "fsdp_sharded_full",
+        "lora_restored": False,
+        "full_state_restored": True,
+        "fsdp_source_dir": str(checkpoint_path / FSDP_MODEL_DIR_NAME),
+        "merged_weights_path": str(merged_weights_path),
+        "merged_state_tensor_count": len(merged_state),
+        "restored_tensor_count": len(selected),
+        "source_key_preview": source_key_preview,
+        "missing_key_count": len(load_result.missing_keys),
+        "unexpected_key_count": len(load_result.unexpected_keys),
+        "audio_encoder_trainable_parameter_count": sum(
+            parameter.numel() for parameter in base_model.audio_encoder.parameters() if parameter.requires_grad
+        ),
+        "aligner_restore": {
+            "loaded_aligner_tensor_count": aligner_loaded,
+            "restored_boundary_embeddings": boundary_loaded,
+        },
+    }
+
+
+def load_generation_model(
+    plugin: ModuleType,
+    checkpoint_dir: str,
+    device: torch.device,
+    fsdp_export_dir: str | None = None,
+) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
     checkpoint_path = Path(checkpoint_dir)
     if not checkpoint_path.is_dir():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_path}")
+    if is_fsdp_sharded_checkpoint(checkpoint_path):
+        return load_full_fsdp_base_model(plugin, checkpoint_path, device, fsdp_export_dir)
+
     adapter_path = checkpoint_path / "adapter_model.safetensors"
     if not adapter_path.is_file():
         raise FileNotFoundError(f"LoRA adapter file not found: {adapter_path}")
@@ -164,6 +304,7 @@ def load_generation_model(plugin: ModuleType, checkpoint_dir: str, device: torch
         raise RuntimeError("LoRA restoration produced no injected lora_A modules in the generation model")
     return model, processor, {
         "checkpoint_dir": str(checkpoint_path),
+        "checkpoint_format": "lora_adapter",
         "lora_restored": True,
         "lora_tensor_count": lora_tensor_count,
         "injected_lora_module_count": injected_lora_module_count,
@@ -343,7 +484,7 @@ def main() -> None:
     print(f"[config] available_audio_groups={len(groups)} selected_indices={selected_indices}")
     print(f"[config] max_new_tokens={args.max_new_tokens} generation_path=audio_manual_cache seed={args.seed}")
     plugin = import_plugin(args.plugin_path)
-    model, processor, restore = load_generation_model(plugin, args.checkpoint, device)
+    model, processor, restore = load_generation_model(plugin, args.checkpoint, device, args.fsdp_export_dir)
     print(f"[restore] {json.dumps(restore, ensure_ascii=False)}")
     if not restore["aligner_restore"]["restored_boundary_embeddings"]:
         print("[warning] audio_bos/audio_eos were not found in the checkpoint; model initialization values are in use.")
