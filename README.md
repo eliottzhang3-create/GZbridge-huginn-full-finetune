@@ -305,9 +305,10 @@ Historical / smoke / preparation queue:
 
 Important queue rule from the user:
 
-- for **1 GPU** jobs:
-  - CPU cores must be `<= 8`
-  - memory must be `<= 32G`
+- the limit is **per requested GPU** for every `vc submit` job:
+  - CPU cores per GPU must be `<= 8`
+  - memory per GPU must be `<= 32G`
+- therefore a `-g N` job must satisfy `-c <= 8*N` and `-m <= 32*N G`.
 
 Therefore the standard single-GPU submit shape is:
 
@@ -318,6 +319,12 @@ For **8 GPU** jobs, the current full-training submit script uses:
 - `-c 32 -m 256G -g 8 -n 1`
 
 which satisfies the per-GPU rule.
+
+For the active **7 GPU** cross-world smoke and resume jobs, use:
+
+- `-c 28 -m 224G -g 7 -n 1`
+
+This requests four CPU cores and 32G memory per GPU, safely within the queue limit. Do not use `-g 7 -m 256G`, and do not use `-g 1 -m 64G`.
 
 Remote jobs should be launched through the provided `vc submit` shell scripts, not by directly starting long training commands manually.
 
@@ -1018,7 +1025,7 @@ As of 2026-07-19:
 - single-GPU LoRA routes on ACAVCAPS/AudioCaps are historical validated baselines, not the only current path.
 - 8-GPU Swift FSDP2 initialization, one-step backward, 20-step stability, and sharded checkpoint resume have passed.
 - the formal 8-GPU run reached `checkpoint-2802` (epoch 1); the active operation is 7-GPU resume to target `checkpoint-6005`.
-- FSDP checkpoint evaluation is implemented in the existing Clotho retrieval, Clotho sample-generation, and MMAU-mini scripts. They merge the model DCP shards once to `checkpoint-2802_merged_full_state/model.safetensors`, then reuse that cache. Submit these one-GPU 5090 jobs sequentially, each with `64G` CPU memory.
+- FSDP checkpoint evaluation is implemented in the existing Clotho retrieval, Clotho sample-generation, and MMAU-mini scripts. They merge the model DCP shards once to `checkpoint-2802_merged_full_state/model.safetensors`, then reuse that cache. Submit these one-GPU 5090 jobs sequentially, each with the queue-limited `8 CPU / 32G` request.
 - all remote work is still launched through `vc submit`; Codex edits only this local sync repository.
 
 ### AudioCaps v2 route (updated 2026-07-17)
