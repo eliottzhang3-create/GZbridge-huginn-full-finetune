@@ -18,10 +18,8 @@ export HUGINN_AUDIO_TRAIN_CHAIN_AUDIT=1
 
 TRAIN_MANIFEST="${AUDIOCAPS_FULL_FSDP_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
-OUTPUT_DIR="${AUDIOCAPS_FULL_FSDP_OUTPUT_DIR:-outputs/huginn_audio_audiocaps_v2_full_fsdp7_resume2802_b1ga4}"
+OUTPUT_DIR="${AUDIOCAPS_FULL_FSDP_OUTPUT_DIR:-outputs/huginn_audio_audiocaps_v2_full_fsdp7_e2_b1ga4}"
 LOGGING_DIR="${AUDIOCAPS_FULL_FSDP_LOGGING_DIR:-$OUTPUT_DIR/tensorboard}"
-RESUME_FROM_CHECKPOINT="${AUDIOCAPS_FULL_FSDP_RESUME_FROM_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_full_fsdp8_e2_b1ga4/v0-20260717-084419/checkpoint-2802}"
-RESUME_EXPECTED_GLOBAL_STEP="${AUDIOCAPS_FULL_FSDP_RESUME_EXPECTED_GLOBAL_STEP:-2802}"
 MIN_FREE_GB="${AUDIOCAPS_FULL_FSDP_MIN_FREE_GB:-200}"
 
 WORLD_SIZE=7
@@ -43,43 +41,19 @@ if [ ! -s "$TRAIN_MANIFEST" ] || [ ! -s "$TRAIN_STATS" ]; then
   echo "AudioCaps manifest or stats is missing: manifest=$TRAIN_MANIFEST stats=$TRAIN_STATS" >&2
   exit 1
 fi
-if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
-  echo "FSDP resume checkpoint directory does not exist: $RESUME_FROM_CHECKPOINT" >&2
-  exit 1
-fi
-if [ ! -d "$RESUME_FROM_CHECKPOINT/pytorch_model_fsdp_0" ] || [ ! -d "$RESUME_FROM_CHECKPOINT/optimizer_0" ]; then
-  echo "Resume checkpoint is missing FSDP model or optimizer shard directories: $RESUME_FROM_CHECKPOINT" >&2
-  exit 1
-fi
-if ! find "$RESUME_FROM_CHECKPOINT/pytorch_model_fsdp_0" -type f -print -quit | grep -q .; then
-  echo "Resume checkpoint FSDP model shard directory is empty: $RESUME_FROM_CHECKPOINT/pytorch_model_fsdp_0" >&2
-  exit 1
-fi
-if ! find "$RESUME_FROM_CHECKPOINT/optimizer_0" -type f -print -quit | grep -q .; then
-  echo "Resume checkpoint FSDP optimizer shard directory is empty: $RESUME_FROM_CHECKPOINT/optimizer_0" >&2
-  exit 1
-fi
-
-CALCULATED_TRAINING_STEPS="$(python - "$TRAIN_STATS" "$RESUME_FROM_CHECKPOINT/trainer_state.json" "$RESUME_EXPECTED_GLOBAL_STEP" "$WORLD_SIZE" "$MICRO_BATCH_SIZE" "$GRADIENT_ACCUMULATION_STEPS" <<'PY'
+CALCULATED_TRAINING_STEPS="$(python - "$TRAIN_STATS" "$WORLD_SIZE" "$MICRO_BATCH_SIZE" "$GRADIENT_ACCUMULATION_STEPS" "$NUM_TRAIN_EPOCHS" <<'PY'
 import json
 import math
 import sys
 from dataclasses import fields
 
-stats_path, trainer_state_path, expected_global_step, world_size, micro_batch, grad_accum = sys.argv[1:]
-expected_global_step = int(expected_global_step)
+stats_path, world_size, micro_batch, grad_accum, epochs = sys.argv[1:]
 world_size = int(world_size)
 micro_batch = int(micro_batch)
 grad_accum = int(grad_accum)
+epochs = int(epochs)
 with open(stats_path, encoding='utf-8') as handle:
     stats = json.load(handle)
-with open(trainer_state_path, encoding='utf-8') as handle:
-    trainer_state = json.load(handle)
-if trainer_state.get('global_step') != expected_global_step:
-    raise SystemExit(
-        f"Resume checkpoint global_step={trainer_state.get('global_step')!r}, "
-        f"expected {expected_global_step}"
-    )
 if stats.get('dataset') != 'audiocaps_v2' or stats.get('split') != 'train':
     raise SystemExit(f"Unexpected AudioCaps stats: dataset={stats.get('dataset')!r} split={stats.get('split')!r}")
 record_count = stats.get('record_count')
@@ -104,16 +78,15 @@ missing_fields = sorted(required_fields - available_fields)
 if missing_fields:
     raise SystemExit(f'Installed Swift SftArguments lacks formal FSDP fields: {missing_fields}')
 
-target_global_step = expected_global_step + steps_per_epoch
-print(record_count, steps_per_epoch, expected_global_step, target_global_step)
+print(record_count, steps_per_epoch, steps_per_epoch * epochs)
 PY
 )"
-read -r RECORD_COUNT STEPS_PER_EPOCH RESUME_GLOBAL_STEP TOTAL_STEPS <<< "$CALCULATED_TRAINING_STEPS"
+read -r RECORD_COUNT STEPS_PER_EPOCH TOTAL_STEPS <<< "$CALCULATED_TRAINING_STEPS"
 
-# This resumed run processes exactly one fresh 7-rank data epoch and saves only
-# its terminal, fully resumable FSDP checkpoint.
+# Seven ranks produce an odd 3203 optimizer updates per epoch. Saving on epoch
+# boundaries avoids pretending that a non-integer optimizer step is a half epoch.
 SAVE_STRATEGY=epoch
-SAVE_TOTAL_LIMIT=1
+SAVE_TOTAL_LIMIT=2
 
 AVAILABLE_GB="$(df -BG "$REPO_ROOT" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')"
 if [ -z "$AVAILABLE_GB" ] || [ "$AVAILABLE_GB" -lt "$MIN_FREE_GB" ]; then
@@ -123,13 +96,13 @@ fi
 
 mkdir -p "$OUTPUT_DIR" "$LOGGING_DIR"
 if find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print -quit | grep -q .; then
-  echo "Resume output directory already contains a checkpoint; choose a new AUDIOCAPS_FULL_FSDP_OUTPUT_DIR: $OUTPUT_DIR" >&2
+  echo "Fresh-training output directory already contains a checkpoint; choose a new AUDIOCAPS_FULL_FSDP_OUTPUT_DIR: $OUTPUT_DIR" >&2
   exit 1
 fi
 FSDP_CONFIG_PATH="$OUTPUT_DIR/fsdp2_full_train_no_activation.json"
 printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
 
-echo "========== AUDIOCAPS V2 HUGINN FULL FSDP7 RESUME TRAIN =========="
+echo "========== AUDIOCAPS V2 HUGINN FULL FSDP7 FRESH TRAIN =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "launch_mode=swift_cli_internal_torchrun"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
@@ -148,16 +121,15 @@ echo "per_device_train_batch_size=$MICRO_BATCH_SIZE"
 echo "gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS"
 echo "global_effective_batch_size=$((WORLD_SIZE * MICRO_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
 echo "num_train_epochs=$NUM_TRAIN_EPOCHS max_steps=$TOTAL_STEPS"
-echo "steps_per_epoch_7rank=$STEPS_PER_EPOCH resume_global_step=$RESUME_GLOBAL_STEP target_global_step=$TOTAL_STEPS"
-echo "resume_data_policy=ignore_old_8rank_data_skip_then_process_one_fresh_7rank_epoch"
+echo "steps_per_epoch_7rank=$STEPS_PER_EPOCH total_steps=$TOTAL_STEPS"
+echo "initialization=original_huginn_audio_model_no_resume_checkpoint"
 echo "save_strategy=$SAVE_STRATEGY save_total_limit=$SAVE_TOTAL_LIMIT"
-echo "expected_checkpoint=$TOTAL_STEPS"
+echo "expected_checkpoints=$STEPS_PER_EPOCH,$TOTAL_STEPS"
 echo "learning_rate=$LEARNING_RATE aligner_lr=$ALIGNER_LR"
 echo "lr_scheduler_type=cosine warmup_ratio=$WARMUP_RATIO weight_decay=$WEIGHT_DECAY max_grad_norm=$MAX_GRAD_NORM"
 echo "logging_steps=$LOGGING_STEPS report_to=tensorboard"
 echo "save_only_model=false"
 echo "free_storage_gb=$AVAILABLE_GB min_required_gb=$MIN_FREE_GB"
-echo "resume_from_checkpoint=$RESUME_FROM_CHECKPOINT"
 
 TRAIN_PID=""
 MONITOR_PID=""
@@ -198,7 +170,7 @@ on_exit() {
   status=$?
   trap - EXIT
   stop_resource_monitor
-  echo "========== AUDIOCAPS FULL FSDP7 RESUME TRAIN EXIT =========="
+  echo "========== AUDIOCAPS FULL FSDP7 FRESH TRAIN EXIT =========="
   echo "exit_status=$status"
   echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
   exit "$status"
@@ -206,7 +178,7 @@ on_exit() {
 
 on_signal() {
   signal_name=$1
-  echo "========== AUDIOCAPS FULL FSDP7 RESUME TRAIN SIGNAL =========="
+  echo "========== AUDIOCAPS FULL FSDP7 FRESH TRAIN SIGNAL =========="
   echo "received_signal=$signal_name"
   echo "signal_time=$(date '+%Y-%m-%d %H:%M:%S')"
   if [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null; then
@@ -234,7 +206,6 @@ CMD+=(--per_device_train_batch_size "$MICRO_BATCH_SIZE" --gradient_accumulation_
 CMD+=(--logging_steps "$LOGGING_STEPS" --save_strategy "$SAVE_STRATEGY" --save_total_limit "$SAVE_TOTAL_LIMIT")
 CMD+=(--dataloader_num_workers 0 --dataloader_pin_memory false --dataset_num_proc 1)
 CMD+=(--save_only_model false --report_to tensorboard --bf16 true --seed 42 --data_seed 42)
-CMD+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT" --ignore_data_skip true)
 
 "${CMD[@]}" &
 TRAIN_PID=$!
