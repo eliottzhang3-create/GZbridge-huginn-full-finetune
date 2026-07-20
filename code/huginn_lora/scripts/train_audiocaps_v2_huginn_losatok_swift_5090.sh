@@ -114,6 +114,7 @@ echo "learning_rate=$LEARNING_RATE aligner_lr=$ALIGNER_LR"
 echo "dataset_shuffle=true train_dataloader_shuffle=true"
 echo "save_strategy=$SAVE_STRATEGY save_steps=$SAVE_STEPS save_total_limit=$SAVE_TOTAL_LIMIT save_only_model=false"
 echo "logging_steps=$LOGGING_STEPS report_to=$REPORT_TO"
+echo "resource_snapshot_interval_seconds=10"
 if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
   echo "resume_from_checkpoint=$RESUME_FROM_CHECKPOINT"
 fi
@@ -139,7 +140,7 @@ print_resource_snapshot() {
 resource_monitor() {
   while kill -0 "$TRAIN_PID" 2>/dev/null; do
     print_resource_snapshot
-    sleep 30
+    sleep 10
   done
 }
 

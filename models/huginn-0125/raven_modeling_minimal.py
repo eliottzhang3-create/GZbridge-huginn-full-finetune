@@ -738,17 +738,11 @@ class RavenForCausalLM(RavenPreTrainedModel, GenerationMixin):
         )
 
     def _should_debug_activation(self, current_step: int | Tensor) -> bool:
-        if not self.training:
-            return False
-        if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-            rank = 0
-        else:
-            rank = torch.distributed.get_rank()
-        if rank != 0:
-            return False
-
-        step_i = int(current_step) if not torch.is_tensor(current_step) else int(current_step.item())
-        return step_i < 3
+        # Keep recurrent activation statistics disabled during all training runs.
+        # The old debug path synchronizes tensors to compute min/max/mean and can
+        # materially slow training while producing high-volume `[act-debug]` logs.
+        del current_step
+        return False
 
     def _debug_activation_stats(self, tag: str, x: torch.Tensor, current_step: int | Tensor):
         if not self._should_debug_activation(current_step):
