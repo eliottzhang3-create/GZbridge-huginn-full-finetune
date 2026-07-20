@@ -18,7 +18,20 @@ RUNTIME_DIR="$(mktemp -d /tmp/huginn_losatok_smoke.XXXXXX)"
 SMOKE_MANIFEST="$RUNTIME_DIR/audiocaps_v2_one_record.jsonl"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_losatok_swift.py"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-losatok-v1"
-OUTPUT_DIR="${LOSATOK_SMOKE_OUTPUT_DIR:-outputs/huginn_losatok_audiocaps_v2_smoke1_5090}"
+RECORD_COUNT="${LOSATOK_SMOKE_RECORD_COUNT:-32}"
+BATCH_SIZE="${LOSATOK_SMOKE_BATCH_SIZE:-8}"
+GRADIENT_ACCUMULATION_STEPS="${LOSATOK_SMOKE_GRADIENT_ACCUMULATION_STEPS:-4}"
+OUTPUT_DIR="${LOSATOK_SMOKE_OUTPUT_DIR:-outputs/huginn_losatok_audiocaps_v2_smoke32_b8ga4_5090}"
+
+if ! [[ "$RECORD_COUNT" =~ ^[1-9][0-9]*$ && "$BATCH_SIZE" =~ ^[1-9][0-9]*$ && "$GRADIENT_ACCUMULATION_STEPS" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Smoke record count, batch size, and accumulation steps must be positive integers" >&2
+  exit 1
+fi
+EXPECTED_RECORD_COUNT=$((BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))
+if [ "$RECORD_COUNT" -ne "$EXPECTED_RECORD_COUNT" ]; then
+  echo "For exactly one full optimizer update, record_count must equal batch_size * accumulation: $RECORD_COUNT != $EXPECTED_RECORD_COUNT" >&2
+  exit 1
+fi
 
 on_exit() {
   status=$?
@@ -37,7 +50,8 @@ echo "runtime_manifest=$SMOKE_MANIFEST"
 echo "model=$MODEL_PATH"
 echo "output_dir=$OUTPUT_DIR"
 echo "mode=lora_llm frozen_losatok aligner_trainable"
-echo "batch_size=1 gradient_accumulation_steps=1 max_steps=1"
+echo "record_count=$RECORD_COUNT"
+echo "batch_size=$BATCH_SIZE gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS effective_batch_size=$EXPECTED_RECORD_COUNT max_steps=1"
 echo "checkpoint_saving=disabled tensorboard=disabled"
 
 python - <<'PY'
@@ -50,7 +64,8 @@ PY
 
 python -u code/huginn_lora/scripts/smoke_huginn_losatok_swift.py \
   --source_manifest "$SOURCE_MANIFEST" \
-  --output_manifest "$SMOKE_MANIFEST"
+  --output_manifest "$SMOKE_MANIFEST" \
+  --record_count "$RECORD_COUNT"
 
 swift sft \
   --model "$MODEL_PATH" \
@@ -72,8 +87,8 @@ swift sft \
   --lora_alpha 32 \
   --lora_dropout 0.05 \
   --max_steps 1 \
-  --per_device_train_batch_size 1 \
-  --gradient_accumulation_steps 1 \
+  --per_device_train_batch_size "$BATCH_SIZE" \
+  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
   --gradient_checkpointing true \
   --logging_steps 1 \
   --save_strategy no \

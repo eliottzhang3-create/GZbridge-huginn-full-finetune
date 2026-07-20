@@ -10,7 +10,7 @@ vc submit \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 8 -m 32G -g 1 \
   -n 1 \
-  -j smoke-huginn-losatok-swift-5090-$(date +%m%d%H%M) \
+  -j smoke-huginn-losatok-b8ga4-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/smoke_huginn_losatok_swift_5090.JOB.log" \
   --cmd "bash scripts/smoke_huginn_losatok_swift.sh"
