@@ -240,6 +240,7 @@ def load_full_fsdp_base_model(
             f"FSDP streaming restore did not recover critical trained tensors: {missing_critical[:20]} "
             f"(total={len(missing_critical)})"
         )
+    missing_target_keys = [key for key in target_state if key not in restored_target_keys]
     if any(parameter.requires_grad for parameter in base_model.audio_encoder.parameters()):
         raise RuntimeError("Audio encoder unexpectedly became trainable during FSDP generation restore")
 
@@ -263,8 +264,8 @@ def load_full_fsdp_base_model(
         "unmatched_source_key_count": len(unmatched_source_keys),
         "unmatched_source_key_preview": unmatched_source_keys[:20],
         "source_key_preview": source_key_preview,
-        "missing_key_count": len(load_result.missing_keys),
-        "unexpected_key_count": len(load_result.unexpected_keys),
+        "missing_key_count": len(missing_target_keys),
+        "unexpected_key_count": len(unmatched_source_keys),
         "audio_encoder_trainable_parameter_count": sum(
             parameter.numel() for parameter in base_model.audio_encoder.parameters() if parameter.requires_grad
         ),
