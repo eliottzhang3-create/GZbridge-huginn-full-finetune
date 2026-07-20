@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -75,6 +76,82 @@ def inspect_tensor_file(path: Path) -> dict[str, Any]:
     }
 
 
+def inspect_fsdp_dcp_directory(path: Path) -> dict[str, Any]:
+    """Inspect DCP metadata and read one tiny tensor without merging model shards."""
+    try:
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint import FileSystemReader
+    except Exception as exc:  # pragma: no cover - remote package dependent
+        return {'path': str(path), 'error': f'{type(exc).__name__}: {exc}'}
+
+    try:
+        metadata = FileSystemReader(str(path)).read_metadata()
+    except Exception as exc:  # pragma: no cover - remote checkpoint dependent
+        return {'path': str(path), 'error': f'read_metadata {type(exc).__name__}: {exc}'}
+
+    state_metadata = getattr(metadata, 'state_dict_metadata', {})
+    entries: list[dict[str, Any]] = []
+    load_candidates: list[tuple[int, str, tuple[int, ...], torch.dtype]] = []
+    for key, value in state_metadata.items():
+        size = getattr(value, 'size', None)
+        properties = getattr(value, 'properties', None)
+        dtype = getattr(properties, 'dtype', None)
+        shape = tuple(int(item) for item in size) if size is not None else None
+        numel = math.prod(shape) if shape is not None else None
+        entries.append({
+            'key': str(key),
+            'metadata_type': type(value).__name__,
+            'shape': shape,
+            'dtype': str(dtype) if dtype is not None else None,
+            'numel': numel,
+        })
+        if shape is not None and isinstance(dtype, torch.dtype) and numel is not None and numel > 0:
+            load_candidates.append((numel, str(key), shape, dtype))
+
+    storage_data = getattr(metadata, 'storage_data', {})
+    storage_paths = sorted({
+        str(getattr(storage_info, 'relative_path', '<unknown>'))
+        for storage_info in storage_data.values()
+    })
+    report: dict[str, Any] = {
+        'path': str(path),
+        'metadata_type': type(metadata).__name__,
+        'state_key_count': len(entries),
+        'storage_file_count': len(storage_paths),
+        'storage_file_preview': storage_paths[:20],
+        'state_key_preview': entries[:20],
+        'single_tensor_load': None,
+    }
+    if not load_candidates:
+        report['single_tensor_load'] = {'status': 'skipped', 'reason': 'no tensor metadata entry found'}
+        return report
+
+    _, sample_key, sample_shape, sample_dtype = min(load_candidates, key=lambda item: item[0])
+    probe = {sample_key: torch.empty(sample_shape, dtype=sample_dtype, device='cpu')}
+    try:
+        # Passing only this key is the intended streaming probe: it must not materialize
+        # the full 4.25B-parameter checkpoint in the 32G single-GPU job.
+        dcp.load(probe, checkpoint_id=str(path))
+        sample = probe[sample_key]
+        report['single_tensor_load'] = {
+            'status': 'passed',
+            'key': sample_key,
+            'shape': tuple(sample.shape),
+            'dtype': str(sample.dtype),
+            'numel': sample.numel(),
+            'finite': bool(torch.isfinite(sample).all().item()) if sample.is_floating_point() else None,
+        }
+    except Exception as exc:  # pragma: no cover - remote DCP behavior dependent
+        report['single_tensor_load'] = {
+            'status': 'failed',
+            'key': sample_key,
+            'shape': sample_shape,
+            'dtype': str(sample_dtype),
+            'error': f'{type(exc).__name__}: {exc}',
+        }
+    return report
+
+
 def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, Any]:
     if not checkpoint_dir.is_dir():
         raise FileNotFoundError(f'Checkpoint directory not found: {checkpoint_dir}')
@@ -88,6 +165,7 @@ def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, Any]:
         for path in files
     ]
     tensor_reports = []
+    fsdp_dcp_reports = []
     json_reports: dict[str, Any] = {}
     for path in files:
         lower_name = path.name.lower()
@@ -102,11 +180,16 @@ def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, Any]:
             except Exception as exc:  # pragma: no cover - remote checkpoint dependent
                 json_reports[str(path.relative_to(checkpoint_dir))] = {'error': f'{type(exc).__name__}: {exc}'}
 
+    for path in sorted(child for child in checkpoint_dir.iterdir() if child.is_dir()):
+        if path.name.startswith('pytorch_model_fsdp_'):
+            fsdp_dcp_reports.append(inspect_fsdp_dcp_directory(path))
+
     return {
         'checkpoint_dir': str(checkpoint_dir),
         'file_count': len(entries),
         'files': entries,
         'tensor_reports': tensor_reports,
+        'fsdp_dcp_reports': fsdp_dcp_reports,
         'json_reports': json_reports,
     }
 
@@ -150,6 +233,8 @@ def main() -> None:
         print(f"[checkpoint] path={report['checkpoint_dir']} file_count={report['file_count']}")
         for tensor_report in report['tensor_reports']:
             print(f'[checkpoint] tensor_report={json.dumps(tensor_report, ensure_ascii=False)}')
+        for fsdp_dcp_report in report['fsdp_dcp_reports']:
+            print(f'[checkpoint] fsdp_dcp_report={json.dumps(fsdp_dcp_report, ensure_ascii=False)}')
         print(f"[checkpoint] json_files={list(report['json_reports'])}")
 
     validation_failures = []
