@@ -4,9 +4,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import wave
 from pathlib import Path
-
-import torchaudio
 
 
 def parse_args() -> argparse.Namespace:
@@ -37,9 +36,13 @@ def main() -> None:
     audio_path = Path(audios[0])
     if not audio_path.is_file():
         raise FileNotFoundError(f"Smoke audio is missing: {audio_path}")
-    info = torchaudio.info(str(audio_path))
-    if info.num_frames <= 0 or info.sample_rate <= 0:
-        raise ValueError(f"Invalid smoke audio metadata: {info}")
+    with wave.open(str(audio_path), "rb") as handle:
+        channels = handle.getnchannels()
+        sample_rate = handle.getframerate()
+        frame_count = handle.getnframes()
+        sample_width = handle.getsampwidth()
+    if frame_count <= 0 or sample_rate <= 0:
+        raise ValueError(f"Invalid smoke WAV metadata: frames={frame_count} sample_rate={sample_rate}")
     output_manifest.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_manifest.with_suffix(".jsonl.tmp")
     temporary.write_text(raw_record + "\n", encoding="utf-8")
@@ -49,8 +52,8 @@ def main() -> None:
     print(f"[smoke] source_manifest={source_manifest}")
     print(f"[smoke] output_manifest={output_manifest}")
     print(f"[smoke] audio_path={audio_path}")
-    print(f"[smoke] source_sample_rate={info.sample_rate} channels={info.num_channels}")
-    print(f"[smoke] source_frames={info.num_frames} duration_seconds={info.num_frames / info.sample_rate:.6f}")
+    print(f"[smoke] source_sample_rate={sample_rate} channels={channels} sample_width_bytes={sample_width}")
+    print(f"[smoke] source_frames={frame_count} duration_seconds={frame_count / sample_rate:.6f}")
     print(f"[smoke] caption={caption}")
 
 

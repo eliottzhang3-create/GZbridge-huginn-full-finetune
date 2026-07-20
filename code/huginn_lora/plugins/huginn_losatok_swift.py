@@ -77,7 +77,10 @@ def load_audio_16k(path: Path) -> torch.Tensor:
     if not path.is_file():
         raise FileNotFoundError(f"Audio file does not exist: {path}")
     try:
-        waveform, source_sr = torchaudio.load(str(path))
+        audio_load = getattr(torchaudio, "load", None)
+        if not callable(audio_load):
+            raise RuntimeError("installed torchaudio exposes no top-level load API")
+        waveform, source_sr = audio_load(str(path))
         waveform = waveform.mean(dim=0)
         if source_sr != DEFAULT_SAMPLE_RATE:
             waveform = torchaudio.functional.resample(waveform, source_sr, DEFAULT_SAMPLE_RATE)
