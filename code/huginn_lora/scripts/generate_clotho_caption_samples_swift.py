@@ -34,7 +34,6 @@ ALIGNER_PREFIXES = (
 )
 SKIP_STATE_TOKENS = ("optimizer", "scheduler", "rng", "trainer_state", "training_args")
 FSDP_MODEL_DIR_NAME = "pytorch_model_fsdp_0"
-FSDP_MERGED_WEIGHTS_NAME = "model.safetensors"
 FULL_TRAINED_PREFIXES = (
     "transformer.",
     "lm_head.",
@@ -57,7 +56,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--fsdp-export-dir",
         default=None,
-        help="Optional shared cache directory for a merged FSDP SHARDED_STATE_DICT checkpoint.",
+        help="Deprecated compatibility option; FSDP checkpoints are restored tensor-by-tensor without an export.",
     )
     parser.add_argument("--device", default="cuda:0")
     return parser.parse_args()
@@ -156,76 +155,89 @@ def is_fsdp_sharded_checkpoint(checkpoint_path: Path) -> bool:
     return (checkpoint_path / FSDP_MODEL_DIR_NAME).is_dir()
 
 
-def resolve_fsdp_export_dir(checkpoint_path: Path, fsdp_export_dir: str | None) -> Path:
-    if fsdp_export_dir:
-        return Path(fsdp_export_dir)
-    return checkpoint_path.parent / f"{checkpoint_path.name}_merged_full_state"
-
-
-def merge_fsdp_model_weights(checkpoint_path: Path, fsdp_export_dir: str | None) -> Path:
-    export_dir = resolve_fsdp_export_dir(checkpoint_path, fsdp_export_dir)
-    merged_weights_path = export_dir / FSDP_MERGED_WEIGHTS_NAME
-    if merged_weights_path.is_file() and merged_weights_path.stat().st_size > 0:
-        print(f"[fsdp-export] reusing_merged_weights={merged_weights_path}")
-        return merged_weights_path
-
-    source_dir = checkpoint_path / FSDP_MODEL_DIR_NAME
-    if not source_dir.is_dir():
-        raise FileNotFoundError(f"FSDP model checkpoint directory not found: {source_dir}")
-    export_dir.mkdir(parents=True, exist_ok=True)
-    print(f"[fsdp-export] source_dir={source_dir}")
-    print(f"[fsdp-export] export_dir={export_dir}")
-    try:
-        from accelerate.utils import merge_fsdp_weights
-    except ImportError as exc:
-        raise RuntimeError("Accelerate merge_fsdp_weights is required for FSDP checkpoint evaluation") from exc
-
-    # FSDP SHARDED_STATE_DICT is converted on CPU before the direct single-GPU model is built.
-    merge_fsdp_weights(str(source_dir), str(export_dir), safe_serialization=True)
-    if not merged_weights_path.is_file() or merged_weights_path.stat().st_size == 0:
-        raise RuntimeError(f"FSDP merge completed without a non-empty weights file: {merged_weights_path}")
-    print(f"[fsdp-export] merged_weights={merged_weights_path} bytes={merged_weights_path.stat().st_size}")
-    return merged_weights_path
-
-
 def load_full_fsdp_base_model(
     plugin: ModuleType,
     checkpoint_path: Path,
     device: torch.device,
     fsdp_export_dir: str | None = None,
 ) -> tuple[torch.nn.Module, Any, dict[str, Any]]:
-    merged_weights_path = merge_fsdp_model_weights(checkpoint_path, fsdp_export_dir)
-    # Build first: plugin construction transiently loads the fp32 Huginn backbone.
-    # Keeping the merged state dict out of memory during that operation reduces the
-    # CPU peak substantially on the one-GPU evaluation job.
+    source_dir = checkpoint_path / FSDP_MODEL_DIR_NAME
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"FSDP model checkpoint directory not found: {source_dir}")
+    if fsdp_export_dir:
+        print(f"[fsdp-stream] ignored_deprecated_export_dir={fsdp_export_dir}")
+
+    try:
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint import FileSystemReader
+    except Exception as exc:
+        raise RuntimeError("torch.distributed.checkpoint is required for FSDP streaming evaluation") from exc
+
+    # The base model stays on CPU until every DCP tensor has been copied into it.
+    # This avoids Accelerate's all-at-once merge, which exceeds the queue's 32G cap.
     base_model = plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
     target_state = base_model.state_dict()
-    merged_state = state_dict_from_file(merged_weights_path)
-    if not merged_state:
-        raise RuntimeError(f"Merged FSDP state dict is empty: {merged_weights_path}")
-    selected: dict[str, torch.Tensor] = {}
-    source_key_preview: list[str] = []
-    for source_key, tensor in merged_state.items():
-        for target_key in candidate_target_keys(source_key):
-            if target_key in target_state and target_state[target_key].shape == tensor.shape:
-                selected[target_key] = tensor
-                if len(source_key_preview) < 20:
-                    source_key_preview.append(source_key)
-                break
+    metadata = FileSystemReader(str(source_dir)).read_metadata()
+    state_metadata = getattr(metadata, "state_dict_metadata", {})
+    if not state_metadata:
+        raise RuntimeError(f"FSDP DCP metadata has no state entries: {source_dir}")
 
-    load_result = base_model.load_state_dict(selected, strict=False)
-    missing_critical = [key for key in load_result.missing_keys if key.startswith(FULL_TRAINED_PREFIXES)]
+    restore_plan: list[tuple[str, str, tuple[int, ...], torch.dtype]] = []
+    unmatched_source_keys: list[str] = []
+    for source_key, tensor_metadata in state_metadata.items():
+        source_key = str(source_key)
+        shape_value = getattr(tensor_metadata, "size", None)
+        properties = getattr(tensor_metadata, "properties", None)
+        source_dtype = getattr(properties, "dtype", None)
+        if shape_value is None or not isinstance(source_dtype, torch.dtype):
+            continue
+        shape = tuple(int(size) for size in shape_value)
+        matched_target_key = None
+        for target_key in candidate_target_keys(source_key):
+            if target_key in target_state and tuple(target_state[target_key].shape) == shape:
+                matched_target_key = target_key
+                break
+        if matched_target_key is None:
+            unmatched_source_keys.append(source_key)
+            continue
+        restore_plan.append((source_key, matched_target_key, shape, source_dtype))
+    if not restore_plan:
+        raise RuntimeError(f"No FSDP DCP tensors matched the Huginn audio model: {source_dir}")
+
+    print(f"[fsdp-stream] source_dir={source_dir}")
+    print(
+        f"[fsdp-stream] metadata_tensor_count={len(state_metadata)} "
+        f"restore_tensor_count={len(restore_plan)} unmatched_source_count={len(unmatched_source_keys)}"
+    )
+    restored_target_keys: set[str] = set()
+    source_key_preview: list[str] = []
+    for index, (source_key, target_key, shape, source_dtype) in enumerate(restore_plan, start=1):
+        # DCP reads only the requested key. Do not accumulate these temporary buffers.
+        streamed_tensor = torch.empty(shape, dtype=source_dtype, device="cpu")
+        dcp.load({source_key: streamed_tensor}, checkpoint_id=str(source_dir))
+        with torch.no_grad():
+            target_state[target_key].copy_(streamed_tensor.to(dtype=target_state[target_key].dtype))
+        restored_target_keys.add(target_key)
+        if len(source_key_preview) < 20:
+            source_key_preview.append(source_key)
+        del streamed_tensor
+        if index == 1 or index % 25 == 0 or index == len(restore_plan):
+            print(f"[fsdp-stream] restored_tensors={index}/{len(restore_plan)}", flush=True)
+
+    missing_critical = [
+        key for key in target_state if key.startswith(FULL_TRAINED_PREFIXES) and key not in restored_target_keys
+    ]
     # Huginn ties lm_head.weight to transformer.wte.weight. Some FSDP state-dict
     # exports retain only one side of this alias, which is still a complete restore.
     if (
         "lm_head.weight" in missing_critical
-        and "transformer.wte.weight" in selected
+        and "transformer.wte.weight" in restored_target_keys
         and bool(getattr(base_model.config, "tie_embeddings", False))
     ):
         missing_critical.remove("lm_head.weight")
     if missing_critical:
         raise RuntimeError(
-            f"Merged FSDP state did not restore critical trained tensors: {missing_critical[:20]} "
+            f"FSDP streaming restore did not recover critical trained tensors: {missing_critical[:20]} "
             f"(total={len(missing_critical)})"
         )
     if any(parameter.requires_grad for parameter in base_model.audio_encoder.parameters()):
@@ -234,23 +246,22 @@ def load_full_fsdp_base_model(
     base_model.to(device=device, dtype=torch.bfloat16)
     base_model.eval()
     processor = plugin.build_huginn_audio_processor()
-    aligner_loaded = sum(
-        1 for key in selected if key.startswith(ALIGNER_PREFIXES)
-    )
+    aligner_loaded = sum(1 for key in restored_target_keys if key.startswith(ALIGNER_PREFIXES))
     boundary_loaded = [
         key
-        for key in selected
+        for key in restored_target_keys
         if key.endswith((".audio_bos", ".audio_eos")) or key in {"audio_bos", "audio_eos"}
     ]
     return base_model, processor, {
         "checkpoint_dir": str(checkpoint_path),
-        "checkpoint_format": "fsdp_sharded_full",
+        "checkpoint_format": "fsdp_sharded_streaming",
         "lora_restored": False,
         "full_state_restored": True,
-        "fsdp_source_dir": str(checkpoint_path / FSDP_MODEL_DIR_NAME),
-        "merged_weights_path": str(merged_weights_path),
-        "merged_state_tensor_count": len(merged_state),
-        "restored_tensor_count": len(selected),
+        "fsdp_source_dir": str(source_dir),
+        "dcp_metadata_tensor_count": len(state_metadata),
+        "restored_tensor_count": len(restored_target_keys),
+        "unmatched_source_key_count": len(unmatched_source_keys),
+        "unmatched_source_key_preview": unmatched_source_keys[:20],
         "source_key_preview": source_key_preview,
         "missing_key_count": len(load_result.missing_keys),
         "unexpected_key_count": len(load_result.unexpected_keys),

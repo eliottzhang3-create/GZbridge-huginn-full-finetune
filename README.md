@@ -147,7 +147,7 @@ Whisper is never LoRA-wrapped or full-trained in either policy.
   - `save_only_model=false` so each FSDP checkpoint remains fully resumable if a same-world-size continuation is later requested.
 - the runtime prechecks manifest statistics, Swift argument compatibility, a clean output directory, and at least `200 GB` free storage.
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
-- FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators first merge `pytorch_model_fsdp_0` into a reusable full safetensors export and then load an ordinary one-GPU model; this new path is code-verified locally but awaits its first remote run.
+- FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming path was confirmed by a successful single-tensor DCP read and awaits its first full remote generation run.
 
 #### Historical but relevant routes
 
@@ -1024,7 +1024,7 @@ As of 2026-07-20:
 - single-GPU LoRA routes on ACAVCAPS/AudioCaps are historical validated baselines, not the only current path.
 - 8-GPU Swift FSDP2 initialization, one-step backward, 20-step stability, and sharded checkpoint resume have passed.
 - the formal 8-GPU run reached historical `checkpoint-2802` (epoch 1); the active operation is a fresh 7-GPU two-epoch run targeting `checkpoint-3203` and `checkpoint-6406`.
-- FSDP checkpoint evaluation is implemented in the existing Clotho retrieval, Clotho sample-generation, and MMAU-mini scripts. They merge the model DCP shards once to `checkpoint-2802_merged_full_state/model.safetensors`, then reuse that cache. Submit these one-GPU 5090 jobs sequentially, each with the queue-limited `8 CPU / 32G` request.
+- FSDP checkpoint evaluation is implemented in the existing Clotho retrieval, Clotho sample-generation, and MMAU-mini scripts. They stream DCP tensors directly from the original 8 shard files into a one-GPU model and never create a merged full-weight cache. Submit these one-GPU 5090 jobs sequentially, each with the queue-limited `8 CPU / 32G` request.
 - all remote work is still launched through `vc submit`; Codex edits only this local sync repository.
 
 ### AudioCaps v2 route (updated 2026-07-17)
