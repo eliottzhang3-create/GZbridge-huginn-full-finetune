@@ -27,16 +27,96 @@ BATCH_SIZE=8
 GRADIENT_ACCUMULATION_STEPS=4
 EXPECTED_LORA_TENSORS=66
 EXPECTED_ALIGNER_TENSORS=20
+ACTIVE_PID=""
+ACTIVE_STAGE=""
+MONITOR_PID=""
+
+print_resource_snapshot() {
+  echo "========== LOSATOK CHECKPOINT RESOURCE SNAPSHOT =========="
+  echo "snapshot_time=$(date '+%Y-%m-%d %H:%M:%S')"
+  echo "stage=${ACTIVE_STAGE:-none}"
+  if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
+    ps -o pid,ppid,rss,vsz,%mem,etime,stat,cmd -p "$ACTIVE_PID" || true
+  fi
+  nvidia-smi --query-gpu=index,name,utilization.gpu,memory.used,memory.total --format=csv,noheader || true
+  for cgroup_file in \
+    /sys/fs/cgroup/memory.current \
+    /sys/fs/cgroup/memory.max \
+    /sys/fs/cgroup/memory.events \
+    /sys/fs/cgroup/memory/memory.usage_in_bytes \
+    /sys/fs/cgroup/memory/memory.limit_in_bytes \
+    /sys/fs/cgroup/memory/memory.failcnt; do
+    if [ -r "$cgroup_file" ]; then
+      echo "[cgroup] $(basename "$cgroup_file")=$(tr '\n' ' ' < "$cgroup_file")"
+    fi
+  done
+  df -h "$RUN_ROOT" 2>/dev/null || true
+}
+
+resource_monitor() {
+  while [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; do
+    print_resource_snapshot
+    sleep 5
+  done
+}
+
+stop_resource_monitor() {
+  if [ -n "$MONITOR_PID" ] && kill -0 "$MONITOR_PID" 2>/dev/null; then
+    kill "$MONITOR_PID" 2>/dev/null || true
+    wait "$MONITOR_PID" 2>/dev/null || true
+  fi
+  MONITOR_PID=""
+}
+
+run_stage() {
+  local stage=$1
+  shift
+  ACTIVE_STAGE=$stage
+  echo "========== LOSATOK STAGE START =========="
+  echo "stage=$ACTIVE_STAGE"
+  "$@" &
+  ACTIVE_PID=$!
+  resource_monitor &
+  MONITOR_PID=$!
+  set +e
+  wait "$ACTIVE_PID"
+  local status=$?
+  set -e
+  stop_resource_monitor
+  print_resource_snapshot
+  ACTIVE_PID=""
+  if [ "$status" -ne 0 ]; then
+    echo "========== LOSATOK STAGE FAILED =========="
+    echo "stage=$ACTIVE_STAGE exit_status=$status"
+    return "$status"
+  fi
+  echo "========== LOSATOK STAGE PASSED =========="
+  echo "stage=$ACTIVE_STAGE"
+}
 
 on_exit() {
   status=$?
   trap - EXIT
+  stop_resource_monitor
   echo "========== HUGINN LOSATOK CHECKPOINT RESUME EXIT =========="
   echo "exit_status=$status"
   echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
   exit "$status"
 }
 trap on_exit EXIT
+
+on_signal() {
+  local signal_name=$1
+  echo "========== LOSATOK CHECKPOINT SIGNAL =========="
+  echo "signal=$signal_name stage=${ACTIVE_STAGE:-none}"
+  print_resource_snapshot
+  if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
+    kill -TERM "$ACTIVE_PID" 2>/dev/null || true
+  fi
+  exit 143
+}
+trap 'on_signal TERM' TERM
+trap 'on_signal INT' INT
 
 find_checkpoint() {
   local root=$1
@@ -84,6 +164,7 @@ python -u code/huginn_lora/scripts/smoke_huginn_losatok_swift.py \
   --record_count "$RECORD_COUNT"
 
 echo "========== LOSATOK SAVE PHASE =========="
+run_save_phase() {
 swift sft \
   --model "$MODEL_PATH" \
   --model_type huginn_losatok_raven \
@@ -117,6 +198,8 @@ swift sft \
   --save_only_model false \
   --report_to none \
   --bf16 true
+}
+run_stage save_phase run_save_phase
 
 CHECKPOINT_1="$(find_checkpoint "$SAVE_OUTPUT_DIR" checkpoint-1)"
 echo "========== LOSATOK CHECKPOINT-1 INSPECT =========="
@@ -124,6 +207,7 @@ echo "checkpoint_1=$CHECKPOINT_1"
 inspect_checkpoint "$CHECKPOINT_1" "$RUN_ROOT/checkpoint-1.inspect.json"
 
 echo "========== LOSATOK RESUME PHASE =========="
+run_resume_phase() {
 swift sft \
   --model "$MODEL_PATH" \
   --model_type huginn_losatok_raven \
@@ -158,6 +242,8 @@ swift sft \
   --report_to none \
   --bf16 true \
   --resume_from_checkpoint "$CHECKPOINT_1"
+}
+run_stage resume_phase run_resume_phase
 
 CHECKPOINT_2="$(find_checkpoint "$RESUME_OUTPUT_DIR" checkpoint-2)"
 echo "========== LOSATOK CHECKPOINT-2 INSPECT =========="
