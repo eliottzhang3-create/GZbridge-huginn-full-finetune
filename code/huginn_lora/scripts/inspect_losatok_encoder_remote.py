@@ -72,6 +72,20 @@ def read_pcm_wav(path: Path) -> tuple[torch.Tensor, int]:
     return torch.from_numpy(samples.copy()).unsqueeze(0), int(sample_rate)
 
 
+def torchaudio_usage_report(code_dir: Path) -> list[dict[str, Any]]:
+    """Show the exact upstream torchaudio call sites before attempting imports."""
+    matches: list[dict[str, Any]] = []
+    for source_path in sorted((code_dir / "modules").glob("*.py")):
+        for line_number, line in enumerate(source_path.read_text(encoding="utf-8").splitlines(), start=1):
+            if "torchaudio" in line or "audio_transforms" in line:
+                matches.append({
+                    "path": str(source_path.relative_to(code_dir)),
+                    "line": line_number,
+                    "source": line.strip(),
+                })
+    return matches
+
+
 def build_local_semantic_encoder_class(midasheng_dir: Path):
     """Use local MiDasheng without the official source's Hugging Face network ID."""
     import torch.nn as nn
@@ -145,8 +159,12 @@ def main() -> None:
     print(f"[paths] losatok_checkpoint={losatok_checkpoint} bytes={losatok_checkpoint.stat().st_size}")
     print(f"[paths] input_wav={input_wav}")
     print(f"[packages] {json.dumps(packages, ensure_ascii=False)}")
+    print(f"[torchaudio-usage] {json.dumps(torchaudio_usage_report(code_dir), ensure_ascii=False)}")
 
-    required_modules = ("yaml", "einops")
+    # LoSATok's Dasheng acoustic encoder imports torchaudio.transforms at module
+    # import time. librosa/soundfile are only used by the upstream infer CLI and
+    # are intentionally not required by this inspector.
+    required_modules = ("yaml", "einops", "torchaudio")
     unavailable = [name for name in required_modules if not packages[name].get("available")]
     if unavailable:
         raise RuntimeError(f"Required LoSATok Python modules are unavailable: {unavailable}")
