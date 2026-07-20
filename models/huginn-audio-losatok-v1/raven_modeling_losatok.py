@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+import importlib
 import sys
 from pathlib import Path
 from typing import Optional
@@ -59,8 +60,7 @@ class AudioBoundaryEmbeddings(nn.Module):
 
 
 def _build_local_semantic_encoder(midasheng_dir: Path):
-    from transformers import AutoModelForCausalLM
-    import semantic_bottleneck
+    semantic_bottleneck = importlib.import_module("semantic_bottleneck")
 
     class LocalSemanticEncoder(nn.Module):
         def __init__(self, high_dim: int = 1280, low_dim: int = 128, hidden_dim: int = 512):
@@ -102,8 +102,8 @@ class FrozenLoSATokEncoder(nn.Module):
                 raise FileNotFoundError(f"LoSATok required path is missing: {path}")
         if str(code_dir) not in sys.path:
             sys.path.insert(0, str(code_dir))
-        import yaml
-        import losatok
+        yaml = importlib.import_module("yaml")
+        losatok = importlib.import_module("losatok")
 
         losatok.SemanticEncoder = _build_local_semantic_encoder(midasheng_dir)
         yaml_config = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
