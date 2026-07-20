@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 import importlib
+import os
 import sys
 from pathlib import Path
 from typing import Optional
@@ -156,6 +157,18 @@ class FrozenLoSATokEncoder(nn.Module):
             if values is None:
                 raise KeyError(f"LoSATok output key {self.output_key!r} is unavailable: {sorted(encoded)}")
             outputs.append(values.detach().float())
+        audit_requested = os.environ.get("HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT", "").strip().lower() in {"1", "true", "yes"}
+        if audit_requested and os.environ.get("RANK", "0") == "0" and not getattr(self, "_audit_logged", False):
+            true_lengths = [int(mask.sum().item()) for mask in audio_attention_mask]
+            token_lengths = [int(values.size(1)) for values in outputs]
+            trainable = sum(parameter.numel() for parameter in self.parameters() if parameter.requires_grad)
+            print(
+                "[HuginnLoSATok] train_chain_audit_encoder "
+                f"padded_values={tuple(audio_input_values.shape)} true_sample_lengths={true_lengths} "
+                f"unified_token_lengths={token_lengths} unified_hidden_size={outputs[0].size(-1)} "
+                f"encoder_trainable={trainable}"
+            )
+            self._audit_logged = True
         return outputs
 
 
@@ -226,7 +239,18 @@ class HuginnLoSATokForConditionalGeneration(RavenForCausalLM):
         chunks.append(audio_embeds)
         if self.audio_eos is not None:
             chunks.append(self.audio_eos.expand(audio_embeds.size(0), -1, -1))
-        return torch.cat(chunks, dim=1)
+        prefix = torch.cat(chunks, dim=1)
+        audit_requested = os.environ.get("HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT", "").strip().lower() in {"1", "true", "yes"}
+        if audit_requested and os.environ.get("RANK", "0") == "0" and not getattr(self, "_prefix_audit_logged", False):
+            expected = self.config.audio_target_token_count + int(self.audio_bos is not None) + int(self.audio_eos is not None)
+            if prefix.size(1) != expected:
+                raise RuntimeError(f"LoSATok audio prefix mismatch: got={prefix.size(1)} expected={expected}")
+            print(
+                "[HuginnLoSATok] train_chain_audit_prefix "
+                f"compressed_tokens={self.config.audio_target_token_count} prefix={tuple(prefix.shape)}"
+            )
+            self._prefix_audit_logged = True
+        return prefix
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None,
                                       cache_position=None, audio_input_values=None, audio_attention_mask=None, **kwargs):
