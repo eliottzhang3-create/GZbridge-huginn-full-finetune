@@ -197,13 +197,22 @@ def main() -> None:
         )
     model.eval().to(args.device)
 
-    waveform, sample_rate = read_pcm_wav(input_wav)
+    waveform, source_sample_rate = read_pcm_wav(input_wav)
+    target_sample_rate = int(model.sample_rate)
+    if source_sample_rate != target_sample_rate:
+        import torchaudio
+
+        waveform = torchaudio.functional.resample(
+            waveform,
+            orig_freq=source_sample_rate,
+            new_freq=target_sample_rate,
+        )
+    sample_rate = target_sample_rate
     duration_seconds = waveform.shape[-1] / float(sample_rate)
-    if sample_rate != 16000:
-        raise ValueError(f"Expected the inspect WAV to be 16 kHz, got {sample_rate} Hz: {input_wav}")
     print(
-        f"[audio] sample_rate={sample_rate} waveform_shape={tuple(waveform.shape)} "
-        f"duration_seconds={duration_seconds:.6f}",
+        f"[audio] source_sample_rate={source_sample_rate} target_sample_rate={sample_rate} "
+        f"resample_method={'torchaudio_bandlimited_sinc' if source_sample_rate != sample_rate else 'none'} "
+        f"waveform_shape={tuple(waveform.shape)} duration_seconds={duration_seconds:.6f}",
         flush=True,
     )
 
@@ -221,6 +230,7 @@ def main() -> None:
         "midasheng_dir": str(midasheng_dir),
         "checkpoint": str(losatok_checkpoint),
         "input_wav": str(input_wav),
+        "source_sample_rate": source_sample_rate,
         "input_sample_rate": sample_rate,
         "input_duration_seconds": duration_seconds,
         "token_count": token_count,
