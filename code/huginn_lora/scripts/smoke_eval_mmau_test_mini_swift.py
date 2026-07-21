@@ -109,26 +109,33 @@ def tokenize_candidate(tokenizer: Any, prompt: str, choice: str) -> tuple[torch.
     return prompt_ids, full_ids[prompt_ids.shape[0]:]
 
 
-def prepare_audio_features(
+def prepare_audio_inputs(
     plugin: Any,
     processor: Any,
     audio_bytes: bytes,
     source_label: str,
     device: torch.device,
-) -> tuple[torch.Tensor, float]:
+) -> tuple[dict[str, torch.Tensor], float]:
+    if getattr(plugin, "MODEL_TYPE", None) == "huginn_losatok_raven":
+        waveform = plugin.decode_audio_bytes_16k(audio_bytes, source_label)
+        values = waveform.unsqueeze(0).to(device=device, dtype=torch.float32)
+        return {
+            "audio_input_values": values,
+            "audio_attention_mask": torch.ones_like(values, dtype=torch.long),
+        }, waveform.numel() / float(plugin.DEFAULT_SAMPLE_RATE)
     feature_extractor = processor.feature_extractor
     sample_rate = int(getattr(feature_extractor, "sampling_rate", plugin.DEFAULT_SAMPLE_RATE))
     waveform = plugin.decode_audio_with_ffmpeg_bytes(audio_bytes, source_label, sample_rate)
     waveform = plugin.trim_audio(waveform, sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
     features = feature_extractor([waveform], sampling_rate=sample_rate, return_tensors="pt")["input_features"]
-    return features.to(device=device, dtype=torch.bfloat16), len(waveform) / float(sample_rate)
+    return {"audio_input_features": features.to(device=device, dtype=torch.bfloat16)}, len(waveform) / float(sample_rate)
 
 
 def score_choice(
     model: torch.nn.Module,
     prompt_ids: torch.Tensor,
     candidate_ids: torch.Tensor,
-    audio_features: torch.Tensor,
+    audio_inputs: dict[str, torch.Tensor],
     device: torch.device,
     num_steps: int | None = None,
 ) -> dict[str, Any]:
@@ -138,8 +145,8 @@ def score_choice(
     prefill_kwargs: dict[str, Any] = {
         "input_ids": prompt_ids.unsqueeze(0).to(device),
         "attention_mask": attention_mask.unsqueeze(0),
-        "audio_input_features": audio_features,
         "use_cache": True,
+        **audio_inputs,
     }
     if num_steps is not None:
         prefill_kwargs["num_steps"] = num_steps
@@ -197,14 +204,14 @@ def evaluate_row(
         raise ValueError("MMAU test-mini answer is empty")
 
     audio_bytes, metadata = extract_embedded_audio(row)
-    audio_features, used_seconds = prepare_audio_features(plugin, processor, audio_bytes, metadata["id"], device)
+    audio_inputs, used_seconds = prepare_audio_inputs(plugin, processor, audio_bytes, metadata["id"], device)
     prompt = build_prompt(plugin, instruction, choices)
     tokenizer = processor.tokenizer
     prompt_ids, _ = tokenize_candidate(tokenizer, prompt, choices[0])
     choice_scores = []
     for choice in choices:
         _, candidate_ids = tokenize_candidate(tokenizer, prompt, choice)
-        score = score_choice(model, prompt_ids, candidate_ids, audio_features, device, num_steps=num_steps)
+        score = score_choice(model, prompt_ids, candidate_ids, audio_inputs, device, num_steps=num_steps)
         choice_scores.append({"choice": choice, **score})
 
     predicted_index = max(range(len(choice_scores)), key=lambda index: choice_scores[index]["mean_logprob"])

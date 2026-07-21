@@ -19,6 +19,7 @@ SAMPLE_COUNT="${CLOTHO_CAPTION_SAMPLE_COUNT:-3}"
 MAX_NEW_TOKENS="${CLOTHO_CAPTION_MAX_NEW_TOKENS:-64}"
 CHECKPOINTS_RAW="${CLOTHO_CAPTION_CHECKPOINTS:-}"
 FSDP_EXPORT_DIR="${HUGINN_AUDIO_FSDP_EVAL_EXPORT_DIR:-}"
+PLUGIN_PATH="${CLOTHO_CAPTION_PLUGIN_PATH:-$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_swift.py}"
 
 checkpoint_slug() {
   local checkpoint="${1%/}"
@@ -43,12 +44,14 @@ generate_one_checkpoint() {
   echo "max_new_tokens=$MAX_NEW_TOKENS"
   echo "generation_path=audio_manual_cache"
   echo "fsdp_export_dir=${FSDP_EXPORT_DIR:-<checkpoint-sibling-default>}"
+  echo "plugin_path=$PLUGIN_PATH"
 
   CMD=(python -u code/huginn_lora/scripts/generate_clotho_caption_samples_swift.py \
     --checkpoint "$checkpoint" \
     --output-dir "$output_dir" \
     --sample-count "$SAMPLE_COUNT" \
-    --max-new-tokens "$MAX_NEW_TOKENS")
+    --max-new-tokens "$MAX_NEW_TOKENS" \
+    --plugin-path "$PLUGIN_PATH")
   if [ -n "$FSDP_EXPORT_DIR" ]; then
     CMD+=(--fsdp-export-dir "$FSDP_EXPORT_DIR")
   fi

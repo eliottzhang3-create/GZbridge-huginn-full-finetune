@@ -98,6 +98,25 @@ def load_audio_16k(path: Path) -> torch.Tensor:
     return waveform
 
 
+def decode_audio_bytes_16k(audio_bytes: bytes, source_label: str) -> torch.Tensor:
+    """Decode MMAU's embedded media bytes through ffmpeg into the LoSATok input form."""
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError("ffmpeg is required to decode embedded MMAU audio")
+    command = [
+        ffmpeg, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", "pipe:0",
+        "-f", "f32le", "-ac", "1", "-ar", str(DEFAULT_SAMPLE_RATE), "pipe:1",
+    ]
+    result = subprocess.run(command, input=audio_bytes, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg failed to decode embedded audio {source_label}: {result.stderr.decode(errors='replace')}")
+    waveform = torch.from_numpy(np.frombuffer(result.stdout, dtype=np.float32).copy())
+    waveform = waveform[:int(DEFAULT_SAMPLE_RATE * DEFAULT_MAX_AUDIO_SECONDS)].contiguous()
+    if waveform.numel() == 0:
+        raise ValueError(f"Embedded audio decoded to an empty waveform: {source_label}")
+    return waveform
+
+
 class HuginnLoSATokProcessor:
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
@@ -271,6 +290,15 @@ def build_model(model_dir: str) -> torch.nn.Module:
     model.audio_encoder.eval()
     audit_model_split(model)
     return patch_shift_loss(model)
+
+
+def build_huginn_losatok_evaluation_model() -> torch.nn.Module:
+    """Public evaluation entrypoint used by retrieval, generation, and MMAU scripts."""
+    return build_model(str(AUDIO_MODEL_DIR))
+
+
+def build_huginn_losatok_evaluation_processor() -> HuginnLoSATokProcessor:
+    return build_processor()
 
 
 class HuginnLoSATokTemplate(Template):

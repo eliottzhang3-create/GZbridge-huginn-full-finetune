@@ -22,6 +22,7 @@ LOG_EVERY="${MMAU_LOG_EVERY:-10}"
 NUM_STEPS="${MMAU_NUM_STEPS:-}"
 CHECKPOINTS_RAW="${MMAU_CHECKPOINTS:-}"
 FSDP_EXPORT_DIR="${HUGINN_AUDIO_FSDP_EVAL_EXPORT_DIR:-}"
+PLUGIN_PATH="${MMAU_PLUGIN_PATH:-$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_swift.py}"
 
 MAX_SAMPLES_ARGS=()
 if [ -n "$MAX_SAMPLES" ]; then
@@ -55,11 +56,13 @@ evaluate_one_checkpoint() {
   echo "start_offset=$START_OFFSET max_samples=${MAX_SAMPLES:-<all>} log_every=$LOG_EVERY"
   echo "num_steps=${NUM_STEPS:-<config.mean_recurrence>}"
   echo "fsdp_export_dir=${FSDP_EXPORT_DIR:-<checkpoint-sibling-default>}"
+  echo "plugin_path=$PLUGIN_PATH"
 
   CMD=(python -u code/huginn_lora/scripts/eval_mmau_test_mini_swift.py \
     --checkpoint "$checkpoint" \
     --dataset-path "$DATASET_PATH" \
     --output-dir "$output_dir" \
+    --plugin-path "$PLUGIN_PATH" \
     --start-offset "$START_OFFSET" \
     --log-every "$LOG_EVERY" \
     "${MAX_SAMPLES_ARGS[@]}" \

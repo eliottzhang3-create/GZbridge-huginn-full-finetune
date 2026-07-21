@@ -17,6 +17,7 @@ OUTPUT_DIR="${SWIFT_RETRIEVAL_OUTPUT_DIR:-$REPO_ROOT/outputs/huginn_audio_retrie
 SAMPLE_COUNT="${SWIFT_RETRIEVAL_SAMPLE_COUNT:-all}"
 CHECKPOINTS_RAW="${SWIFT_RETRIEVAL_CHECKPOINTS:-}"
 FSDP_EXPORT_DIR="${HUGINN_AUDIO_FSDP_EVAL_EXPORT_DIR:-}"
+PLUGIN_PATH="${SWIFT_RETRIEVAL_PLUGIN_PATH:-$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_swift.py}"
 CHECKPOINT_ARGS=()
 FSDP_EXPORT_ARGS=()
 
@@ -45,9 +46,11 @@ echo "output_dir=$OUTPUT_DIR"
 echo "sample_count=$SAMPLE_COUNT"
 echo "checkpoints=${CHECKPOINTS_RAW:-<script-defaults>}"
 echo "fsdp_export_dir=${FSDP_EXPORT_DIR:-<checkpoint-sibling-default>}"
+echo "plugin_path=$PLUGIN_PATH"
 
 python -u code/huginn_lora/scripts/eval_huginn_audio_text_retrieval_swift.py \
   --output_dir "$OUTPUT_DIR" \
   --sample_count "$SAMPLE_COUNT" \
+  --plugin_path "$PLUGIN_PATH" \
   "${FSDP_EXPORT_ARGS[@]}" \
   "${CHECKPOINT_ARGS[@]}"

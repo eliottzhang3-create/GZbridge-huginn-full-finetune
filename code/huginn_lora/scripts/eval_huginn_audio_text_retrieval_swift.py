@@ -222,12 +222,18 @@ def load_checkpoint(
     checkpoint_path = Path(checkpoint_dir)
     if not checkpoint_path.is_dir():
         raise FileNotFoundError(f'Checkpoint directory not found: {checkpoint_path}')
+    is_losatok = getattr(plugin, 'MODEL_TYPE', None) == 'huginn_losatok_raven'
     if is_fsdp_sharded_checkpoint(checkpoint_path):
+        if is_losatok:
+            raise RuntimeError('LoSATok retrieval currently supports Swift LoRA checkpoints, not FSDP checkpoints')
         # Full FSDP updates both the projector path and Huginn's text embedding table.
         # It must therefore restore the complete model, unlike the LoRA-only path below.
         return load_full_fsdp_base_model(plugin, checkpoint_path, device, fsdp_export_dir)
 
-    base_model = plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
+    base_model = (
+        plugin.build_huginn_losatok_evaluation_model()
+        if is_losatok else plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
+    )
     # This retrieval definition never runs Huginn recurrent blocks. It uses only
     # the projector-side audio tokens and the frozen raw text embedding table, so
     # LoRA weights cannot affect its result and are deliberately not restored.
@@ -235,7 +241,10 @@ def load_checkpoint(
     if any(parameter.requires_grad for parameter in base_model.audio_encoder.parameters()):
         raise RuntimeError('Audio encoder unexpectedly became trainable during evaluation restore')
 
-    processor = plugin.build_huginn_audio_processor()
+    processor = (
+        plugin.build_huginn_losatok_evaluation_processor()
+        if is_losatok else plugin.build_huginn_audio_processor()
+    )
     base_model.to(device=device, dtype=torch.bfloat16)
     base_model.eval()
     return base_model, processor, {
@@ -265,20 +274,40 @@ def compute_audio_embeddings(
     batch_size: int,
 ) -> torch.Tensor:
     embeddings = []
-    feature_extractor = processor.feature_extractor
-    sample_rate = int(getattr(feature_extractor, 'sampling_rate', plugin.DEFAULT_SAMPLE_RATE))
+    is_losatok = getattr(plugin, 'MODEL_TYPE', None) == 'huginn_losatok_raven'
+    feature_extractor = None if is_losatok else processor.feature_extractor
+    sample_rate = plugin.DEFAULT_SAMPLE_RATE if is_losatok else int(
+        getattr(feature_extractor, 'sampling_rate', plugin.DEFAULT_SAMPLE_RATE)
+    )
     for start in range(0, len(groups), batch_size):
         batch_groups = groups[start:start + batch_size]
-        waveforms = [
-            plugin.load_audio_file(Path(audio_path), sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
-            for audio_path, _ in batch_groups
-        ]
-        inputs = feature_extractor(waveforms, sampling_rate=sample_rate, return_tensors='pt')
-        features = inputs['input_features'].to(device=device, dtype=torch.bfloat16)
-        with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
-            encoded = audio_model.audio_encoder(input_features=features, return_dict=True).last_hidden_state
-            projected = audio_model.audio_projector(audio_model.temporal_compressor(encoded))
-            embeddings.append(mean_pool(projected).float())
+        if is_losatok:
+            waveforms = [plugin.load_audio_16k(Path(audio_path)) for audio_path, _ in batch_groups]
+            max_length = max(waveform.numel() for waveform in waveforms)
+            values = torch.zeros((len(waveforms), max_length), device=device, dtype=torch.float32)
+            mask = torch.zeros((len(waveforms), max_length), device=device, dtype=torch.long)
+            for index, waveform in enumerate(waveforms):
+                values[index, :waveform.numel()] = waveform.to(device=device)
+                mask[index, :waveform.numel()] = 1
+            with torch.inference_mode():
+                token_sequences = audio_model.audio_encoder(values, mask)
+                aligner_dtype = next(audio_model.temporal_compressor.parameters()).dtype
+                projected = torch.cat([
+                    audio_model.audio_projector(audio_model.temporal_compressor(tokens.to(dtype=aligner_dtype)))
+                    for tokens in token_sequences
+                ], dim=0)
+                embeddings.append(mean_pool(projected).float())
+        else:
+            waveforms = [
+                plugin.load_audio_file(Path(audio_path), sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
+                for audio_path, _ in batch_groups
+            ]
+            inputs = feature_extractor(waveforms, sampling_rate=sample_rate, return_tensors='pt')
+            features = inputs['input_features'].to(device=device, dtype=torch.bfloat16)
+            with torch.inference_mode(), torch.autocast(device_type='cuda', dtype=torch.bfloat16):
+                encoded = audio_model.audio_encoder(input_features=features, return_dict=True).last_hidden_state
+                projected = audio_model.audio_projector(audio_model.temporal_compressor(encoded))
+                embeddings.append(mean_pool(projected).float())
         print(f'[retrieval] audio_batches={start + len(batch_groups)}/{len(groups)}', flush=True)
     return torch.cat(embeddings, dim=0)
 

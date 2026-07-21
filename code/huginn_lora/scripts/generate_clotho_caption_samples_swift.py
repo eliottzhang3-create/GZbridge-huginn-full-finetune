@@ -285,14 +285,20 @@ def load_generation_model(
     checkpoint_path = Path(checkpoint_dir)
     if not checkpoint_path.is_dir():
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_path}")
+    is_losatok = getattr(plugin, "MODEL_TYPE", None) == "huginn_losatok_raven"
     if is_fsdp_sharded_checkpoint(checkpoint_path):
+        if is_losatok:
+            raise RuntimeError("LoSATok evaluation currently supports Swift LoRA checkpoints, not FSDP checkpoints")
         return load_full_fsdp_base_model(plugin, checkpoint_path, device, fsdp_export_dir)
 
     adapter_path = checkpoint_path / "adapter_model.safetensors"
     if not adapter_path.is_file():
         raise FileNotFoundError(f"LoRA adapter file not found: {adapter_path}")
 
-    base_model = plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
+    base_model = (
+        plugin.build_huginn_losatok_evaluation_model()
+        if is_losatok else plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
+    )
     aligner_report = load_aligner_state(base_model, checkpoint_path)
     if any(parameter.requires_grad for parameter in base_model.audio_encoder.parameters()):
         raise RuntimeError("Audio encoder unexpectedly became trainable during generation restore")
@@ -302,14 +308,16 @@ def load_generation_model(
     peft_model = PeftModel.from_pretrained(base_model, str(checkpoint_path), is_trainable=False)
     peft_model.to(device=device, dtype=torch.bfloat16)
     peft_model.eval()
-    # PEFT injects LoRA layers into this underlying model. Calling its generate
-    # method directly preserves those layers while exposing audio_input_features
-    # to Transformers' generation-kwargs validator.
+    # PEFT injects LoRA layers into this underlying model. Calling it directly
+    # preserves LoRA while exposing the plugin-specific audio inputs.
     model = peft_model.base_model.model
     if not hasattr(model, "audio_encoder") or not hasattr(model, "audio_projector"):
         raise TypeError(f"Unexpected PEFT base model type: {type(model)}")
     model.eval()
-    processor = plugin.build_huginn_audio_processor()
+    processor = (
+        plugin.build_huginn_losatok_evaluation_processor()
+        if is_losatok else plugin.build_huginn_audio_processor()
+    )
     lora_tensor_count = len(state_dict_from_file(adapter_path))
     injected_lora_module_count = sum(1 for name, _ in model.named_modules() if "lora_A" in name)
     if injected_lora_module_count == 0:
@@ -398,16 +406,25 @@ def generate_caption(
     max_new_tokens: int,
     device: torch.device,
 ) -> dict[str, Any]:
-    feature_extractor = processor.feature_extractor
     tokenizer = processor.tokenizer
-    sample_rate = int(getattr(feature_extractor, "sampling_rate", plugin.DEFAULT_SAMPLE_RATE))
-    waveform = plugin.load_audio_file(audio_path, sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
-    features = feature_extractor([waveform], sampling_rate=sample_rate, return_tensors="pt")["input_features"]
+    is_losatok = getattr(plugin, "MODEL_TYPE", None) == "huginn_losatok_raven"
+    if is_losatok:
+        waveform = plugin.load_audio_16k(audio_path)
+        sample_rate = plugin.DEFAULT_SAMPLE_RATE
+        audio_inputs = {
+            "audio_input_values": waveform.unsqueeze(0).to(device=device, dtype=torch.float32),
+            "audio_attention_mask": torch.ones((1, waveform.numel()), device=device, dtype=torch.long),
+        }
+    else:
+        feature_extractor = processor.feature_extractor
+        sample_rate = int(getattr(feature_extractor, "sampling_rate", plugin.DEFAULT_SAMPLE_RATE))
+        waveform = plugin.load_audio_file(audio_path, sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
+        features = feature_extractor([waveform], sampling_rate=sample_rate, return_tensors="pt")["input_features"]
+        audio_inputs = {"audio_input_features": features.to(device=device, dtype=torch.bfloat16)}
     prompt = build_prompt(plugin)
     tokenized = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
     input_ids = tokenized["input_ids"].to(device)
     attention_mask = tokenized["attention_mask"].to(device)
-    audio_features = features.to(device=device, dtype=torch.bfloat16)
 
     stop_token_ids = {
         token_id
@@ -423,8 +440,8 @@ def generate_caption(
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
-            audio_input_features=audio_features,
             use_cache=True,
+            **audio_inputs,
         )
         if outputs.logits is None or outputs.past_key_values is None:
             raise RuntimeError("Audio prefill did not return logits and a Huginn KV cache")
