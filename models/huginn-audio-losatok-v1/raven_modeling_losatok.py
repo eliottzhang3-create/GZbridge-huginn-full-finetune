@@ -147,17 +147,34 @@ class FrozenLoSATokEncoder(nn.Module):
         if audio_input_values.ndim != 2 or audio_attention_mask.shape != audio_input_values.shape:
             raise ValueError("LoSATok audio values and attention mask must both have shape [batch, samples]")
         device = next(self.model.parameters()).device
+        patch_embed = self.model.dasheng_tokenizer.encoder.patch_embed
+        patch_embed_dtype = patch_embed.weight.dtype
+        use_encoder_autocast = device.type == "cuda" and patch_embed_dtype in {torch.bfloat16, torch.float16}
+        audit_requested = os.environ.get("HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT", "").strip().lower() in {"1", "true", "yes"}
+        if audit_requested and os.environ.get("RANK", "0") == "0" and not getattr(
+            self, "_dtype_audit_logged", False
+        ):
+            print(
+                "[HuginnLoSATok] train_chain_audit_encoder_dtype "
+                f"waveform_dtype={audio_input_values.dtype} patch_embed_dtype={patch_embed_dtype} "
+                f"patch_embed_device={patch_embed.weight.device} autocast={use_encoder_autocast}"
+            )
+            self._dtype_audit_logged = True
         outputs: list[torch.Tensor] = []
         for waveform, mask in zip(audio_input_values, audio_attention_mask):
             length = int(mask.sum().item())
             if length <= 0:
                 raise ValueError("LoSATok received an empty audio waveform")
-            encoded = self.model.encoder_forward(waveform[:length].unsqueeze(0).to(device=device, dtype=torch.float32))
+            encoder_input = waveform[:length].unsqueeze(0).to(device=device, dtype=torch.float32)
+            if use_encoder_autocast:
+                with torch.autocast(device_type="cuda", dtype=patch_embed_dtype):
+                    encoded = self.model.encoder_forward(encoder_input)
+            else:
+                encoded = self.model.encoder_forward(encoder_input)
             values = encoded.get(self.output_key)
             if values is None:
                 raise KeyError(f"LoSATok output key {self.output_key!r} is unavailable: {sorted(encoded)}")
             outputs.append(values.detach().float())
-        audit_requested = os.environ.get("HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT", "").strip().lower() in {"1", "true", "yes"}
         if audit_requested and os.environ.get("RANK", "0") == "0" and not getattr(self, "_audit_logged", False):
             true_lengths = [int(mask.sum().item()) for mask in audio_attention_mask]
             token_lengths = [int(values.size(1)) for values in outputs]
