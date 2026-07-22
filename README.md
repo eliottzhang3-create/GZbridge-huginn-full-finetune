@@ -49,16 +49,16 @@ This repo contains **two major experiment families**:
      - the current **Swift multimodal route** in `code/huginn_lora`
    - objective: audio-to-text understanding and modality alignment, not speech generation
 
-### Current highest-priority tasks (updated 2026-07-20)
+### Current highest-priority tasks (updated 2026-07-22)
 
-Two audio lines now run in parallel and must remain separate:
+Two audio lines coexist and must remain strictly separate:
 
-1. **Whisper-large FSDP full training** remains the long-running formal AudioCaps-v2 run on the original Huginn backbone with 7 RTX 5090 GPUs. The historical 8-GPU `checkpoint-2802` is not a resume source; no cross-world-size FSDP restore is part of that plan.
-2. **LoSATok replacement branch** is the current development task. It keeps Swift and the LoRA policy, replaces only Whisper-large with a frozen LoSATok encoder, and has completed Swift parameter, real forward/backward, and checkpoint save/resume validation. The fresh three-epoch AudioCaps-v2 formal LoRA script is now ready for submission.
+1. **Whisper-large FSDP full finetuning** uses frozen Whisper-large, a full-trainable aligner, and full-trainable Huginn under Swift FSDP2. The historical 8-GPU `checkpoint-2802` is an evaluation artifact, not a cross-world-size resume source. Do not infer the current remote job state without a user-supplied log.
+2. **LoSATok Swift LoRA continuation** is the current single-GPU experimental line. It uses a frozen official LoSATok stack, a full-trainable aligner, and Huginn LoRA. Its three-epoch AudioCaps-v2 training is complete, and a one-epoch ClothoAQA warm-start from its epoch-1 checkpoint is also complete. Current immediate work is evaluation, beginning with MMAU `test_mini` for the ClothoAQA checkpoint.
 
-The audio architecture is:
+The shared audio architecture is:
 
-- frozen Whisper-large audio encoder
+- frozen audio encoder: Whisper-large on the Whisper route, or full LoSATok on the LoSATok route
 - trainable aligner: temporal compressor, audio projector, and audio boundary embeddings
 - Huginn text backbone
 - audio prefix of `audio_bos + 32 compressed audio tokens + audio_eos`, concatenated before text embeddings
@@ -80,7 +80,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 
 ### Current execution status
 
-#### LoSATok Swift LoRA replacement branch: current status
+#### LoSATok Swift LoRA replacement branch: completed training and active evaluation
 
 - The official LoSATok code and weights are remote-only assets; they are deliberately not committed to this sync repository.
 - Remote LoSATok asset roots:
@@ -117,13 +117,37 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   4. use `unified_emb` rather than the 128-dimensional low bottleneck output;
   5. use compressor stride `4`, then `AdaptiveAvgPool1d(32)`, because LoSATok is about 25 Hz and the Whisper stride `12` would over-compress short clips before the 32-token pool;
   6. preserve the official LoSATok load dtypes when Swift casts Huginn and the trainable aligner to BF16 (MiDasheng begins in BF16 while other official modules retain their own dtype); cast only the frozen encoder output at the compressor boundary.
-- Formal LoSATok AudioCaps-v2 LoRA entrypoints:
+- Formal LoSATok AudioCaps-v2 LoRA run: completed remotely.
   - runtime: `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_swift_5090.sh`
   - submit: `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_swift_5090.sh`
-  - default training: 3 epochs, `B=8`, `GA=4`, effective batch 32, Huginn/aligner LR `1e-4`, TensorBoard enabled, dataset and DataLoader shuffle enabled, first-30-second truncation, and one full resumable checkpoint per epoch.
-  - expected updates: `2802` per epoch and `8406` over 3 epochs; expected epoch checkpoints are approximately `checkpoint-2802`, `checkpoint-5604`, and `checkpoint-8406`.
+  - configuration: 3 epochs, `B=8`, `GA=4`, effective batch 32, Huginn/aligner LR `1e-4`, TensorBoard, dataset/DataLoader shuffle, first-30-second truncation, and one full checkpoint per epoch.
+  - completed run root:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_losatok_audiocaps_v2_train_e3_b8ga4_5090/v1-20260720-162632`
+  - known epoch checkpoints:
+    - `checkpoint-2802`
+    - `checkpoint-5604`
+    - `checkpoint-8406`
+- LoSATok ClothoAQA LoRA warm-start: completed remotely.
+  - source checkpoint:
+    - the LoSATok AudioCaps epoch-1 `checkpoint-2802` above
+  - semantic rule: this is a **weight warm-start**, not a Trainer resume. The runtime sets `HUGINN_LOSATOK_INIT_ALIGNER_CHECKPOINT=<checkpoint>` and Swift receives `--adapters <checkpoint> --load_args false`; LoRA plus aligner weights are restored, while optimizer, scheduler, RNG, global step, and data position start fresh for ClothoAQA.
+  - the plugin now strictly restores all `20` tensors in `vit.safetensors` before PEFT loads the `66` LoRA tensors; this includes `audio_bos` and `audio_eos`. It then re-enables the aligner while asserting LoSATok remains frozen.
+  - runtime and submit scripts:
+    - `code/huginn_lora/scripts/train_clotho_aqa_huginn_losatok_swift_5090.sh`
+    - `code/huginn_lora/run_train_clotho_aqa_huginn_losatok_swift_5090.sh`
+  - completed run checkpoint:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_losatok_clothoaqa_e1_warmstart2802_b8ga4_5090/v0-20260722-024418/checkpoint-659`
+  - configuration: 1 epoch, `B=8`, `GA=4`, effective batch 32, LoRA/aligner LR `1e-4`, one epoch checkpoint, TensorBoard, and 10-second resource snapshots.
+- Current LoSATok MMAU-mini evaluation target:
+  - checkpoint: the ClothoAQA `checkpoint-659` above
+  - submit script: `code/huginn_lora/run_eval_mmau_test_mini_losatok_swift_5090.sh`
+  - output directory: `outputs/mmau_test_mini_losatok_clothoaqa_e1_checkpoint659`
+  - no MMAU result has been supplied yet; do not claim a score.
+- LoSATok evaluation restore rules:
+  - caption generation and MMAU restore both LoRA (`66` tensors) and aligner (`20` tensors);
+  - retrieval restores the aligner only because its definition pools encoder/projector tokens and raw Huginn input embeddings without running LoRA-modified recurrent blocks.
 
-#### Verified end-to-end multimodal chain
+#### Verified Whisper end-to-end multimodal chain
 
 - framework: `swift==4.1.3`, using `swift sft`
 - model package: `models/huginn-audio-whisper-v1`
@@ -173,7 +197,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   - 20-step 8-GPU stability smoke passed with `exit_status=0`, around `53.8 s/update`, and about `26.3 GiB` GPU memory.
   - 8-GPU sharded save/resume passed: a saved `checkpoint-2` resumed in a fresh job and produced `checkpoint-3`, validating FSDP model, optimizer, scheduler, RNG, and Trainer state recovery.
 
-#### Formal FSDP run and current fresh plan
+#### Formal FSDP run and historical fresh-run plan
 
 - runtime script:
   - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_full_fsdp8.sh`
@@ -184,7 +208,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   - `2802` updates make one 8-GPU epoch
   - completed checkpoint:
     - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_full_fsdp8_e2_b1ga4/v0-20260717-084419/checkpoint-2802`
-- active 7-GPU fresh run:
+- 7-GPU fresh-run plan (do not assume it is still active without logs):
   - initializes from the original Huginn audio model; it passes no `resume_from_checkpoint` and has no dependency on `checkpoint-2802`
   - keeps the same FSDP2 configuration, micro-batch `1`, and gradient accumulation `4`; global effective batch is `28`
   - `89658` samples produce `3203` optimizer updates per 7-GPU epoch and `6406` updates across 2 epochs
@@ -207,7 +231,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   - warm-start source: AudioCaps `checkpoint-5604`
   - corrected checkpoints save all `20` aligner tensors, including `audio_bos` and `audio_eos`
   - do not claim its multi-epoch training completed without a final remote log.
-- Planned LoRA continuation after WavCaps (not yet inspected or trained as of this README update):
+- Historical planned LoRA continuation after WavCaps (not the active LoSATok continuation and not confirmed as executed):
   - start checkpoint:
     - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_wavcaps_audioset_sl_e2_warmstart5604_b8ga4_5090/v0-20260715-101351/checkpoint-6754`
   - stage 1: one epoch of direct full concatenation of AudioCaps-v2 and Clotho-v2 caption records, both learning rates `5e-5`
@@ -219,11 +243,11 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 
 The practical mainline is:
 
-1. do not disturb the fresh Whisper-large FSDP run on 7 GPUs;
-2. submit and monitor the fresh formal three-epoch LoSATok AudioCaps-v2 LoRA run;
-3. keep FSDP checkpoint streaming evaluation separate from LoRA adapter checkpoint handling;
-4. keep historical Whisper LoRA continuation/evaluation separate from the fresh LoSATok route;
-5. submit all remote jobs through matching `vc submit` wrappers.
+1. do not disturb any active Whisper-large FSDP job; its runtime state must be established from logs, not guessed;
+2. treat the LoSATok AudioCaps-v2 and ClothoAQA training runs above as completed checkpoint sources;
+3. evaluate LoSATok and Whisper checkpoints only with their matching model/plugin path;
+4. keep FSDP checkpoint streaming evaluation separate from LoRA adapter checkpoint handling;
+5. submit all remote work through matching `vc submit` wrappers.
 
 ---
 
@@ -280,7 +304,7 @@ Codex **cannot directly operate on the remote server**. Any remote command must 
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/code/huginn_lora/LosatokCode`
 
 - Remote Whisper encoder root:
-  - current mainline:
+  - Whisper route:
     - `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large`
   - historical / earlier audio branch:
     - `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-small`
@@ -300,15 +324,15 @@ Codex **cannot directly operate on the remote server**. Any remote command must 
 
 Do not casually change the container unless the user explicitly asks.
 
-### Current remote dataset / artifact roots that matter for the Swift audio line
+### Remote dataset / artifact roots that matter for the Swift audio line
 
 - Public ACAVCAPS tar-shard root:
   - `/hpc_stor03/public/shared/data/raa/ACAVCAPS`
 - Remote repo-side generated Swift dataset artifacts:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps`
-- Current formal subset chunk directory:
+- Historical formal subset chunk directory:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/subset_56_full_1tar_chunks`
-- Current formal curriculum master:
+- Historical formal curriculum master:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/acavcaps_subset_56_full_curriculum_ordered.jsonl`
 - Personal AudioCaps v2 root (inspected and manifest-prepared):
   - `/hpc_stor03/sjtu_home/jinwei.zhang/data/audiocaps_v2`
@@ -350,13 +374,13 @@ Important note:
 
 ## Queue / Submission Constraints
 
-The current queue in active use for the Swift audio **formal-training** line is:
+The current default queue for new Swift audio training and evaluation jobs is:
 
 - `pdgpu-5090`
 
-Historical / smoke / preparation queue:
+Historical scripts may still name:
 
-- `pdgpu-3090`
+- `pdgpu-3090`; do not select it by default unless the user explicitly asks.
 
 Important queue rule from the user:
 
@@ -413,6 +437,11 @@ repo-root/
       raven_modeling_minimal.py
       config.json
       __init__.py
+    huginn-audio-losatok-v1/
+      _base.py
+      raven_config_losatok.py
+      raven_modeling_losatok.py
+      config.json
   code/
     recurrent-pretraining-main/
       finetuning_test_gsm8k_fsdp.py
@@ -436,6 +465,7 @@ repo-root/
       plugins/
         huginn_swift.py
         huginn_audio_swift.py
+        huginn_losatok_swift.py
         huginn_swift_39.py
       scripts/
         train_huginn_sft_lora.sh
@@ -459,6 +489,9 @@ repo-root/
         prepare_acavcaps_formal_chunked_swift_dataset_limited.sh
         prepare_acavcaps_formal_full_chunked_swift_dataset.sh
         train_acavcaps_huginn_audio_swift_mid.sh
+        prepare_clotho_aqa_huginn_losatok_swift_dataset.sh
+        train_audiocaps_v2_huginn_losatok_swift_5090.sh
+        train_clotho_aqa_huginn_losatok_swift_5090.sh
       run_smoke_huginn_audio_swift_5090.sh
       run_smoke_huginn_audio_swift_3090.sh
       run_inspect_swift_mllm_registration_5090.sh
@@ -659,9 +692,9 @@ Important clarification:
   - full-train `aligner`
   - LoRA-train Huginn language model only
 
-### Current architecture details that matter
+### Whisper architecture details that matter
 
-For the current `models/huginn-audio-whisper-v1` implementation:
+For the Whisper-specific `models/huginn-audio-whisper-v1` implementation:
 
 - Whisper output:
   - `last_hidden_state: [B, T_audio, hidden_audio]`
@@ -683,6 +716,17 @@ For the current `models/huginn-audio-whisper-v1` implementation:
   - optional `audio_eos`
 - final audio prefix:
   - prepended before text embeddings
+
+### LoSATok architecture details that matter
+
+For `models/huginn-audio-losatok-v1` and `huginn_losatok_swift.py`:
+
+- input audio is decoded to mono 16 kHz, deterministically truncated to the first 30 seconds;
+- LoSATok emits `unified_emb: [B, T, 1280]` at about 25 Hz;
+- batch waveforms are padded only for collation. The wrapper slices every item back to its true length and encodes examples individually because the upstream LoSATok encoder-forward does not apply an input attention mask;
+- trainable alignment path: LoSATok `unified_emb` -> stride-4 temporal compressor -> `AdaptiveAvgPool1d(32)` -> projector to Huginn width `5280` -> learned BOS/EOS boundaries;
+- final prefix remains 34 tokens: `audio_bos + 32 audio tokens + audio_eos`;
+- all official LoSATok modules stay frozen. Only compressor, projector, boundary embeddings, and Huginn LoRA tensors train.
 
 ### Important model files
 
@@ -707,6 +751,13 @@ For the current `models/huginn-audio-whisper-v1` implementation:
 - `code/huginn_lora/run_checkpoint_resume_huginn_losatok_swift_5090.sh`
 - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_swift_5090.sh`
 - `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_swift_5090.sh`
+- `code/huginn_lora/scripts/prepare_clotho_aqa_huginn_losatok_swift_dataset.sh`
+- `code/huginn_lora/run_prepare_clotho_aqa_huginn_losatok_swift_5090.sh`
+- `code/huginn_lora/scripts/train_clotho_aqa_huginn_losatok_swift_5090.sh`
+- `code/huginn_lora/run_train_clotho_aqa_huginn_losatok_swift_5090.sh`
+- `code/huginn_lora/run_eval_huginn_losatok_text_retrieval_swift_5090.sh`
+- `code/huginn_lora/run_generate_clotho_caption_samples_losatok_swift_5090.sh`
+- `code/huginn_lora/run_eval_mmau_test_mini_losatok_swift_5090.sh`
 
 This is a separate model type/template pair (`huginn_losatok_raven`, `huginn_losatok_text`). Do not substitute it into the Whisper plugin or reuse Whisper checkpoints as LoSATok aligner checkpoints.
 
@@ -742,6 +793,10 @@ This is a separate model type/template pair (`huginn_losatok_raven`, `huginn_los
 
 - ClothoAQA:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_aqa_huginn`
+  - prepared LoSATok Swift manifest:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/clotho_aqa/clotho_aqa_train_swift.jsonl`
+  - companion stats:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/clotho_aqa/clotho_aqa_train_swift.jsonl.stats.json`
 
 - tiny ClothoAQA subset:
   - `/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_aqa_huginn_tiny_train32`
@@ -893,7 +948,7 @@ The following points are already important confirmed project memory:
 6. **Single-GPU mid-scale ACAVCAPS training also completed successfully**
    - a mid training run on 3090 finished successfully
    - observed memory was around `21.7 GiB`
-   - this is important because it means the current mainline is no longer blocked at the runtime-validation stage
+   - this established the historical tar-backed route was not blocked at runtime validation
 
 7. **Formal 5090 memory and I/O behavior are now characterized**
    - earlier attempts could OOM when the wrong parameter split left the audio encoder trainable; that split is no longer the current route
@@ -902,9 +957,9 @@ The following points are already important confirmed project memory:
    - the replacement curriculum master keeps records from each tar contiguous and disables Swift dataset/DataLoader shuffling
    - its 20-step 5090 validation completed normally at about `6.2 s/step`
 
-### Current ACAVCAPS status and design
+### Historical ACAVCAPS status and design
 
-The current Swift audio mainline has moved from Clotho-only smoke work to **ACAVCAPS**.
+ACAVCAPS was a validated Swift audio training route after the early Clotho-only smoke work. It is retained as reusable tar-backed infrastructure, not the current LoSATok continuation dataset.
 
 Important ACAVCAPS facts:
 
@@ -914,9 +969,9 @@ Important ACAVCAPS facts:
   - `.flac`
   - `.json`
 - the repo must **not** copy or rewrite the shared dataset in place
-- the current training-data route reads those tar shards directly
+- the historical training-data route reads those tar shards directly
 
-Current implementation strategy:
+Historical implementation strategy:
 
 1. inspect tar shard structure and decode support
 2. build Swift JSONL records that reference:
@@ -932,7 +987,7 @@ This means:
 - the manifest stores **tar-backed metadata**, not duplicated audio payloads
 - decoding happens at training time
 
-### Current ACAVCAPS manifest / chunk pipeline
+### Historical ACAVCAPS manifest / chunk pipeline
 
 There are now several different ACAVCAPS preparation layers and they must not be confused:
 
@@ -949,12 +1004,12 @@ There are now several different ACAVCAPS preparation layers and they must not be
    - used to verify longer single-GPU training stability
 
 4. **Formal chunk manifests**
-   - used for the current mainline large-scale ACAVCAPS preparation
+   - used for the historical large-scale ACAVCAPS preparation
    - chunking exists to keep preparation resumable and easier to debug
 
-### Current formal chunk and master-manifest mainline (updated 2026-07-13)
+### Historical formal chunk and master-manifest route (updated 2026-07-13)
 
-The **current training mainline** is the verified 56-tar full-record subset:
+The historical formal-training route is the verified 56-tar full-record subset:
 
 - select 56 tar shards:
   - `00A=12,0M0=8,S00=10,S0A=12,SMA=8,0MA=3,SM0=3`
@@ -979,11 +1034,11 @@ Historical note:
 - an all-ACAVCAPS experimental route (`1071` tars, `4` tars/chunk, first `256` records/tar) exists in the repository for resumable preprocessing experiments
 - it is **not** the current formal-training dataset and must not be substituted for the 56-tar curriculum master without an explicit new experiment decision
 
-### Current formal-training configuration (updated 2026-07-13)
+### Historical formal-training configuration (updated 2026-07-13)
 
 The formal ACAVCAPS training route uses the verified metadata-only master manifest:
 
-- active curriculum master manifest:
+- historical curriculum master manifest:
   - `data/audio_swift/acavcaps/acavcaps_subset_56_full_curriculum_ordered.jsonl`
 - companion stats file:
   - `data/audio_swift/acavcaps/acavcaps_subset_56_full_curriculum_ordered.jsonl.stats.json`
@@ -991,7 +1046,7 @@ The formal ACAVCAPS training route uses the verified metadata-only master manife
   - `239854` samples from the 56 full-tar subset chunks
 - audio/caption integrity:
   - the master builder verifies each JSON caption, same-stem FLAC member, and tar membership before writing the master manifest
-- active queue:
+- historical formal queue:
   - `pdgpu-5090`
 - single-GPU formal configuration:
   - micro-batch: `8`
@@ -1026,11 +1081,11 @@ The formal ACAVCAPS training route uses the verified metadata-only master manife
 - next full-run target:
   - `max_steps=7500`, approximately one epoch at effective batch 32
 
-This is the current mainline formal-training route for the Swift ACAVCAPS project.
+This is historical validated ACAVCAPS infrastructure. Do not treat it as the active LoSATok training dataset unless the user explicitly returns to ACAVCAPS.
 
 ---
 
-## Current Audio Training Defaults
+## Historical Standalone Audio Training Defaults
 
 ### `finetuning_audio_whisper_clotho_aqa.py`
 
@@ -1094,16 +1149,17 @@ Do not change the audio encoder's policy without an explicit new experiment deci
 
 ### Current Swift audio status that new agents must assume
 
-As of 2026-07-20:
+As of 2026-07-22:
 
 - Swift registration, tar/WAV decoding, audio-prefix insertion, shifted NTP loss, and audio-encoder freezing have all been remote-verified.
-- single-GPU LoRA routes on ACAVCAPS/AudioCaps are historical validated baselines, not the only current path.
+- single-GPU Whisper LoRA routes on ACAVCAPS/AudioCaps are historical validated baselines.
+- the LoSATok single-GPU LoRA route has completed three AudioCaps-v2 epochs and one ClothoAQA continuation epoch; it is a current checkpoint-producing/evaluation line.
 - 8-GPU Swift FSDP2 initialization, one-step backward, 20-step stability, and sharded checkpoint resume have passed.
-- the formal 8-GPU run reached historical `checkpoint-2802` (epoch 1); the active operation is a fresh 7-GPU two-epoch run targeting `checkpoint-3203` and `checkpoint-6406`.
+- the formal 8-GPU run reached historical `checkpoint-2802` (epoch 1). A separate fresh 7-GPU plan exists, but its live remote status must be confirmed from logs.
 - FSDP checkpoint evaluation is implemented in the existing Clotho retrieval, Clotho sample-generation, and MMAU-mini scripts. They stream DCP tensors directly from the original 8 shard files into a one-GPU model and never create a merged full-weight cache. Submit these one-GPU 5090 jobs sequentially, each with the queue-limited `8 CPU / 32G` request.
 - all remote work is still launched through `vc submit`; Codex edits only this local sync repository.
 
-### AudioCaps v2 route (updated 2026-07-17)
+### AudioCaps v2 routes (updated 2026-07-22)
 
 - AudioCaps v2 is in personal remote storage, so it uses ordinary WAV paths rather than ACAVCAPS tar references.
 - data preparation passed:
@@ -1116,25 +1172,29 @@ As of 2026-07-20:
     - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-5604`
     - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-8406`
   - do not infer final five-epoch completion without its final remote log.
+- completed LoSATok LoRA route:
+  - model/package: `huginn_losatok_raven` with `huginn_losatok_text`
+  - run root: `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_losatok_audiocaps_v2_train_e3_b8ga4_5090/v1-20260720-162632`
+  - known checkpoints: `checkpoint-2802`, `checkpoint-5604`, `checkpoint-8406`
+  - all three LoSATok checkpoints use the normal Swift LoRA layout: `adapter_model.safetensors` (66 LoRA tensors) plus `vit.safetensors` (20 aligner tensors, including boundaries).
 - current full-parameter route:
   - starts from the original audio model, not a LoRA checkpoint
   - uses FSDP2 across eight 5090 GPUs
   - trains Huginn plus aligner while keeping Whisper frozen
   - formal schedule and scripts are defined in the top-level current-status section.
 
-### Swift Clotho Retrieval Evaluation (updated 2026-07-15)
+### Swift Clotho Retrieval Evaluation (updated 2026-07-22)
 
-- Purpose: compare AudioCaps epoch-2 `checkpoint-5604` and epoch-3 `checkpoint-8406` on grouped Clotho caption retrieval.
+- Purpose: compare checkpoints on grouped Clotho caption retrieval. The existing evaluator supports both Whisper and LoSATok Swift LoRA checkpoints through the selected plugin path.
 - Embedding definition follows the earlier standalone retrieval implementation:
-  - audio: mean pool of `Whisper -> temporal_compressor -> audio_projector` tokens, excluding audio boundary embeddings
+  - audio: mean pool of `audio_encoder -> temporal_compressor -> audio_projector` tokens, excluding audio boundary embeddings
   - text: masked mean of raw Huginn input token embeddings for each caption, without recurrent hidden states
   - metric: cosine-similarity audio-to-text and text-to-audio Recall@1/5/10, MRR, positive/negative similarity gap, and failure examples
-- This is an adapter-alignment metric: LoRA is intentionally not restored because neither side traverses LoRA-modified Huginn blocks. The evaluator restores and verifies the `18` projector/compressor tensors from `vit.safetensors`; it must never evaluate with a randomly initialized aligner.
-- Checkpoint-layout inspection is complete. A checkpoint also contains `66` LoRA tensors in `adapter_model.safetensors`, but these are deliberately irrelevant to this embedding-only retrieval metric.
-- Important unresolved checkpoint limitation:
-  - `audio_bos` / `audio_eos` are absent from the observed checkpoint files
-  - evaluators and generators warn and retain model-initialized values for them
-  - this means current restore is not a mathematically complete restoration of the trainable state; resolve the save path before making strict final benchmark claims
+- This is an adapter-alignment metric: LoRA is intentionally not restored because neither side traverses LoRA-modified Huginn blocks. The evaluator restores the aligner; it must never evaluate with a randomly initialized compressor/projector.
+- Current LoSATok checkpoints have `66` LoRA tensors and `20` aligner tensors, including `audio_bos/audio_eos`. The boundary embeddings are excluded from the pooled retrieval representation by definition, but still remain part of complete generation/MMAU restoration.
+- LoSATok retrieval submit wrapper:
+  - `code/huginn_lora/run_eval_huginn_losatok_text_retrieval_swift_5090.sh`
+  - it currently targets AudioCaps LoSATok `checkpoint-5604` and `checkpoint-8406`; change its fixed checkpoint list deliberately for other comparisons.
 
 ### Current Evaluation Mainline (added 2026-07-15)
 
@@ -1162,6 +1222,9 @@ As of 2026-07-20:
 - recurrence:
   - default generation uses the model configuration `mean_recurrence=32`
   - do not add a hard-coded lower recurrence value unless the user explicitly requests an experiment
+- LoSATok generation support:
+  - the same generic Python evaluator now branches on `MODEL_TYPE == huginn_losatok_raven`, sends 16 kHz waveform values plus masks, and restores both LoRA and aligner tensors.
+  - submit wrapper: `code/huginn_lora/run_generate_clotho_caption_samples_losatok_swift_5090.sh`
 
 #### MMAU `test_mini` evaluation
 
@@ -1173,6 +1236,7 @@ As of 2026-07-20:
   - environment inspect: `scripts/inspect_mmau_environment.py` and `run_inspect_mmau_environment_5090.sh`
   - five-sample smoke: `scripts/smoke_eval_mmau_test_mini_swift.py` and `run_smoke_eval_mmau_test_mini_swift_5090.sh`
   - resumable full mini evaluation: `scripts/eval_mmau_test_mini_swift.py`, `scripts/eval_mmau_test_mini_swift.sh`, and `run_eval_mmau_test_mini_swift_5090.sh`
+  - LoSATok single-checkpoint submit wrapper: `code/huginn_lora/run_eval_mmau_test_mini_losatok_swift_5090.sh`
 - scoring protocol:
   - this is multiple-choice evaluation, not free caption generation
   - for every complete answer choice, the custom evaluator computes its mean teacher-forced token log-probability conditioned on audio and prompt
@@ -1182,15 +1246,26 @@ As of 2026-07-20:
   - full evaluation appends and `fsync`s a JSONL result per sample, then skips already completed IDs only when the saved run configuration matches
   - use distinct output directories for different checkpoints or recurrence values
   - `MMAU_NUM_STEPS` maps to the evaluator's `--num-steps`; unset means the default model recurrence
-- current requested comparison:
-  - AudioCaps `checkpoint-5604` at `r=1`, `r=8`, and `r=16` on the full mini set
-  - scores have not yet been supplied, so README must not claim a winner
+- current requested evaluation:
+  - LoSATok ClothoAQA `checkpoint-659`:
+    - `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_losatok_clothoaqa_e1_warmstart2802_b8ga4_5090/v0-20260722-024418/checkpoint-659`
+  - output directory: `outputs/mmau_test_mini_losatok_clothoaqa_e1_checkpoint659`
+  - no score has been supplied, so README must not claim a winner.
 - formal MMAU note:
   - mini is for local development and has answers
   - the formal hidden-answer set is a separate acquisition/submission step; final predictions must preserve the selected complete option text in the official submission JSON format
 
 ### Current useful Swift training entrypoints
 
+- LoSATok AudioCaps-v2 formal LoRA (completed checkpoint source):
+  - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_swift_5090.sh`
+  - `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_swift_5090.sh`
+- LoSATok ClothoAQA manifest preparation:
+  - `code/huginn_lora/scripts/prepare_clotho_aqa_huginn_losatok_swift_dataset.sh`
+  - `code/huginn_lora/run_prepare_clotho_aqa_huginn_losatok_swift_5090.sh`
+- LoSATok ClothoAQA one-epoch LoRA warm-start (completed checkpoint source):
+  - `code/huginn_lora/scripts/train_clotho_aqa_huginn_losatok_swift_5090.sh`
+  - `code/huginn_lora/run_train_clotho_aqa_huginn_losatok_swift_5090.sh`
 - Huginn/Clotho-style smoke:
   - `code/huginn_lora/scripts/smoke_huginn_audio_swift.sh`
 - trainable-parameter validation:
@@ -1215,9 +1290,9 @@ As of 2026-07-20:
   - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_formal_stress100.sh`
 - Swift Trainer sampler/shuffle source inspection:
   - `code/huginn_lora/scripts/inspect_swift_sampler_behavior.sh`
-- current formal 5090 runtime script:
+- historical formal 5090 runtime script:
   - `code/huginn_lora/scripts/train_acavcaps_huginn_audio_swift_formal_5090.sh`
-- current formal 5090 submit wrapper:
+- historical formal 5090 submit wrapper:
   - `code/huginn_lora/run_train_acavcaps_huginn_audio_swift_formal_5090.sh`
 
 ---
@@ -1327,6 +1402,10 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 
 - `code/huginn_lora/plugins/huginn_audio_swift.py`
 - `code/huginn_lora/plugins/huginn_losatok_swift.py`
+- `code/huginn_lora/scripts/prepare_clotho_aqa_huginn_losatok_swift_dataset.sh`
+- `code/huginn_lora/scripts/train_clotho_aqa_huginn_losatok_swift_5090.sh`
+- `code/huginn_lora/run_prepare_clotho_aqa_huginn_losatok_swift_5090.sh`
+- `code/huginn_lora/run_train_clotho_aqa_huginn_losatok_swift_5090.sh`
 - `code/huginn_lora/scripts/inspect_losatok_encoder_remote.py`
 - `code/huginn_lora/scripts/inspect_huginn_losatok_swift_trainables.py`
 - `code/huginn_lora/scripts/inspect_huginn_losatok_swift_trainables.sh`
@@ -1389,9 +1468,11 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/scripts/eval_huginn_audio_text_retrieval_swift.py`
 - `code/huginn_lora/run_inspect_swift_huginn_audio_checkpoints_5090.sh`
 - `code/huginn_lora/run_eval_huginn_audio_text_retrieval_swift_5090.sh`
+- `code/huginn_lora/run_eval_huginn_losatok_text_retrieval_swift_5090.sh`
 - `code/huginn_lora/scripts/generate_clotho_caption_samples_swift.py`
 - `code/huginn_lora/scripts/generate_clotho_caption_samples_swift.sh`
 - `code/huginn_lora/run_generate_clotho_caption_samples_swift_5090.sh`
+- `code/huginn_lora/run_generate_clotho_caption_samples_losatok_swift_5090.sh`
 - `code/huginn_lora/scripts/inspect_mmau_environment.py`
 - `code/huginn_lora/scripts/inspect_mmau_environment.sh`
 - `code/huginn_lora/run_inspect_mmau_environment_5090.sh`
@@ -1401,6 +1482,7 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 - `code/huginn_lora/scripts/eval_mmau_test_mini_swift.py`
 - `code/huginn_lora/scripts/eval_mmau_test_mini_swift.sh`
 - `code/huginn_lora/run_eval_mmau_test_mini_swift_5090.sh`
+- `code/huginn_lora/run_eval_mmau_test_mini_losatok_swift_5090.sh`
 
 ### Audio evaluation
 
@@ -1429,18 +1511,20 @@ Any new chat should assume the following:
      - Whisper-small encoder
      - frozen backbone + frozen encoder
      - trainable compressor/projector
-   - current forward branch:
+   - separate Whisper Swift branch:
      - original Huginn backbone
      - Whisper-large encoder
      - Swift multimodal training path
      - frozen audio encoder and full-trainable aligner
-     - both a historical LoRA mode and the currently active FSDP full-parameter mode
-   - current encoder-replacement integration branch:
+     - historical LoRA and separate FSDP full-parameter modes
+   - current encoder-replacement LoSATok branch:
      - LoSATok with 16 kHz waveform input and `unified_emb` output
      - Swift LoRA registration/model/template code is locally implemented
      - complete LoSATok is frozen; only aligner plus Huginn LoRA train
      - standalone encoder inspection, Swift final parameter inspection, B1 and B8/GA4 real smoke, and LoRA checkpoint save/resume all passed
-     - a fresh three-epoch AudioCaps-v2 formal LoRA script is ready for submission
+     - completed three AudioCaps-v2 epochs at `checkpoint-2802`, `checkpoint-5604`, and `checkpoint-8406`
+     - completed one ClothoAQA warm-start epoch from LoSATok `checkpoint-2802` to ClothoAQA `checkpoint-659`
+     - current immediate evaluation target is the ClothoAQA checkpoint on MMAU `test_mini`
 8. The current audio project already has:
    - smoke training
    - tiny overfit
@@ -1490,7 +1574,7 @@ Any new chat should assume the following:
 9. Do not forget that the Swift branch has already passed remote smoke and mid training; do not regress it back into an "unverified" mental model.
 10. For Whisper full-training requests, default to the **Swift multimodal FSDP full-training path**. For encoder replacement requests, use the dedicated LoSATok Swift files; its inspect/smoke/checkpoint validation now passes, but do not modify the verified Whisper plugin or cross-load Whisper and LoSATok checkpoints.
 11. For current Swift audio training and evaluation, use the `pdgpu-5090` submit wrappers unless an existing legacy smoke/preparation wrapper explicitly targets `pdgpu-3090`.
-12. For ACAVCAPS, remember that the current formal route is the pair-verified tar-backed curriculum master, not raw-audio copying and not the old globally shuffled master.
+12. For ACAVCAPS, remember that its formal route is the pair-verified tar-backed curriculum master, not raw-audio copying and not the old globally shuffled master. It is historical infrastructure unless the user explicitly chooses ACAVCAPS again.
 13. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
 
 ---
@@ -1518,26 +1602,19 @@ Any new chat should assume the following:
 - The audio line itself now contains:
   - a historical standalone PyTorch training route
   - a validated Swift multimodal LoRA route
-  - a validated Swift FSDP2 full-parameter route whose formal two-epoch AudioCaps-v2 run is ready for submission
+  - a validated Swift FSDP2 full-parameter route with separate Whisper checkpoint handling
+  - a completed LoSATok AudioCaps-v2 LoRA run and completed LoSATok-to-ClothoAQA LoRA continuation
 - The most likely immediate work is:
-  - submit and monitor the formal seven-GPU Swift FSDP2 AudioCaps-v2 run
-  - use the existing streaming DCP evaluator path for its historical 8-GPU checkpoint when needed
-  - continue using the validated Swift LoRA route for its existing checkpoint comparisons
-  - continue improving audio alignment / caption quality
-  - evaluate checkpoints with retrieval / visualization / caption metrics
-  - compare finetuning strategies:
-    - LoRA
-    - broader finetuning if needed later
-  - compare audio encoders:
-    - Whisper-large
-    - LoSATok, whose dedicated Swift replacement branch is now under integration
-  - possibly add new audio datasets or unfreeze more modules in later stages
+  - run and inspect MMAU-mini for LoSATok ClothoAQA `checkpoint-659`
+  - run the matching LoSATok Clotho retrieval and qualitative Clotho caption-generation evaluations when requested
+  - compare LoSATok checkpoints only after result logs are available
+  - continue monitoring the independent Whisper FSDP line only when the user supplies its remote status
 
 ### Current immediate next-step expectation
 
 If a new agent is asked "what should we do now", the best default interpretation is:
 
-1. determine whether the request concerns the running Whisper FSDP branch or the new LoSATok Swift LoRA integration branch; do not silently mix their model files, plugins, or checkpoints
+1. determine whether the request concerns the Whisper FSDP branch or the completed/current LoSATok Swift LoRA branch; do not silently mix their model files, plugins, datasets, or checkpoints
 2. for the running Whisper FSDP branch, keep:
    - original Huginn backbone
    - Whisper-large encoder
@@ -1548,18 +1625,22 @@ If a new agent is asked "what should we do now", the best default interpretation
    - 56 selected tars, `239854` pair-verified records
    - curriculum order: `00A,0M0,S00,S0A,0MA,SM0,SMA`
    - tar-backed FLAC decode with shuffle disabled for sequential shard access
-4. treat AudioCaps v2 as both the latest LoRA checkpoint-producing route and the current FSDP formal-training dataset:
+4. treat AudioCaps v2 as the latest LoSATok checkpoint-producing route and a separate Whisper FSDP dataset:
    - `89658` valid WAV-caption samples
-   - evaluation checkpoints currently known: `checkpoint-5604`, `checkpoint-8406`
-   - historical formal FSDP epoch-1 checkpoint exists at `checkpoint-2802`; the active 7-GPU fresh run targets `checkpoint-3203` and `checkpoint-6406`
-5. retain the evaluation routes as separate historical/parallel work:
+   - LoSATok completed run root: `outputs/huginn_losatok_audiocaps_v2_train_e3_b8ga4_5090/v1-20260720-162632`
+   - LoSATok checkpoints: `checkpoint-2802`, `checkpoint-5604`, `checkpoint-8406`
+   - historical Whisper FSDP epoch-1 checkpoint exists at its separate FSDP output root; never load it through PEFT/LoRA code
+5. treat ClothoAQA as the latest LoSATok continuation dataset:
+   - completed output: `outputs/huginn_losatok_clothoaqa_e1_warmstart2802_b8ga4_5090/v0-20260722-024418/checkpoint-659`
+   - it was initialized by adapter-plus-aligner weight warm-start from LoSATok AudioCaps `checkpoint-2802`, not by Trainer resume.
+6. retain the evaluation routes as separate work:
    - Clotho retrieval checks adapter alignment
    - manual cached decoding checks qualitative caption behavior
    - MMAU mini scores multiple-choice audio understanding
-6. for the current MMAU experiment, compare `checkpoint-5604` at `r=1`, `r=8`, and `r=16` using distinct output directories; no result should be assumed before logs are supplied
-7. do local code edits only; let the user run all remote jobs and bring logs back
+7. for the current MMAU experiment, evaluate LoSATok ClothoAQA `checkpoint-659` through `run_eval_mmau_test_mini_losatok_swift_5090.sh`; no result should be assumed before logs are supplied.
+8. do local code edits only; let the user run all remote jobs and bring logs back.
 
-For LoSATok requests, the required inspect, smoke, and checkpoint-resume validations have passed. Start formal training only with the dedicated LoSATok model/plugin/template scripts, and keep all LoSATok checkpoints separate from Whisper checkpoints.
+For LoSATok requests, encoder inspect, Swift parameter inspection, B1 and B8/GA4 smoke, checkpoint save/resume, formal AudioCaps-v2 LoRA training, and ClothoAQA warm-start training have passed. Keep all LoSATok checkpoints separate from Whisper checkpoints. For a new cross-dataset LoSATok continuation, use adapter-plus-aligner warm-start rather than `resume_from_checkpoint` unless the user explicitly wants to continue the same dataset/trainer state.
 
 Before any long remote run:
 
