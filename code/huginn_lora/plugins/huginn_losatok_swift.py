@@ -79,29 +79,27 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
     if "freqs_cis" not in model._buffers:
         raise RuntimeError("FSDP2 compatibility requested but Huginn has no freqs_cis buffer")
     marked = []
-    removed_batchnorm_counters = []
+    nonpersistent_batchnorm_counters = []
     for module_name, module in model.named_modules():
         for buffer_name, buffer in module._buffers.items():
             if buffer is None:
                 continue
             module._non_persistent_buffers_set.add(buffer_name)
             marked.append(f"{module_name}.{buffer_name}" if module_name else buffer_name)
-        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
-            if "num_batches_tracked" in module._buffers:
-                # The complete official LoSATok encoder is forced to eval() by
-                # FrozenLoSATokEncoder, so this training-only BatchNorm counter
-                # is never read or updated. Delete the registration completely:
-                # keeping a None-valued entry lets FSDP enumerate the buffer name
-                # even though ordinary Module.state_dict() omits its value.
-                del module._buffers["num_batches_tracked"]
-                module._non_persistent_buffers_set.discard("num_batches_tracked")
-                removed_batchnorm_counters.append(
-                    f"{module_name}.num_batches_tracked" if module_name else "num_batches_tracked"
-                )
+        if (
+            isinstance(module, torch.nn.modules.batchnorm._BatchNorm)
+            and module._buffers.get("num_batches_tracked") is not None
+        ):
+            # Keep the registered tensor so ordinary recursive load_state_dict
+            # calls can access BatchNorm.num_batches_tracked. The FSDP2 loader
+            # patch below filters only its transient state-dict key.
+            nonpersistent_batchnorm_counters.append(
+                f"{module_name}.num_batches_tracked" if module_name else "num_batches_tracked"
+            )
     print(
         "[HuginnLoSATokSwift] FSDP2 compatibility: marked non-persistent buffers "
         f"count={len(marked)} names={marked} "
-        f"removed_batchnorm_counters={removed_batchnorm_counters}"
+        f"nonpersistent_batchnorm_counters={nonpersistent_batchnorm_counters}"
     )
 
 
@@ -110,11 +108,13 @@ def patch_accelerate_fsdp2_state_dict_key_alignment() -> None:
 
     Accelerate 1.13 pairs ``full_sd.items()`` with
     ``meta_sharded_sd.values()`` by position on rank 0, while non-main ranks
-    iterate ``meta_sharded_sd`` directly.  FSDP can re-expose a registered
-    None-valued ``num_batches_tracked`` buffer even though the underlying
-    BatchNorm module rejects that key during ``load_state_dict``.  Filter the
-    counter from the incoming full state and use a temporary post-hook to
-    remove it from every FSDP-generated state dict on every rank.
+    iterate ``meta_sharded_sd`` directly. FSDP can re-expose a non-persistent
+    ``num_batches_tracked`` buffer, and its metadata-free ``sharded_sd`` also
+    makes PyTorch BatchNorm's legacy loader synthesize that counter again. The
+    underlying module then rejects the synthesized key because the buffer is
+    non-persistent. Filter the counter from every FSDP-generated state dict and
+    temporarily disable BatchNorm running-stat tracking only during the load so
+    the legacy compatibility path cannot recreate it.
 
     LoSATok is permanently frozen and forced to eval mode, so this training-only
     BatchNorm counter has no effect on encoder outputs. Running means and
@@ -151,17 +151,29 @@ def patch_accelerate_fsdp2_state_dict_key_alignment() -> None:
                 state_dict.pop(name, None)
                 removed_meta_keys.add(name)
 
+        batchnorm_tracking_states = []
+        for module in model.modules():
+            if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+                batchnorm_tracking_states.append((module, module.track_running_stats))
+                module.track_running_stats = False
+
         hook = model.register_state_dict_post_hook(filter_state_dict)
         try:
             return original(accelerator, model, full_sd, cpu_offload=cpu_offload)
         finally:
             hook.remove()
+            for module, track_running_stats in batchnorm_tracking_states:
+                module.track_running_stats = track_running_stats
             if removed_full_keys or removed_meta_keys:
                 print(
                     "[HuginnLoSATokSwift] FSDP2 removed stale BatchNorm counters "
                     f"rank={os.environ.get('RANK', '0')} full_sd={removed_full_keys} "
                     f"meta_sharded_sd={sorted(removed_meta_keys)}"
                 )
+            print(
+                "[HuginnLoSATokSwift] FSDP2 BatchNorm load guard "
+                f"rank={os.environ.get('RANK', '0')} modules={len(batchnorm_tracking_states)} restored=true"
+            )
 
     patched._huginn_key_alignment_patched = True
     fsdp_utils.fsdp2_load_full_state_dict = patched
@@ -487,8 +499,6 @@ def build_model(model_dir: str) -> torch.nn.Module:
     config.freeze_audio_encoder = True
     config.freeze_text_backbone = False
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-    enable_fsdp2_nonpersistent_rope_buffer(model)
-    patch_accelerate_fsdp2_state_dict_key_alignment()
     result = model.load_huginn_backbone_from_pretrained(str(HUGINN_MODEL_DIR), torch_dtype=torch.float32)
     print_missing_summary(result.missing_keys, result.unexpected_keys)
     model.audio_encoder.requires_grad_(False)
@@ -497,6 +507,8 @@ def build_model(model_dir: str) -> torch.nn.Module:
     if initial_aligner_checkpoint:
         aligner_report = load_initial_aligner_state(model, Path(initial_aligner_checkpoint))
         print(f"[HuginnLoSATokSwift] initial_aligner_restore={aligner_report}")
+    enable_fsdp2_nonpersistent_rope_buffer(model)
+    patch_accelerate_fsdp2_state_dict_key_alignment()
     audit_model_split(model)
     return patch_shift_loss(model)
 
