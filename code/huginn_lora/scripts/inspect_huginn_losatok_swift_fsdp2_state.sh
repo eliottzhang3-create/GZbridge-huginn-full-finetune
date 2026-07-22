@@ -14,4 +14,4 @@ export CUDA_VISIBLE_DEVICES=0
 export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
 export HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT=1
 
-python scripts/inspect_huginn_losatok_swift_fsdp2_state.py
+python "$SCRIPT_DIR/inspect_huginn_losatok_swift_fsdp2_state.py"
