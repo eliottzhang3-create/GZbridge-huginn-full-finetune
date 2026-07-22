@@ -174,6 +174,10 @@ trap on_exit EXIT
 trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
 
+# Swift rejects save_only_model=true with SHARDED_STATE_DICT even when
+# save_strategy=no. Keep the FSDP state-dict type used by the validated
+# route, disable model-only saving, and rely on save_strategy=no for the
+# no-checkpoint smoke contract.
 swift sft \
   --model "$MODEL_PATH" \
   --model_type huginn_losatok_raven \
@@ -204,7 +208,7 @@ swift sft \
   --dataloader_num_workers 0 \
   --dataloader_pin_memory false \
   --dataset_num_proc 1 \
-  --save_only_model true \
+  --save_only_model false \
   --report_to none \
   --bf16 true &
 TRAIN_PID=$!
