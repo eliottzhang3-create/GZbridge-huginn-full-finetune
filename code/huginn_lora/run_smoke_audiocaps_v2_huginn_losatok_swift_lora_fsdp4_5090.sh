@@ -19,7 +19,7 @@ vc submit \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 32 -m 128G -g 4 \
   -n 1 \
-  -j smoke-losatok-lora-fsdp4-5090-$(date +%m%d%H%M) \
+  -j smoke-losatok-dynamic90s-lora-fsdp4-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/smoke_audiocaps_v2_huginn_losatok_swift_lora_fsdp4_5090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/smoke_audiocaps_v2_huginn_losatok_swift_lora_fsdp4.sh"

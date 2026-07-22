@@ -12,6 +12,8 @@
   "audio_encoder_hidden_size": 1280,
   "audio_sample_rate": 16000,
   "audio_target_token_count": 32,
+  "audio_dynamic_tokens": false,
+  "audio_max_token_count": 375,
   "audio_compressor_intermediate_size": 1536,
   "audio_compressor_kernel_size": 7,
   "audio_compressor_stride": 4,

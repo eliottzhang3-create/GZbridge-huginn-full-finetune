@@ -147,6 +147,29 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   - caption generation and MMAU restore both LoRA (`66` tensors) and aligner (`20` tensors);
   - retrieval restores the aligner only because its definition pools encoder/projector tokens and raw Huginn input embeddings without running LoRA-modified recurrent blocks.
 
+#### LoSATok dynamic-compressor FSDP4 experiment: implemented locally, remote validation pending
+
+- This is a new experimental branch layered on the same LoSATok model code. It is enabled only by
+  `HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS=1`, so the completed kernel-7/stride-4/fixed-32 checkpoints retain their
+  legacy construction when the variable is unset.
+- New audio context policy:
+  - retain at most the first `90` seconds at 16 kHz;
+  - remove the final `AdaptiveAvgPool1d(32)`;
+  - temporal compressor kernel `11`, stride `6`, symmetric padding `5`;
+  - cap compressed audio at `375` tokens;
+  - retain trainable `audio_bos` and `audio_eos`, so the maximum audio prefix is `377` tokens;
+  - keep Swift `--max_length 192` for text, giving a maximum combined prefill of `569`, below Huginn's `4096` block size.
+- Variable-length batches are padded only to the longest audio prefix in the current batch. Padded audio positions use
+  attention mask `0` and labels `-100`; they are not supervised. Valid dynamic audio positions use a non-pad placeholder
+  token ID so Huginn's compiled attention mask does not accidentally hide the supplied audio embeddings.
+- Four-GPU validation reuses
+  `code/huginn_lora/scripts/smoke_audiocaps_v2_huginn_losatok_swift_lora_fsdp4.sh`:
+  - `20` optimizer steps, `B=1`, `GA=4`, global effective batch `16`;
+  - FSDP2 full shard, activation checkpointing disabled;
+  - save and inspect `checkpoint-20` with `save_only_model=false`.
+- No successful remote log has been supplied for this dynamic-compressor/checkpoint smoke yet. Do not treat it as validated
+  and do not load the older fixed-32 aligner checkpoints while the dynamic environment variable is enabled.
+
 #### Verified Whisper end-to-end multimodal chain
 
 - framework: `swift==4.1.3`, using `swift sft`

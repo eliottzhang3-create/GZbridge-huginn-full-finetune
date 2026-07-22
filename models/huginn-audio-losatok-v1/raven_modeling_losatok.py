@@ -19,7 +19,16 @@ from .raven_config_losatok import HuginnLoSATokConfig
 
 
 class TrainableTemporalCompressor(nn.Module):
-    def __init__(self, hidden_size: int, target_token_count: int, intermediate_size: int, kernel_size: int, stride: int):
+    def __init__(
+        self,
+        hidden_size: int,
+        target_token_count: int,
+        max_token_count: int,
+        dynamic_tokens: bool,
+        intermediate_size: int,
+        kernel_size: int,
+        stride: int,
+    ):
         super().__init__()
         padding = kernel_size // 2
         self.gate_proj = nn.Conv1d(hidden_size, intermediate_size, kernel_size, stride, padding)
@@ -27,14 +36,20 @@ class TrainableTemporalCompressor(nn.Module):
         self.down_proj = nn.Conv1d(intermediate_size, hidden_size, kernel_size=1)
         self.shortcut_pool = nn.AvgPool1d(kernel_size=stride, stride=stride, ceil_mode=True)
         self.shortcut_proj = nn.Conv1d(hidden_size, hidden_size, kernel_size=1)
-        self.output_pool = nn.AdaptiveAvgPool1d(target_token_count)
+        self.output_pool = None if dynamic_tokens else nn.AdaptiveAvgPool1d(target_token_count)
+        self.max_token_count = max_token_count
 
     def forward(self, values: torch.Tensor) -> torch.Tensor:
         values = values.transpose(1, 2)
         gated = self.down_proj(torch.sigmoid(self.gate_proj(values)) * self.up_proj(values))
         shortcut = self.shortcut_proj(self.shortcut_pool(values))
         length = min(gated.size(-1), shortcut.size(-1))
-        return self.output_pool(gated[..., :length] + shortcut[..., :length]).transpose(1, 2)
+        compressed = gated[..., :length] + shortcut[..., :length]
+        if self.output_pool is not None:
+            compressed = self.output_pool(compressed)
+        if compressed.size(-1) > self.max_token_count:
+            compressed = compressed[..., :self.max_token_count]
+        return compressed.transpose(1, 2)
 
 
 class AudioProjector(nn.Module):
@@ -199,6 +214,8 @@ class HuginnLoSATokForConditionalGeneration(RavenForCausalLM):
         self.temporal_compressor = TrainableTemporalCompressor(
             config.audio_encoder_hidden_size,
             config.audio_target_token_count,
+            config.audio_max_token_count,
+            config.audio_dynamic_tokens,
             config.audio_compressor_intermediate_size,
             config.audio_compressor_kernel_size,
             config.audio_compressor_stride,
@@ -242,32 +259,62 @@ class HuginnLoSATokForConditionalGeneration(RavenForCausalLM):
         self._freeze_requested_modules()
         return result
 
-    def build_audio_prefix(self, audio_input_values: torch.Tensor, audio_attention_mask: torch.Tensor) -> torch.Tensor:
+    def build_audio_prefix(
+        self, audio_input_values: torch.Tensor, audio_attention_mask: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         token_sequences = self.audio_encoder(audio_input_values, audio_attention_mask)
         aligner_dtype = next(self.temporal_compressor.parameters()).dtype
         projected = [
             self.audio_projector(self.temporal_compressor(tokens.to(dtype=aligner_dtype)))
             for tokens in token_sequences
         ]
-        audio_embeds = torch.cat(projected, dim=0)
-        chunks = []
-        if self.audio_bos is not None:
-            chunks.append(self.audio_bos.expand(audio_embeds.size(0), -1, -1))
-        chunks.append(audio_embeds)
-        if self.audio_eos is not None:
-            chunks.append(self.audio_eos.expand(audio_embeds.size(0), -1, -1))
-        prefix = torch.cat(chunks, dim=1)
+        compressed_lengths = [int(values.size(1)) for values in projected]
+        if any(length <= 0 or length > self.config.audio_max_token_count for length in compressed_lengths):
+            raise RuntimeError(
+                "LoSATok compressed token count is outside the configured range: "
+                f"lengths={compressed_lengths} max={self.config.audio_max_token_count}"
+            )
+
+        prefix_sequences = []
+        for audio_embeds in projected:
+            chunks = []
+            if self.audio_bos is not None:
+                chunks.append(self.audio_bos)
+            chunks.append(audio_embeds)
+            if self.audio_eos is not None:
+                chunks.append(self.audio_eos)
+            prefix_sequences.append(torch.cat(chunks, dim=1))
+
+        prefix_lengths = [int(values.size(1)) for values in prefix_sequences]
+        batch_prefix_length = max(prefix_lengths)
+        prefix = torch.cat([
+            F.pad(values, (0, 0, 0, batch_prefix_length - values.size(1)))
+            for values in prefix_sequences
+        ], dim=0)
+        prefix_mask = torch.cat([
+            F.pad(
+                torch.ones((1, values.size(1)), dtype=torch.long, device=values.device),
+                (0, batch_prefix_length - values.size(1)),
+            )
+            for values in prefix_sequences
+        ], dim=0)
         audit_requested = os.environ.get("HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT", "").strip().lower() in {"1", "true", "yes"}
         if audit_requested and os.environ.get("RANK", "0") == "0" and not getattr(self, "_prefix_audit_logged", False):
-            expected = self.config.audio_target_token_count + int(self.audio_bos is not None) + int(self.audio_eos is not None)
-            if prefix.size(1) != expected:
-                raise RuntimeError(f"LoSATok audio prefix mismatch: got={prefix.size(1)} expected={expected}")
+            if not self.config.audio_dynamic_tokens and any(
+                length != self.config.audio_target_token_count for length in compressed_lengths
+            ):
+                raise RuntimeError(
+                    "Fixed LoSATok compressor token mismatch: "
+                    f"lengths={compressed_lengths} expected={self.config.audio_target_token_count}"
+                )
             print(
                 "[HuginnLoSATok] train_chain_audit_prefix "
-                f"compressed_tokens={self.config.audio_target_token_count} prefix={tuple(prefix.shape)}"
+                f"dynamic={self.config.audio_dynamic_tokens} compressed_lengths={compressed_lengths} "
+                f"prefix_lengths={prefix_lengths} batch_prefix={tuple(prefix.shape)} "
+                f"valid_prefix_tokens={prefix_mask.sum(dim=1).tolist()}"
             )
             self._prefix_audit_logged = True
-        return prefix
+        return prefix, prefix_mask
 
     def prepare_inputs_for_generation(self, input_ids, past_key_values=None, attention_mask=None, inputs_embeds=None,
                                       cache_position=None, audio_input_values=None, audio_attention_mask=None, **kwargs):
@@ -292,22 +339,41 @@ class HuginnLoSATokForConditionalGeneration(RavenForCausalLM):
             if input_embeds is not None or audio_attention_mask is None:
                 raise ValueError("LoSATok prefill requires audio values/mask and no precomputed input_embeds")
             text_embeds = self.transformer.wte(input_ids)
-            prefix = self.build_audio_prefix(audio_input_values, audio_attention_mask)
+            prefix, prefix_mask = self.build_audio_prefix(audio_input_values, audio_attention_mask)
             input_embeds = torch.cat([prefix.to(text_embeds.dtype), text_embeds], dim=1)
             prefix_length = prefix.size(1)
+            prefix_ids = torch.full(
+                (input_ids.size(0), prefix_length),
+                self.config.pad_token_id,
+                dtype=input_ids.dtype,
+                device=input_ids.device,
+            )
+            if self.config.audio_dynamic_tokens:
+                # Valid audio embeddings need a non-pad placeholder ID because
+                # Huginn's compiled mask checks both attention_mask and token IDs.
+                # Keep the legacy fixed-prefix path unchanged for old checkpoints.
+                prefix_ids = prefix_ids.masked_fill(
+                    prefix_mask.to(device=input_ids.device, dtype=torch.bool),
+                    self.config.bos_token_id,
+                )
             model_ids = torch.cat([
-                torch.full((input_ids.size(0), prefix_length), self.config.pad_token_id, dtype=input_ids.dtype, device=input_ids.device),
+                prefix_ids,
                 input_ids,
             ], dim=1)
             if labels is not None:
                 model_labels = torch.cat([
                     torch.full((labels.size(0), prefix_length), -100, dtype=labels.dtype, device=labels.device), labels,
                 ], dim=1)
-            if attention_mask is not None:
-                model_mask = torch.cat([
-                    torch.ones((attention_mask.size(0), prefix_length), dtype=attention_mask.dtype, device=attention_mask.device),
-                    attention_mask,
-                ], dim=1)
+            text_mask = attention_mask if attention_mask is not None else torch.ones_like(input_ids)
+            model_mask = torch.cat([
+                prefix_mask.to(device=text_mask.device, dtype=text_mask.dtype),
+                text_mask,
+            ], dim=1)
+            if model_ids.size(1) > self.config.block_size:
+                raise RuntimeError(
+                    f"LoSATok combined context exceeds Huginn block size: "
+                    f"combined={model_ids.size(1)} block_size={self.config.block_size}"
+                )
         if output_details is None:
             output_details = {
                 "return_logits": True,

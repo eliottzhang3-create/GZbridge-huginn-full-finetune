@@ -19,10 +19,11 @@ export OMP_NUM_THREADS=4
 # step-state must not be recomputed by activation checkpointing.
 export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
 export HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT=1
+export HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS=1
 
 TRAIN_MANIFEST="${LOSATOK_FSDP4_SMOKE_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
-OUTPUT_DIR="${LOSATOK_FSDP4_SMOKE_OUTPUT_DIR:-outputs/huginn_losatok_lora_fsdp4_smoke20}"
+OUTPUT_DIR="${LOSATOK_FSDP4_SMOKE_OUTPUT_DIR:-outputs/huginn_losatok_dynamic90s_lora_fsdp4_smoke20_ckpt}"
 LOGGING_DIR="${LOSATOK_FSDP4_SMOKE_LOGGING_DIR:-$OUTPUT_DIR/tensorboard}"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_losatok_swift.py"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-losatok-v1"
@@ -92,13 +93,19 @@ echo "NPROC_PER_NODE=$NPROC_PER_NODE"
 echo "dataset=$TRAIN_MANIFEST"
 echo "output_dir=$OUTPUT_DIR"
 echo "model_arch=huginn_losatok_raven"
-echo "architecture=current_fixed_audio_prefix"
+echo "architecture=dynamic_audio_prefix"
+echo "audio_max_seconds=90"
+echo "losatok_nominal_token_rate_hz=25"
+echo "compressor_kernel_size=11 compressor_stride=6 adaptive_pool=false"
+echo "max_compressed_audio_tokens=375 max_audio_prefix_tokens=377"
+echo "max_text_tokens=192 max_combined_context_tokens=569"
+echo "audio_batch_padding=per_batch_max attention_mask_zero labels_minus_100"
 echo "audio_encoder_policy=frozen"
 echo "tuner_type=lora_llm"
 echo "huginn_base_policy=frozen"
 echo "aligner_policy=trainable_including_audio_bos_audio_eos"
 echo "expected_losatok_trainable_parameters=0"
-echo "expected_aligner_trainable_parameters=47224608"
+echo "expected_aligner_trainable_parameters=62953248"
 echo "expected_huginn_lora_trainable_parameters=12541440"
 echo "expected_huginn_base_trainable_parameters=0"
 echo "fsdp=custom_fsdp2_json full_shard_auto_wrap"
@@ -108,7 +115,7 @@ echo "per_device_train_batch_size=$MICRO_BATCH_SIZE"
 echo "gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS"
 echo "global_effective_batch_size=$((WORLD_SIZE * MICRO_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
 echo "max_steps=$MAX_STEPS"
-echo "save_strategy=no save_checkpoint=false"
+echo "save_strategy=steps save_steps=20 save_checkpoint=true save_only_model=false"
 echo "learning_rate=$LEARNING_RATE aligner_lr=$ALIGNER_LR"
 echo "train_chain_audit=true"
 
@@ -152,10 +159,6 @@ on_exit() {
   echo "========== HUGINN LOSATOK LORA FSDP4 20-STEP SMOKE EXIT =========="
   echo "exit_status=$status"
   echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
-  if find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print -quit | grep -q .; then
-    echo "ERROR: smoke was configured not to save checkpoints, but one was found" >&2
-    status=1
-  fi
   exit "$status"
 }
 
@@ -174,10 +177,9 @@ trap on_exit EXIT
 trap 'on_signal TERM' TERM
 trap 'on_signal INT' INT
 
-# Swift rejects save_only_model=true with SHARDED_STATE_DICT even when
-# save_strategy=no. Keep the FSDP state-dict type used by the validated
-# route, disable model-only saving, and rely on save_strategy=no for the
-# no-checkpoint smoke contract.
+# Keep save_only_model=false because Swift rejects model-only saving with a
+# SHARDED_STATE_DICT and because this smoke explicitly validates a full-state
+# FSDP checkpoint save at step 20. Resume is outside this smoke's scope.
 swift sft \
   --model "$MODEL_PATH" \
   --model_type huginn_losatok_raven \
@@ -204,7 +206,9 @@ swift sft \
   --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
   --gradient_checkpointing false \
   --logging_steps 1 \
-  --save_strategy no \
+  --save_strategy steps \
+  --save_steps "$MAX_STEPS" \
+  --save_total_limit 1 \
   --dataloader_num_workers 0 \
   --dataloader_pin_memory false \
   --dataset_num_proc 1 \
@@ -219,4 +223,49 @@ set +e
 wait "$TRAIN_PID"
 TRAIN_STATUS=$?
 set -e
-exit "$TRAIN_STATUS"
+if [ "$TRAIN_STATUS" -ne 0 ]; then
+  exit "$TRAIN_STATUS"
+fi
+
+mapfile -t CHECKPOINT_MATCHES < <(find "$OUTPUT_DIR" -type d -name "checkpoint-$MAX_STEPS" -print | sort)
+if [ "${#CHECKPOINT_MATCHES[@]}" -ne 1 ]; then
+  echo "Expected exactly one checkpoint-$MAX_STEPS below $OUTPUT_DIR, found ${#CHECKPOINT_MATCHES[@]}" >&2
+  printf '  %s\n' "${CHECKPOINT_MATCHES[@]:-<none>}" >&2
+  exit 1
+fi
+CHECKPOINT_DIR="${CHECKPOINT_MATCHES[0]}"
+
+python - "$CHECKPOINT_DIR" "$MAX_STEPS" "$WORLD_SIZE" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+checkpoint_dir = Path(sys.argv[1])
+expected_step = int(sys.argv[2])
+world_size = int(sys.argv[3])
+trainer_state_path = checkpoint_dir / "trainer_state.json"
+if not trainer_state_path.is_file():
+    raise SystemExit(f"Missing trainer_state.json: {trainer_state_path}")
+trainer_state = json.loads(trainer_state_path.read_text(encoding="utf-8"))
+actual_step = trainer_state.get("global_step")
+if actual_step != expected_step:
+    raise SystemExit(f"Checkpoint global_step mismatch: expected={expected_step} actual={actual_step}")
+files = sorted(path for path in checkpoint_dir.rglob("*") if path.is_file())
+data_files = [
+    path for path in files
+    if path.name != "trainer_state.json" and path.stat().st_size > 0
+]
+if len(data_files) < world_size:
+    raise SystemExit(
+        f"Checkpoint has too few non-empty state files for world_size={world_size}: {len(data_files)}"
+    )
+print(f"[checkpoint] verified_path={checkpoint_dir}")
+print(f"[checkpoint] verified_global_step={actual_step}")
+print(f"[checkpoint] nonempty_state_file_count={len(data_files)} world_size={world_size}")
+for path in data_files[:32]:
+    print(f"[checkpoint] file={path.relative_to(checkpoint_dir)} bytes={path.stat().st_size}")
+PY
+
+echo "========== HUGINN LOSATOK DYNAMIC FSDP4 SMOKE PASSED =========="
+echo "checkpoint_20=$CHECKPOINT_DIR"
+exit 0

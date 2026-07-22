@@ -44,7 +44,9 @@ MODEL_TYPE = "huginn_losatok_raven"
 MODEL_ARCH_NAME = "huginn_audio_losatok"
 TEMPLATE_TYPE = "huginn_losatok_text"
 DEFAULT_SAMPLE_RATE = 16000
-DEFAULT_MAX_AUDIO_SECONDS = 30.0
+DYNAMIC_AUDIO_TOKENS_ENV = "HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS"
+DYNAMIC_AUDIO_TOKENS_ENABLED = os.environ.get(DYNAMIC_AUDIO_TOKENS_ENV, "").strip().lower() in {"1", "true", "yes"}
+DEFAULT_MAX_AUDIO_SECONDS = 90.0 if DYNAMIC_AUDIO_TOKENS_ENABLED else 30.0
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio and respond accurately."
 ALIGNER_PREFIXES = ("temporal_compressor", "audio_projector", "audio_boundary_embeddings")
 INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_LOSATOK_INIT_ALIGNER_CHECKPOINT"
@@ -55,6 +57,16 @@ TRAIN_CHAIN_AUDIT_ENV = "HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT"
 
 def _requested(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def configure_audio_compressor(config):
+    """Enable the new variable-length 90-second LoSATok alignment route."""
+    if _requested(DYNAMIC_AUDIO_TOKENS_ENV):
+        config.audio_dynamic_tokens = True
+        config.audio_max_token_count = 375
+        config.audio_compressor_kernel_size = 11
+        config.audio_compressor_stride = 6
+    return config
 
 
 def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
@@ -198,7 +210,7 @@ def _decode_with_ffmpeg(path: Path, target_sr: int) -> torch.Tensor:
 
 
 def load_audio_16k(path: Path) -> torch.Tensor:
-    """Decode to mono 16 kHz and deterministically retain the first 30 seconds."""
+    """Decode to mono 16 kHz and retain the configured leading audio window."""
     if not path.is_file():
         raise FileNotFoundError(f"Audio file does not exist: {path}")
     try:
@@ -493,7 +505,7 @@ def audit_model_split(model: torch.nn.Module) -> None:
 
 
 def build_model(model_dir: str) -> torch.nn.Module:
-    config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+    config = configure_audio_compressor(AutoConfig.from_pretrained(model_dir, trust_remote_code=True))
     config.losatok_root = str(LOSATOK_ROOT)
     config.losatok_code_dir = str(LOSATOK_CODE_DIR)
     config.freeze_audio_encoder = True
@@ -571,13 +583,17 @@ class HuginnLoSATokTemplate(Template):
 
 class HuginnLoSATokLoader(ModelLoader):
     def get_config(self, model_dir: str):
-        config = AutoConfig.from_pretrained(model_dir, trust_remote_code=True)
+        config = configure_audio_compressor(AutoConfig.from_pretrained(model_dir, trust_remote_code=True))
         config.losatok_root = str(LOSATOK_ROOT)
         config.losatok_code_dir = str(LOSATOK_CODE_DIR)
         config.freeze_audio_encoder = True
         config.freeze_text_backbone = False
         print(f"[HuginnLoSATokSwift] config.losatok_root={config.losatok_root}")
         print(f"[HuginnLoSATokSwift] config.audio_sample_rate={config.audio_sample_rate}")
+        print(f"[HuginnLoSATokSwift] config.audio_dynamic_tokens={config.audio_dynamic_tokens}")
+        print(f"[HuginnLoSATokSwift] config.audio_max_token_count={config.audio_max_token_count}")
+        print(f"[HuginnLoSATokSwift] config.audio_max_seconds={DEFAULT_MAX_AUDIO_SECONDS}")
+        print(f"[HuginnLoSATokSwift] config.audio_compressor_kernel_size={config.audio_compressor_kernel_size}")
         print(f"[HuginnLoSATokSwift] config.audio_compressor_stride={config.audio_compressor_stride}")
         return config
 

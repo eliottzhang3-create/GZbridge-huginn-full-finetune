@@ -18,6 +18,8 @@ class HuginnLoSATokConfig(RavenConfig):
         audio_encoder_hidden_size: int = 1280,
         audio_sample_rate: int = 16000,
         audio_target_token_count: int = 32,
+        audio_dynamic_tokens: bool = False,
+        audio_max_token_count: int = 375,
         audio_compressor_intermediate_size: int = 1536,
         audio_compressor_kernel_size: int = 7,
         audio_compressor_stride: int = 4,
@@ -34,6 +36,8 @@ class HuginnLoSATokConfig(RavenConfig):
         self.audio_encoder_hidden_size = audio_encoder_hidden_size
         self.audio_sample_rate = audio_sample_rate
         self.audio_target_token_count = audio_target_token_count
+        self.audio_dynamic_tokens = audio_dynamic_tokens
+        self.audio_max_token_count = audio_max_token_count
         self.audio_compressor_intermediate_size = audio_compressor_intermediate_size
         self.audio_compressor_kernel_size = audio_compressor_kernel_size
         self.audio_compressor_stride = audio_compressor_stride
