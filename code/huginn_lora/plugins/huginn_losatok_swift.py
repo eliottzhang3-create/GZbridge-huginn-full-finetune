@@ -105,6 +105,48 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
     )
 
 
+def patch_accelerate_fsdp2_state_dict_key_alignment() -> None:
+    """Filter stale full-state keys before Accelerate 1.13's FSDP2 loader.
+
+    Accelerate 1.13 pairs ``full_sd.items()`` with
+    ``meta_sharded_sd.values()`` by position.  Swift/PEFT can expose a
+    transient frozen-buffer key on the pre-shard wrapper even though the
+    post-shard model no longer has that key.  The positional zip then creates
+    a ``sharded_sd`` entry that ``model.load_state_dict`` rejects as unexpected.
+    Restricting the full state dict to keys present in the post-shard model
+    keeps the two sequences aligned.  The patch is opt-in and only installed
+    for the existing Huginn FSDP2 compatibility environment.
+    """
+    requested = os.environ.get(FSDP2_NONPERSISTENT_ROPE_ENV, "").strip().lower()
+    if requested not in {"1", "true", "yes"}:
+        return
+    try:
+        from accelerate.utils import fsdp_utils
+    except ImportError:
+        return
+    original = fsdp_utils.fsdp2_load_full_state_dict
+    if getattr(original, "_huginn_key_alignment_patched", False):
+        return
+
+    def patched(accelerator, model, full_sd, cpu_offload=False):
+        meta_keys = set(model.state_dict().keys())
+        full_keys = set(full_sd.keys())
+        extra_keys = sorted(full_keys - meta_keys)
+        missing_keys = sorted(meta_keys - full_keys)
+        if extra_keys or missing_keys:
+            if accelerator.is_main_process:
+                print(
+                    "[HuginnLoSATokSwift] FSDP2 state-dict key alignment "
+                    f"extra_full_keys={extra_keys} missing_full_keys={missing_keys}"
+                )
+            full_sd = {name: tensor for name, tensor in full_sd.items() if name in meta_keys}
+        return original(accelerator, model, full_sd, cpu_offload=cpu_offload)
+
+    patched._huginn_key_alignment_patched = True
+    fsdp_utils.fsdp2_load_full_state_dict = patched
+    print("[HuginnLoSATokSwift] installed Accelerate FSDP2 state-dict key-alignment patch")
+
+
 def _decode_with_ffmpeg(path: Path, target_sr: int) -> torch.Tensor:
     ffmpeg = shutil.which("ffmpeg")
     if ffmpeg is None:
@@ -425,6 +467,7 @@ def build_model(model_dir: str) -> torch.nn.Module:
     config.freeze_text_backbone = False
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
     enable_fsdp2_nonpersistent_rope_buffer(model)
+    patch_accelerate_fsdp2_state_dict_key_alignment()
     result = model.load_huginn_backbone_from_pretrained(str(HUGINN_MODEL_DIR), torch_dtype=torch.float32)
     print_missing_summary(result.missing_keys, result.unexpected_keys)
     model.audio_encoder.requires_grad_(False)
