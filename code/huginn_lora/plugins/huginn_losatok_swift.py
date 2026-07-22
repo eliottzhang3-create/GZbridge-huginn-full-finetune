@@ -79,15 +79,29 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
     if "freqs_cis" not in model._buffers:
         raise RuntimeError("FSDP2 compatibility requested but Huginn has no freqs_cis buffer")
     marked = []
+    removed_batchnorm_counters = []
     for module_name, module in model.named_modules():
         for buffer_name, buffer in module._buffers.items():
             if buffer is None:
                 continue
             module._non_persistent_buffers_set.add(buffer_name)
             marked.append(f"{module_name}.{buffer_name}" if module_name else buffer_name)
+        if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
+            counter = module._buffers.get("num_batches_tracked")
+            if counter is not None:
+                # The complete official LoSATok encoder is forced to eval() by
+                # FrozenLoSATokEncoder, so this training-only BatchNorm counter
+                # is never read or updated. Removing it also prevents Swift's
+                # PEFT state-dict wrapper from re-emitting it after the buffer
+                # was marked non-persistent above.
+                module._buffers["num_batches_tracked"] = None
+                removed_batchnorm_counters.append(
+                    f"{module_name}.num_batches_tracked" if module_name else "num_batches_tracked"
+                )
     print(
         "[HuginnLoSATokSwift] FSDP2 compatibility: marked non-persistent buffers "
-        f"count={len(marked)} names={marked}"
+        f"count={len(marked)} names={marked} "
+        f"removed_batchnorm_counters={removed_batchnorm_counters}"
     )
 
 
