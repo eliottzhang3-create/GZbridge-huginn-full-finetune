@@ -58,15 +58,16 @@ def _requested(name: str) -> bool:
 
 
 def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
-    """Make Huginn's deterministic RoPE cache compatible with Accelerate FSDP2.
+    """Make Huginn and the frozen LoSATok stack compatible with Accelerate FSDP2.
 
     With ``cpu_ram_efficient_loading=True``, Accelerate 1.13's FSDP2 loader
     reconstructs the model from ``model.state_dict()`` and expects every
-    persistent entry to be a sharded DTensor. Huginn's ``freqs_cis`` is a
-    deterministic, fixed buffer rather than a trainable parameter, so it
-    remains an ordinary Tensor and does not have ``device_mesh``. Keeping it
-    non-persistent removes it from that state-dict reload and lets Accelerate
-    handle it through its non-persistent-buffer path instead.
+    persistent entry to be a sharded DTensor. Huginn's ``freqs_cis`` and any
+    buffers inside the dynamically loaded official LoSATok stack are ordinary
+    Tensors rather than sharded parameters, so they do not have ``device_mesh``.
+    Keeping all non-empty buffers non-persistent removes them from that
+    state-dict reload and lets Accelerate preserve and re-register them through
+    its dedicated non-persistent-buffer path instead.
 
     The behavior is opt-in so evaluation and non-FSDP2 runs retain the normal
     persistent-buffer semantics. The four-GPU FSDP2 smoke script enables it
@@ -77,8 +78,17 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
         return
     if "freqs_cis" not in model._buffers:
         raise RuntimeError("FSDP2 compatibility requested but Huginn has no freqs_cis buffer")
-    model._non_persistent_buffers_set.add("freqs_cis")
-    print("[HuginnLoSATokSwift] FSDP2 compatibility: freqs_cis marked non-persistent")
+    marked = []
+    for module_name, module in model.named_modules():
+        for buffer_name, buffer in module._buffers.items():
+            if buffer is None:
+                continue
+            module._non_persistent_buffers_set.add(buffer_name)
+            marked.append(f"{module_name}.{buffer_name}" if module_name else buffer_name)
+    print(
+        "[HuginnLoSATokSwift] FSDP2 compatibility: marked non-persistent buffers "
+        f"count={len(marked)} names={marked}"
+    )
 
 
 def _decode_with_ffmpeg(path: Path, target_sr: int) -> torch.Tensor:
