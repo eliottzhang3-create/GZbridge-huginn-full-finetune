@@ -49,11 +49,36 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio a
 ALIGNER_PREFIXES = ("temporal_compressor", "audio_projector", "audio_boundary_embeddings")
 INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_LOSATOK_INIT_ALIGNER_CHECKPOINT"
 FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_LOSATOK_FORCE_ALIGNER_TRAINABLE"
+FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT"
 
 
 def _requested(name: str) -> bool:
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes"}
+
+
+def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
+    """Make Huginn's deterministic RoPE cache compatible with Accelerate FSDP2.
+
+    With ``cpu_ram_efficient_loading=True``, Accelerate 1.13's FSDP2 loader
+    reconstructs the model from ``model.state_dict()`` and expects every
+    persistent entry to be a sharded DTensor. Huginn's ``freqs_cis`` is a
+    deterministic, fixed buffer rather than a trainable parameter, so it
+    remains an ordinary Tensor and does not have ``device_mesh``. Keeping it
+    non-persistent removes it from that state-dict reload and lets Accelerate
+    handle it through its non-persistent-buffer path instead.
+
+    The behavior is opt-in so evaluation and non-FSDP2 runs retain the normal
+    persistent-buffer semantics. The four-GPU FSDP2 smoke script enables it
+    through ``HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1``.
+    """
+    requested = os.environ.get(FSDP2_NONPERSISTENT_ROPE_ENV, "").strip().lower()
+    if requested not in {"1", "true", "yes"}:
+        return
+    if "freqs_cis" not in model._buffers:
+        raise RuntimeError("FSDP2 compatibility requested but Huginn has no freqs_cis buffer")
+    model._non_persistent_buffers_set.add("freqs_cis")
+    print("[HuginnLoSATokSwift] FSDP2 compatibility: freqs_cis marked non-persistent")
 
 
 def _decode_with_ffmpeg(path: Path, target_sr: int) -> torch.Tensor:
@@ -375,6 +400,7 @@ def build_model(model_dir: str) -> torch.nn.Module:
     config.freeze_audio_encoder = True
     config.freeze_text_backbone = False
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+    enable_fsdp2_nonpersistent_rope_buffer(model)
     result = model.load_huginn_backbone_from_pretrained(str(HUGINN_MODEL_DIR), torch_dtype=torch.float32)
     print_missing_summary(result.missing_keys, result.unexpected_keys)
     model.audio_encoder.requires_grad_(False)
