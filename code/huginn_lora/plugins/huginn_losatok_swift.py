@@ -87,14 +87,14 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
             module._non_persistent_buffers_set.add(buffer_name)
             marked.append(f"{module_name}.{buffer_name}" if module_name else buffer_name)
         if isinstance(module, torch.nn.modules.batchnorm._BatchNorm):
-            counter = module._buffers.get("num_batches_tracked")
-            if counter is not None:
+            if "num_batches_tracked" in module._buffers:
                 # The complete official LoSATok encoder is forced to eval() by
                 # FrozenLoSATokEncoder, so this training-only BatchNorm counter
-                # is never read or updated. Removing it also prevents Swift's
-                # PEFT state-dict wrapper from re-emitting it after the buffer
-                # was marked non-persistent above.
-                module._buffers["num_batches_tracked"] = None
+                # is never read or updated. Delete the registration completely:
+                # keeping a None-valued entry lets FSDP enumerate the buffer name
+                # even though ordinary Module.state_dict() omits its value.
+                del module._buffers["num_batches_tracked"]
+                module._non_persistent_buffers_set.discard("num_batches_tracked")
                 removed_batchnorm_counters.append(
                     f"{module_name}.num_batches_tracked" if module_name else "num_batches_tracked"
                 )
@@ -106,16 +106,20 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
 
 
 def patch_accelerate_fsdp2_state_dict_key_alignment() -> None:
-    """Filter stale full-state keys before Accelerate 1.13's FSDP2 loader.
+    """Filter stale BatchNorm counters from both FSDP2 state-dict branches.
 
     Accelerate 1.13 pairs ``full_sd.items()`` with
-    ``meta_sharded_sd.values()`` by position.  Swift/PEFT can expose a
-    transient frozen-buffer key on the pre-shard wrapper even though the
-    post-shard model no longer has that key.  The positional zip then creates
-    a ``sharded_sd`` entry that ``model.load_state_dict`` rejects as unexpected.
-    Restricting the full state dict to keys present in the post-shard model
-    keeps the two sequences aligned.  The patch is opt-in and only installed
-    for the existing Huginn FSDP2 compatibility environment.
+    ``meta_sharded_sd.values()`` by position on rank 0, while non-main ranks
+    iterate ``meta_sharded_sd`` directly.  FSDP can re-expose a registered
+    None-valued ``num_batches_tracked`` buffer even though the underlying
+    BatchNorm module rejects that key during ``load_state_dict``.  Filter the
+    counter from the incoming full state and use a temporary post-hook to
+    remove it from every FSDP-generated state dict on every rank.
+
+    LoSATok is permanently frozen and forced to eval mode, so this training-only
+    BatchNorm counter has no effect on encoder outputs. Running means and
+    variances remain untouched. The patch is opt-in and only installed for the
+    existing Huginn FSDP2 compatibility environment.
     """
     requested = os.environ.get(FSDP2_NONPERSISTENT_ROPE_ENV, "").strip().lower()
     if requested not in {"1", "true", "yes"}:
@@ -129,18 +133,35 @@ def patch_accelerate_fsdp2_state_dict_key_alignment() -> None:
         return
 
     def patched(accelerator, model, full_sd, cpu_offload=False):
-        meta_keys = set(model.state_dict().keys())
-        full_keys = set(full_sd.keys())
-        extra_keys = sorted(full_keys - meta_keys)
-        missing_keys = sorted(meta_keys - full_keys)
-        if extra_keys or missing_keys:
-            if accelerator.is_main_process:
+        def is_stale_batchnorm_counter(name: str) -> bool:
+            return name == "num_batches_tracked" or name.endswith(".num_batches_tracked")
+
+        removed_full_keys = sorted(name for name in full_sd if is_stale_batchnorm_counter(name))
+        if removed_full_keys:
+            full_sd = full_sd.copy()
+            for name in removed_full_keys:
+                full_sd.pop(name, None)
+
+        removed_meta_keys: set[str] = set()
+
+        def filter_state_dict(module, state_dict, prefix, local_metadata):
+            del module, prefix, local_metadata
+            stale_keys = [name for name in state_dict if is_stale_batchnorm_counter(name)]
+            for name in stale_keys:
+                state_dict.pop(name, None)
+                removed_meta_keys.add(name)
+
+        hook = model.register_state_dict_post_hook(filter_state_dict)
+        try:
+            return original(accelerator, model, full_sd, cpu_offload=cpu_offload)
+        finally:
+            hook.remove()
+            if removed_full_keys or removed_meta_keys:
                 print(
-                    "[HuginnLoSATokSwift] FSDP2 state-dict key alignment "
-                    f"extra_full_keys={extra_keys} missing_full_keys={missing_keys}"
+                    "[HuginnLoSATokSwift] FSDP2 removed stale BatchNorm counters "
+                    f"rank={os.environ.get('RANK', '0')} full_sd={removed_full_keys} "
+                    f"meta_sharded_sd={sorted(removed_meta_keys)}"
                 )
-            full_sd = {name: tensor for name, tensor in full_sd.items() if name in meta_keys}
-        return original(accelerator, model, full_sd, cpu_offload=cpu_offload)
 
     patched._huginn_key_alignment_patched = True
     fsdp_utils.fsdp2_load_full_state_dict = patched
