@@ -53,6 +53,8 @@ INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_LOSATOK_INIT_ALIGNER_CHECKPOINT"
 FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_LOSATOK_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT"
+DYNAMIC_ALIGNER_TRAINABLE_PARAMETERS = 62_953_248
+HUGINN_LORA_TRAINABLE_PARAMETERS = 12_541_440
 
 
 def _requested(name: str) -> bool:
@@ -426,6 +428,74 @@ def patch_peft_adapter_restore() -> None:
     print("[HuginnLoSATokSwift] installed PEFT adapter-restore aligner patch")
 
 
+def audit_final_trainable_split(model: torch.nn.Module) -> dict[str, int]:
+    """Verify the actual post-PEFT/FSDP trainable topology on first forward."""
+    groups = {
+        "losatok_encoder": 0,
+        "aligner": 0,
+        "huginn_lora": 0,
+        "huginn_base": 0,
+        "other": 0,
+    }
+    trainable_names: dict[str, list[str]] = {name: [] for name in groups}
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        parts = set(name.split("."))
+        if "audio_encoder" in parts:
+            group = "losatok_encoder"
+        elif any(prefix in parts for prefix in ALIGNER_PREFIXES):
+            group = "aligner"
+        elif "lora_" in name:
+            group = "huginn_lora"
+        elif "transformer" in parts or "lm_head" in parts:
+            group = "huginn_base"
+        else:
+            group = "other"
+        groups[group] += parameter.numel()
+        if len(trainable_names[group]) < 20:
+            trainable_names[group].append(name)
+
+    invalid = {
+        "losatok_encoder": groups["losatok_encoder"],
+        "huginn_base": groups["huginn_base"],
+        "other": groups["other"],
+    }
+    if any(invalid.values()):
+        raise RuntimeError(
+            "Final trainable topology contains forbidden parameters: "
+            f"groups={groups} names={trainable_names}"
+        )
+    if groups["aligner"] <= 0 or groups["huginn_lora"] <= 0:
+        raise RuntimeError(
+            "Final trainable topology is missing aligner or Huginn LoRA parameters: "
+            f"groups={groups} names={trainable_names}"
+        )
+    if DYNAMIC_AUDIO_TOKENS_ENABLED:
+        expected = {
+            "aligner": DYNAMIC_ALIGNER_TRAINABLE_PARAMETERS,
+            "huginn_lora": HUGINN_LORA_TRAINABLE_PARAMETERS,
+        }
+        actual = {name: groups[name] for name in expected}
+        if actual != expected:
+            raise RuntimeError(
+                "Dynamic LoSATok post-PEFT/FSDP trainable counts changed unexpectedly: "
+                f"expected={expected} actual={actual} names={trainable_names}"
+            )
+    if model.audio_bos is None or model.audio_eos is None:
+        raise RuntimeError("Audio BOS/EOS boundary embeddings are required for LoSATok training")
+    if not model.audio_bos.requires_grad or not model.audio_eos.requires_grad:
+        raise RuntimeError("Audio BOS/EOS boundary embeddings must remain trainable")
+
+    if os.environ.get("RANK", "0") == "0":
+        print(
+            "[HuginnLoSATokSwift] final_trainable_split "
+            f"groups={groups} total={sum(groups.values())} "
+            "policy=aligner_plus_huginn_lora_only audio_bos_eos_trainable=true"
+        )
+    return groups
+
+
 def patch_shift_loss(model: torch.nn.Module) -> torch.nn.Module:
     if getattr(model, "_huginn_losatok_shift_loss_patched", False):
         return model
@@ -440,6 +510,11 @@ def patch_shift_loss(model: torch.nn.Module) -> torch.nn.Module:
             input_ids = args[0]
         if labels is None:
             return original(*args, **kwargs)
+        if _requested(TRAIN_CHAIN_AUDIT_ENV) and not getattr(
+            self, "_huginn_losatok_final_split_audited", False
+        ):
+            audit_final_trainable_split(self)
+            self._huginn_losatok_final_split_audited = True
         without_labels = dict(kwargs)
         without_labels["labels"] = None
         outputs = original(*args, **without_labels)
@@ -454,6 +529,10 @@ def patch_shift_loss(model: torch.nn.Module) -> torch.nn.Module:
             prefix_labels = torch.full(
                 (labels.size(0), prefix_length), -100, dtype=labels.dtype, device=labels.device)
             full_labels = torch.cat([prefix_labels, labels], dim=1).to(logits.device)
+        if full_labels.shape != logits.shape[:2]:
+            raise RuntimeError(
+                f"NTP full-sequence mismatch: logits={tuple(logits.shape)} labels={tuple(full_labels.shape)}"
+            )
         shift_logits = logits[:, :-1].contiguous()
         shift_labels = full_labels[:, 1:].contiguous()
         if shift_logits.shape[:2] != shift_labels.shape:
@@ -467,12 +546,22 @@ def patch_shift_loss(model: torch.nn.Module) -> torch.nn.Module:
             prefix_tokens = int(logits.size(1) - labels.size(1))
             if not bool((full_labels[:, :prefix_tokens] == -100).all().item()):
                 raise RuntimeError("LoSATok audio prefix labels are not masked")
+            text_supervision = labels.ne(-100)
+            if not bool(text_supervision.any(dim=1).all().item()):
+                raise RuntimeError("Every LoSATok SFT sample must contain at least one supervised text token")
+            first_supervised_text = text_supervision.to(torch.int64).argmax(dim=1)
+            if bool(first_supervised_text.eq(0).any().item()):
+                raise RuntimeError(
+                    "The first text position must be prompt-masked so dynamic audio padding cannot predict a target"
+                )
             print(
                 "[HuginnLoSATokSwift] train_chain_audit_ntp "
                 f"text_input_ids={tuple(input_ids.shape) if torch.is_tensor(input_ids) else None} "
                 f"audio_values={tuple(audio_values.shape) if torch.is_tensor(audio_values) else None} "
                 f"logits={tuple(logits.shape)} prefix_tokens={prefix_tokens} "
-                f"supervised_tokens={int((shift_labels != -100).sum().item())}"
+                f"supervised_tokens={int((shift_labels != -100).sum().item())} "
+                f"first_supervised_text_positions={first_supervised_text.tolist()} "
+                "loss_alignment=logits[t]_predict_labels[t+1] prefix_labels=-100"
             )
             self._huginn_losatok_ntp_audited = True
         outputs.loss = loss
