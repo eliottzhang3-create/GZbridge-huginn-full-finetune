@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 mkdir -p log
 
 CMD_PREFIX=""
-for name in ACAVCAPS_WDS_PRIVATE_ROOT ACAVCAPS_WDS_FULL_MANIFEST_OUT ACAVCAPS_WDS_SEED ACAVCAPS_WDS_SAMPLE_SHUFFLE_BUFFER; do
+for name in ACAVCAPS_WDS_PRIVATE_ROOT ACAVCAPS_WDS_FULL_MANIFEST_OUT ACAVCAPS_WDS_SEED ACAVCAPS_WDS_SAMPLE_SHUFFLE_BUFFER ACAVCAPS_WDS_PROGRESS_INTERVAL_TARS; do
   value="${!name:-}"
   if [ -n "$value" ]; then
     printf -v quoted_value '%q' "$value"
@@ -23,4 +23,3 @@ vc submit \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/inspect_acavcaps_wds_full_preflight_5090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/inspect_acavcaps_wds_full_preflight_5090.sh"
-

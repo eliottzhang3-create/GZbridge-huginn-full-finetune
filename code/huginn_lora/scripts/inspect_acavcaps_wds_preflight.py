@@ -5,6 +5,7 @@ import collections
 import importlib.metadata
 import inspect
 import json
+import os
 import platform
 import random
 import sys
@@ -139,6 +140,70 @@ def safe_manifest_path(manifest_path: Path, dataset_root: Path) -> None:
         )
 
 
+def progress_path_for(manifest_path: Path) -> Path:
+    return manifest_path.with_suffix(".progress.json")
+
+
+def write_progress(
+    progress_path: Path,
+    dataset_root: Path,
+    args: argparse.Namespace,
+    completed: dict[tuple[str, int, str], dict[str, Any]],
+    *,
+    status: str = "running",
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "status": status,
+        "dataset_root": str(dataset_root),
+        "scan_mode": args.scan_mode,
+        "seed": args.seed,
+        "sample_shuffle_buffer": args.sample_shuffle_buffer,
+        "completed_tars": [
+            result for _, result in sorted(completed.items(), key=lambda item: item[0])
+        ],
+    }
+    safe_manifest_path(progress_path, dataset_root)
+    progress_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = progress_path.with_name(f"{progress_path.name}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(temporary, progress_path)
+
+
+def load_progress(
+    progress_path: Path,
+    dataset_root: Path,
+    args: argparse.Namespace,
+) -> dict[tuple[str, int, str], dict[str, Any]]:
+    if not args.resume or not progress_path.is_file():
+        return {}
+    payload = json.loads(progress_path.read_text(encoding="utf-8"))
+    expected = {
+        "dataset_root": str(dataset_root),
+        "scan_mode": args.scan_mode,
+        "seed": args.seed,
+        "sample_shuffle_buffer": args.sample_shuffle_buffer,
+    }
+    for key, value in expected.items():
+        if payload.get(key) != value:
+            raise ValueError(
+                f"Progress checkpoint metadata mismatch for {key}: "
+                f"stored={payload.get(key)!r} expected={value!r}; use a new manifest_out"
+            )
+    completed: dict[tuple[str, int, str], dict[str, Any]] = {}
+    for result in payload.get("completed_tars", []):
+        if not isinstance(result, dict):
+            raise ValueError(f"Invalid completed tar entry in progress checkpoint: {result!r}")
+        stage = str(result.get("stage", ""))
+        order_index = result.get("order_index")
+        path = str(result.get("path", ""))
+        if not stage or not isinstance(order_index, int) or not path or result.get("valid") is None:
+            raise ValueError(f"Invalid completed tar metadata in progress checkpoint: {result!r}")
+        completed[(stage, order_index, path)] = result
+    print(f"[resume] progress_path={progress_path} completed_tars={len(completed)}", flush=True)
+    return completed
+
+
 def inspect_webdataset(manifest: dict[str, Any], buffer_size: int, samples_per_tar: int) -> bool:
     header("WEBDATASET API")
     try:
@@ -267,6 +332,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--print_each_tar", action="store_true")
     parser.add_argument("--skip_wds_probe", action="store_true")
     parser.add_argument("--skip_swift_probe", action="store_true")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume full/sampled scanning from the private .progress.json checkpoint if present.",
+    )
+    parser.add_argument(
+        "--progress_interval_tars",
+        type=int,
+        default=10,
+        help="Persist the private progress checkpoint after this many scanned tars.",
+    )
     return parser.parse_args()
 
 
@@ -281,6 +357,8 @@ def main() -> int:
         raise ValueError("--sample_shuffle_buffer must be positive")
     if args.scan_tars_per_stage <= 0:
         raise ValueError("--scan_tars_per_stage must be positive")
+    if args.progress_interval_tars <= 0:
+        raise ValueError("--progress_interval_tars must be positive")
     dataset_root = Path(args.dataset_root).resolve()
     if not dataset_root.is_dir():
         raise FileNotFoundError(f"ACAVCAPS public root does not exist: {dataset_root}")
@@ -294,8 +372,16 @@ def main() -> int:
     print(f"[schedule] sample_shuffle_buffer={args.sample_shuffle_buffer}")
     print(f"[schedule] scan_mode={args.scan_mode} scan_tars_per_stage={args.scan_tars_per_stage}")
 
+    manifest_path = Path(args.manifest_out).resolve()
+    safe_manifest_path(manifest_path, dataset_root)
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_path = progress_path_for(manifest_path)
+    completed_results = load_progress(progress_path, dataset_root, args)
+    print(f"[progress] checkpoint={progress_path} resume={args.resume} interval_tars={args.progress_interval_tars}")
+
     stages: list[dict[str, Any]] = []
     all_valid: bool | None = True if args.scan_mode != "inventory" else None
+    scanned_tars_since_checkpoint = 0
     for stage_index, (stage_name, categories) in enumerate(STAGES):
         stage_tars: list[tuple[str, Path]] = []
         for category in categories:
@@ -313,13 +399,30 @@ def main() -> int:
                 args.scan_mode == "sampled" and order_index < args.scan_tars_per_stage
             )
             if should_scan:
-                result = scan_tar(tar_path, args.preview_per_tar)
+                progress_key = (stage_name, order_index, str(tar_path))
+                result = completed_results.get(progress_key)
+                resumed = result is not None
+                if result is None:
+                    result = scan_tar(tar_path, args.preview_per_tar)
+                    result["scan_status"] = "scanned"
+                    result.update({"category": category, "stage": stage_name, "order_index": order_index})
+                    completed_results[progress_key] = result
+                    scanned_tars_since_checkpoint += 1
+                else:
+                    result = dict(result)
                 stage_sample_count += int(result["json_count"])
                 scanned_tar_count += 1
                 if all_valid is None:
                     all_valid = bool(result["valid"])
                 else:
                     all_valid = all_valid and bool(result["valid"])
+                if not resumed and scanned_tars_since_checkpoint >= args.progress_interval_tars:
+                    write_progress(progress_path, dataset_root, args, completed_results)
+                    print(
+                        f"[checkpoint] wrote={progress_path} completed_tars={len(completed_results)}",
+                        flush=True,
+                    )
+                    scanned_tars_since_checkpoint = 0
             else:
                 result = {
                     "path": str(tar_path),
@@ -356,7 +459,7 @@ def main() -> int:
             elif args.scan_mode == "full" and (order_index + 1) % 10 == 0:
                 print(
                     f"[progress] stage={stage_name} scanned_tars={order_index + 1}/{len(stage_tars)} "
-                    f"validated_tars={scanned_tar_count}",
+                    f"validated_tars={scanned_tar_count} resumed_total={len(completed_results)}",
                     flush=True,
                 )
 
@@ -376,6 +479,9 @@ def main() -> int:
             f"[stage] {stage_name} tar_count={len(tar_entries)} scanned_tar_count={scanned_tar_count} "
             f"sample_count={stage_sample_count if scanned_tar_count == len(tar_entries) else 'unknown'}"
         )
+        if args.scan_mode in {"full", "sampled"}:
+            write_progress(progress_path, dataset_root, args, completed_results)
+            print(f"[checkpoint] stage_complete={stage_name} completed_tars={len(completed_results)}", flush=True)
 
     manifest = {
         "schema_version": 1,
@@ -398,9 +504,6 @@ def main() -> int:
         f"all_pairs_valid={all_valid if all_valid is not None else 'not_scanned'}"
     )
 
-    manifest_path = Path(args.manifest_out).resolve()
-    safe_manifest_path(manifest_path, dataset_root)
-    manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"[manifest] wrote_private_manifest={manifest_path}")
 
@@ -423,6 +526,8 @@ def main() -> int:
     }
     stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"[stats] wrote_private_stats={stats_path}")
+    write_progress(progress_path, dataset_root, args, completed_results, status="complete")
+    print(f"[progress] completed_checkpoint={progress_path}")
 
     wds_ok = True if args.skip_wds_probe else inspect_webdataset(manifest, args.sample_shuffle_buffer, args.wds_probe_samples)
     swift_ok = True if args.skip_swift_probe else inspect_swift_iterable_support()
