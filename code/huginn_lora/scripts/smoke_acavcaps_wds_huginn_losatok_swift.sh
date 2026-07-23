@@ -42,7 +42,7 @@ echo "output_dir=$OUTPUT_DIR"
 echo "mode=legacy_fixed32 frozen_losatok_encoder aligner_trainable huginn_lora_trainable"
 echo "selected_data=first_2_tars_per_stage_full_stream"
 echo "max_steps=20 per_device_train_batch_size=8 gradient_accumulation_steps=4 effective_batch_size=32"
-echo "dataset_shuffle=false train_dataloader_shuffle=false"
+echo "streaming=true dataset_shuffle=false train_dataloader_shuffle=false"
 echo "checkpoint_saving=disabled dynamic_audio_tokens=disabled"
 
 python - <<'PY'
@@ -59,6 +59,7 @@ swift sft \
   --template huginn_losatok_text \
   --external_plugins "$PLUGIN_PATH" \
   --dataset "$ACAVCAPS_WDS_MANIFEST" \
+  --streaming true \
   --dataset_shuffle false \
   --train_dataloader_shuffle false \
   --sortish_sampler false \
