@@ -54,7 +54,7 @@ This repo contains **two major experiment families**:
 Two audio lines coexist and must remain strictly separate:
 
 1. **Whisper-large FSDP full finetuning** uses frozen Whisper-large, a full-trainable aligner, and full-trainable Huginn under Swift FSDP2. The historical 8-GPU `checkpoint-2802` is an evaluation artifact, not a cross-world-size resume source. Do not infer the current remote job state without a user-supplied log.
-2. **LoSATok Swift LoRA continuation** has a completed legacy single-GPU fixed-32 line and a new four-GPU dynamic-prefix line. Both use a frozen official LoSATok stack, a full-trainable aligner, and Huginn LoRA. The dynamic line has passed its 20-step FSDP2 smoke and checkpoint-save validation; its next run is a fresh three-epoch AudioCaps-v2 training.
+2. **LoSATok Swift LoRA continuation** has a completed legacy single-GPU fixed-32 line and a new two-GPU dynamic-prefix formal line. Both use a frozen official LoSATok stack, a full-trainable aligner, and Huginn LoRA. The dynamic line's four-GPU 20-step FSDP2 smoke and checkpoint-save validation passed; its formal run is now configured for two GPUs to reduce wall-clock overhead.
 
 The shared audio architecture is:
 
@@ -147,7 +147,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   - caption generation and MMAU restore both LoRA (`66` tensors) and aligner (`20` tensors);
   - retrieval restores the aligner only because its definition pools encoder/projector tokens and raw Huginn input embeddings without running LoRA-modified recurrent blocks.
 
-#### LoSATok dynamic-compressor FSDP4 experiment: smoke verified, formal training prepared
+#### LoSATok dynamic-compressor FSDP2 experiment: smoke verified, two-GPU formal training prepared
 
 - This is a new experimental branch layered on the same LoSATok model code. It is enabled only by
   `HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS=1`, so the completed kernel-7/stride-4/fixed-32 checkpoints retain their
@@ -184,10 +184,13 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   requires every sample to contain a supervised text target and requires the first text position to remain prompt-masked, so a
   shorter sample's right-padded audio-prefix tail cannot become the position directly responsible for a supervised target.
 - Formal three-epoch AudioCaps-v2 scripts:
-  - runtime: `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp4.sh`;
-  - submit: `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp4_5090.sh`;
-  - four 5090 GPUs, `B=1`, `GA=4`, global effective batch `16`, LR/aligner LR `1e-4`, dataset and DataLoader shuffle,
+  - runtime: `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2.sh`;
+  - submit: `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.sh`;
+  - two 5090 GPUs, per-device `B=4`, `GA=4`, global effective batch `32`, LR/aligner LR `1e-4`,
+    dataset and DataLoader shuffle,
     TensorBoard, one full sharded checkpoint per epoch, three retained checkpoints, and post-run checkpoint verification.
+- The four-GPU smoke remains the validated FSDP2 compatibility baseline; the two-GPU formal configuration is a resource
+  change and must be confirmed from its own remote startup/first-step log before treating the formal run as complete.
 - Do not load older fixed-32 aligner checkpoints while the dynamic environment variable is enabled unless a deliberate
   architecture-conversion procedure is implemented and separately validated.
 

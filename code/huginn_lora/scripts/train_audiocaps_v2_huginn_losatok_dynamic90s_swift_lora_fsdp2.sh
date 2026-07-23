@@ -10,33 +10,34 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NPROC_PER_NODE=4
+export CUDA_VISIBLE_DEVICES=0,1
+export NPROC_PER_NODE=2
 export OMP_NUM_THREADS=4
 
-# These are the exact compatibility switches used by the successful four-GPU
-# dynamic-prefix smoke. Huginn recurrent activation recomputation remains off.
+# These are the exact compatibility switches used by the successful dynamic-
+# prefix smoke. The formal run uses two ranks; Huginn recurrent activation
+# recomputation remains off.
 export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
 export HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS=1
 export HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT=1
 
-TRAIN_MANIFEST="${LOSATOK_DYNAMIC_FSDP4_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
+TRAIN_MANIFEST="${LOSATOK_DYNAMIC_FSDP2_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
-OUTPUT_DIR="${LOSATOK_DYNAMIC_FSDP4_OUTPUT_DIR:-outputs/huginn_losatok_dynamic90s_audiocaps_v2_e3_b1ga4_fsdp4}"
-LOGGING_DIR="${LOSATOK_DYNAMIC_FSDP4_LOGGING_DIR:-$OUTPUT_DIR/tensorboard}"
+OUTPUT_DIR="${LOSATOK_DYNAMIC_FSDP2_OUTPUT_DIR:-outputs/huginn_losatok_dynamic90s_audiocaps_v2_e3_b4ga4_fsdp2}"
+LOGGING_DIR="${LOSATOK_DYNAMIC_FSDP2_LOGGING_DIR:-$OUTPUT_DIR/tensorboard}"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_losatok_swift.py"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-losatok-v1"
 LOSATOK_ROOT=/hpc_stor03/sjtu_home/jinwei.zhang/models/LoSATok
 LOSATOK_CODE_DIR="$REPO_ROOT/code/huginn_lora/LosatokCode"
 
-WORLD_SIZE=4
-MICRO_BATCH_SIZE=1
+WORLD_SIZE=2
+MICRO_BATCH_SIZE=4
 GRADIENT_ACCUMULATION_STEPS=4
 NUM_TRAIN_EPOCHS=3
-LEARNING_RATE="${LOSATOK_DYNAMIC_FSDP4_LEARNING_RATE:-1e-4}"
-ALIGNER_LR="${LOSATOK_DYNAMIC_FSDP4_ALIGNER_LR:-1e-4}"
-LOGGING_STEPS="${LOSATOK_DYNAMIC_FSDP4_LOGGING_STEPS:-10}"
-REPORT_TO="${LOSATOK_DYNAMIC_FSDP4_REPORT_TO:-tensorboard}"
+LEARNING_RATE="${LOSATOK_DYNAMIC_FSDP2_LEARNING_RATE:-1e-4}"
+ALIGNER_LR="${LOSATOK_DYNAMIC_FSDP2_ALIGNER_LR:-1e-4}"
+LOGGING_STEPS="${LOSATOK_DYNAMIC_FSDP2_LOGGING_STEPS:-10}"
+REPORT_TO="${LOSATOK_DYNAMIC_FSDP2_REPORT_TO:-tensorboard}"
 
 FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":false,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
 
@@ -52,7 +53,7 @@ for required_path in \
   "$LOSATOK_ROOT/midashenglm" \
   "$LOSATOK_CODE_DIR/config/16k_16k_25Hz_losatok.yml"; do
   if [ ! -e "$required_path" ]; then
-    echo "Required LoSATok FSDP4 training path is missing: $required_path" >&2
+    echo "Required LoSATok FSDP2 training path is missing: $required_path" >&2
     exit 1
   fi
 done
@@ -104,14 +105,14 @@ PY
 
 mkdir -p "$OUTPUT_DIR" "$LOGGING_DIR"
 if find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print -quit | grep -q .; then
-  echo "Formal output already contains checkpoints; choose a fresh LOSATOK_DYNAMIC_FSDP4_OUTPUT_DIR: $OUTPUT_DIR" >&2
+  echo "Formal output already contains checkpoints; choose a fresh LOSATOK_DYNAMIC_FSDP2_OUTPUT_DIR: $OUTPUT_DIR" >&2
   exit 1
 fi
 
 FSDP_CONFIG_PATH="$OUTPUT_DIR/fsdp2_lora_no_activation.json"
 printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
 
-echo "========== AUDIOCAPS-V2 HUGINN LOSATOK DYNAMIC90S LORA FSDP4 TRAIN =========="
+echo "========== AUDIOCAPS-V2 HUGINN LOSATOK DYNAMIC90S LORA FSDP2-2GPU TRAIN =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "launch_mode=swift_cli_internal_torchrun"
 echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
@@ -133,7 +134,7 @@ echo "aligner_policy=trainable_including_audio_bos_audio_eos expected_trainable_
 echo "huginn_lora_policy=trainable expected_trainable_parameters=12541440"
 echo "expected_total_trainable_parameters=75494688"
 echo "loss=next_token_prediction logits[t]_predict_labels[t+1] audio_prefix_labels=-100"
-echo "fsdp=custom_fsdp2_json full_shard_auto_wrap"
+echo "fsdp=custom_fsdp2_json full_shard_auto_wrap world_size=$WORLD_SIZE"
 echo "fsdp_version=2 state_dict_type=SHARDED_STATE_DICT"
 echo "fsdp_activation_checkpointing=false gradient_checkpointing=false"
 echo "num_train_epochs=$NUM_TRAIN_EPOCHS"
@@ -150,7 +151,7 @@ TRAIN_PID=""
 MONITOR_PID=""
 
 print_resource_snapshot() {
-  echo "========== LOSATOK DYNAMIC90S FSDP4 RESOURCE SNAPSHOT =========="
+  echo "========== LOSATOK DYNAMIC90S FSDP2-2GPU RESOURCE SNAPSHOT =========="
   echo "snapshot_time=$(date '+%Y-%m-%d %H:%M:%S')"
   if [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null; then
     ps -o pid,ppid,rss,vsz,%mem,etime,stat,cmd -p "$TRAIN_PID" || true
@@ -186,7 +187,7 @@ on_exit() {
   status=$?
   trap - EXIT
   stop_resource_monitor
-  echo "========== AUDIOCAPS-V2 HUGINN LOSATOK DYNAMIC90S LORA FSDP4 EXIT =========="
+  echo "========== AUDIOCAPS-V2 HUGINN LOSATOK DYNAMIC90S LORA FSDP2-2GPU EXIT =========="
   echo "exit_status=$status"
   echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
   exit "$status"
@@ -194,7 +195,7 @@ on_exit() {
 
 on_signal() {
   local signal_name=$1
-  echo "========== LOSATOK DYNAMIC90S FSDP4 SIGNAL =========="
+  echo "========== LOSATOK DYNAMIC90S FSDP2-2GPU SIGNAL =========="
   echo "received_signal=$signal_name"
   print_resource_snapshot
   if [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null; then
@@ -295,7 +296,6 @@ for index, checkpoint_dir in enumerate(checkpoint_dirs, start=1):
     previous_step = step
 PY
 
-echo "========== AUDIOCAPS-V2 HUGINN LOSATOK DYNAMIC90S LORA FSDP4 TRAIN PASSED =========="
+echo "========== AUDIOCAPS-V2 HUGINN LOSATOK DYNAMIC90S LORA FSDP2-2GPU TRAIN PASSED =========="
 printf 'checkpoint=%s\n' "${CHECKPOINT_DIRS[@]}"
 exit 0
-
