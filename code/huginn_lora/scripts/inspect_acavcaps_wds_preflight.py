@@ -66,6 +66,7 @@ def scan_tar(tar_path: Path, preview_count: int) -> dict[str, Any]:
     flac_names: list[str] = []
     other_audio_names: list[str] = []
     invalid_json: list[dict[str, str]] = []
+    invalid_caption: list[dict[str, str]] = []
     preview: list[dict[str, Any]] = []
     key_counter: collections.Counter[str] = collections.Counter()
 
@@ -88,6 +89,8 @@ def scan_tar(tar_path: Path, preview_count: int) -> dict[str, Any]:
                     invalid_json.append({"member": member.name, "error": f"{type(exc).__name__}: {exc}"})
                     continue
                 info = json_caption_info(payload)
+                if int(info.get("long_count", 0)) <= 0:
+                    invalid_caption.append({"member": member.name, "error": "missing non-empty long caption"})
                 for key in info.get("payload_keys", []):
                     key_counter[key] += 1
                 if len(preview) < preview_count:
@@ -115,12 +118,14 @@ def scan_tar(tar_path: Path, preview_count: int) -> dict[str, Any]:
         "duplicate_flac_count": len(duplicate_flac),
         "other_audio_count": len(other_audio_names),
         "invalid_json_count": len(invalid_json),
+        "invalid_caption_count": len(invalid_caption),
         "missing_flac_preview": missing_flac[:5],
         "orphan_flac_preview": orphan_flac[:5],
         "invalid_json_preview": invalid_json[:5],
+        "invalid_caption_preview": invalid_caption[:5],
         "preview": preview,
         "json_key_counts": dict(key_counter),
-        "valid": not (missing_flac or duplicate_json or duplicate_flac or invalid_json),
+        "valid": not (missing_flac or duplicate_json or duplicate_flac or invalid_json or invalid_caption),
     }
 
 
@@ -327,7 +332,9 @@ def main() -> int:
                     "duplicate_flac_count": None,
                     "other_audio_count": None,
                     "invalid_json_count": None,
+                    "invalid_caption_count": None,
                     "preview": [],
+                    "invalid_caption_preview": [],
                     "json_key_counts": {},
                     "valid": None,
                 }
@@ -343,7 +350,8 @@ def main() -> int:
                 print(
                     f"[tar] stage={stage_name} order={order_index} category={category} "
                     f"name={tar_path.name} json={result['json_count']} flac={result['flac_count']} "
-                    f"missing_flac={result['missing_flac_count']} invalid_json={result['invalid_json_count']}"
+                    f"missing_flac={result['missing_flac_count']} invalid_json={result['invalid_json_count']} "
+                    f"invalid_caption={result['invalid_caption_count']}"
                 )
             elif args.scan_mode == "full" and (order_index + 1) % 10 == 0:
                 print(
@@ -396,11 +404,32 @@ def main() -> int:
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"[manifest] wrote_private_manifest={manifest_path}")
 
+    stats_path = manifest_path.with_suffix(".stats.json")
+    safe_manifest_path(stats_path, dataset_root)
+    stats = {
+        "schema_version": 1,
+        "manifest_path": str(manifest_path),
+        "dataset_root": str(dataset_root),
+        "public_root_mutation": "forbidden",
+        "scan_mode": args.scan_mode,
+        "seed": args.seed,
+        "sample_shuffle_buffer": args.sample_shuffle_buffer,
+        "stage_order": [stage["name"] for stage in stages],
+        "stage_tar_counts": {stage["name"]: stage["tar_count"] for stage in stages},
+        "stage_sample_counts": {stage["name"]: stage["sample_count"] for stage in stages},
+        "tar_count": total_tars,
+        "sample_count": total_samples,
+        "all_pairs_valid": all_valid,
+    }
+    stats_path.write_text(json.dumps(stats, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"[stats] wrote_private_stats={stats_path}")
+
     wds_ok = True if args.skip_wds_probe else inspect_webdataset(manifest, args.sample_shuffle_buffer, args.wds_probe_samples)
     swift_ok = True if args.skip_swift_probe else inspect_swift_iterable_support()
     header("PREFLIGHT RESULT")
     print(f"[result] public_root_changed=false")
     print(f"[result] manifest_written=true path={manifest_path}")
+    print(f"[result] stats_written=true path={stats_path}")
     pair_status = (
         "PASS" if args.scan_mode == "full" and all_valid
         else "FAIL" if all_valid is False
