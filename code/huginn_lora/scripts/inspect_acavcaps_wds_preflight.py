@@ -247,8 +247,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--manifest_out", default=str(DEFAULT_MANIFEST))
     parser.add_argument("--seed", type=int, default=20260723)
     parser.add_argument("--sample_shuffle_buffer", type=int, default=512)
+    parser.add_argument(
+        "--scan_mode",
+        choices=("inventory", "sampled", "full"),
+        default="inventory",
+        help=(
+            "inventory only lists and schedules tar files; sampled scans the first N tars per stage; "
+            "full scans every tar and is intentionally a long-running IO job"
+        ),
+    )
+    parser.add_argument("--scan_tars_per_stage", type=int, default=2)
     parser.add_argument("--preview_per_tar", type=int, default=2)
     parser.add_argument("--wds_probe_samples", type=int, default=8)
+    parser.add_argument("--print_each_tar", action="store_true")
     parser.add_argument("--skip_wds_probe", action="store_true")
     parser.add_argument("--skip_swift_probe", action="store_true")
     return parser.parse_args()
@@ -263,6 +274,8 @@ def main() -> int:
     args = parse_args()
     if args.sample_shuffle_buffer <= 0:
         raise ValueError("--sample_shuffle_buffer must be positive")
+    if args.scan_tars_per_stage <= 0:
+        raise ValueError("--scan_tars_per_stage must be positive")
     dataset_root = Path(args.dataset_root).resolve()
     if not dataset_root.is_dir():
         raise FileNotFoundError(f"ACAVCAPS public root does not exist: {dataset_root}")
@@ -274,9 +287,10 @@ def main() -> int:
     print("[dataset] policy=read_only_public_root")
     print(f"[schedule] seed={args.seed}")
     print(f"[schedule] sample_shuffle_buffer={args.sample_shuffle_buffer}")
+    print(f"[schedule] scan_mode={args.scan_mode} scan_tars_per_stage={args.scan_tars_per_stage}")
 
     stages: list[dict[str, Any]] = []
-    all_valid = True
+    all_valid: bool | None = True if args.scan_mode != "inventory" else None
     for stage_index, (stage_name, categories) in enumerate(STAGES):
         stage_tars: list[tuple[str, Path]] = []
         for category in categories:
@@ -288,17 +302,55 @@ def main() -> int:
         rng.shuffle(stage_tars)
         tar_entries: list[dict[str, Any]] = []
         stage_sample_count = 0
+        scanned_tar_count = 0
         for order_index, (category, tar_path) in enumerate(stage_tars):
-            result = scan_tar(tar_path, args.preview_per_tar)
+            should_scan = args.scan_mode == "full" or (
+                args.scan_mode == "sampled" and order_index < args.scan_tars_per_stage
+            )
+            if should_scan:
+                result = scan_tar(tar_path, args.preview_per_tar)
+                stage_sample_count += int(result["json_count"])
+                scanned_tar_count += 1
+                if all_valid is None:
+                    all_valid = bool(result["valid"])
+                else:
+                    all_valid = all_valid and bool(result["valid"])
+            else:
+                result = {
+                    "path": str(tar_path),
+                    "scan_status": "not_scanned",
+                    "json_count": None,
+                    "flac_count": None,
+                    "missing_flac_count": None,
+                    "orphan_flac_count": None,
+                    "duplicate_json_count": None,
+                    "duplicate_flac_count": None,
+                    "other_audio_count": None,
+                    "invalid_json_count": None,
+                    "preview": [],
+                    "json_key_counts": {},
+                    "valid": None,
+                }
             result.update({"category": category, "stage": stage_name, "order_index": order_index})
             tar_entries.append(result)
-            stage_sample_count += int(result["json_count"])
-            all_valid = all_valid and bool(result["valid"])
-            print(
-                f"[tar] stage={stage_name} order={order_index} category={category} "
-                f"name={tar_path.name} json={result['json_count']} flac={result['flac_count']} "
-                f"missing_flac={result['missing_flac_count']} invalid_json={result['invalid_json_count']}"
-            )
+            if should_scan and (
+                args.print_each_tar
+                or args.scan_mode != "full"
+                or order_index < 3
+                or (order_index + 1) % 25 == 0
+                or order_index + 1 == len(stage_tars)
+            ):
+                print(
+                    f"[tar] stage={stage_name} order={order_index} category={category} "
+                    f"name={tar_path.name} json={result['json_count']} flac={result['flac_count']} "
+                    f"missing_flac={result['missing_flac_count']} invalid_json={result['invalid_json_count']}"
+                )
+            elif args.scan_mode == "full" and (order_index + 1) % 10 == 0:
+                print(
+                    f"[progress] stage={stage_name} scanned_tars={order_index + 1}/{len(stage_tars)} "
+                    f"validated_tars={scanned_tar_count}",
+                    flush=True,
+                )
 
         stages.append(
             {
@@ -306,11 +358,16 @@ def main() -> int:
                 "categories": list(categories),
                 "seed": args.seed + stage_index,
                 "tar_count": len(tar_entries),
-                "sample_count": stage_sample_count,
+                "scanned_tar_count": scanned_tar_count,
+                "sample_count": stage_sample_count if scanned_tar_count == len(tar_entries) else None,
+                "scanned_sample_count": stage_sample_count,
                 "tars": tar_entries,
             }
         )
-        print(f"[stage] {stage_name} tar_count={len(tar_entries)} sample_count={stage_sample_count}")
+        print(
+            f"[stage] {stage_name} tar_count={len(tar_entries)} scanned_tar_count={scanned_tar_count} "
+            f"sample_count={stage_sample_count if scanned_tar_count == len(tar_entries) else 'unknown'}"
+        )
 
     manifest = {
         "schema_version": 1,
@@ -319,11 +376,19 @@ def main() -> int:
         "schedule_policy": "stage_order_fixed_tar_order_shuffled_per_stage_sample_buffered_per_tar",
         "seed": args.seed,
         "sample_shuffle_buffer": args.sample_shuffle_buffer,
+        "scan_mode": args.scan_mode,
         "stages": stages,
     }
-    total_samples = sum(int(stage["sample_count"]) for stage in stages)
+    total_samples = (
+        sum(int(stage["sample_count"]) for stage in stages)
+        if all(stage["sample_count"] is not None for stage in stages)
+        else None
+    )
     total_tars = sum(int(stage["tar_count"]) for stage in stages)
-    print(f"[summary] tar_count={total_tars} sample_count={total_samples} all_pairs_valid={all_valid}")
+    print(
+        f"[summary] tar_count={total_tars} sample_count={total_samples if total_samples is not None else 'unknown'} "
+        f"all_pairs_valid={all_valid if all_valid is not None else 'not_scanned'}"
+    )
 
     manifest_path = Path(args.manifest_out).resolve()
     safe_manifest_path(manifest_path, dataset_root)
@@ -336,10 +401,16 @@ def main() -> int:
     header("PREFLIGHT RESULT")
     print(f"[result] public_root_changed=false")
     print(f"[result] manifest_written=true path={manifest_path}")
-    print(f"[result] tar_pair_validation={'PASS' if all_valid else 'FAIL'}")
+    pair_status = (
+        "PASS" if args.scan_mode == "full" and all_valid
+        else "FAIL" if all_valid is False
+        else "PARTIAL" if args.scan_mode == "sampled"
+        else "NOT_SCANNED"
+    )
+    print(f"[result] tar_pair_validation={pair_status}")
     print(f"[result] webdataset_probe={'PASS' if wds_ok else 'FAIL'}")
     print(f"[result] swift_iterable_probe={'PASS' if swift_ok else 'FAIL'}")
-    return 0 if all_valid and wds_ok and swift_ok else 2
+    return 0 if all_valid is not False and wds_ok and swift_ok else 2
 
 
 if __name__ == "__main__":

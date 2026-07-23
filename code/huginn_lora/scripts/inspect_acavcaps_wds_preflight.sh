@@ -13,6 +13,8 @@ export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
 export ACAVCAPS_WDS_SEED="${ACAVCAPS_WDS_SEED:-20260723}"
 export ACAVCAPS_WDS_SAMPLE_SHUFFLE_BUFFER="${ACAVCAPS_WDS_SAMPLE_SHUFFLE_BUFFER:-512}"
+export ACAVCAPS_WDS_SCAN_MODE="${ACAVCAPS_WDS_SCAN_MODE:-inventory}"
+export ACAVCAPS_WDS_SCAN_TARS_PER_STAGE="${ACAVCAPS_WDS_SCAN_TARS_PER_STAGE:-2}"
 
 PRIVATE_ROOT="${ACAVCAPS_WDS_PRIVATE_ROOT:-$REPO_ROOT/data/audio_swift/acavcaps_wds}"
 MANIFEST_OUT="${ACAVCAPS_WDS_MANIFEST_OUT:-$PRIVATE_ROOT/acavcaps_wds_stage_schedule_seed${ACAVCAPS_WDS_SEED}.json}"
@@ -24,9 +26,13 @@ echo "public_dataset_root=/hpc_stor03/public/shared/data/raa/ACAVCAPS"
 echo "private_manifest=$MANIFEST_OUT"
 echo "seed=$ACAVCAPS_WDS_SEED"
 echo "sample_shuffle_buffer=$ACAVCAPS_WDS_SAMPLE_SHUFFLE_BUFFER"
+echo "scan_mode=$ACAVCAPS_WDS_SCAN_MODE"
+echo "scan_tars_per_stage=$ACAVCAPS_WDS_SCAN_TARS_PER_STAGE"
 
 python -u code/huginn_lora/scripts/inspect_acavcaps_wds_preflight.py \
   --dataset_root /hpc_stor03/public/shared/data/raa/ACAVCAPS \
   --manifest_out "$MANIFEST_OUT" \
   --seed "$ACAVCAPS_WDS_SEED" \
-  --sample_shuffle_buffer "$ACAVCAPS_WDS_SAMPLE_SHUFFLE_BUFFER"
+  --sample_shuffle_buffer "$ACAVCAPS_WDS_SAMPLE_SHUFFLE_BUFFER" \
+  --scan_mode "$ACAVCAPS_WDS_SCAN_MODE" \
+  --scan_tars_per_stage "$ACAVCAPS_WDS_SCAN_TARS_PER_STAGE"
