@@ -646,13 +646,28 @@ class HuginnLoSATokTemplate(Template):
                     return Path(audio_item[key])
         raise TypeError(f"Unsupported LoSATok audio item: {type(audio_item)}")
 
+    @staticmethod
+    def _audio_bytes(audio_item: Any) -> bytes | None:
+        if not isinstance(audio_item, dict) or "audio_bytes" not in audio_item:
+            return None
+        value = audio_item["audio_bytes"]
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, (bytearray, memoryview)):
+            return bytes(value)
+        raise TypeError(f"Unsupported LoSATok embedded audio type: {type(value)}")
+
     def _encode(self, inputs: StdTemplateInputs) -> dict[str, Any]:
         encoded = super()._encode(inputs)
         if not getattr(inputs, "audios", None):
             return encoded
         if len(inputs.audios) != 1:
             raise ValueError("Huginn LoSATok template requires exactly one audio clip per record")
-        encoded["audio_input_values"] = load_audio_16k(self._path(inputs.audios[0]))
+        audio_bytes = self._audio_bytes(inputs.audios[0])
+        if audio_bytes is not None:
+            encoded["audio_input_values"] = decode_audio_bytes_16k(audio_bytes, "Swift dataset audio_bytes")
+        else:
+            encoded["audio_input_values"] = load_audio_16k(self._path(inputs.audios[0]))
         return encoded
 
     def _data_collator_mm_data(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
