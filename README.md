@@ -54,7 +54,7 @@ This repo contains **two major experiment families**:
 Two audio lines coexist and must remain strictly separate:
 
 1. **LoSATok legacy fixed-32 ACAVCAPS continuation** is the usable short-term training line. It starts from the completed single-GPU AudioCaps-v2 LoRA checkpoint `.../huginn_losatok_audiocaps_v2_train_e3_b8ga4_5090/v1-20260720-162632/checkpoint-2802`, keeps the whole official LoSATok stack frozen, and trains only the aligner plus Huginn LoRA. Its read-only WebDataset pipeline, quarter-manifest derivation, and fresh-process warm-start save/reload smoke have passed. The formal quarter ACAVCAPS job is prepared, but must not be described as completed until its remote log is supplied.
-2. **LoSATok dynamic-90s two-GPU FSDP2 line** is the main engineering blocker. Forward/backward smoke tests and ACAVCAPS distributed data loading pass. Historical dynamic DCP checkpoints contain `66` LoRA tensors and **zero** of the required `20` aligner tensors and must not be used. The current dynamic save smoke now passes its first strict `66 + 20` DCP audit after the PEFT wrapper repair, but fresh-process Trainer resume is still under validation because Swift's legacy `lora_llm` loader assumes a separate `vit.safetensors` file. The immediate task is to complete that save-plus-fresh-process-reload validation, then restart dynamic AudioCaps-v2 for two epochs before dynamic ACAVCAPS-quarter continuation.
+2. **LoSATok dynamic-90s two-GPU FSDP2 line** has now passed its complete save/resume gate. Forward/backward, ACAVCAPS distributed loading, strict `66 LoRA + 20 aligner` DCP saving, fresh-process same-world-size Trainer resume, continued optimization, and a second complete DCP save all pass. Historical dynamic DCP checkpoints with `66` LoRA and `0` aligner remain unusable. The next task is the newly prepared fresh two-epoch AudioCaps-v2 run, followed by strict audit of both epoch checkpoints and then dynamic ACAVCAPS-quarter continuation.
 3. **Whisper-large FSDP full finetuning** remains a separate historical/independent line: frozen Whisper-large, full-trainable aligner, full-trainable Huginn under Swift FSDP2. The historical 8-GPU `checkpoint-2802` is an evaluation artifact, not a cross-world-size resume source. Do not infer its remote job state without a user-supplied log.
 
 The shared audio architecture is:
@@ -231,12 +231,18 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
     `LoRALLMTuner.from_pretrained` as a `staticmethod`, while the initial defensive patch accepted only an instance method.
     No model, dataset, CUDA tensor, process group, or checkpoint was touched in that failed run. The plugin now preserves all
     three Python descriptor forms and logs the selected form; the expected remote value is
-    `tuner_class=LoRALLMTuner descriptor=staticmethod`. This final resume repair remains **pending smoke validation**.
+    `tuner_class=LoRALLMTuner descriptor=staticmethod`.
+  - Final remote result: the dedicated smoke completed end to end. It saved
+    `.../run-20260724_112507/save_phase/v0-20260724-112551/checkpoint-2`, restored it in a fresh two-rank process, continued
+    from global step `2` to `3`, saved
+    `.../run-20260724_112507/resume_phase/v0-20260724-113128/checkpoint-3`, and printed
+    `LOSATOK DYNAMIC FSDP2 MODULES-TO-SAVE SAVE/RESUME SMOKE PASSED`. Both strict DCP audits are therefore complete.
 - The formal dynamic AudioCaps-v2 script remains
   - runtime: `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2.sh`;
   - submit: `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.sh`;
-  but it is **blocked** until a saved checkpoint has the contract `66 LoRA + 20 aligner`, passes a fresh-process FSDP reload,
-  and only then will be reset to a new two-epoch AudioCaps-v2 run.
+  - status: ready for a fresh two-epoch AudioCaps-v2 run; two GPUs, `B=4`, `GA=4`, effective batch `32`, one checkpoint per
+    epoch, `save_only_model=false`, and a required `66 + 20` DCP audit for every resulting checkpoint. It is prepared but must
+    not be described as started or completed until the user supplies the remote training log.
 - Do not load older fixed-32 aligner checkpoints while the dynamic environment variable is enabled unless a deliberate
   architecture-conversion procedure is implemented and separately validated.
 
@@ -1286,8 +1292,8 @@ Historical validation facts retained here; active status is updated through 2026
 - Swift registration, tar/WAV decoding, audio-prefix insertion, shifted NTP loss, and audio-encoder freezing have all been remote-verified.
 - single-GPU Whisper LoRA routes on ACAVCAPS/AudioCaps are historical validated baselines.
 - the LoSATok single-GPU LoRA route has completed three AudioCaps-v2 epochs and one ClothoAQA continuation epoch; it is a current checkpoint-producing/evaluation line.
-- the distinct dynamic-90s LoSATok FSDP2 route is not checkpoint-producing yet: its compute smoke passes, but its audited DCP
-  checkpoints omit all `20` aligner tensors. Refer to the dated dynamic section near the beginning of this README before using it.
+- the distinct dynamic-90s LoSATok FSDP2 route now passes complete `66 LoRA + 20 aligner` DCP save, fresh-process two-rank
+  Trainer resume, continued optimization, and re-save. Only the older `20260723-054928` checkpoints remain incomplete.
 - 8-GPU Swift FSDP2 initialization, one-step backward, 20-step stability, and sharded checkpoint resume have passed.
 - the formal 8-GPU run reached historical `checkpoint-2802` (epoch 1). A separate fresh 7-GPU plan exists, but its live remote status must be confirmed from logs.
 - FSDP checkpoint evaluation is implemented in the existing Clotho retrieval, Clotho sample-generation, and MMAU-mini scripts. They stream DCP tensors directly from the original 8 shard files into a one-GPU model and never create a merged full-weight cache. Submit these one-GPU 5090 jobs sequentially, each with the queue-limited `8 CPU / 32G` request.
@@ -1675,8 +1681,8 @@ Any new chat should assume the following:
      - legacy fixed-32 checkpoint save/resume passed; do not generalize that result to dynamic FSDP2
      - completed three AudioCaps-v2 epochs at `checkpoint-2802`, `checkpoint-5604`, and `checkpoint-8406`
      - completed one ClothoAQA warm-start epoch from LoSATok `checkpoint-2802` to ClothoAQA `checkpoint-659`
-     - dynamic 90-second two-GPU forward/backward and WebDataset smoke pass, but dynamic DCP saving is currently incomplete
-       (`66` LoRA / `0` aligner instead of `66` / `20`); dynamic checkpoint evaluation and continuation are blocked pending repair
+     - dynamic 90-second two-GPU forward/backward, WebDataset, complete DCP save, and fresh-process resume smokes pass;
+       the new formal two-epoch AudioCaps-v2 run is prepared, while the older `66` / `0` checkpoints remain forbidden
      - legacy fixed-32 quarter-ACAVCAPS warm-start save/reload passed and is the currently usable continuation route
 8. The current audio project already has:
    - smoke training
@@ -1725,7 +1731,7 @@ Any new chat should assume the following:
    - the older standalone audio scripts in `code/recurrent-pretraining-main`
    - the newer Swift multimodal LoRA and FSDP route in `code/huginn_lora`
 9. Do not forget that the Swift branch has already passed remote smoke and mid training; do not regress it back into an "unverified" mental model.
-10. For Whisper full-training requests, default to the **Swift multimodal FSDP full-training path**. For encoder replacement requests, use the dedicated LoSATok Swift files. Legacy fixed-32 LoSATok checkpoint validation passes; dynamic-90s FSDP2 checkpoint validation currently fails because aligner weights are absent. Do not modify the verified Whisper plugin or cross-load Whisper and LoSATok checkpoints.
+10. For Whisper full-training requests, default to the **Swift multimodal FSDP full-training path**. For encoder replacement requests, use the dedicated LoSATok Swift files. Both legacy fixed-32 checkpoint validation and the repaired dynamic-90s FSDP2 complete save/resume validation pass; the older dynamic `66` / `0` checkpoints are still invalid. Do not modify the verified Whisper plugin or cross-load Whisper and LoSATok checkpoints.
 11. For current Swift audio training and evaluation, use the `pdgpu-5090` submit wrappers unless an existing legacy smoke/preparation wrapper explicitly targets `pdgpu-3090`.
 12. For ACAVCAPS, use the current private WebDataset stage manifest: global tar-order shuffle within each stage plus runtime buffer shuffle within each tar, with FLAC decoded only during training. Never modify the shared public dataset root or add manual rank sharding on top of Accelerate's `DataLoaderDispatcher` behavior.
 13. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
@@ -1757,22 +1763,23 @@ Any new chat should assume the following:
   - a validated legacy fixed-32 LoSATok Swift LoRA route
   - a validated Swift FSDP2 full-parameter route with separate Whisper checkpoint handling
   - a completed LoSATok AudioCaps-v2 LoRA run and completed LoSATok-to-ClothoAQA LoRA continuation
-- Dynamic LoSATok is architecturally and computationally validated, but is **not checkpoint-valid** yet. Its old two-GPU DCP
-  checkpoints have `66` LoRA / `0` aligner tensors. Any code or log claim to the contrary predates the current direct DCP audit
-  and is superseded.
+- Dynamic LoSATok is architecturally, computationally, and checkpoint-resume validated. The repaired route saves and reloads
+  `66` LoRA plus `20` aligner tensors under two-rank FSDP2. Its old `20260723-054928` checkpoints still have `66` / `0` and
+  remain permanently excluded from evaluation or continuation.
 
 ### Current immediate next-step expectation (updated 2026-07-24)
 
 If a new agent is asked "what should we do now", the best default interpretation is:
 
 1. determine which of the three incompatible paths is requested: legacy fixed-32 LoSATok, dynamic-90s LoSATok FSDP2, or Whisper FSDP. Do not silently mix plugins, checkpoint layouts, or data loaders.
-2. for the **current dynamic blocker**, run or inspect only the dedicated modules-to-save debug smoke. Collect the two diagnostic lines emitted by the plugin: `PEFT modules-to-save topology audit` and `FSDP2 pre-DCP save-state audit`. Do not attempt MMAU/generation or ACAVCAPS continuation from the incomplete dynamic DCPs.
+2. for the **dynamic route**, use only checkpoints produced after the complete save/resume smoke repair and require `66 + 20`
+   DCP audit success. Never use the historical incomplete dynamic DCPs for MMAU, generation, or ACAVCAPS continuation.
 3. for the **usable legacy ACAVCAPS path**, use the completed fixed-32 AudioCaps checkpoint
    `huginn_losatok_audiocaps_v2_train_e3_b8ga4_5090/v1-20260720-162632/checkpoint-2802` as an adapter-plus-aligner
    **weight warm-start**, not a Trainer resume. The quarter schedule is `271` read-only tars across the three curriculum stages,
    streaming FLAC decode at training time, one 5090, `B=8`, `GA=4`.
-4. only after the dynamic debug smoke saves `66 + 20` tensors and fresh-process reload passes: make a new dynamic AudioCaps-v2
-   two-epoch run, audit every saved checkpoint, then warm-start dynamic ACAVCAPS-quarter training.
+4. the dynamic debug smoke now passes; the current next step is the fresh dynamic AudioCaps-v2 two-epoch run. Audit both epoch
+   checkpoints, then warm-start dynamic ACAVCAPS-quarter training from the selected complete checkpoint.
 5. retain evaluation as a separate line. Legacy adapter/vit checkpoints can use manual generation/MMAU restore; the incomplete
    dynamic DCPs cannot. No MMAU or Clotho-generation result should be inferred without a supplied remote log.
 6. do local code/docs edits only; all remote work must be submitted through the existing `run_*.sh` wrappers using `vc submit`.

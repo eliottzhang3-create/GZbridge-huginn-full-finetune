@@ -24,17 +24,19 @@ export HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT=1
 
 TRAIN_MANIFEST="${LOSATOK_DYNAMIC_FSDP2_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
-OUTPUT_DIR="${LOSATOK_DYNAMIC_FSDP2_OUTPUT_DIR:-outputs/huginn_losatok_dynamic90s_audiocaps_v2_e3_b4ga4_fsdp2}"
+OUTPUT_DIR="${LOSATOK_DYNAMIC_FSDP2_OUTPUT_DIR:-outputs/huginn_losatok_dynamic90s_audiocaps_v2_e2_b4ga4_fsdp2_complete}"
 LOGGING_DIR="${LOSATOK_DYNAMIC_FSDP2_LOGGING_DIR:-$OUTPUT_DIR/tensorboard}"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_losatok_swift.py"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-losatok-v1"
+CHECKPOINT_AUDIT_SCRIPT="$REPO_ROOT/code/huginn_lora/scripts/inspect_losatok_dynamic_fsdp_checkpoint.py"
 LOSATOK_ROOT=/hpc_stor03/sjtu_home/jinwei.zhang/models/LoSATok
 LOSATOK_CODE_DIR="$REPO_ROOT/code/huginn_lora/LosatokCode"
 
 WORLD_SIZE=2
 MICRO_BATCH_SIZE=4
 GRADIENT_ACCUMULATION_STEPS=4
-NUM_TRAIN_EPOCHS=3
+NUM_TRAIN_EPOCHS=2
+MODULES_TO_SAVE=(temporal_compressor audio_projector audio_boundary_embeddings)
 LEARNING_RATE="${LOSATOK_DYNAMIC_FSDP2_LEARNING_RATE:-1e-4}"
 ALIGNER_LR="${LOSATOK_DYNAMIC_FSDP2_ALIGNER_LR:-1e-4}"
 LOGGING_STEPS="${LOSATOK_DYNAMIC_FSDP2_LOGGING_STEPS:-10}"
@@ -49,6 +51,7 @@ fi
 for required_path in \
   "$MODEL_PATH" \
   "$PLUGIN_PATH" \
+  "$CHECKPOINT_AUDIT_SCRIPT" \
   "$LOSATOK_ROOT/ckpts/losatok_kl1e-3.pth" \
   "$LOSATOK_ROOT/ckpts/semantic_encoder.pth" \
   "$LOSATOK_ROOT/midashenglm" \
@@ -86,7 +89,7 @@ from swift.arguments.sft_args import SftArguments
 available = {field.name for field in fields(SftArguments)}
 required = {
     "fsdp", "num_train_epochs", "save_strategy", "save_total_limit",
-    "save_only_model", "tuner_type", "freeze_aligner",
+    "save_only_model", "tuner_type", "freeze_aligner", "modules_to_save",
 }
 missing = sorted(required - available)
 if missing:
@@ -144,7 +147,8 @@ echo "gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS"
 echo "global_effective_batch_size=$((WORLD_SIZE * MICRO_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
 echo "learning_rate=$LEARNING_RATE aligner_lr=$ALIGNER_LR"
 echo "dataset_shuffle=true train_dataloader_shuffle=true"
-echo "save_strategy=epoch save_total_limit=3 save_only_model=false"
+echo "modules_to_save=${MODULES_TO_SAVE[*]} expected_checkpoint_tensors=lora_66+aligner_20"
+echo "save_strategy=epoch save_total_limit=$NUM_TRAIN_EPOCHS save_only_model=false"
 echo "logging_steps=$LOGGING_STEPS report_to=$REPORT_TO"
 echo "train_chain_audit=true"
 
@@ -224,6 +228,7 @@ swift sft \
   --logging_dir "$LOGGING_DIR" \
   --tuner_type lora_llm \
   --freeze_aligner false \
+  --modules_to_save "${MODULES_TO_SAVE[@]}" \
   --learning_rate "$LEARNING_RATE" \
   --aligner_lr "$ALIGNER_LR" \
   --lora_rank 16 \
@@ -236,7 +241,7 @@ swift sft \
   --gradient_checkpointing false \
   --logging_steps "$LOGGING_STEPS" \
   --save_strategy epoch \
-  --save_total_limit 3 \
+  --save_total_limit "$NUM_TRAIN_EPOCHS" \
   --dataloader_num_workers 0 \
   --dataloader_pin_memory false \
   --dataset_num_proc 1 \
@@ -256,8 +261,8 @@ if [ "$TRAIN_STATUS" -ne 0 ]; then
 fi
 
 mapfile -t CHECKPOINT_DIRS < <(find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print | sort -V)
-if [ "${#CHECKPOINT_DIRS[@]}" -ne 3 ]; then
-  echo "Expected exactly three epoch checkpoints below $OUTPUT_DIR, found ${#CHECKPOINT_DIRS[@]}" >&2
+if [ "${#CHECKPOINT_DIRS[@]}" -ne "$NUM_TRAIN_EPOCHS" ]; then
+  echo "Expected exactly $NUM_TRAIN_EPOCHS epoch checkpoints below $OUTPUT_DIR, found ${#CHECKPOINT_DIRS[@]}" >&2
   printf '  %s\n' "${CHECKPOINT_DIRS[@]:-<none>}" >&2
   exit 1
 fi
@@ -296,6 +301,14 @@ for index, checkpoint_dir in enumerate(checkpoint_dirs, start=1):
     )
     previous_step = step
 PY
+
+for checkpoint_dir in "${CHECKPOINT_DIRS[@]}"; do
+  echo "========== FORMAL CHECKPOINT DCP AUDIT =========="
+  echo "checkpoint=$checkpoint_dir"
+  python -u "$CHECKPOINT_AUDIT_SCRIPT" \
+    --checkpoint "$checkpoint_dir" \
+    --require_complete
+done
 
 echo "========== AUDIOCAPS-V2 HUGINN LOSATOK DYNAMIC90S LORA FSDP2-2GPU TRAIN PASSED =========="
 printf 'checkpoint=%s\n' "${CHECKPOINT_DIRS[@]}"

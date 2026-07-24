@@ -24,7 +24,7 @@ vc submit \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 16 -m 64G -g 2 \
   -n 1 \
-  -j losatok-dyn90-f2-b4ga4-e3-$(date +%m%d%H%M) \
+  -j losatok-dyn90-f2-b4ga4-e2-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2.sh"
