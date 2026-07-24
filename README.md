@@ -199,9 +199,19 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
     `peft_config.modules_to_save` from this inner model;
   - immediately before DCP write, Accelerate calls `_get_model_state_dict(..., adapter_only=True)` and receives exactly
     `66` LoRA keys, `0` aligner keys, and `0` other keys;
-  - DCP therefore behaves correctly by writing those same 66 keys. The remaining investigation is upstream: identify which
-    Swift/Transformers path forces `adapter_only=True`, and why `modules_to_save` did not produce wrappers. Do **not** simply
-    force `adapter_only=False`, because that could serialize the frozen multi-billion-parameter Huginn backbone.
+  - the captured call stack and source locate that flag in the normal Transformers checkpoint flow:
+    `transformers/trainer.py:_get_fsdp_ckpt_kwargs()` returns `{"adapter_only": True}` whenever the installed Accelerate
+    `save_fsdp_model` exposes that argument; `Trainer._save_optimizer_and_scheduler` passes it to the FSDP writer. This is not
+    caused by `save_only_model` or by the DCP writer;
+  - Accelerate then deliberately calls PEFT `get_peft_model_state_dict` for a `FSDPPeftModelForCausalLM`; its paired load path
+    calls `set_peft_model_state_dict`. This is the desired checkpoint format **if** the aligner is represented by PEFT
+    `ModulesToSaveWrapper` entries;
+  - Swift's `lora_layers.py` explicitly supports that wrapper and checks every model-module suffix before LoRA target matching.
+    The failed smoke log confirms the actual `LoraConfig` did receive all three names, so argument parsing/config construction
+    is not the defect. The narrow remaining investigation is the `tuner_backend=peft` implementation selected by
+    `Swift.prepare_model`: determine why it does not instantiate the wrappers despite that config. Once repaired, the existing
+    adapter-only FSDP save/load pairing should include LoRA plus aligner without any custom DCP format or sidecar. Do **not**
+    simply force `adapter_only=False`, because that could serialize the frozen multi-billion-parameter Huginn backbone.
 - Current targeted diagnostic:
   - `code/huginn_lora/scripts/smoke_audiocaps_v2_huginn_losatok_dynamic90s_modules_save_fsdp2_5090.sh`;
   - submit only through `code/huginn_lora/run_smoke_audiocaps_v2_huginn_losatok_dynamic90s_modules_save_fsdp2_5090.sh`;

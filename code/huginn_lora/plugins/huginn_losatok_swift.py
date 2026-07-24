@@ -479,7 +479,7 @@ def force_aligner_trainable(model: torch.nn.Module) -> None:
     print(f"[HuginnLoSATokSwift] restored_aligner_trainable_parameters={trainable}")
 
 
-def audit_modules_to_save_topology(model: torch.nn.Module) -> None:
+def audit_modules_to_save_topology(model: torch.nn.Module, *, stage: str = "first_forward") -> None:
     """Opt-in, key-only inspection of PEFT's aligner wrapping after FSDP setup."""
     if not _requested(FSDP_SAVE_DEBUG_ENV) or getattr(
         model, "_huginn_losatok_modules_to_save_audited", False
@@ -518,9 +518,59 @@ def audit_modules_to_save_topology(model: torch.nn.Module) -> None:
     if os.environ.get("RANK", "0") == "0":
         print(
             "[HuginnLoSATokSwift] PEFT modules-to-save topology audit "
-            f"peft_configs={peft_configs} wrappers={wrappers} aligner_modules={aligner_modules}"
+            f"stage={stage} model_type={type(model)} peft_configs={peft_configs} "
+            f"wrappers={wrappers} aligner_modules={aligner_modules}"
         )
     model._huginn_losatok_modules_to_save_audited = True
+
+
+def patch_swift_prepare_model_audit() -> None:
+    """Trace PEFT wrapping immediately after Swift creates the adapter model.
+
+    The forward audit observes the inner Huginn model after FSDP setup.  This
+    opt-in hook observes the object returned by ``Swift.prepare_model`` before
+    FSDP preparation, which distinguishes a PEFT wrapping failure from a later
+    FSDP transformation.  It is diagnostic only and returns Swift's original
+    model object unchanged.
+    """
+    if not _requested(FSDP_SAVE_DEBUG_ENV):
+        return
+    try:
+        from swift.tuners import Swift
+    except ImportError:
+        return
+    descriptor = Swift.__dict__.get("prepare_model")
+    original = Swift.prepare_model
+    if getattr(original, "_huginn_losatok_prepare_audit_patched", False):
+        return
+
+    def run_original_and_audit(*args, **kwargs):
+        config = args[1] if len(args) > 1 else kwargs.get("config")
+        configured_modules = getattr(config, "modules_to_save", None)
+        result = original(*args, **kwargs)
+        if os.environ.get("RANK", "0") == "0":
+            print(
+                "[HuginnLoSATokSwift] PEFT prepare-model audit "
+                f"config_type={type(config)} configured_modules_to_save={configured_modules} "
+                f"result_type={type(result)}"
+            )
+        audit_modules_to_save_topology(result, stage="immediately_after_swift_prepare_model")
+        return result
+
+    if isinstance(descriptor, staticmethod):
+        run_original_and_audit._huginn_losatok_prepare_audit_patched = True
+        Swift.prepare_model = staticmethod(run_original_and_audit)
+    elif isinstance(descriptor, classmethod):
+        def classmethod_wrapper(cls, *args, **kwargs):
+            del cls
+            return run_original_and_audit(*args, **kwargs)
+
+        classmethod_wrapper._huginn_losatok_prepare_audit_patched = True
+        Swift.prepare_model = classmethod(classmethod_wrapper)
+    else:
+        run_original_and_audit._huginn_losatok_prepare_audit_patched = True
+        Swift.prepare_model = run_original_and_audit
+    print("[HuginnLoSATokSwift] installed Swift.prepare_model PEFT wrapping audit")
 
 
 def patch_peft_adapter_restore() -> None:
@@ -629,7 +679,7 @@ def patch_shift_loss(model: torch.nn.Module) -> torch.nn.Module:
             self, "_huginn_losatok_final_split_audited", False
         ):
             audit_final_trainable_split(self)
-            audit_modules_to_save_topology(self)
+            audit_modules_to_save_topology(self, stage="first_forward_inner_model")
             self._huginn_losatok_final_split_audited = True
         without_labels = dict(kwargs)
         without_labels["labels"] = None
@@ -727,6 +777,7 @@ def build_model(model_dir: str) -> torch.nn.Module:
     enable_fsdp2_nonpersistent_rope_buffer(model)
     patch_accelerate_fsdp2_state_dict_key_alignment()
     patch_accelerate_fsdp2_save_state_audit()
+    patch_swift_prepare_model_audit()
     audit_model_split(model)
     return patch_shift_loss(model)
 
