@@ -273,8 +273,18 @@ def load_full_fsdp_base_model(
         restore_model = peft_model
     target_state = restore_model.state_dict()
 
+    # DCP keys and PEFT keys can carry different wrapper prefixes (for example
+    # ``model.`` versus ``base_model.model.``).  Normalize aliases on both
+    # sides instead of assuming that stripping prefixes from the source is
+    # sufficient.
+    target_aliases: dict[str, list[str]] = {}
+    for target_key in target_state:
+        for alias in candidate_target_keys(target_key):
+            target_aliases.setdefault(alias, []).append(target_key)
+
     restore_plan: list[tuple[str, str, tuple[int, ...], torch.dtype]] = []
     unmatched_source_keys: list[str] = []
+    shape_mismatch_count = 0
     for source_key, tensor_metadata in state_metadata.items():
         source_key = str(source_key)
         shape_value = getattr(tensor_metadata, "size", None)
@@ -284,16 +294,29 @@ def load_full_fsdp_base_model(
             continue
         shape = tuple(int(size) for size in shape_value)
         matched_target_key = None
-        for target_key in candidate_target_keys(source_key):
-            if target_key in target_state and tuple(target_state[target_key].shape) == shape:
-                matched_target_key = target_key
+        source_aliases = candidate_target_keys(source_key)
+        for alias in source_aliases:
+            for target_key in target_aliases.get(alias, []):
+                if tuple(target_state[target_key].shape) == shape:
+                    matched_target_key = target_key
+                    break
+            if matched_target_key is not None:
                 break
         if matched_target_key is None:
             unmatched_source_keys.append(source_key)
+            if any(alias in target_aliases for alias in source_aliases):
+                shape_mismatch_count += 1
             continue
         restore_plan.append((source_key, matched_target_key, shape, source_dtype))
     if not restore_plan:
-        raise RuntimeError(f"No FSDP DCP tensors matched the Huginn audio model: {source_dir}")
+        source_preview = [str(key) for key in list(state_metadata)[:12]]
+        target_preview = list(target_state)[:12]
+        raise RuntimeError(
+            "No FSDP DCP tensors matched the Huginn audio model: "
+            f"{source_dir}; metadata_keys={len(state_metadata)} "
+            f"target_keys={len(target_state)} shape_mismatch_count={shape_mismatch_count} "
+            f"source_preview={source_preview} target_preview={target_preview}"
+        )
 
     print(f"[fsdp-stream] source_dir={source_dir}")
     print(
