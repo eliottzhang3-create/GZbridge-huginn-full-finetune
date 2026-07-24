@@ -111,6 +111,11 @@ def candidate_target_keys(source_key: str) -> list[str]:
         normalized.add(key)
         normalized.add(key.replace(".modules_to_save.default.", "."))
         normalized.add(key.replace(".original_module.", "."))
+        # FSDP2 saved this LoRA state with the adapter name elided
+        # (``lora_A.weight``), while a freshly created PEFT model uses the
+        # default adapter namespace (``lora_A.default.weight``).
+        normalized.add(key.replace(".lora_A.default.", ".lora_A."))
+        normalized.add(key.replace(".lora_B.default.", ".lora_B."))
     return list(normalized)
 
 
