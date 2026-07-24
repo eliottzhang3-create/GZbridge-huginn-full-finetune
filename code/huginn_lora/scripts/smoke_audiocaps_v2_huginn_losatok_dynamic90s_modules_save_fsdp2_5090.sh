@@ -16,6 +16,7 @@ export OMP_NUM_THREADS=4
 export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
 export HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS=1
 export HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT=1
+export HUGINN_LOSATOK_FSDP_SAVE_DEBUG=1
 unset HUGINN_LOSATOK_FORCE_ALIGNER_TRAINABLE
 
 TRAIN_MANIFEST="${LOSATOK_DYNAMIC_MODULES_SAVE_SMOKE_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
@@ -94,6 +95,7 @@ echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "world_size=$WORLD_SIZE per_device_batch=$MICRO_BATCH_SIZE accumulation=$GRADIENT_ACCUMULATION_STEPS"
 echo "dynamic_audio_prefix=90_seconds compressor=kernel11_stride6 adaptive_pool=false"
 echo "modules_to_save=${MODULES_TO_SAVE[*]}"
+echo "fsdp_save_debug=true (logs PEFT wrapping and the exact pre-DCP state-dict keys)"
 echo "required_dcp_tensor_contract=lora_66+aligner_20"
 echo "phase1=max_steps_$SAVE_STEPS save_checkpoint_$SAVE_STEPS"
 echo "phase2=fresh_process_resume_checkpoint_$SAVE_STEPS max_steps_$RESUME_MAX_STEPS save_checkpoint_$RESUME_MAX_STEPS"

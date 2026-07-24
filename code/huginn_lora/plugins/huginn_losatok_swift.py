@@ -53,6 +53,7 @@ INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_LOSATOK_INIT_ALIGNER_CHECKPOINT"
 FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_LOSATOK_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT"
+FSDP_SAVE_DEBUG_ENV = "HUGINN_LOSATOK_FSDP_SAVE_DEBUG"
 DYNAMIC_ALIGNER_TRAINABLE_PARAMETERS = 62_953_248
 HUGINN_LORA_TRAINABLE_PARAMETERS = 12_541_440
 
@@ -192,6 +193,67 @@ def patch_accelerate_fsdp2_state_dict_key_alignment() -> None:
     patched._huginn_key_alignment_patched = True
     fsdp_utils.fsdp2_load_full_state_dict = patched
     print("[HuginnLoSATokSwift] installed Accelerate FSDP2 state-dict key-alignment patch")
+
+
+def _fsdp_save_state_groups(state_dict: dict[str, Any]) -> dict[str, list[str]]:
+    """Classify the exact state entries returned to Accelerate's FSDP writer.
+
+    This function deliberately inspects keys only.  It does not materialize,
+    clone, move, or otherwise alter any sharded tensor in a checkpoint save.
+    """
+    groups: dict[str, list[str]] = {"lora": [], "aligner": [], "other": []}
+    for raw_key in state_dict:
+        key = str(raw_key)
+        aliases = checkpoint_key_aliases(key)
+        if any(".lora_A." in alias or ".lora_B." in alias for alias in aliases):
+            groups["lora"].append(key)
+        elif any(alias.startswith(ALIGNER_PREFIXES) for alias in aliases):
+            groups["aligner"].append(key)
+        else:
+            groups["other"].append(key)
+    return groups
+
+
+def patch_accelerate_fsdp2_save_state_audit() -> None:
+    """Opt-in trace of the state dict *before* Accelerate writes FSDP DCP.
+
+    The current failure can arise in only two places: PEFT may omit the
+    aligner from the state dict it gives Accelerate, or DCP may omit an entry
+    that it receives.  Accelerate's DCP writer is deterministic and serializes
+    precisely the mapping returned by ``_get_model_state_dict``.  Logging that
+    mapping therefore distinguishes the two cases without changing the save.
+
+    Enabled only for the dedicated debug smoke via
+    ``HUGINN_LOSATOK_FSDP_SAVE_DEBUG=1``.  It must never be set for a formal
+    run merely to avoid unnecessary diagnostic output.
+    """
+    if not _requested(FSDP_SAVE_DEBUG_ENV):
+        return
+    try:
+        from accelerate.utils import fsdp_utils
+    except ImportError:
+        return
+    original = fsdp_utils._get_model_state_dict
+    if getattr(original, "_huginn_losatok_save_audit_patched", False):
+        return
+
+    def patched(model, adapter_only=False, sd_options=None):
+        state_dict = original(model, adapter_only=adapter_only, sd_options=sd_options)
+        if os.environ.get("RANK", "0") == "0":
+            groups = _fsdp_save_state_groups(state_dict)
+            print(
+                "[HuginnLoSATokSwift] FSDP2 pre-DCP save-state audit "
+                f"adapter_only={adapter_only} tensor_count={len(state_dict)} "
+                f"lora={len(groups['lora'])} aligner={len(groups['aligner'])} "
+                f"other={len(groups['other'])} "
+                f"aligner_preview={groups['aligner'][:8]} "
+                f"other_preview={groups['other'][:8]}"
+            )
+        return state_dict
+
+    patched._huginn_losatok_save_audit_patched = True
+    fsdp_utils._get_model_state_dict = patched
+    print("[HuginnLoSATokSwift] installed Accelerate FSDP2 pre-DCP save-state audit")
 
 
 def _decode_with_ffmpeg(path: Path, target_sr: int) -> torch.Tensor:
@@ -408,6 +470,50 @@ def force_aligner_trainable(model: torch.nn.Module) -> None:
     print(f"[HuginnLoSATokSwift] restored_aligner_trainable_parameters={trainable}")
 
 
+def audit_modules_to_save_topology(model: torch.nn.Module) -> None:
+    """Opt-in, key-only inspection of PEFT's aligner wrapping after FSDP setup."""
+    if not _requested(FSDP_SAVE_DEBUG_ENV) or getattr(
+        model, "_huginn_losatok_modules_to_save_audited", False
+    ):
+        return
+
+    peft_configs: list[dict[str, Any]] = []
+    wrappers: list[dict[str, Any]] = []
+    aligner_modules: list[dict[str, Any]] = []
+    for module_name, module in model.named_modules():
+        config = getattr(module, "peft_config", None)
+        if isinstance(config, dict):
+            for adapter_name, adapter_config in config.items():
+                configured = getattr(adapter_config, "modules_to_save", None)
+                if configured is not None:
+                    peft_configs.append({
+                        "module": module_name or "<root>",
+                        "adapter": str(adapter_name),
+                        "modules_to_save": list(configured),
+                    })
+        if type(module).__name__ == "ModulesToSaveWrapper":
+            wrappers.append({
+                "module": module_name,
+                "module_key": getattr(module, "module_key", None),
+                "adapters": sorted(str(name) for name in getattr(module, "modules_to_save", {})),
+            })
+        if module_name.split(".")[-1] in ALIGNER_PREFIXES:
+            aligner_modules.append({
+                "module": module_name,
+                "type": f"{type(module).__module__}.{type(module).__name__}",
+                "parameter_count": sum(parameter.numel() for parameter in module.parameters()),
+                "trainable_parameter_count": sum(
+                    parameter.numel() for parameter in module.parameters() if parameter.requires_grad
+                ),
+            })
+    if os.environ.get("RANK", "0") == "0":
+        print(
+            "[HuginnLoSATokSwift] PEFT modules-to-save topology audit "
+            f"peft_configs={peft_configs} wrappers={wrappers} aligner_modules={aligner_modules}"
+        )
+    model._huginn_losatok_modules_to_save_audited = True
+
+
 def patch_peft_adapter_restore() -> None:
     if getattr(patch_peft_adapter_restore, "_patched", False):
         return
@@ -514,6 +620,7 @@ def patch_shift_loss(model: torch.nn.Module) -> torch.nn.Module:
             self, "_huginn_losatok_final_split_audited", False
         ):
             audit_final_trainable_split(self)
+            audit_modules_to_save_topology(self)
             self._huginn_losatok_final_split_audited = True
         without_labels = dict(kwargs)
         without_labels["labels"] = None
@@ -610,6 +717,7 @@ def build_model(model_dir: str) -> torch.nn.Module:
         print(f"[HuginnLoSATokSwift] initial_aligner_restore={aligner_report}")
     enable_fsdp2_nonpersistent_rope_buffer(model)
     patch_accelerate_fsdp2_state_dict_key_alignment()
+    patch_accelerate_fsdp2_save_state_audit()
     audit_model_split(model)
     return patch_shift_loss(model)
 
