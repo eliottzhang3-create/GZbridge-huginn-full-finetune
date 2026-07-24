@@ -19,6 +19,8 @@ DEFAULT_MODEL_PATH = "/hpc_stor03/sjtu_home/jinwei.zhang/models/HRM-text"
 EXPECTED_WEIGHT_BYTES = 2_365_606_568
 EXPECTED_WEIGHT_SHA256 = "f8fe2b2bf6948414e8e8d6538659198726d98f967c55b533b7aabe8a1fa9a584"
 EXPECTED_PARAMETER_COUNT = 1_182_795_264
+EXPECTED_LAYERS_PER_MODULE = 16
+EXPECTED_COMBINED_H_L_LAYERS = 32
 REQUIRED_FILES = (
     "config.json",
     "LICENSE",
@@ -112,7 +114,9 @@ def main() -> None:
         "model_type": "hrm_text",
         "architectures": ["HrmTextForCausalLM"],
         "hidden_size": 1536,
-        "num_hidden_layers": 32,
+        # The native HF schema stores the layer count of each recurrent
+        # module. HRM-Text-1B has 16 H-module layers plus 16 L-module layers.
+        "num_hidden_layers": EXPECTED_LAYERS_PER_MODULE,
         "H_cycles": 2,
         "L_cycles": 3,
         "prefix_lm": True,
@@ -125,6 +129,12 @@ def main() -> None:
     }
     if config_mismatches:
         raise RuntimeError(f"Unexpected HRM-Text config values: {config_mismatches}")
+    combined_h_l_layers = int(raw_config["num_hidden_layers"]) * 2
+    if combined_h_l_layers != EXPECTED_COMBINED_H_L_LAYERS:
+        raise RuntimeError(
+            "Unexpected combined H/L layer count: "
+            f"expected={EXPECTED_COMBINED_H_L_LAYERS}, actual={combined_h_l_layers}"
+        )
 
     print("[stage] load=AutoConfig", flush=True)
     config = AutoConfig.from_pretrained(model_path, local_files_only=True)
@@ -202,6 +212,8 @@ def main() -> None:
         "config": {
             "class": f"{config.__class__.__module__}.{config.__class__.__name__}",
             **{key: getattr(config, key) for key in expected_config},
+            "layers_per_module": config.num_hidden_layers,
+            "combined_h_l_layers": combined_h_l_layers,
             "attn_implementation": attention_implementation,
         },
         "tokenizer": {
