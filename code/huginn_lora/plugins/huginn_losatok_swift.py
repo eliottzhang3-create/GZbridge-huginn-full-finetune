@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import traceback
 from pathlib import Path
 from types import MethodType
 from typing import Any
@@ -241,13 +242,21 @@ def patch_accelerate_fsdp2_save_state_audit() -> None:
         state_dict = original(model, adapter_only=adapter_only, sd_options=sd_options)
         if os.environ.get("RANK", "0") == "0":
             groups = _fsdp_save_state_groups(state_dict)
+            caller_frames = []
+            for frame in traceback.extract_stack(limit=48):
+                normalized_path = frame.filename.replace("\\", "/")
+                if any(
+                    marker in normalized_path
+                    for marker in ("/swift/", "/transformers/", "/accelerate/", "/peft/")
+                ):
+                    caller_frames.append(f"{normalized_path}:{frame.lineno}:{frame.name}")
             print(
                 "[HuginnLoSATokSwift] FSDP2 pre-DCP save-state audit "
-                f"adapter_only={adapter_only} tensor_count={len(state_dict)} "
+                f"adapter_only={adapter_only} model_type={type(model)} tensor_count={len(state_dict)} "
                 f"lora={len(groups['lora'])} aligner={len(groups['aligner'])} "
                 f"other={len(groups['other'])} "
                 f"aligner_preview={groups['aligner'][:8]} "
-                f"other_preview={groups['other'][:8]}"
+                f"other_preview={groups['other'][:8]} caller_frames={caller_frames[-12:]}"
             )
         return state_dict
 
