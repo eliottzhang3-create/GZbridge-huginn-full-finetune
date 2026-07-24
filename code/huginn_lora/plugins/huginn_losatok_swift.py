@@ -8,6 +8,7 @@ is called.  This prevents padded zeros from changing the audio representation.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
@@ -480,6 +481,122 @@ def force_aligner_trainable(model: torch.nn.Module) -> None:
     print(f"[HuginnLoSATokSwift] restored_aligner_trainable_parameters={trainable}")
 
 
+def _fsdp_dcp_lora_resume_model(
+    base_model: torch.nn.Module,
+    checkpoint_dir: Path,
+    *,
+    adapter_name: str,
+) -> torch.nn.Module:
+    """Recreate a PEFT topology from an adapter-only FSDP2 DCP checkpoint.
+
+    Swift 4.1.3 treats ``resume_from_checkpoint`` as an adapter directory
+    during its early model-preparation phase.  That is valid for legacy
+    LoRA checkpoints, which contain ``adapter_config.json``.  A Transformers
+    4.53 / Accelerate 1.13 FSDP2 adapter-only checkpoint instead stores the
+    adapter tensors in ``pytorch_model_fsdp_0`` DCP shards and intentionally
+    has no standalone PEFT files.  The later Trainer/Accelerate resume path
+    still knows how to restore those DCP shards, but it first needs this same
+    PEFT module topology to exist.
+
+    Infer the exact LoRA targets and rank from DCP metadata only.  No model
+    tensor is loaded here; Accelerate remains the sole owner of DCP model and
+    optimizer/RNG restoration.  The constructor hook adds the three aligner
+    modules-to-save wrappers for the dynamic route.
+    """
+    source_dir = checkpoint_dir / "pytorch_model_fsdp_0"
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"Dynamic LoSATok FSDP DCP directory is missing: {source_dir}")
+    try:
+        from torch.distributed.checkpoint import FileSystemReader
+        from peft import LoraConfig, TaskType, get_peft_model
+    except Exception as exc:
+        raise RuntimeError(
+            "Unable to import the FSDP-DCP/PEFT APIs required for dynamic LoSATok resume"
+        ) from exc
+
+    metadata = FileSystemReader(str(source_dir)).read_metadata()
+    state_metadata = getattr(metadata, "state_dict_metadata", {})
+    lora_entries = [
+        (str(key), entry) for key, entry in state_metadata.items()
+        if ".lora_A." in str(key) or ".lora_B." in str(key)
+    ]
+    if not lora_entries:
+        raise RuntimeError(f"Dynamic LoSATok FSDP DCP has no LoRA metadata entries: {source_dir}")
+
+    module_names = set(dict(base_model.named_modules()))
+    target_modules: set[str] = set()
+    ranks: set[int] = set()
+    unresolved: list[str] = []
+    for source_key, entry in lora_entries:
+        if ".lora_A." in source_key:
+            shape_value = getattr(entry, "size", None)
+            shape = tuple(int(value) for value in shape_value) if shape_value is not None else ()
+            if not shape:
+                raise RuntimeError(f"Dynamic LoSATok DCP LoRA-A metadata has no shape: {source_key}")
+            ranks.add(int(shape[0]))
+        matched = False
+        for candidate in checkpoint_key_aliases(source_key):
+            if ".lora_A." in candidate:
+                module_path = candidate.split(".lora_A.", 1)[0]
+            elif ".lora_B." in candidate:
+                module_path = candidate.split(".lora_B.", 1)[0]
+            else:
+                continue
+            if module_path in module_names:
+                target_modules.add(module_path)
+                matched = True
+                break
+        if not matched:
+            unresolved.append(source_key)
+    if unresolved:
+        raise RuntimeError(
+            "Unable to map every dynamic LoSATok FSDP DCP LoRA entry onto the fresh base model: "
+            f"unresolved={unresolved[:10]} count={len(unresolved)}"
+        )
+    if len(ranks) != 1:
+        raise RuntimeError(f"Dynamic LoSATok DCP LoRA ranks are inconsistent: {sorted(ranks)}")
+
+    rank = next(iter(ranks))
+    saved_args: dict[str, Any] = {}
+    args_path = checkpoint_dir.parent / "args.json"
+    if args_path.is_file():
+        try:
+            payload = json.loads(args_path.read_text(encoding="utf-8"))
+            if isinstance(payload, dict):
+                saved_args = payload
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"Unable to read dynamic LoSATok checkpoint args: {args_path}") from exc
+    lora_alpha = int(saved_args.get("lora_alpha", rank * 2))
+    lora_dropout = float(saved_args.get("lora_dropout", 0.05))
+    config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=rank,
+        lora_alpha=lora_alpha,
+        lora_dropout=lora_dropout,
+        target_modules=sorted(target_modules),
+        bias="none",
+        inference_mode=False,
+    )
+    restored = get_peft_model(base_model, config, adapter_name=adapter_name)
+    injected_target_count = sum(
+        1 for name, _ in restored.named_modules()
+        if name.endswith(".lora_A.default") or name == "lora_A.default"
+    )
+    if injected_target_count != len(target_modules):
+        raise RuntimeError(
+            "Dynamic LoSATok FSDP resume recreated an unexpected LoRA topology: "
+            f"metadata_targets={len(target_modules)} injected_targets={injected_target_count}"
+        )
+    if os.environ.get("RANK", "0") == "0":
+        print(
+            "[HuginnLoSATokSwift] recreated PEFT topology from dynamic FSDP DCP for Trainer resume "
+            f"checkpoint={checkpoint_dir} lora_metadata_tensors={len(lora_entries)} "
+            f"target_count={len(target_modules)} rank={rank} alpha={lora_alpha} dropout={lora_dropout} "
+            f"aligner_modules_to_save={list(ALIGNER_PREFIXES)}"
+        )
+    return restored
+
+
 def audit_modules_to_save_topology(model: torch.nn.Module, *, stage: str = "first_forward") -> None:
     """Opt-in, key-only inspection of PEFT's aligner wrapping after FSDP setup."""
     if not _requested(FSDP_SAVE_DEBUG_ENV) or getattr(
@@ -786,7 +903,34 @@ def patch_peft_adapter_restore() -> None:
 
     @classmethod
     def patched(cls, *args, **kwargs):
-        restored = original(*args, **kwargs)
+        # PeftModel.from_pretrained(model, model_id, ...) receives the
+        # checkpoint from Swift's resume_from_checkpoint path.  Intercept only
+        # our opt-in dynamic FSDP DCP format; ordinary legacy PEFT adapter
+        # directories must retain PEFT's original load behavior.
+        base_model = args[0] if args else kwargs.get("model")
+        model_id = args[1] if len(args) >= 2 else kwargs.get("model_id")
+        checkpoint_dir = Path(model_id) if isinstance(model_id, (str, os.PathLike)) else None
+        is_dynamic_fsdp_dcp = (
+            DYNAMIC_AUDIO_TOKENS_ENABLED
+            and _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
+            and checkpoint_dir is not None
+            and (checkpoint_dir / "pytorch_model_fsdp_0").is_dir()
+            and not (checkpoint_dir / "adapter_config.json").is_file()
+        )
+        if is_dynamic_fsdp_dcp:
+            if not isinstance(base_model, torch.nn.Module):
+                raise RuntimeError(
+                    "Dynamic LoSATok FSDP resume did not receive a base torch model for PEFT reconstruction: "
+                    f"model_type={type(base_model)}"
+                )
+            adapter_name = str(kwargs.get("adapter_name", "default"))
+            restored = _fsdp_dcp_lora_resume_model(
+                base_model,
+                checkpoint_dir,
+                adapter_name=adapter_name,
+            )
+        else:
+            restored = original(*args, **kwargs)
         force_aligner_trainable(restored)
         return restored
 
