@@ -125,6 +125,22 @@ def main() -> int:
     )
     prepared_loader = accelerator.prepare(loader)
 
+    dataloader_config = getattr(accelerator, "dataloader_config", None)
+    accelerator_state = getattr(accelerator, "state", None)
+    dispatch_batches = getattr(dataloader_config, "dispatch_batches", None)
+    if dispatch_batches is None and accelerator_state is not None:
+        dispatch_batches = getattr(accelerator_state, "dispatch_batches", None)
+    split_batches = getattr(dataloader_config, "split_batches", None)
+    if split_batches is None and accelerator_state is not None:
+        split_batches = getattr(accelerator_state, "split_batches", None)
+    if accelerator.process_index == 0:
+        print(
+            f"[accelerate] prepared_loader_type={type(prepared_loader).__name__} "
+            f"dispatch_batches={dispatch_batches!r} split_batches={split_batches!r} "
+            f"even_batches={getattr(dataloader_config, 'even_batches', None)!r}",
+            flush=True,
+        )
+
     local_ids: list[str] = []
     for row in prepared_loader:
         if not isinstance(row, dict):
@@ -175,6 +191,10 @@ def main() -> int:
             f"probe_samples_per_rank={args.probe_samples_per_rank} consume_all={args.consume_all}"
         )
         print(f"[distributed] world_size={accelerator.num_processes} probe_lengths={lengths}")
+        if dispatch_batches:
+            print("[distributed] read_mode=process0_loader_dispatches_batches_to_other_ranks")
+        else:
+            print("[distributed] read_mode=each_rank_has_prepared_iterable_loader")
         print(f"[distributed] cross_rank_overlap_pairs={overlap_pairs}")
         print("[result] status=PASS accelerate_prepare=pass equal_lengths=true cross_rank_overlap=0")
     return 0

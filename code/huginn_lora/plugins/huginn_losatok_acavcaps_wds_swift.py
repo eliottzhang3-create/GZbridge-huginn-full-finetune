@@ -32,6 +32,18 @@ EXPECTED_STAGE_NAMES = ("stage1", "stage2", "stage3")
 DEFAULT_BUFFER_SIZE = 512
 
 
+def _identity_nodesplitter(urls):
+    """Keep every rank eligible to read each single-tar pipeline.
+
+    Each WebDataset instance here contains exactly one tar URL. WebDataset's
+    default ``single_node_only`` rejects any torch.distributed world, while
+    ``split_by_node`` would assign the single URL to only one rank. The actual
+    rank-level sample/batch partitioning is intentionally left to Accelerate's
+    prepared DataLoader.
+    """
+    return urls
+
+
 def _load_base_plugin() -> Any:
     spec = importlib.util.spec_from_file_location("huginn_losatok_swift_base", BASE_PLUGIN_PATH)
     if spec is None or spec.loader is None:
@@ -126,7 +138,11 @@ def iter_acavcaps_rows(manifest: dict[str, Any]) -> Iterator[dict[str, Any]]:
             if not tar_path.is_file():
                 raise FileNotFoundError(f"ACAVCAPS tar does not exist: {tar_path}")
 
-            dataset = wds.WebDataset(str(tar_path), shardshuffle=False)
+            dataset = wds.WebDataset(
+                str(tar_path),
+                shardshuffle=False,
+                nodesplitter=_identity_nodesplitter,
+            )
             try:
                 dataset = dataset.shuffle(buffer_size)
             except TypeError:

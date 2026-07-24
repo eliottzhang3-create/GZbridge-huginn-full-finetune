@@ -208,6 +208,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   - `run_inspect_acavcaps_wds_distributed_sharding_5090.sh` tests Swift `load_dataset` plus `Accelerator.prepare(DataLoader)` for cross-rank overlap and equal probe lengths;
   - `run_smoke_acavcaps_wds_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.sh` is a short dynamic two-GPU FSDP2 forward/backward smoke with no checkpoint saving.
 - The distributed sharding probe is mandatory before formal training. The ACAVCAPS generator itself must not be manually rank-sharded until the actual Accelerate behavior is observed, because a second manual sharding layer could silently drop samples.
+- The first two-GPU probe exposed and fixed a WebDataset guard: its default `single_node_only` rejects any `torch.distributed` world, even on one physical node. The ACAVCAPS loader now passes an identity `nodesplitter` because each WebDataset instance contains one tar; Accelerate remains responsible for rank-level batch/sample partitioning.
 - The future AudioCaps-v2 dynamic checkpoint is a new-task weight warm-start, not a Trainer resume. Use `inspect_losatok_dynamic_warmstart_checkpoint.py` first. Adapter/vit checkpoints can use the existing adapter-plus-aligner restore route; FSDP2 DCP checkpoints require a dedicated streaming restore path and must not be passed directly as `--adapters`.
 
 #### Verified Whisper end-to-end multimodal chain
