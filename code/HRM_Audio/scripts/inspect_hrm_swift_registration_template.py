@@ -129,6 +129,12 @@ def audit_encoded(
     question: str,
     response: str | None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    expected_mode = "transformers" if response is None else "train"
+    if mode != expected_mode:
+        raise ValueError(
+            f"Unexpected Swift template mode for response={response is not None}: "
+            f"expected={expected_mode!r} actual={mode!r}"
+        )
     messages = [{"role": "user", "content": question}]
     if response is not None:
         messages.append({"role": "assistant", "content": response})
@@ -460,7 +466,7 @@ def main() -> None:
             template=infer_template,
             tokenizer=tokenizer,
             template_type=template_type,
-            mode="infer",
+            mode="transformers",
             question=spec["question"],
             response=None,
         )
