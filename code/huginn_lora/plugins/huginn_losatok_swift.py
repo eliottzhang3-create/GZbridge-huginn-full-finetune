@@ -577,6 +577,44 @@ def patch_swift_prepare_model_audit() -> None:
     print("[HuginnLoSATokSwift] installed Swift.prepare_model PEFT wrapping audit")
 
 
+def patch_peft_constructor_audit() -> None:
+    """Observe PEFT's own construction boundary for the debug save smoke.
+
+    Some Swift code paths retain a local prepare function instead of invoking
+    the public ``Swift.prepare_model`` descriptor.  Every normal PEFT causal
+    model nevertheless initializes through ``PeftModel.__init__``.  Inspecting
+    immediately after that constructor therefore gives an unambiguous answer
+    about whether PEFT created ``ModulesToSaveWrapper`` instances before FSDP.
+    """
+    if not _requested(FSDP_SAVE_DEBUG_ENV):
+        return
+    try:
+        from peft.peft_model import PeftModel
+    except Exception as exc:
+        print(
+            "[HuginnLoSATokSwift] unable to install PEFT constructor audit "
+            f"error_type={type(exc).__name__} error={exc}"
+        )
+        return
+    original = PeftModel.__init__
+    if getattr(original, "_huginn_losatok_constructor_audit_patched", False):
+        return
+
+    def patched(self, *args, **kwargs):
+        result = original(self, *args, **kwargs)
+        if os.environ.get("RANK", "0") == "0":
+            print(
+                "[HuginnLoSATokSwift] PEFT constructor audit "
+                f"model_type={type(self)} peft_configs={getattr(self, 'peft_config', None)}"
+            )
+        audit_modules_to_save_topology(self, stage="immediately_after_peft_constructor")
+        return result
+
+    patched._huginn_losatok_constructor_audit_patched = True
+    PeftModel.__init__ = patched
+    print("[HuginnLoSATokSwift] installed PEFT constructor modules-to-save audit")
+
+
 def patch_peft_adapter_restore() -> None:
     if getattr(patch_peft_adapter_restore, "_patched", False):
         return
@@ -910,6 +948,7 @@ def register_huginn_losatok_arch() -> None:
 register_huginn_losatok_arch()
 patch_peft_adapter_restore()
 patch_swift_prepare_model_audit()
+patch_peft_constructor_audit()
 register_model(
     ModelMeta(
         MODEL_TYPE,
