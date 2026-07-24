@@ -34,6 +34,11 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help="Checkpoint directory; pass once per checkpoint.",
     )
+    parser.add_argument(
+        "--require_complete",
+        action="store_true",
+        help="Exit nonzero unless every inspected checkpoint has exactly 66 LoRA and 20 aligner tensors.",
+    )
     return parser.parse_args()
 
 
@@ -121,8 +126,10 @@ def main() -> None:
     if not checkpoints:
         checkpoints = [DEFAULT_RUN_ROOT / "checkpoint-2802", DEFAULT_RUN_ROOT / "checkpoint-5604"]
     totals = {"lora": 0, "aligner": 0, "other": 0}
+    per_checkpoint_counts: list[dict[str, int]] = []
     for checkpoint in checkpoints:
         counts = inspect_checkpoint(checkpoint)
+        per_checkpoint_counts.append(counts)
         for group, count in counts.items():
             totals[group] += count
     print(
@@ -130,6 +137,14 @@ def main() -> None:
         f"checkpoint_count={len(checkpoints)} total_lora={totals['lora']} "
         f"total_aligner={totals['aligner']} total_other={totals['other']}"
     )
+    if args.require_complete and any(
+        counts["lora"] != 66 or counts["aligner"] != 20
+        for counts in per_checkpoint_counts
+    ):
+        raise SystemExit(
+            "One or more inspected FSDP checkpoints are incomplete; "
+            f"expected_per_checkpoint=(lora=66, aligner=20) totals={totals}"
+        )
 
 
 if __name__ == "__main__":
