@@ -147,8 +147,19 @@ def main() -> None:
         raise RuntimeError(f"Tokenizer/config vocabulary mismatch: tokenizer={len(tokenizer)}, config={config.vocab_size}")
 
     device = torch.device(args.device)
+    if device.type != "cuda":
+        raise ValueError(f"This inspect requires a CUDA device, got {device}")
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    torch.cuda.set_device(device_index)
+    # Materialize the CUDA context before calling the PyTorch 2.11 memory APIs.
+    device_properties = torch.cuda.get_device_properties(device_index)
+    print(
+        f"[cuda] device={device} index={device_index} name={device_properties.name!r} "
+        f"total_gib={device_properties.total_memory / (1024**3):.3f}",
+        flush=True,
+    )
     torch.cuda.empty_cache()
-    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.reset_peak_memory_stats(device_index)
     print("[stage] load=AutoModelForCausalLM dtype=bfloat16 attention=sdpa", flush=True)
     model, loading_info = AutoModelForCausalLM.from_pretrained(
         model_path,
@@ -160,7 +171,7 @@ def main() -> None:
         output_loading_info=True,
     )
     model.eval()
-    torch.cuda.synchronize(device)
+    torch.cuda.synchronize(device_index)
 
     normalized_loading_info = loading_info_report(loading_info)
     nonempty_loading_info = {key: value for key, value in normalized_loading_info.items() if value}
@@ -241,10 +252,12 @@ def main() -> None:
             "loading_info": normalized_loading_info,
         },
         "cuda_memory": {
-            "allocated_gib": torch.cuda.memory_allocated(device) / (1024**3),
-            "reserved_gib": torch.cuda.memory_reserved(device) / (1024**3),
-            "peak_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
-            "peak_reserved_gib": torch.cuda.max_memory_reserved(device) / (1024**3),
+            "device_index": device_index,
+            "device_name": device_properties.name,
+            "allocated_gib": torch.cuda.memory_allocated(device_index) / (1024**3),
+            "reserved_gib": torch.cuda.memory_reserved(device_index) / (1024**3),
+            "peak_allocated_gib": torch.cuda.max_memory_allocated(device_index) / (1024**3),
+            "peak_reserved_gib": torch.cuda.max_memory_reserved(device_index) / (1024**3),
         },
     }
     atomic_write_json(args.output_report, report)

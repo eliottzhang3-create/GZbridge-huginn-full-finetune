@@ -17,6 +17,12 @@ export TOKENIZERS_PARALLELISM=false
 
 MODEL_PATH="${HRM_TEXT_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/HRM-text}"
 OUTPUT_REPORT="${HRM_MODEL_LOAD_OUTPUT_REPORT:-$REPO_ROOT/outputs/hrm_text/model_load_inspect.json}"
+SKIP_SHA256="${HRM_SKIP_SHA256:-0}"
+
+SHA256_ARGS=()
+if [ "$SKIP_SHA256" = "1" ]; then
+  SHA256_ARGS=(--skip-sha256)
+fi
 
 echo "========== INSPECT HRM-TEXT MODEL LOAD =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
@@ -25,8 +31,10 @@ echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "MODEL_PATH=$MODEL_PATH"
 echo "OUTPUT_REPORT=$OUTPUT_REPORT"
 echo "OFFLINE_MODE=true"
+echo "SKIP_SHA256=$SKIP_SHA256"
 
 python -u code/HRM_Audio/scripts/inspect_hrm_model_load.py \
   --model-path "$MODEL_PATH" \
   --device cuda:0 \
-  --output-report "$OUTPUT_REPORT"
+  --output-report "$OUTPUT_REPORT" \
+  "${SHA256_ARGS[@]}"

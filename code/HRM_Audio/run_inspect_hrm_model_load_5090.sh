@@ -6,7 +6,7 @@ cd "$SCRIPT_DIR"
 mkdir -p log
 
 CMD_PREFIX=""
-for name in HRM_TEXT_MODEL_PATH HRM_MODEL_LOAD_OUTPUT_REPORT; do
+for name in HRM_TEXT_MODEL_PATH HRM_MODEL_LOAD_OUTPUT_REPORT HRM_SKIP_SHA256; do
   value="${!name:-}"
   if [ -n "$value" ]; then
     printf -v quoted_value '%q' "$value"

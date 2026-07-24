@@ -104,6 +104,7 @@ def main() -> None:
 
     device = torch.device(args.device)
     device_index = device.index if device.index is not None else torch.cuda.current_device()
+    torch.cuda.set_device(device_index)
     properties = torch.cuda.get_device_properties(device_index)
     bf16_supported = torch.cuda.is_bf16_supported()
     if not bf16_supported:
@@ -124,7 +125,7 @@ def main() -> None:
         flush=True,
     )
 
-    torch.cuda.reset_peak_memory_stats(device)
+    torch.cuda.reset_peak_memory_stats(device_index)
     left = torch.arange(256, device=device, dtype=torch.float32).reshape(16, 16).to(torch.bfloat16)
     right = torch.eye(16, device=device, dtype=torch.bfloat16)
     product = left @ right
@@ -143,7 +144,7 @@ def main() -> None:
     )
     if attention_output.shape != query.shape or not torch.isfinite(attention_output).all():
         raise RuntimeError("BF16 CUDA SDPA smoke failed")
-    torch.cuda.synchronize(device)
+    torch.cuda.synchronize(device_index)
 
     report = {
         "status": "ok",
@@ -173,7 +174,7 @@ def main() -> None:
             "bf16_supported": bf16_supported,
             "bf16_matmul_finite": bool(torch.isfinite(product).all().item()),
             "sdpa_finite": bool(torch.isfinite(attention_output).all().item()),
-            "peak_memory_allocated_gib": torch.cuda.max_memory_allocated(device) / (1024**3),
+            "peak_memory_allocated_gib": torch.cuda.max_memory_allocated(device_index) / (1024**3),
         },
     }
     atomic_write_json(args.output_report, report)
