@@ -113,7 +113,9 @@ def build_template(get_template, processor: Any, template_type: str):
         template_type=template_type,
         processor=processor,
         max_length=512,
-        use_chat_template=False,
+        # In Swift 4.4.2 this must stay enabled for TemplateMeta.prompt to be
+        # rendered. False selects a simplified query-only generation template.
+        use_chat_template=True,
         padding_side="right",
         padding_free=False,
         template_backend="swift",
