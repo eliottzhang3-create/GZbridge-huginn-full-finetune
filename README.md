@@ -194,6 +194,22 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - Do not load older fixed-32 aligner checkpoints while the dynamic environment variable is enabled unless a deliberate
   architecture-conversion procedure is implemented and separately validated.
 
+#### Dynamic LoSATok ACAVCAPS continuation preparation (updated 2026-07-24)
+
+- The full read-only ACAVCAPS preflight completed successfully:
+  - `1071` tar shards;
+  - `4,664,169` JSON/FLAC sample pairs;
+  - stage schedule `00A/0M0/S00 -> S0A/SM0/0MA -> SMA`;
+  - all tar pair, JSON, and non-empty `long` caption checks passed;
+  - private full manifest, stats, and resumable progress checkpoint were written.
+- No offline audio decoding is part of the formal preparation. The FLAC bytes stay inside the public tar shards and are decoded by the Swift LoSATok template during training.
+- Before formal ACAVCAPS training, run the new preparation checks:
+  - `run_inspect_acavcaps_wds_dynamic_training_config_5090.sh` validates the full manifest/stats and computes the two-GPU effective-batch step count;
+  - `run_inspect_acavcaps_wds_distributed_sharding_5090.sh` tests Swift `load_dataset` plus `Accelerator.prepare(DataLoader)` for cross-rank overlap and equal probe lengths;
+  - `run_smoke_acavcaps_wds_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.sh` is a short dynamic two-GPU FSDP2 forward/backward smoke with no checkpoint saving.
+- The distributed sharding probe is mandatory before formal training. The ACAVCAPS generator itself must not be manually rank-sharded until the actual Accelerate behavior is observed, because a second manual sharding layer could silently drop samples.
+- The future AudioCaps-v2 dynamic checkpoint is a new-task weight warm-start, not a Trainer resume. Use `inspect_losatok_dynamic_warmstart_checkpoint.py` first. Adapter/vit checkpoints can use the existing adapter-plus-aligner restore route; FSDP2 DCP checkpoints require a dedicated streaming restore path and must not be passed directly as `--adapters`.
+
 #### Verified Whisper end-to-end multimodal chain
 
 - framework: `swift==4.1.3`, using `swift sft`

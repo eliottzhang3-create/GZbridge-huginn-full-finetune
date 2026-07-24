@@ -1,8 +1,10 @@
-"""ACAVCAPS WebDataset registration for the legacy fixed-32 LoSATok route.
+"""ACAVCAPS WebDataset registration for the LoSATok Swift routes.
 
 The public ACAVCAPS tree is read-only. This plugin consumes the private
 tar-level schedule manifest and exposes a finite Hugging Face IterableDataset
 whose rows contain the JSON caption and FLAC bytes from each WebDataset sample.
+The base model plugin selects legacy fixed-32 or dynamic 90-second prefixes from
+``HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS``; this dataset layer is shared by both.
 The model/template registration is imported from the existing LoSATok plugin;
 only this ACAVCAPS route adds the dataset registration.
 """
