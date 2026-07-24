@@ -525,6 +525,88 @@ def audit_modules_to_save_topology(model: torch.nn.Module, *, stage: str = "firs
     model._huginn_losatok_modules_to_save_audited = True
 
 
+def _active_modules_to_save_names(wrapper: torch.nn.Module) -> list[str]:
+    """Return PEFT adapter copies selected by a ModulesToSaveWrapper.
+
+    PEFT 0.18 normally uses the ``default`` adapter here.  Keep this helper
+    tolerant of its string/list API so the narrowly-scoped protection below
+    remains correct if an explicit adapter is selected during restoration.
+    """
+    copies = getattr(wrapper, "modules_to_save", {})
+    available = [str(name) for name in copies]
+    active = getattr(wrapper, "active_adapter", None)
+    if isinstance(active, str):
+        requested = [active]
+    elif isinstance(active, (list, tuple, set)):
+        requested = [str(name) for name in active]
+    else:
+        requested = []
+    selected = [name for name in requested if name in copies]
+    if not selected and "default" in copies:
+        selected = ["default"]
+    if not selected and len(available) == 1:
+        selected = available
+    if not selected:
+        raise RuntimeError(
+            "Dynamic LoSATok aligner ModulesToSaveWrapper has no selectable adapter copy: "
+            f"available={available} active={active}"
+        )
+    return selected
+
+
+def guard_peft_aligner_wrapper_trainability(wrapper: torch.nn.Module, *, module_name: str) -> None:
+    """Ensure Swift can only unfreeze the PEFT-owned aligner copy.
+
+    ``ModulesToSaveWrapper`` contains both ``original_module`` and a deep-copy
+    in ``modules_to_save.<adapter>``.  Swift's generic ``freeze_aligner``
+    handling calls ``requires_grad_(True)`` on the wrapper, which otherwise
+    recursively unfreezes both copies.  That doubles optimizer parameters and
+    violates PEFT's adapter-only checkpoint ownership.  Replacing *only this
+    wrapper instance's* method preserves Swift's intended API while directing
+    its unfreeze request exclusively to PEFT's selected saved copy.
+    """
+    if getattr(wrapper, "_huginn_losatok_trainability_guarded", False):
+        return
+    if type(wrapper).__name__ != "ModulesToSaveWrapper":
+        raise RuntimeError(
+            "Expected PEFT ModulesToSaveWrapper for dynamic LoSATok aligner, "
+            f"got module={module_name} type={type(wrapper)}"
+        )
+    if not hasattr(wrapper, "original_module") or not hasattr(wrapper, "modules_to_save"):
+        raise RuntimeError(
+            "PEFT ModulesToSaveWrapper lacks expected ownership fields for dynamic LoSATok aligner: "
+            f"module={module_name}"
+        )
+
+    def guarded_requires_grad_(self, requires_grad: bool = True):
+        # Never optimize the base-model branch.  PEFT's adapter-only state
+        # dict intentionally owns only modules_to_save.<active_adapter>.
+        self.original_module.requires_grad_(False)
+        for copy in self.modules_to_save.values():
+            copy.requires_grad_(False)
+        if requires_grad:
+            for adapter_name in _active_modules_to_save_names(self):
+                self.modules_to_save[adapter_name].requires_grad_(True)
+        return self
+
+    wrapper.requires_grad_ = MethodType(guarded_requires_grad_, wrapper)
+    wrapper._huginn_losatok_trainability_guarded = True
+    # Establish the correct topology immediately, before Trainer constructs
+    # its optimizer.  Later Swift --freeze_aligner false calls are intercepted
+    # by the wrapper method above and retain this same ownership split.
+    wrapper.requires_grad_(True)
+    original_trainable = sum(parameter.numel() for parameter in wrapper.original_module.parameters()
+                             if parameter.requires_grad)
+    saved_trainable = sum(parameter.numel() for parameter in wrapper.modules_to_save.parameters()
+                          if parameter.requires_grad)
+    if original_trainable or not saved_trainable:
+        raise RuntimeError(
+            "Failed to establish PEFT-owned dynamic LoSATok aligner trainability: "
+            f"module={module_name} original_trainable={original_trainable} "
+            f"saved_trainable={saved_trainable}"
+        )
+
+
 def patch_swift_prepare_model_audit() -> None:
     """Trace PEFT wrapping immediately after Swift creates the adapter model.
 
@@ -644,6 +726,37 @@ def patch_peft_constructor_modules_to_save() -> None:
                     "PEFT did not wrap every required dynamic LoSATok aligner module: "
                     f"missing={missing} wrappers={list(wrappers)} "
                     f"config_modules_to_save={getattr(peft_config, 'modules_to_save', None)}"
+                )
+            guarded_wrappers: list[dict[str, Any]] = []
+            for aligner_name in ALIGNER_PREFIXES:
+                wrapper_name, wrapper = next(
+                    (item for item in wrappers.items() if item[0].endswith(aligner_name)),
+                    (None, None),
+                )
+                if wrapper is None or wrapper_name is None:
+                    # ``missing`` above already makes this unreachable; retain
+                    # an explicit error to keep this ownership repair fail-fast.
+                    raise RuntimeError(
+                        "Unable to locate required PEFT wrapper after dynamic LoSATok validation: "
+                        f"aligner={aligner_name} wrappers={list(wrappers)}"
+                    )
+                guard_peft_aligner_wrapper_trainability(wrapper, module_name=wrapper_name)
+                guarded_wrappers.append({
+                    "module": wrapper_name,
+                    "active_copies": _active_modules_to_save_names(wrapper),
+                    "original_trainable": sum(
+                        parameter.numel() for parameter in wrapper.original_module.parameters()
+                        if parameter.requires_grad
+                    ),
+                    "saved_trainable": sum(
+                        parameter.numel() for parameter in wrapper.modules_to_save.parameters()
+                        if parameter.requires_grad
+                    ),
+                })
+            if os.environ.get("RANK", "0") == "0":
+                print(
+                    "[HuginnLoSATokSwift] installed PEFT aligner wrapper trainability guards "
+                    f"wrappers={guarded_wrappers}"
                 )
         if debug and os.environ.get("RANK", "0") == "0":
             print(
