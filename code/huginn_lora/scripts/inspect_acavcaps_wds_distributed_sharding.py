@@ -8,6 +8,7 @@ and does not construct the LoSATok model. It is intentionally run with
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import importlib.util
 import os
@@ -69,6 +70,31 @@ def sample_id(row: dict[str, Any]) -> str:
     return f"{stage}|{tar_path}|{key}"
 
 
+def sample_hash(row: dict[str, Any]) -> int:
+    """Encode row identity as an int64 so DataLoaderDispatcher can concatenate it."""
+    identity = sample_id(row)
+    digest = hashlib.blake2b(identity.encode("utf-8"), digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False) & ((1 << 63) - 1)
+
+
+def tensor_collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
+    if len(batch) != 1:
+        raise RuntimeError(f"The shard probe expects DataLoader batch_size=1, got {len(batch)}")
+    row = batch[0]
+    audios = row.get("audios")
+    if not isinstance(audios, list) or len(audios) != 1 or not isinstance(audios[0], dict):
+        raise ValueError(f"Unexpected audios field: {audios!r}")
+    audio_bytes = audios[0].get("audio_bytes")
+    if not isinstance(audio_bytes, (bytes, bytearray, memoryview)) or len(audio_bytes) == 0:
+        raise ValueError("ACAVCAPS row contains empty/non-bytes audio_bytes")
+    import torch
+
+    return {
+        "sample_hash": torch.tensor([sample_hash(row)], dtype=torch.long),
+        "audio_bytes_length": torch.tensor([len(audio_bytes)], dtype=torch.long),
+    }
+
+
 def main() -> int:
     args = parse_args()
     if args.probe_samples_per_rank <= 0 or args.expected_world_size <= 0 or args.max_tars_per_stage < 0:
@@ -121,7 +147,7 @@ def main() -> int:
         batch_size=1,
         num_workers=0,
         pin_memory=False,
-        collate_fn=lambda batch: batch[0],
+        collate_fn=tensor_collate,
     )
     prepared_loader = accelerator.prepare(loader)
 
@@ -133,34 +159,42 @@ def main() -> int:
     split_batches = getattr(dataloader_config, "split_batches", None)
     if split_batches is None and accelerator_state is not None:
         split_batches = getattr(accelerator_state, "split_batches", None)
+    effective_dispatch_batches = dispatch_batches
+    if effective_dispatch_batches is None:
+        effective_dispatch_batches = type(prepared_loader).__name__ == "DataLoaderDispatcher"
     if accelerator.process_index == 0:
         print(
             f"[accelerate] prepared_loader_type={type(prepared_loader).__name__} "
-            f"dispatch_batches={dispatch_batches!r} split_batches={split_batches!r} "
+            f"dispatch_batches={dispatch_batches!r} effective_dispatch_batches={effective_dispatch_batches!r} "
+            f"split_batches={split_batches!r} "
             f"even_batches={getattr(dataloader_config, 'even_batches', None)!r}",
             flush=True,
         )
 
-    local_ids: list[str] = []
-    for row in prepared_loader:
-        if not isinstance(row, dict):
-            raise TypeError(f"Prepared loader yielded {type(row).__name__}, expected dict")
-        local_ids.append(sample_id(row))
-        if not args.consume_all and len(local_ids) >= args.probe_samples_per_rank:
+    local_hashes: list[int] = []
+    for batch in prepared_loader:
+        if not isinstance(batch, dict) or "sample_hash" not in batch or "audio_bytes_length" not in batch:
+            raise TypeError(f"Prepared loader yielded an unexpected tensor batch: {type(batch).__name__}")
+        hashes = batch["sample_hash"].reshape(-1).detach().cpu().tolist()
+        byte_lengths = batch["audio_bytes_length"].reshape(-1).detach().cpu().tolist()
+        if any(int(length) <= 0 for length in byte_lengths):
+            raise RuntimeError("Prepared loader yielded an empty audio_bytes length")
+        local_hashes.extend(int(value) for value in hashes)
+        if not args.consume_all and len(local_hashes) >= args.probe_samples_per_rank:
             break
 
     accelerator.wait_for_everyone()
-    gathered: list[list[str] | None] = [None for _ in range(accelerator.num_processes)]
+    gathered: list[list[int] | None] = [None for _ in range(accelerator.num_processes)]
     import torch.distributed as dist
 
     if not dist.is_available() or not dist.is_initialized():
         raise RuntimeError("torch.distributed is not initialized; run this script through torchrun")
-    dist.all_gather_object(gathered, local_ids)
+    dist.all_gather_object(gathered, local_hashes)
 
     rank = accelerator.process_index
-    local_unique = len(set(local_ids))
-    if local_unique != len(local_ids):
-        raise RuntimeError(f"Rank {rank} produced duplicate sample IDs in its probe: rows={len(local_ids)} unique={local_unique}")
+    local_unique = len(set(local_hashes))
+    if local_unique != len(local_hashes):
+        raise RuntimeError(f"Rank {rank} produced duplicate sample hashes in its probe: rows={len(local_hashes)} unique={local_unique}")
     lengths = [len(values or []) for values in gathered]
     if len(set(lengths)) != 1:
         raise RuntimeError(f"Ranks did not receive equal probe lengths: lengths={lengths}")
@@ -175,11 +209,11 @@ def main() -> int:
     if overlap_pairs:
         raise RuntimeError(f"Distributed IterableDataset probe found cross-rank duplicate samples: {overlap_pairs}")
 
-    print(
-        f"[rank={rank}] python={sys.version.split()[0]} platform={platform.platform()} "
-        f"accelerate_version={importlib.metadata.version('accelerate')} "
-        f"world_size={accelerator.num_processes} local_rows={len(local_ids)} "
-        f"first_ids={local_ids[:4]}",
+        print(
+            f"[rank={rank}] python={sys.version.split()[0]} platform={platform.platform()} "
+            f"accelerate_version={importlib.metadata.version('accelerate')} "
+            f"world_size={accelerator.num_processes} local_rows={len(local_hashes)} "
+            f"first_hashes={local_hashes[:4]}",
         flush=True,
     )
     accelerator.wait_for_everyone()
@@ -191,7 +225,7 @@ def main() -> int:
             f"probe_samples_per_rank={args.probe_samples_per_rank} consume_all={args.consume_all}"
         )
         print(f"[distributed] world_size={accelerator.num_processes} probe_lengths={lengths}")
-        if dispatch_batches:
+        if effective_dispatch_batches:
             print("[distributed] read_mode=process0_loader_dispatches_batches_to_other_ranks")
         else:
             print("[distributed] read_mode=each_rank_has_prepared_iterable_loader")
