@@ -22,6 +22,7 @@ DEFAULT_RUN_ROOT = Path(
 )
 FSDP_MODEL_DIR_NAME = "pytorch_model_fsdp_0"
 TENSOR_FILE_SUFFIXES = {".safetensors", ".bin", ".pt", ".pth"}
+AUXILIARY_STATE_FILE_PREFIXES = ("rng_state", "scheduler", "optimizer")
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,6 +53,19 @@ def metadata_entry_summary(key: str, metadata: Any) -> str:
     return f"key={key} shape={tuple(shape) if shape is not None else None} dtype={dtype}"
 
 
+def weight_sidecars(root: Path, *, exclude_root: Path | None = None) -> list[Path]:
+    files: list[Path] = []
+    for path in sorted(root.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in TENSOR_FILE_SUFFIXES:
+            continue
+        if any(path.name.startswith(prefix) for prefix in AUXILIARY_STATE_FILE_PREFIXES):
+            continue
+        if exclude_root is not None and path.is_relative_to(exclude_root):
+            continue
+        files.append(path)
+    return files
+
+
 def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, int]:
     from torch.distributed.checkpoint import FileSystemReader
 
@@ -72,10 +86,8 @@ def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, int]:
         key = str(raw_key)
         grouped[classify_key(key)].append((key, entry_metadata))
 
-    sidecars = [
-        path for path in sorted(checkpoint_dir.rglob("*"))
-        if path.is_file() and path.suffix.lower() in TENSOR_FILE_SUFFIXES
-    ]
+    sidecars = weight_sidecars(checkpoint_dir)
+    run_root_sidecars = weight_sidecars(checkpoint_dir.parent, exclude_root=checkpoint_dir)
 
     print("========== LOSATOK DYNAMIC FSDP2 CHECKPOINT CONTENT AUDIT ==========")
     print(f"[checkpoint] path={checkpoint_dir}")
@@ -86,9 +98,12 @@ def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, int]:
         print(f"[dcp] {group}_tensor_count={len(entries)}")
         for key, entry_metadata in entries[:8]:
             print(f"[dcp-{group}] {metadata_entry_summary(key, entry_metadata)}")
-    print(f"[sidecar] tensor_file_count={len(sidecars)}")
+    print(f"[sidecar] checkpoint_weight_file_count={len(sidecars)}")
     for path in sidecars:
         print(f"[sidecar] path={path.relative_to(checkpoint_dir)} bytes={path.stat().st_size}")
+    print(f"[sidecar] run_root_external_weight_file_count={len(run_root_sidecars)}")
+    for path in run_root_sidecars:
+        print(f"[sidecar-run-root] path={path.relative_to(checkpoint_dir.parent)} bytes={path.stat().st_size}")
 
     complete = len(grouped["lora"]) == 66 and len(grouped["aligner"]) == 20
     print(
