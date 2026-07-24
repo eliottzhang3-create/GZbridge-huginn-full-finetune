@@ -54,7 +54,7 @@ This repo contains **two major experiment families**:
 Two audio lines coexist and must remain strictly separate:
 
 1. **LoSATok legacy fixed-32 ACAVCAPS continuation** is the usable short-term training line. It starts from the completed single-GPU AudioCaps-v2 LoRA checkpoint `.../huginn_losatok_audiocaps_v2_train_e3_b8ga4_5090/v1-20260720-162632/checkpoint-2802`, keeps the whole official LoSATok stack frozen, and trains only the aligner plus Huginn LoRA. Its read-only WebDataset pipeline, quarter-manifest derivation, and fresh-process warm-start save/reload smoke have passed. The formal quarter ACAVCAPS job is prepared, but must not be described as completed until its remote log is supplied.
-2. **LoSATok dynamic-90s two-GPU FSDP2 line** is the main engineering blocker. Forward/backward smoke tests and ACAVCAPS distributed data loading pass, but its saved FSDP DCP checkpoints currently contain all `66` LoRA tensors and **zero** of the required `20` aligner tensors. Those dynamic checkpoints cannot be used for evaluation, warm-start, or resume. The immediate task is to identify and repair the PEFT/FSDP2 save path, validate save plus fresh-process reload, then restart dynamic AudioCaps-v2 for two epochs before dynamic ACAVCAPS-quarter continuation.
+2. **LoSATok dynamic-90s two-GPU FSDP2 line** is the main engineering blocker. Forward/backward smoke tests and ACAVCAPS distributed data loading pass. Historical dynamic DCP checkpoints contain `66` LoRA tensors and **zero** of the required `20` aligner tensors and must not be used. The current dynamic save smoke now passes its first strict `66 + 20` DCP audit after the PEFT wrapper repair, but fresh-process Trainer resume is still under validation because Swift's legacy `lora_llm` loader assumes a separate `vit.safetensors` file. The immediate task is to complete that save-plus-fresh-process-reload validation, then restart dynamic AudioCaps-v2 for two epochs before dynamic ACAVCAPS-quarter continuation.
 3. **Whisper-large FSDP full finetuning** remains a separate historical/independent line: frozen Whisper-large, full-trainable aligner, full-trainable Huginn under Swift FSDP2. The historical 8-GPU `checkpoint-2802` is an evaluation artifact, not a cross-world-size resume source. Do not infer its remote job state without a user-supplied log.
 
 The shared audio architecture is:
@@ -207,10 +207,8 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
     calls `set_peft_model_state_dict`. This is the desired checkpoint format **if** the aligner is represented by PEFT
     `ModulesToSaveWrapper` entries;
   - Swift's `lora_layers.py` explicitly supports that wrapper and checks every model-module suffix before LoRA target matching.
-    The failed smoke log confirms the actual `LoraConfig` did receive all three names, so argument parsing/config construction
-    is not the defect. The narrow remaining investigation is the `tuner_backend=peft` implementation selected by
-    `Swift.prepare_model`: determine why it does not instantiate the wrappers despite that config. Once repaired, the existing
-    adapter-only FSDP save/load pairing should include LoRA plus aligner without any custom DCP format or sidecar. Do **not**
+    This historical trace is superseded by the current dynamic-only PEFT-constructor repair described below. The existing
+    adapter-only FSDP save/load pairing can include LoRA plus aligner without any custom DCP format or sidecar. Do **not**
     simply force `adapter_only=False`, because that could serialize the frozen multi-billion-parameter Huginn backbone.
 - Current targeted diagnostic:
   - `code/huginn_lora/scripts/smoke_audiocaps_v2_huginn_losatok_dynamic90s_modules_save_fsdp2_5090.sh`;
@@ -218,9 +216,18 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   - it enables the opt-in `HUGINN_LOSATOK_FSDP_SAVE_DEBUG=1` trace and the dynamic-only
     `HUGINN_LOSATOK_PEFT_ALIGNER_MODULES_TO_SAVE=1` repair. The plugin restores the three aligner names onto the PEFT
     `LoraConfig` immediately before `PeftModel.__init__`, requires all three `ModulesToSaveWrapper` instances to appear, and
-    then records the exact LoRA/aligner/other key counts returned by Accelerate immediately before DCP write. This repair is
-    **pending smoke validation**; it must save `66 + 20` and pass the script's fresh-process resume phase before it is treated
-    as valid.
+    then records the exact LoRA/aligner/other key counts returned by Accelerate immediately before DCP write.
+  - Current evidence from the `2026-07-24` smoke: phase 1 passed its strict DCP audit (otherwise `set -e` would have stopped
+    before phase 2), proving the newly saved checkpoint contains `66` LoRA and `20` aligner tensors. In phase 2, the plugin
+    rebuilt the exact PEFT topology from DCP metadata: `33` LoRA targets, rank `16`, alpha `32`, dropout `0.05`, plus all
+    three `ModulesToSaveWrapper` aligners. Each wrapper intentionally owns an original frozen branch and one trainable
+    `modules_to_save.default` branch; its total parameter count is therefore doubled while its trainable count remains the
+    expected aligner total `62,953,248`.
+  - The remaining fresh-resume failure is now isolated to `swift/tuner_plugin/lora_llm.py`: after PEFT reconstruction it
+    unconditionally loads the legacy fixed-32 sidecar `vit.safetensors`, which does not exist and must not be fabricated for
+    an adapter-only DCP. The plugin now contains a dynamic-DCP-only interception that bypasses this legacy sidecar read and
+    lets Accelerate restore the `20` aligner tensors from DCP alongside LoRA, optimizer, scheduler, and RNG. This final resume
+    repair remains **pending smoke validation**.
 - The formal dynamic AudioCaps-v2 script remains
   - runtime: `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2.sh`;
   - submit: `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.sh`;

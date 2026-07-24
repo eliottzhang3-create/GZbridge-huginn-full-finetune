@@ -597,6 +597,19 @@ def _fsdp_dcp_lora_resume_model(
     return restored
 
 
+def _is_dynamic_fsdp_dcp_checkpoint(model_id: Any) -> tuple[bool, Path | None]:
+    """Identify only the adapter-only DCP format produced by this route."""
+    checkpoint_dir = Path(model_id) if isinstance(model_id, (str, os.PathLike)) else None
+    enabled = (
+        DYNAMIC_AUDIO_TOKENS_ENABLED
+        and _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
+        and checkpoint_dir is not None
+        and (checkpoint_dir / "pytorch_model_fsdp_0").is_dir()
+        and not (checkpoint_dir / "adapter_config.json").is_file()
+    )
+    return enabled, checkpoint_dir
+
+
 def audit_modules_to_save_topology(model: torch.nn.Module, *, stage: str = "first_forward") -> None:
     """Opt-in, key-only inspection of PEFT's aligner wrapping after FSDP setup."""
     if not _requested(FSDP_SAVE_DEBUG_ENV) or getattr(
@@ -909,14 +922,7 @@ def patch_peft_adapter_restore() -> None:
         # directories must retain PEFT's original load behavior.
         base_model = args[0] if args else kwargs.get("model")
         model_id = args[1] if len(args) >= 2 else kwargs.get("model_id")
-        checkpoint_dir = Path(model_id) if isinstance(model_id, (str, os.PathLike)) else None
-        is_dynamic_fsdp_dcp = (
-            DYNAMIC_AUDIO_TOKENS_ENABLED
-            and _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
-            and checkpoint_dir is not None
-            and (checkpoint_dir / "pytorch_model_fsdp_0").is_dir()
-            and not (checkpoint_dir / "adapter_config.json").is_file()
-        )
+        is_dynamic_fsdp_dcp, checkpoint_dir = _is_dynamic_fsdp_dcp_checkpoint(model_id)
         if is_dynamic_fsdp_dcp:
             if not isinstance(base_model, torch.nn.Module):
                 raise RuntimeError(
@@ -937,6 +943,80 @@ def patch_peft_adapter_restore() -> None:
     PeftModel.from_pretrained = patched
     patch_peft_adapter_restore._patched = True
     print("[HuginnLoSATokSwift] installed PEFT adapter-restore aligner patch")
+
+
+def patch_swift_lora_llm_fsdp_dcp_resume() -> None:
+    """Bypass Swift's legacy ``vit.safetensors`` reload for DCP resumes.
+
+    Swift's custom ``lora_llm`` tuner deliberately loads the separate
+    ``vit.safetensors`` aligner file after PEFT restores a legacy LoRA adapter.
+    That policy is correct for the fixed-32 checkpoint layout, but incorrect
+    for the dynamic FSDP2 adapter-only DCP layout: the 20 aligner tensors are
+    already inside DCP and are restored later by Accelerate.  This targeted
+    patch finds that exact tuner method by its ``vit.safetensors`` constant and
+    routes only dynamic DCP checkpoints through the already-patched PEFT
+    topology reconstruction path.
+    """
+    if not (_requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV) or _requested(FSDP_SAVE_DEBUG_ENV)):
+        return
+    try:
+        import swift.tuner_plugin.lora_llm as lora_llm_module
+        from peft import PeftModel
+    except Exception as exc:
+        print(
+            "[HuginnLoSATokSwift] unable to install Swift lora_llm DCP-resume patch "
+            f"error_type={type(exc).__name__} error={exc}"
+        )
+        return
+
+    candidates: list[tuple[str, type, Any]] = []
+    for class_name, candidate in vars(lora_llm_module).items():
+        if not isinstance(candidate, type):
+            continue
+        method = candidate.__dict__.get("from_pretrained")
+        if method is None:
+            continue
+        function = method.__func__ if isinstance(method, (staticmethod, classmethod)) else method
+        code = getattr(function, "__code__", None)
+        if code is not None and "vit.safetensors" in repr(code.co_consts):
+            candidates.append((str(class_name), candidate, method))
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "Expected exactly one Swift lora_llm legacy vit.safetensors loader for dynamic FSDP resume, "
+            f"found={[name for name, _, _ in candidates]}"
+        )
+
+    class_name, tuner_class, descriptor = candidates[0]
+    if isinstance(descriptor, (staticmethod, classmethod)):
+        raise RuntimeError(
+            "Unexpected Swift lora_llm from_pretrained descriptor; cannot safely preserve legacy behavior: "
+            f"class={class_name} descriptor_type={type(descriptor)}"
+        )
+    original = descriptor
+    if getattr(original, "_huginn_losatok_fsdp_dcp_resume_patched", False):
+        return
+
+    def patched(self, model, model_id, *args, **kwargs):
+        is_dynamic_fsdp_dcp, checkpoint_dir = _is_dynamic_fsdp_dcp_checkpoint(model_id)
+        if is_dynamic_fsdp_dcp:
+            if checkpoint_dir is None:
+                raise RuntimeError("Dynamic LoSATok DCP resume checkpoint path unexpectedly disappeared")
+            if os.environ.get("RANK", "0") == "0":
+                print(
+                    "[HuginnLoSATokSwift] bypassing Swift legacy vit.safetensors reload for dynamic FSDP DCP resume "
+                    f"checkpoint={checkpoint_dir}"
+                )
+            # PeftModel.from_pretrained is patched above to reconstruct the
+            # topology from DCP metadata without reading adapter sidecars.
+            return PeftModel.from_pretrained(model, model_id, *args, **kwargs)
+        return original(self, model, model_id, *args, **kwargs)
+
+    patched._huginn_losatok_fsdp_dcp_resume_patched = True
+    tuner_class.from_pretrained = patched
+    print(
+        "[HuginnLoSATokSwift] installed Swift lora_llm dynamic-FSDP-DCP resume patch "
+        f"tuner_class={class_name}"
+    )
 
 
 def audit_final_trainable_split(model: torch.nn.Module) -> dict[str, int]:
@@ -1251,6 +1331,7 @@ def register_huginn_losatok_arch() -> None:
 
 register_huginn_losatok_arch()
 patch_peft_adapter_restore()
+patch_swift_lora_llm_fsdp_dcp_resume()
 patch_swift_prepare_model_audit()
 patch_peft_constructor_modules_to_save()
 register_model(
