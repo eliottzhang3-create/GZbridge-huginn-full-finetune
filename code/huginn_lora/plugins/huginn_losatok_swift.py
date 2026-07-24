@@ -536,8 +536,12 @@ def patch_swift_prepare_model_audit() -> None:
     if not _requested(FSDP_SAVE_DEBUG_ENV):
         return
     try:
-        from swift.tuners import Swift
-    except ImportError:
+        from swift.tuners.base import Swift
+    except Exception as exc:
+        print(
+            "[HuginnLoSATokSwift] unable to install Swift.prepare_model PEFT wrapping audit "
+            f"error_type={type(exc).__name__} error={exc}"
+        )
         return
     descriptor = Swift.__dict__.get("prepare_model")
     original = Swift.prepare_model
@@ -777,7 +781,6 @@ def build_model(model_dir: str) -> torch.nn.Module:
     enable_fsdp2_nonpersistent_rope_buffer(model)
     patch_accelerate_fsdp2_state_dict_key_alignment()
     patch_accelerate_fsdp2_save_state_audit()
-    patch_swift_prepare_model_audit()
     audit_model_split(model)
     return patch_shift_loss(model)
 
@@ -906,6 +909,7 @@ def register_huginn_losatok_arch() -> None:
 
 register_huginn_losatok_arch()
 patch_peft_adapter_restore()
+patch_swift_prepare_model_audit()
 register_model(
     ModelMeta(
         MODEL_TYPE,
