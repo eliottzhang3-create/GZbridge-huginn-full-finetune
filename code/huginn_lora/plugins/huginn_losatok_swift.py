@@ -968,6 +968,8 @@ def patch_swift_lora_llm_fsdp_dcp_resume() -> None:
             f"error_type={type(exc).__name__} error={exc}"
         )
         return
+    if getattr(lora_llm_module, "_huginn_losatok_fsdp_dcp_resume_patched", False):
+        return
 
     candidates: list[tuple[str, type, Any]] = []
     for class_name, candidate in vars(lora_llm_module).items():
@@ -987,35 +989,59 @@ def patch_swift_lora_llm_fsdp_dcp_resume() -> None:
         )
 
     class_name, tuner_class, descriptor = candidates[0]
-    if isinstance(descriptor, (staticmethod, classmethod)):
-        raise RuntimeError(
-            "Unexpected Swift lora_llm from_pretrained descriptor; cannot safely preserve legacy behavior: "
-            f"class={class_name} descriptor_type={type(descriptor)}"
-        )
-    original = descriptor
+    original = descriptor.__func__ if isinstance(descriptor, (staticmethod, classmethod)) else descriptor
     if getattr(original, "_huginn_losatok_fsdp_dcp_resume_patched", False):
         return
 
-    def patched(self, model, model_id, *args, **kwargs):
+    def maybe_restore_dynamic_dcp(model, model_id, *args, **kwargs):
         is_dynamic_fsdp_dcp, checkpoint_dir = _is_dynamic_fsdp_dcp_checkpoint(model_id)
-        if is_dynamic_fsdp_dcp:
-            if checkpoint_dir is None:
-                raise RuntimeError("Dynamic LoSATok DCP resume checkpoint path unexpectedly disappeared")
-            if os.environ.get("RANK", "0") == "0":
-                print(
-                    "[HuginnLoSATokSwift] bypassing Swift legacy vit.safetensors reload for dynamic FSDP DCP resume "
-                    f"checkpoint={checkpoint_dir}"
-                )
-            # PeftModel.from_pretrained is patched above to reconstruct the
-            # topology from DCP metadata without reading adapter sidecars.
-            return PeftModel.from_pretrained(model, model_id, *args, **kwargs)
-        return original(self, model, model_id, *args, **kwargs)
+        if not is_dynamic_fsdp_dcp:
+            return False, None
+        if checkpoint_dir is None:
+            raise RuntimeError("Dynamic LoSATok DCP resume checkpoint path unexpectedly disappeared")
+        if os.environ.get("RANK", "0") == "0":
+            print(
+                "[HuginnLoSATokSwift] bypassing Swift legacy vit.safetensors reload for dynamic FSDP DCP resume "
+                f"checkpoint={checkpoint_dir}"
+            )
+        # PeftModel.from_pretrained is patched above to reconstruct the
+        # topology from DCP metadata without reading adapter sidecars.
+        return True, PeftModel.from_pretrained(model, model_id, *args, **kwargs)
 
-    patched._huginn_losatok_fsdp_dcp_resume_patched = True
-    tuner_class.from_pretrained = patched
+    if isinstance(descriptor, staticmethod):
+        def patched(model, model_id, *args, **kwargs):
+            handled, result = maybe_restore_dynamic_dcp(model, model_id, *args, **kwargs)
+            if handled:
+                return result
+            return original(model, model_id, *args, **kwargs)
+
+        patched._huginn_losatok_fsdp_dcp_resume_patched = True
+        tuner_class.from_pretrained = staticmethod(patched)
+        descriptor_kind = "staticmethod"
+    elif isinstance(descriptor, classmethod):
+        def patched(cls, model, model_id, *args, **kwargs):
+            handled, result = maybe_restore_dynamic_dcp(model, model_id, *args, **kwargs)
+            if handled:
+                return result
+            return original(cls, model, model_id, *args, **kwargs)
+
+        patched._huginn_losatok_fsdp_dcp_resume_patched = True
+        tuner_class.from_pretrained = classmethod(patched)
+        descriptor_kind = "classmethod"
+    else:
+        def patched(self, model, model_id, *args, **kwargs):
+            handled, result = maybe_restore_dynamic_dcp(model, model_id, *args, **kwargs)
+            if handled:
+                return result
+            return original(self, model, model_id, *args, **kwargs)
+
+        patched._huginn_losatok_fsdp_dcp_resume_patched = True
+        tuner_class.from_pretrained = patched
+        descriptor_kind = "instance_method"
+    lora_llm_module._huginn_losatok_fsdp_dcp_resume_patched = True
     print(
         "[HuginnLoSATokSwift] installed Swift lora_llm dynamic-FSDP-DCP resume patch "
-        f"tuner_class={class_name}"
+        f"tuner_class={class_name} descriptor={descriptor_kind}"
     )
 
 

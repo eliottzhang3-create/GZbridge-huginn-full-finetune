@@ -226,8 +226,12 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
   - The remaining fresh-resume failure is now isolated to `swift/tuner_plugin/lora_llm.py`: after PEFT reconstruction it
     unconditionally loads the legacy fixed-32 sidecar `vit.safetensors`, which does not exist and must not be fabricated for
     an adapter-only DCP. The plugin now contains a dynamic-DCP-only interception that bypasses this legacy sidecar read and
-    lets Accelerate restore the `20` aligner tensors from DCP alongside LoRA, optimizer, scheduler, and RNG. This final resume
-    repair remains **pending smoke validation**.
+    lets Accelerate restore the `20` aligner tensors from DCP alongside LoRA, optimizer, scheduler, and RNG. The first launch
+    of that interception stopped during external-plugin import because remote Swift 4.1.3 declares
+    `LoRALLMTuner.from_pretrained` as a `staticmethod`, while the initial defensive patch accepted only an instance method.
+    No model, dataset, CUDA tensor, process group, or checkpoint was touched in that failed run. The plugin now preserves all
+    three Python descriptor forms and logs the selected form; the expected remote value is
+    `tuner_class=LoRALLMTuner descriptor=staticmethod`. This final resume repair remains **pending smoke validation**.
 - The formal dynamic AudioCaps-v2 script remains
   - runtime: `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2.sh`;
   - submit: `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.sh`;
