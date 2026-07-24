@@ -55,6 +55,7 @@ FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_LOSATOK_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT"
 FSDP_SAVE_DEBUG_ENV = "HUGINN_LOSATOK_FSDP_SAVE_DEBUG"
+PEFT_ALIGNER_MODULES_TO_SAVE_ENV = "HUGINN_LOSATOK_PEFT_ALIGNER_MODULES_TO_SAVE"
 DYNAMIC_ALIGNER_TRAINABLE_PARAMETERS = 62_953_248
 HUGINN_LORA_TRAINABLE_PARAMETERS = 12_541_440
 
@@ -577,22 +578,31 @@ def patch_swift_prepare_model_audit() -> None:
     print("[HuginnLoSATokSwift] installed Swift.prepare_model PEFT wrapping audit")
 
 
-def patch_peft_constructor_audit() -> None:
-    """Observe PEFT's own construction boundary for the debug save smoke.
+def patch_peft_constructor_modules_to_save() -> None:
+    """Make dynamic-aligner weights part of PEFT adapter state before wrapping.
 
-    Some Swift code paths retain a local prepare function instead of invoking
-    the public ``Swift.prepare_model`` descriptor.  Every normal PEFT causal
-    model nevertheless initializes through ``PeftModel.__init__``.  Inspecting
-    immediately after that constructor therefore gives an unambiguous answer
-    about whether PEFT created ``ModulesToSaveWrapper`` instances before FSDP.
+    Transformers 4.53 requests FSDP ``adapter_only=True`` checkpoints.  In
+    Accelerate 1.13 this calls PEFT ``get_peft_model_state_dict``, which saves
+    LoRA plus only modules represented by ``ModulesToSaveWrapper``.  Swift's
+    CLI accepts our ``--modules_to_save`` list, but the observed PEFT
+    ``LoraConfig`` arrives with that field reset to ``None``.  The only safe
+    repair is to restore the three aligner module names *before*
+    ``PeftModel.__init__`` injects adapters, so PEFT creates normal wrappers
+    and its standard save/load pair handles the aligner automatically.
+
+    The behavior is explicit and opt-in for the dynamic route.  The same hook
+    additionally prints constructor topology when the dedicated save-debug
+    environment is enabled.
     """
-    if not _requested(FSDP_SAVE_DEBUG_ENV):
+    force_modules_to_save = _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
+    debug = _requested(FSDP_SAVE_DEBUG_ENV)
+    if not force_modules_to_save and not debug:
         return
     try:
         from peft.peft_model import PeftModel
     except Exception as exc:
         print(
-            "[HuginnLoSATokSwift] unable to install PEFT constructor audit "
+            "[HuginnLoSATokSwift] unable to install PEFT constructor modules-to-save hook "
             f"error_type={type(exc).__name__} error={exc}"
         )
         return
@@ -601,18 +611,55 @@ def patch_peft_constructor_audit() -> None:
         return
 
     def patched(self, *args, **kwargs):
+        peft_config = kwargs.get("peft_config")
+        if peft_config is None and len(args) >= 2:
+            # PeftModel.__init__(self, model, peft_config, adapter_name, ...)
+            peft_config = args[1]
+        if force_modules_to_save:
+            if peft_config is None or not hasattr(peft_config, "modules_to_save"):
+                raise RuntimeError(
+                    "Dynamic LoSATok requires a PEFT config with modules_to_save before adapter construction; "
+                    f"config_type={type(peft_config)}"
+                )
+            configured = list(getattr(peft_config, "modules_to_save", None) or [])
+            merged = list(dict.fromkeys([*configured, *ALIGNER_PREFIXES]))
+            peft_config.modules_to_save = merged
+            if os.environ.get("RANK", "0") == "0":
+                print(
+                    "[HuginnLoSATokSwift] injected PEFT aligner modules_to_save before constructor "
+                    f"existing={configured} final={merged}"
+                )
         result = original(self, *args, **kwargs)
-        if os.environ.get("RANK", "0") == "0":
+        wrappers = {
+            name: module for name, module in self.named_modules()
+            if type(module).__name__ == "ModulesToSaveWrapper"
+        }
+        if force_modules_to_save:
+            missing = [
+                name for name in ALIGNER_PREFIXES
+                if not any(wrapper_name.endswith(name) for wrapper_name in wrappers)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "PEFT did not wrap every required dynamic LoSATok aligner module: "
+                    f"missing={missing} wrappers={list(wrappers)} "
+                    f"config_modules_to_save={getattr(peft_config, 'modules_to_save', None)}"
+                )
+        if debug and os.environ.get("RANK", "0") == "0":
             print(
                 "[HuginnLoSATokSwift] PEFT constructor audit "
                 f"model_type={type(self)} peft_configs={getattr(self, 'peft_config', None)}"
             )
-        audit_modules_to_save_topology(self, stage="immediately_after_peft_constructor")
+        if debug:
+            audit_modules_to_save_topology(self, stage="immediately_after_peft_constructor")
         return result
 
     patched._huginn_losatok_constructor_audit_patched = True
     PeftModel.__init__ = patched
-    print("[HuginnLoSATokSwift] installed PEFT constructor modules-to-save audit")
+    print(
+        "[HuginnLoSATokSwift] installed PEFT constructor modules-to-save hook "
+        f"force_aligner_modules_to_save={force_modules_to_save} debug={debug}"
+    )
 
 
 def patch_peft_adapter_restore() -> None:
@@ -948,7 +995,7 @@ def register_huginn_losatok_arch() -> None:
 register_huginn_losatok_arch()
 patch_peft_adapter_restore()
 patch_swift_prepare_model_audit()
-patch_peft_constructor_audit()
+patch_peft_constructor_modules_to_save()
 register_model(
     ModelMeta(
         MODEL_TYPE,

@@ -215,10 +215,12 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - Current targeted diagnostic:
   - `code/huginn_lora/scripts/smoke_audiocaps_v2_huginn_losatok_dynamic90s_modules_save_fsdp2_5090.sh`;
   - submit only through `code/huginn_lora/run_smoke_audiocaps_v2_huginn_losatok_dynamic90s_modules_save_fsdp2_5090.sh`;
-  - it enables the opt-in `HUGINN_LOSATOK_FSDP_SAVE_DEBUG=1` trace in `huginn_losatok_swift.py` and records (a) the PEFT
-    `modules_to_save` configuration, (b) actual `ModulesToSaveWrapper` presence around each aligner module, and (c) the exact
-    LoRA/aligner/other key counts returned by Accelerate immediately before DCP write. This separates wrapper failure, PEFT
-    state-dict filtering, and a DCP-writer failure without changing saved tensors.
+  - it enables the opt-in `HUGINN_LOSATOK_FSDP_SAVE_DEBUG=1` trace and the dynamic-only
+    `HUGINN_LOSATOK_PEFT_ALIGNER_MODULES_TO_SAVE=1` repair. The plugin restores the three aligner names onto the PEFT
+    `LoraConfig` immediately before `PeftModel.__init__`, requires all three `ModulesToSaveWrapper` instances to appear, and
+    then records the exact LoRA/aligner/other key counts returned by Accelerate immediately before DCP write. This repair is
+    **pending smoke validation**; it must save `66 + 20` and pass the script's fresh-process resume phase before it is treated
+    as valid.
 - The formal dynamic AudioCaps-v2 script remains
   - runtime: `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2.sh`;
   - submit: `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.sh`;
