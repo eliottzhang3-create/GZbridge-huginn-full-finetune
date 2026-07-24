@@ -155,6 +155,15 @@ def is_fsdp_sharded_checkpoint(checkpoint_path: Path) -> bool:
     return (checkpoint_path / FSDP_MODEL_DIR_NAME).is_dir()
 
 
+def count_injected_lora_targets(model: torch.nn.Module) -> int:
+    """Count PEFT LoRA leaf modules, not their parent ModuleDict containers."""
+    return sum(
+        1
+        for name, _ in model.named_modules()
+        if name.endswith(".lora_A.default") or name == "lora_A.default"
+    )
+
+
 def infer_fsdp_lora_model(
     base_model: torch.nn.Module,
     state_metadata: dict[str, Any],
@@ -210,11 +219,11 @@ def infer_fsdp_lora_model(
         bias="none",
     )
     peft_model = get_peft_model(base_model, config)
-    injected_targets = [name for name, _ in peft_model.named_modules() if "lora_A" in name]
-    if len(injected_targets) != len(target_modules):
+    injected_target_count = count_injected_lora_targets(peft_model)
+    if injected_target_count != len(target_modules):
         raise RuntimeError(
             "Recreated LoRA target count does not match DCP metadata: "
-            f"metadata_targets={len(target_modules)} injected_targets={len(injected_targets)}"
+            f"metadata_targets={len(target_modules)} injected_targets={injected_target_count}"
         )
     return peft_model, {
         "lora_metadata_key_count": lora_tensor_count,
@@ -222,7 +231,7 @@ def infer_fsdp_lora_model(
         "lora_alpha": rank * 2,
         "target_module_count": len(target_modules),
         "target_module_preview": sorted(target_modules)[:20],
-        "injected_lora_module_count": len(injected_targets),
+        "injected_lora_module_count": injected_target_count,
     }
 
 
@@ -428,7 +437,7 @@ def load_generation_model(
         if is_losatok else plugin.build_huginn_audio_processor()
     )
     lora_tensor_count = len(state_dict_from_file(adapter_path))
-    injected_lora_module_count = sum(1 for name, _ in model.named_modules() if "lora_A" in name)
+    injected_lora_module_count = count_injected_lora_targets(model)
     if injected_lora_module_count == 0:
         raise RuntimeError("LoRA restoration produced no injected lora_A modules in the generation model")
     return model, processor, {
