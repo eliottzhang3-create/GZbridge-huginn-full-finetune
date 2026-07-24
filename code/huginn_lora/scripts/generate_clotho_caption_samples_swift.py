@@ -155,6 +155,77 @@ def is_fsdp_sharded_checkpoint(checkpoint_path: Path) -> bool:
     return (checkpoint_path / FSDP_MODEL_DIR_NAME).is_dir()
 
 
+def infer_fsdp_lora_model(
+    base_model: torch.nn.Module,
+    state_metadata: dict[str, Any],
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Recreate the LoRA wrapper from FSDP DCP metadata for LoSATok eval.
+
+    Swift's FSDP2 DCP checkpoint does not necessarily contain adapter_config.json.
+    The model state still exposes lora_A/lora_B keys, so infer the exact target
+    module paths and rank without loading any tensor payload first.
+    """
+    lora_keys = [str(key) for key in state_metadata if ".lora_A." in str(key) or ".lora_B." in str(key)]
+    if not lora_keys:
+        raise RuntimeError("LoSATok FSDP checkpoint contains no lora_A/lora_B metadata keys")
+
+    module_names = set(dict(base_model.named_modules()))
+    target_modules: set[str] = set()
+    ranks: set[int] = set()
+    lora_tensor_count = 0
+    for source_key in lora_keys:
+        metadata = state_metadata[source_key]
+        shape_value = getattr(metadata, "size", None)
+        shape = tuple(int(value) for value in shape_value) if shape_value is not None else ()
+        if ".lora_A." in source_key:
+            if not shape:
+                raise RuntimeError(f"LoRA A metadata has no shape: {source_key}")
+            ranks.add(int(shape[0]))
+        for candidate in candidate_target_keys(source_key):
+            if ".lora_A." in candidate:
+                module_path = candidate.split(".lora_A.", 1)[0]
+            elif ".lora_B." in candidate:
+                module_path = candidate.split(".lora_B.", 1)[0]
+            else:
+                continue
+            if module_path in module_names:
+                target_modules.add(module_path)
+                break
+        lora_tensor_count += 1
+
+    if not target_modules:
+        raise RuntimeError("Unable to map FSDP LoRA metadata keys to base-model module paths")
+    if len(ranks) != 1:
+        raise RuntimeError(f"LoRA ranks are inconsistent in FSDP metadata: {sorted(ranks)}")
+
+    from peft import LoraConfig, TaskType, get_peft_model
+
+    rank = next(iter(ranks))
+    config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=rank,
+        lora_alpha=rank * 2,
+        lora_dropout=0.05,
+        target_modules=sorted(target_modules),
+        bias="none",
+    )
+    peft_model = get_peft_model(base_model, config)
+    injected_targets = [name for name, _ in peft_model.named_modules() if "lora_A" in name]
+    if len(injected_targets) != len(target_modules):
+        raise RuntimeError(
+            "Recreated LoRA target count does not match DCP metadata: "
+            f"metadata_targets={len(target_modules)} injected_targets={len(injected_targets)}"
+        )
+    return peft_model, {
+        "lora_metadata_key_count": lora_tensor_count,
+        "lora_rank": rank,
+        "lora_alpha": rank * 2,
+        "target_module_count": len(target_modules),
+        "target_module_preview": sorted(target_modules)[:20],
+        "injected_lora_module_count": len(injected_targets),
+    }
+
+
 def load_full_fsdp_base_model(
     plugin: ModuleType,
     checkpoint_path: Path,
@@ -173,14 +244,25 @@ def load_full_fsdp_base_model(
     except Exception as exc:
         raise RuntimeError("torch.distributed.checkpoint is required for FSDP streaming evaluation") from exc
 
+    is_losatok = getattr(plugin, "MODEL_TYPE", None) == "huginn_losatok_raven"
     # The base model stays on CPU until every DCP tensor has been copied into it.
     # This avoids Accelerate's all-at-once merge, which exceeds the queue's 32G cap.
-    base_model = plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
-    target_state = base_model.state_dict()
     metadata = FileSystemReader(str(source_dir)).read_metadata()
     state_metadata = getattr(metadata, "state_dict_metadata", {})
     if not state_metadata:
         raise RuntimeError(f"FSDP DCP metadata has no state entries: {source_dir}")
+
+    base_model = (
+        plugin.build_huginn_losatok_evaluation_model()
+        if is_losatok else plugin.build_huginn_audio_model(str(plugin.AUDIO_MODEL_DIR))
+    )
+    peft_model = None
+    lora_report: dict[str, Any] = {}
+    restore_model: torch.nn.Module = base_model
+    if is_losatok:
+        peft_model, lora_report = infer_fsdp_lora_model(base_model, state_metadata)
+        restore_model = peft_model
+    target_state = restore_model.state_dict()
 
     restore_plan: list[tuple[str, str, tuple[int, ...], torch.dtype]] = []
     unmatched_source_keys: list[str] = []
@@ -224,9 +306,28 @@ def load_full_fsdp_base_model(
         if index == 1 or index % 25 == 0 or index == len(restore_plan):
             print(f"[fsdp-stream] restored_tensors={index}/{len(restore_plan)}", flush=True)
 
-    missing_critical = [
-        key for key in target_state if key.startswith(FULL_TRAINED_PREFIXES) and key not in restored_target_keys
-    ]
+    normalized_restored_keys = {
+        candidate for key in restored_target_keys for candidate in candidate_target_keys(key)
+    }
+    if is_losatok:
+        base_target_keys = set(base_model.state_dict())
+        missing_critical = [
+            key
+            for key in base_target_keys
+            if key.startswith(ALIGNER_PREFIXES)
+            and not any(candidate in normalized_restored_keys for candidate in candidate_target_keys(key))
+        ]
+        lora_target_keys = [key for key in target_state if ".lora_A." in key or ".lora_B." in key]
+        missing_lora = [
+            key
+            for key in lora_target_keys
+            if not any(candidate in normalized_restored_keys for candidate in candidate_target_keys(key))
+        ]
+        missing_critical.extend(missing_lora)
+    else:
+        missing_critical = [
+            key for key in target_state if key.startswith(FULL_TRAINED_PREFIXES) and key not in restored_target_keys
+        ]
     # Huginn ties lm_head.weight to transformer.wte.weight. Some FSDP state-dict
     # exports retain only one side of this alias, which is still a complete restore.
     if (
@@ -244,19 +345,29 @@ def load_full_fsdp_base_model(
     if any(parameter.requires_grad for parameter in base_model.audio_encoder.parameters()):
         raise RuntimeError("Audio encoder unexpectedly became trainable during FSDP generation restore")
 
-    base_model.to(device=device, dtype=torch.bfloat16)
-    base_model.eval()
-    processor = plugin.build_huginn_audio_processor()
-    aligner_loaded = sum(1 for key in restored_target_keys if key.startswith(ALIGNER_PREFIXES))
+    restore_model.to(device=device, dtype=torch.bfloat16)
+    restore_model.eval()
+    model = restore_model.base_model.model if peft_model is not None else restore_model
+    processor = (
+        plugin.build_huginn_losatok_evaluation_processor()
+        if is_losatok else plugin.build_huginn_audio_processor()
+    )
+    aligner_loaded = sum(
+        1
+        for key in base_model.state_dict()
+        if key.startswith(ALIGNER_PREFIXES)
+        and any(candidate in normalized_restored_keys for candidate in candidate_target_keys(key))
+    )
     boundary_loaded = [
-        key
-        for key in restored_target_keys
-        if key.endswith((".audio_bos", ".audio_eos")) or key in {"audio_bos", "audio_eos"}
+        key for key in base_model.state_dict()
+        if (key.endswith((".audio_bos", ".audio_eos")) or key in {"audio_bos", "audio_eos"})
+        and any(candidate in normalized_restored_keys for candidate in candidate_target_keys(key))
     ]
-    return base_model, processor, {
+    return model, processor, {
         "checkpoint_dir": str(checkpoint_path),
         "checkpoint_format": "fsdp_sharded_streaming",
-        "lora_restored": False,
+        "lora_restored": peft_model is not None,
+        "lora_restore": lora_report,
         "full_state_restored": True,
         "fsdp_source_dir": str(source_dir),
         "dcp_metadata_tensor_count": len(state_metadata),
@@ -287,8 +398,6 @@ def load_generation_model(
         raise FileNotFoundError(f"Checkpoint directory not found: {checkpoint_path}")
     is_losatok = getattr(plugin, "MODEL_TYPE", None) == "huginn_losatok_raven"
     if is_fsdp_sharded_checkpoint(checkpoint_path):
-        if is_losatok:
-            raise RuntimeError("LoSATok evaluation currently supports Swift LoRA checkpoints, not FSDP checkpoints")
         return load_full_fsdp_base_model(plugin, checkpoint_path, device, fsdp_export_dir)
 
     adapter_path = checkpoint_path / "adapter_model.safetensors"
