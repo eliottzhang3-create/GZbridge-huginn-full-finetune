@@ -611,11 +611,10 @@ def main() -> None:
             reloaded_model = Swift.from_pretrained(
                 fresh_base,
                 str(checkpoint_dir),
-                is_trainable=False,
-                # PEFT defaults this to True and promotes BF16/FP16 adapters
-                # to FP32 at load time. Preserve the exact training/checkpoint
-                # dtype so recurrent numerical parity is a meaningful test.
-                autocast_adapter_dtype=False,
+                # Match TunerMixin's actual Trainer-resume contract. This also
+                # preserves the FP32 adapter compute policy used by the model
+                # that just completed the optimizer step.
+                is_trainable=True,
             ).eval()
             state_report = compare_adapter_states(model, reloaded_model)
             with torch.inference_mode():
