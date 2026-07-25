@@ -410,7 +410,13 @@ def main() -> None:
             lora_report = lora_module_report(model)
             probes = select_update_probes(model)
             captures, forward_hook = capture_training_forward(tokenizer)
-            hook_handle = hrm_model.register_forward_pre_hook(forward_hook, with_kwargs=True)
+            # Trainer calls the outer PEFT model. PEFT may delegate to the
+            # wrapped causal LM via ``base_model.forward(...)`` rather than
+            # ``base_model(...)``; the former bypasses hooks registered on the
+            # inner HrmTextForCausalLM. Attach the audit to the exact outer
+            # module object that Trainer invokes so the real collated kwargs
+            # are observed before PEFT forwards them to HRM.
+            hook_handle = model.register_forward_pre_hook(forward_hook, with_kwargs=True)
 
             print("========== SWIFT TRAINER PRE-TRAIN AUDIT ==========", flush=True)
             print(f"[trainer] type={trainer.__class__.__module__}.{trainer.__class__.__name__}", flush=True)
