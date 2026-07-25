@@ -34,6 +34,105 @@ It is also the **authoritative project memory** for future Codex / AI-agent chat
 
 ---
 
+## Independent HRM-Text Audio Exploration (updated 2026-07-25)
+
+This is an **additional experimental line with HRM-Text-1B as the recurrent text backbone**. It is not a rename,
+continuation, replacement, or status update of any Huginn experiment below. The Huginn and HRM-Text lines have separate
+owners, environments, model code, checkpoints, outputs, and progress records.
+
+### Ownership and isolation rules
+
+- HRM-Text work is owned under `code/HRM_Audio/` and `models/hrm-text-audio-v1/` only.
+- `code/huginn_lora/`, `code/recurrent-pretraining-main/`, and `models/huginn-*` are read-only design references for this
+  line. Do not modify them while implementing HRM-Text, and do not report HRM results as Huginn results.
+- The Huginn `Project Scope`, priority list, and current-status sections below remain authoritative for Huginn only. This
+  section is the authoritative current-status record for the independent HRM-Text line.
+- Model weights, checkpoints, generated outputs, and large logs remain remote-only and must not be committed to Git.
+
+### Goal and fixed training policy
+
+- Goal: attach the proven audio encoder/aligner pattern to HRM-Text for audio-to-text understanding, then train through
+  **ms-swift**, not through a separate standalone training route.
+- First audio tower: frozen local Whisper-large encoder, trainable temporal compressor, trainable audio projector, and
+  trainable `audio_bos`/`audio_eos` boundary embeddings.
+- First compression policy: mono 16 kHz, first 30 seconds, fixed 32 compressed audio tokens; the complete prefix is
+  `audio_bos + 32 audio tokens + audio_eos` (34 tokens).
+- Final trainability policy: Whisper-large fully frozen; HRM-Text base fully frozen; aligner fully trainable; LoRA on both
+  HRM H/L stacks trainable. Swift `lora_llm` and a dedicated multimodal `model_arch` are planned for this split.
+- The Huginn aligner architecture is a reference, not a shape-compatible checkpoint. Huginn uses hidden size `5280`,
+  while HRM-Text-1B uses `1536`; the HRM audio projector output layer must be newly initialized and trained.
+
+### Local, remote, and environment layout
+
+- Local/remote synchronized code: `code/HRM_Audio/`.
+- Wrapper-model directory: `models/hrm-text-audio-v1/`. The first local implementation now contains
+  `configuration_hrm_text_audio.py`, `modeling_hrm_text_audio.py`, `config.json`, and package exports. It is not yet
+  remote-verified; do not claim the wrapper works until the dedicated wrapper audit passes.
+- Remote repository root:
+  `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune`.
+- Remote HRM-Text snapshot: `/hpc_stor03/sjtu_home/jinwei.zhang/models/HRM-text`; it contains `config.json`,
+  `model.safetensors`, tokenizer files, `README.md`, and `LICENSE`. The weight SHA-256 verified by the load audit is
+  `f8fe2b2bf6948414e8e8d6538659198726d98f967c55b533b7aabe8a1fa9a584`.
+- Planned remote Whisper asset: `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large`.
+- Dedicated remote conda environment: `swift_HRM`, cloned from `swift_huginn` and then independently updated. Verified
+  versions are `ms-swift==4.4.2`, `transformers==5.9.0`, `torch==2.11.0+cu128`, `torchaudio==2.11.0+cu128`,
+  `torchvision==0.26.0+cu128`, `accelerate==1.13.0`, `peft==0.18.1`, and `trl==0.29.1`.
+- Verified accelerator: one RTX 5090 (`31.367 GiB`, BF16 supported). Existing `code/HRM_Audio/run_*_5090.sh` launchers
+  submit the corresponding scripts on the remote cluster.
+
+### Verified text-only HRM-Text baseline
+
+- Environment, CUDA/SDPA, package consistency, native HRM imports, local snapshot integrity, BF16 model loading, and native
+  generation have passed remotely. The checkpoint has `1,182,795,264` parameters and loads fully on `cuda:0`.
+- `code/HRM_Audio/plugins/hrm_text_swift.py` registers native model type `hrm_text_native` and PrefixLM-aware templates
+  `hrm_text_direct` and `hrm_text_synth_cot` in ms-swift 4.4.2. Registration, template/collator encoding, Swift model
+  loading, prefill equivalence, and deterministic generation have passed.
+- HRM-Text-1B runtime recurrence is `L,L,L,H,L,L,L,H`: `H_cycles=2`, `L_cycles=3`, 16 physical layers in each stack.
+  The current downstream SFT policy is static final `K=5`, encoded by `L_bp_cycles=[0,3]`; no K=2-to-K=5 warmup is used.
+- Next-token labels, Swift compact labels/`logits_to_keep`, manual shifted cross entropy, PrefixLM masks, recurrence order,
+  gradient-enabled trailing K steps, and H/L gradient coverage have all passed dedicated audits.
+- Text-only rank-8 LoRA discovery/injection has passed: 256 target modules total (128 H, 128 L), 512 saved adapter
+  tensors, and `8,257,536` trainable parameters; all original HRM parameters remain frozen.
+- The official one-step `SwiftSft`/Trainer smoke has passed end to end: real collation, loss/backward, optimizer update in
+  both H and L LoRA stacks, checkpoint-1 save, fresh Swift trainable reload, and checkpoint integrity checks.
+- Reload validation requires exact adapter tensors/dtypes, exact frozen-base parameters, exact buffers, and exact runtime
+  semantics. Each independently allocated model is self-repeat bitwise deterministic. Cross-instance BF16 logits are
+  accepted with an epsilon-derived numerical envelope plus 100% per-position top-1 agreement; do not reintroduce an
+  invalid `1e-5` bitwise cross-instance logits requirement for recurrent CUDA BF16 GEMMs.
+
+### HRM PrefixLM audio contract
+
+- Planned combined sequence: `[audio_bos, audio_1 ... audio_32, audio_eos, HRM prompt, response]`.
+- Audio plus prompt positions use `token_type_ids=1` and form the bidirectional PrefixLM block. Response/EOS positions use
+  `token_type_ids=0` and remain causal.
+- Audio and prompt labels are `-100`; only response/EOS tokens are next-token targets. Audio padding, if introduced later,
+  must also use attention mask `0` and label `-100`.
+- The wrapper must preserve Swift 4.4.2 compact-label/`logits_to_keep` behavior: multi-sample batches use an integer suffix
+  length, while a single sample uses a boolean text-position mask that must be left-padded with 34 `False` audio positions.
+  During generation it must encode and prepend audio only on the initial prefill, never again during cached token decoding.
+
+### Next implementation gates
+
+1. The first local Whisper-large fixed-32 `HrmTextAudioForConditionalGeneration` and config are implemented in
+   `models/hrm-text-audio-v1/`, reusing Transformers 5.9.0 native HRM classes rather than copying or modifying HRM loops.
+2. The wrapper-only audit is implemented in `code/HRM_Audio/scripts/inspect_hrm_audio_wrapper.py`, with remote launcher
+   `code/HRM_Audio/run_inspect_hrm_audio_wrapper_5090.sh`. It must still remotely pass exact text-only passthrough, strict
+   HRM/Whisper loading, frozen Whisper, `[B,34,1536]` audio prefix, full and compact labels/NTP shift, unchanged static K=5
+   recurrence, finite audio loss, and aligner-only gradients before LoRA injection.
+3. Add audio generation audit: audio is processed once at prefill and cached decoding remains valid.
+4. Extend the HRM Swift plugin with a separate multimodal model type, processor/template, and `MultiModelKeys` registration;
+   keep the already-verified text-only registration intact.
+5. Audit Swift `lora_llm` trainability: Whisper `0`, HRM base `0`, aligner positive/full, H/L LoRA positive, and no
+   unclassified trainable parameters.
+6. Run one real audio Trainer update, then strictly audit save/fresh-process reload of every LoRA, compressor, projector,
+   and boundary tensor. Only after this gate may the line proceed to tiny overfit and formal audio training.
+
+**Current exact status:** the text-only HRM-Text Swift/LoRA/Trainer foundation is complete. The first audio wrapper and its
+wrapper-only audit are implemented locally but have not run remotely. Multimodal Swift registration, verified audio
+forward/backward, audio checkpoint save/reload, tiny overfit, and formal audio training have not started.
+
+---
+
 ## Project Scope
 
 This repo contains **two major experiment families**:

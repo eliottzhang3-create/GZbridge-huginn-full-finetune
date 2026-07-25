@@ -1,0 +1,49 @@
+{
+  "architectures": [
+    "HrmTextAudioForConditionalGeneration"
+  ],
+  "auto_map": {
+    "AutoConfig": "configuration_hrm_text_audio.HrmTextAudioConfig",
+    "AutoModelForCausalLM": "modeling_hrm_text_audio.HrmTextAudioForConditionalGeneration"
+  },
+  "model_type": "hrm_text_audio_whisper_v1",
+  "base_model_name_or_path": "/hpc_stor03/sjtu_home/jinwei.zhang/models/HRM-text",
+  "audio_encoder_name": "/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large",
+  "audio_encoder_hidden_size": 1280,
+  "audio_feature_size": 80,
+  "audio_sample_rate": 16000,
+  "audio_max_seconds": 30.0,
+  "audio_target_token_count": 32,
+  "audio_compressor_intermediate_size": 1536,
+  "audio_compressor_kernel_size": 7,
+  "audio_compressor_stride": 12,
+  "audio_projector_hidden_size": 2048,
+  "freeze_audio_encoder": true,
+  "freeze_text_backbone": true,
+  "use_audio_boundary_embeddings": true,
+  "vocab_size": 65536,
+  "hidden_size": 1536,
+  "intermediate_size": 4096,
+  "num_hidden_layers": 16,
+  "num_attention_heads": 12,
+  "num_key_value_heads": 12,
+  "head_dim": 128,
+  "H_cycles": 2,
+  "L_cycles": 3,
+  "L_bp_cycles": [
+    0,
+    3
+  ],
+  "max_position_embeddings": 4096,
+  "rms_norm_eps": 1e-06,
+  "rope_theta": 10000.0,
+  "tie_word_embeddings": false,
+  "initializer_range": 0.025515518153991442,
+  "embedding_scale": 39.191835884530846,
+  "prefix_lm": true,
+  "pad_token_id": 5,
+  "bos_token_id": 6,
+  "eos_token_id": 11,
+  "torch_dtype": "bfloat16",
+  "transformers_version": "5.9.0"
+}
