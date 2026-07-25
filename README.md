@@ -65,15 +65,15 @@ owners, environments, model code, checkpoints, outputs, and progress records.
 ### Local, remote, and environment layout
 
 - Local/remote synchronized code: `code/HRM_Audio/`.
-- Wrapper-model directory: `models/hrm-text-audio-v1/`. The first local implementation now contains
-  `configuration_hrm_text_audio.py`, `modeling_hrm_text_audio.py`, `config.json`, and package exports. It is not yet
-  remote-verified; do not claim the wrapper works until the dedicated wrapper audit passes.
+- Wrapper-model directory: `models/hrm-text-audio-v1/`. It contains `configuration_hrm_text_audio.py`,
+  `modeling_hrm_text_audio.py`, `config.json`, and package exports, and has passed the dedicated remote wrapper and
+  generation/cache audits.
 - Remote repository root:
   `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune`.
 - Remote HRM-Text snapshot: `/hpc_stor03/sjtu_home/jinwei.zhang/models/HRM-text`; it contains `config.json`,
   `model.safetensors`, tokenizer files, `README.md`, and `LICENSE`. The weight SHA-256 verified by the load audit is
   `f8fe2b2bf6948414e8e8d6538659198726d98f967c55b533b7aabe8a1fa9a584`.
-- Planned remote Whisper asset: `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large`.
+- Verified remote Whisper asset: `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large`.
 - Dedicated remote conda environment: `swift_HRM`, cloned from `swift_huginn` and then independently updated. Verified
   versions are `ms-swift==4.4.2`, `transformers==5.9.0`, `torch==2.11.0+cu128`, `torchaudio==2.11.0+cu128`,
   `torchvision==0.26.0+cu128`, `accelerate==1.13.0`, `peft==0.18.1`, and `trl==0.29.1`.
@@ -129,19 +129,24 @@ owners, environments, model code, checkpoints, outputs, and progress records.
 4. The independent multimodal Swift plugin is implemented in `code/HRM_Audio/plugins/hrm_text_audio_swift.py` with model
    type `hrm_text_audio_whisper`, template `hrm_text_audio`, a dedicated processor/loader, and model arch
    `hrm_text_audio_whisper`. Its `MultiModelKeys` groups are language model `model`/`lm_head`, trainable aligner modules,
-   and frozen generator `audio_encoder`. The registration/encoding/load audit and 5090 launcher are implemented as
+   and frozen generator `audio_encoder`. The registration/encoding/load/audio-prefill audit has passed remotely via
    `code/HRM_Audio/scripts/inspect_hrm_audio_swift_registration.py` and
-   `code/HRM_Audio/run_inspect_hrm_audio_swift_registration_5090.sh`; they have not run remotely yet. The verified
-   text-only model type/templates remain separate and must not be replaced.
-5. Audit Swift `lora_llm` trainability: Whisper `0`, HRM base `0`, aligner positive/full, H/L LoRA positive, and no
-   unclassified trainable parameters.
+   `code/HRM_Audio/run_inspect_hrm_audio_swift_registration_5090.sh`. The verified text-only model type/templates remain
+   separate and were not replaced.
+5. The independent Swift `lora_llm` trainability audit and 5090 launcher are implemented in
+   `code/HRM_Audio/scripts/inspect_hrm_audio_swift_trainability.py` and
+   `code/HRM_Audio/run_inspect_hrm_audio_swift_trainability_5090.sh`. This gate requires exact trainable counts of
+   Whisper `0`, HRM base `0`, aligner `39,538,176`, and rank-8 H/L LoRA `8,257,536` (256 modules, 128 per stack), with
+   `47,795,712` total trainable parameters and no unclassified parameters. It does not execute an optimizer update and is
+   awaiting remote execution.
 6. Run one real audio Trainer update, then strictly audit save/fresh-process reload of every LoRA, compressor, projector,
    and boundary tensor. Only after this gate may the line proceed to tiny overfit and formal audio training.
 
 **Current exact status:** the text-only HRM-Text Swift/LoRA/Trainer foundation is complete. The first audio wrapper has
-passed remote forward/backward and generation/cache audits. The independent multimodal Swift registration and its audit
-are implemented locally but have not run remotely. Audio LoRA/trainability audit, Trainer update, checkpoint save/reload,
-tiny overfit, and formal audio training have not started.
+passed remote forward/backward and generation/cache audits, and the independent multimodal Swift registration,
+processor/template/collator, model load, and audio-prefill audit has also passed remotely. The exact `lora_llm`
+trainability audit is implemented and awaiting remote execution. Audio Trainer update, checkpoint save/reload, tiny
+overfit, and formal audio training have not started.
 
 ---
 
