@@ -22,7 +22,7 @@ unset HUGINN_LOSATOK_FORCE_ALIGNER_TRAINABLE
 unset HUGINN_LOSATOK_INIT_ALIGNER_CHECKPOINT
 unset ACAVCAPS_WDS_MAX_TARS_PER_STAGE
 
-INIT_CHECKPOINT="${LOSATOK_DYNAMIC_ACAV_WDS_INIT_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_losatok_dynamic90s_audiocaps_v2_e2_b4ga4_fsdp2_complete/v0-20260724-115115/checkpoint-2802}"
+INIT_CHECKPOINT="${LOSATOK_DYNAMIC_ACAV_WDS_INIT_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_losatok_dynamic90s_audiocaps_v2_e2_b4ga4_fsdp2_complete/v0-20260724-115115/checkpoint-5604}"
 export HUGINN_LOSATOK_INIT_FSDP_DCP_CHECKPOINT="$INIT_CHECKPOINT"
 export ACAVCAPS_WDS_MANIFEST="${ACAVCAPS_WDS_QUARTER_MANIFEST:-$REPO_ROOT/data/audio_swift/acavcaps_wds/acavcaps_wds_stage_schedule_quarter_ceil_seed20260723.json}"
 export ACAVCAPS_WDS_BUFFER_SIZE="${ACAVCAPS_WDS_BUFFER_SIZE:-512}"
