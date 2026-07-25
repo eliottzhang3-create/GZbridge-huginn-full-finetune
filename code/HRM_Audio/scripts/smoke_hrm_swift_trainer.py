@@ -122,49 +122,98 @@ def capture_training_forward(tokenizer: Any):
     def hook(_module, _args, kwargs):
         if captures:
             return
-        required = ("input_ids", "attention_mask", "labels", "token_type_ids")
+        required = ("input_ids", "attention_mask", "labels", "token_type_ids", "logits_to_keep")
         missing = [name for name in required if not torch.is_tensor(kwargs.get(name))]
+        # For batch_size > 1 Swift represents logits_to_keep as a Python int.
+        if "logits_to_keep" in missing and isinstance(kwargs.get("logits_to_keep"), int):
+            missing.remove("logits_to_keep")
         if missing:
             raise RuntimeError(f"Trainer forward dropped required HRM tensors: {missing}; keys={sorted(kwargs)}")
         input_ids = kwargs["input_ids"].detach().cpu()
         attention_mask = kwargs["attention_mask"].detach().cpu()
         labels = kwargs["labels"].detach().cpu()
         token_type_ids = kwargs["token_type_ids"].detach().cpu()
-        if not (input_ids.shape == attention_mask.shape == labels.shape == token_type_ids.shape):
+        logits_to_keep_value = kwargs["logits_to_keep"]
+        if torch.is_tensor(logits_to_keep_value):
+            if logits_to_keep_value.ndim != 0:
+                raise RuntimeError(
+                    "This batch-size-2 smoke expects integer logits_to_keep, got "
+                    f"tensor shape={tuple(logits_to_keep_value.shape)}"
+                )
+            logits_to_keep = int(logits_to_keep_value.item())
+        else:
+            logits_to_keep = int(logits_to_keep_value)
+        if not (input_ids.shape == attention_mask.shape == token_type_ids.shape):
             raise RuntimeError(
                 "Trainer batch shapes disagree: "
                 f"input={tuple(input_ids.shape)} attention={tuple(attention_mask.shape)} "
-                f"labels={tuple(labels.shape)} token_type={tuple(token_type_ids.shape)}"
+                f"token_type={tuple(token_type_ids.shape)}"
+            )
+        if logits_to_keep <= 1 or labels.shape != (input_ids.shape[0], logits_to_keep):
+            raise RuntimeError(
+                "Swift logits_to_keep/compact-label shape mismatch: "
+                f"input={tuple(input_ids.shape)} labels={tuple(labels.shape)} "
+                f"logits_to_keep={logits_to_keep}"
             )
 
         im_end_id = int(tokenizer.convert_tokens_to_ids("<|im_end|>"))
         eos_id = int(tokenizer.eos_token_id)
         rows: list[dict[str, Any]] = []
+        sequence_width = int(input_ids.shape[1])
+        compact_start = sequence_width - logits_to_keep
         for row_index in range(input_ids.shape[0]):
             valid_length = int(attention_mask[row_index].sum().item())
             valid_ids = input_ids[row_index, :valid_length].tolist()
-            valid_labels = labels[row_index, :valid_length].tolist()
             valid_types = token_type_ids[row_index, :valid_length].tolist()
-            supervised = [index for index, label in enumerate(valid_labels) if label != -100]
-            if not supervised:
-                raise RuntimeError(f"Trainer row {row_index} has no supervised targets")
-            prefix_length = supervised[0]
-            if supervised != list(range(prefix_length, valid_length)):
-                raise RuntimeError(f"Trainer row {row_index} labels are not a contiguous suffix: {supervised}")
+            response_positions = [index for index, token_type in enumerate(valid_types) if token_type == 0]
+            if not response_positions:
+                raise RuntimeError(f"Trainer row {row_index} has no causal response region")
+            prefix_length = response_positions[0]
+            if response_positions != list(range(prefix_length, valid_length)):
+                raise RuntimeError(f"Trainer row {row_index} response token types are not contiguous")
             if prefix_length <= 0 or valid_ids[prefix_length - 1] != im_end_id:
                 raise RuntimeError(f"Trainer row {row_index} first response is not predicted from <|im_end|>")
-            if valid_labels[prefix_length:] != valid_ids[prefix_length:]:
-                raise RuntimeError(f"Trainer row {row_index} response labels differ from response tokens")
-            if valid_labels[-1] != eos_id:
-                raise RuntimeError(f"Trainer row {row_index} does not supervise EOS")
             if set(valid_types[:prefix_length]) != {1} or set(valid_types[prefix_length:]) != {0}:
                 raise RuntimeError(f"Trainer row {row_index} PrefixLM token types are invalid")
-            shifted_supervised = [index for index, target in enumerate(valid_labels[1:]) if target != -100]
-            if shifted_supervised != [position - 1 for position in supervised]:
-                raise RuntimeError(f"Trainer row {row_index} next-token shift is invalid")
+
+            # Swift 4.4.2's prepare_logits_to_keep keeps only a common suffix
+            # of labels for batch_size > 1. It adds one leading prediction
+            # position before the earliest response boundary, then HRM returns
+            # exactly the same suffix of logits. Reconstruct the full labels
+            # from the PrefixLM boundary and prove that the compact labels are
+            # the exact expected suffix.
+            expected_full_labels = [-100] * sequence_width
+            expected_full_labels[prefix_length:valid_length] = valid_ids[prefix_length:valid_length]
+            expected_compact_labels = expected_full_labels[-logits_to_keep:]
+            actual_compact_labels = labels[row_index].tolist()
+            if actual_compact_labels != expected_compact_labels:
+                raise RuntimeError(
+                    f"Trainer row {row_index} compact labels are wrong: "
+                    f"expected={expected_compact_labels} actual={actual_compact_labels}"
+                )
+            supervised_compact = [
+                index for index, label in enumerate(actual_compact_labels) if label != -100
+            ]
+            if not supervised_compact or supervised_compact[0] <= 0:
+                raise RuntimeError(
+                    f"Trainer row {row_index} compact labels lack a leading prediction position: "
+                    f"positions={supervised_compact}"
+                )
+            original_supervised_positions = [compact_start + index for index in supervised_compact]
+            if original_supervised_positions != list(range(prefix_length, valid_length)):
+                raise RuntimeError(
+                    f"Trainer row {row_index} compact-label positions do not map to the full response: "
+                    f"mapped={original_supervised_positions} response={list(range(prefix_length, valid_length))}"
+                )
+            first_prediction_position = compact_start + supervised_compact[0] - 1
+            if first_prediction_position != prefix_length - 1:
+                raise RuntimeError(
+                    f"Trainer row {row_index} first compact logit does not predict the first response token"
+                )
+            last_supervised_compact = supervised_compact[-1]
+            if actual_compact_labels[last_supervised_compact] != eos_id:
+                raise RuntimeError(f"Trainer row {row_index} compact labels do not supervise EOS")
             if valid_length < input_ids.shape[1]:
-                if not bool((labels[row_index, valid_length:] == -100).all().item()):
-                    raise RuntimeError(f"Trainer row {row_index} padding labels are not -100")
                 if not bool((attention_mask[row_index, valid_length:] == 0).all().item()):
                     raise RuntimeError(f"Trainer row {row_index} attention padding is not zero")
                 if not bool((token_type_ids[row_index, valid_length:] == 0).all().item()):
@@ -174,17 +223,24 @@ def capture_training_forward(tokenizer: Any):
                     "row": row_index,
                     "valid_length": valid_length,
                     "prefix_length": prefix_length,
-                    "supervised_targets": len(supervised),
-                    "first_prediction_position": prefix_length - 1,
-                    "first_prediction_token": tokenizer.convert_ids_to_tokens(valid_ids[prefix_length - 1]),
-                    "first_target_token": tokenizer.convert_ids_to_tokens(valid_labels[prefix_length]),
-                    "last_target_is_eos": valid_labels[-1] == eos_id,
+                    "compact_start": compact_start,
+                    "compact_label_length": logits_to_keep,
+                    "supervised_targets": len(supervised_compact),
+                    "supervised_compact_positions": supervised_compact,
+                    "original_supervised_positions": original_supervised_positions,
+                    "first_prediction_position": first_prediction_position,
+                    "first_prediction_token": tokenizer.convert_ids_to_tokens(valid_ids[first_prediction_position]),
+                    "first_target_token": tokenizer.convert_ids_to_tokens(valid_ids[prefix_length]),
+                    "last_target_is_eos": actual_compact_labels[last_supervised_compact] == eos_id,
                     "decoded": tokenizer.decode(valid_ids, skip_special_tokens=False),
                 }
             )
         captures.append(
             {
-                "shape": list(input_ids.shape),
+                "input_shape": list(input_ids.shape),
+                "compact_labels_shape": list(labels.shape),
+                "logits_to_keep": logits_to_keep,
+                "compact_start": compact_start,
                 "token_type_unique": [int(value) for value in torch.unique(token_type_ids).tolist()],
                 "rows": rows,
                 "batch": {
