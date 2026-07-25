@@ -268,8 +268,16 @@ def main() -> None:
     model_meta = model_registry[AUDIO_MODEL_TYPE]
     if not model_meta.is_multimodal or model_meta.template != AUDIO_TEMPLATE_TYPE:
         raise RuntimeError(f"HRM audio ModelMeta is invalid: {model_meta}")
-    if model_meta.model_arch != AUDIO_MODEL_ARCH:
-        raise RuntimeError(f"HRM audio model_arch mismatch: {model_meta.model_arch}")
+    resolved_model_arch = model_meta.model_arch
+    if isinstance(resolved_model_arch, str):
+        resolved_arch_name = resolved_model_arch
+    else:
+        resolved_arch_name = getattr(resolved_model_arch, "arch_name", None)
+    if resolved_arch_name != AUDIO_MODEL_ARCH:
+        raise RuntimeError(
+            f"HRM audio model_arch mismatch: expected={AUDIO_MODEL_ARCH!r} "
+            f"resolved_name={resolved_arch_name!r} value={resolved_model_arch!r}"
+        )
     if model_meta.loader.__name__ != "HrmTextAudioLoader":
         raise RuntimeError(f"HRM audio loader mismatch: {model_meta.loader}")
     if model_meta.architectures != ["HrmTextAudioForConditionalGeneration"]:
@@ -296,6 +304,16 @@ def main() -> None:
     }
     if arch_groups != expected_arch_groups:
         raise RuntimeError(f"HRM audio MultiModelKeys groups mismatch: {arch_groups}")
+    if not isinstance(resolved_model_arch, str):
+        resolved_arch_groups = {
+            name: list(getattr(resolved_model_arch, name))
+            for name in ("language_model", "aligner", "generator")
+        }
+        if resolved_arch_groups != expected_arch_groups or resolved_arch_groups != arch_groups:
+            raise RuntimeError(
+                "Resolved ModelMeta/MODEL_ARCH_MAPPING groups differ: "
+                f"resolved={resolved_arch_groups} registry={arch_groups}"
+            )
 
     wrapper_model_path = args.wrapper_model_path.resolve()
     model, processor = get_model_processor(
@@ -397,6 +415,8 @@ def main() -> None:
             "audio_model_type": AUDIO_MODEL_TYPE,
             "audio_template_type": AUDIO_TEMPLATE_TYPE,
             "audio_model_arch": AUDIO_MODEL_ARCH,
+            "resolved_model_arch_type": f"{type(resolved_model_arch).__module__}.{type(resolved_model_arch).__name__}",
+            "resolved_model_arch_repr": repr(resolved_model_arch),
             "arch_groups": arch_groups,
         },
         "processor": {
