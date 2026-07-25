@@ -52,6 +52,7 @@ DEFAULT_MAX_AUDIO_SECONDS = 90.0 if DYNAMIC_AUDIO_TOKENS_ENABLED else 30.0
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio and respond accurately."
 ALIGNER_PREFIXES = ("temporal_compressor", "audio_projector", "audio_boundary_embeddings")
 INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_LOSATOK_INIT_ALIGNER_CHECKPOINT"
+INIT_FSDP_DCP_CHECKPOINT_ENV = "HUGINN_LOSATOK_INIT_FSDP_DCP_CHECKPOINT"
 FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_LOSATOK_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_LOSATOK_TRAIN_CHAIN_AUDIT"
@@ -385,7 +386,46 @@ def checkpoint_key_aliases(key: str) -> list[str]:
         normalized.add(alias)
         normalized.add(alias.replace(".modules_to_save.default.", "."))
         normalized.add(alias.replace(".original_module.", "."))
+        normalized.add(alias.replace(".lora_A.default.", ".lora_A."))
+        normalized.add(alias.replace(".lora_B.default.", ".lora_B."))
     return list(normalized)
+
+
+def ordered_checkpoint_key_aliases(key: str) -> list[str]:
+    """Return deterministic checkpoint aliases, preferring exact PEFT ownership.
+
+    A ``ModulesToSaveWrapper`` has both an ``original_module`` and a
+    ``modules_to_save.default`` copy.  Their fully normalized aliases are the
+    same, so a DCP warm-start must first try aliases that retain the wrapper
+    ownership and only then fall back to the flattened compatibility aliases.
+    """
+    raw_aliases: list[str] = [key]
+    index = 0
+    while index < len(raw_aliases):
+        alias = raw_aliases[index]
+        index += 1
+        for prefix in ("base_model.model.", "base_model.", "model.", "module."):
+            if alias.startswith(prefix):
+                stripped = alias[len(prefix):]
+                if stripped not in raw_aliases:
+                    raw_aliases.append(stripped)
+
+    ordered: list[str] = []
+
+    def add(value: str) -> None:
+        if value not in ordered:
+            ordered.append(value)
+
+    # Exact wrapper and adapter names must win when both original and saved
+    # branches have an otherwise compatible tensor shape.
+    for alias in raw_aliases:
+        add(alias)
+        add(alias.replace(".lora_A.default.", ".lora_A."))
+        add(alias.replace(".lora_B.default.", ".lora_B."))
+    for alias in raw_aliases:
+        add(alias.replace(".modules_to_save.default.", "."))
+        add(alias.replace(".original_module.", "."))
+    return ordered
 
 
 def read_tensor_state_dict(path: Path) -> dict[str, torch.Tensor]:
@@ -608,6 +648,148 @@ def _is_dynamic_fsdp_dcp_checkpoint(model_id: Any) -> tuple[bool, Path | None]:
         and not (checkpoint_dir / "adapter_config.json").is_file()
     )
     return enabled, checkpoint_dir
+
+
+def _dynamic_fsdp_dcp_weight_warmstart_requested(checkpoint_dir: Path) -> bool:
+    """Return whether this DCP must initialize a *new* training run's weights.
+
+    Trainer resume and cross-dataset weight warm-start have deliberately
+    different semantics.  The former restores optimizer/scheduler/RNG through
+    Accelerate after FSDP preparation.  The latter must restore only adapter
+    weights before FSDP/optimizer creation.  Make the latter an explicit,
+    exact-path opt-in so a normal Trainer resume can never accidentally stream
+    its DCP twice.
+    """
+    configured = os.environ.get(INIT_FSDP_DCP_CHECKPOINT_ENV, "").strip()
+    if not configured:
+        return False
+    requested = Path(configured).expanduser().resolve()
+    actual = checkpoint_dir.resolve()
+    if requested != actual:
+        return False
+    if not DYNAMIC_AUDIO_TOKENS_ENABLED or not _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV):
+        raise RuntimeError(
+            "Dynamic FSDP DCP weight warm-start requires dynamic audio tokens and "
+            "PEFT aligner modules-to-save to be enabled"
+        )
+    return True
+
+
+def _classify_dynamic_dcp_adapter_key(key: str) -> str:
+    aliases = ordered_checkpoint_key_aliases(key)
+    if any(".lora_A." in alias or ".lora_B." in alias for alias in aliases):
+        return "lora"
+    if any(alias.startswith(ALIGNER_PREFIXES) for alias in aliases):
+        return "aligner"
+    return "other"
+
+
+def load_dynamic_fsdp_dcp_adapter_warmstart(
+    model: torch.nn.Module,
+    checkpoint_dir: Path,
+) -> dict[str, Any]:
+    """Stream exactly the LoRA+aligner DCP tensors into a fresh PEFT model.
+
+    This is intentionally not a Trainer resume.  It runs before FSDP wraps the
+    model and before Swift constructs the optimizer, loads no optimizer or RNG
+    state, and restores only the 66 LoRA plus 20 PEFT-owned aligner tensors.
+    Each source tensor is read individually from DCP so the adapter checkpoint
+    is never merged into a full Huginn state dict.
+    """
+    source_dir = checkpoint_dir / "pytorch_model_fsdp_0"
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"Dynamic LoSATok FSDP warm-start DCP directory is missing: {source_dir}")
+    try:
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint import FileSystemReader
+    except Exception as exc:
+        raise RuntimeError("torch.distributed.checkpoint is required for dynamic LoSATok DCP warm-start") from exc
+
+    metadata = FileSystemReader(str(source_dir)).read_metadata()
+    state_metadata = getattr(metadata, "state_dict_metadata", {})
+    if not state_metadata:
+        raise RuntimeError(f"Dynamic LoSATok FSDP warm-start DCP metadata is empty: {source_dir}")
+
+    target_state = model.state_dict()
+    target_aliases: dict[str, list[str]] = {}
+    for target_key in target_state:
+        for alias in ordered_checkpoint_key_aliases(target_key):
+            target_aliases.setdefault(alias, []).append(target_key)
+
+    source_groups: dict[str, list[str]] = {"lora": [], "aligner": [], "other": []}
+    restore_plan: list[tuple[str, str, tuple[int, ...], torch.dtype]] = []
+    unmatched: list[str] = []
+    duplicate_targets: list[tuple[str, str, str]] = []
+    selected_targets: dict[str, str] = {}
+    for raw_source_key, entry in state_metadata.items():
+        source_key = str(raw_source_key)
+        group = _classify_dynamic_dcp_adapter_key(source_key)
+        source_groups[group].append(source_key)
+        shape_value = getattr(entry, "size", None)
+        dtype = getattr(getattr(entry, "properties", None), "dtype", None)
+        if shape_value is None or not isinstance(dtype, torch.dtype):
+            raise RuntimeError(
+                "Dynamic LoSATok FSDP warm-start metadata is missing tensor shape/dtype: "
+                f"key={source_key} shape={shape_value} dtype={dtype}"
+            )
+        shape = tuple(int(value) for value in shape_value)
+        target_key = None
+        for alias in ordered_checkpoint_key_aliases(source_key):
+            for candidate in target_aliases.get(alias, []):
+                if tuple(target_state[candidate].shape) == shape:
+                    target_key = candidate
+                    break
+            if target_key is not None:
+                break
+        if target_key is None:
+            unmatched.append(source_key)
+            continue
+        previous_source = selected_targets.get(target_key)
+        if previous_source is not None:
+            duplicate_targets.append((target_key, previous_source, source_key))
+            continue
+        selected_targets[target_key] = source_key
+        restore_plan.append((source_key, target_key, shape, dtype))
+
+    expected = {"lora": 66, "aligner": 20, "other": 0}
+    actual = {name: len(entries) for name, entries in source_groups.items()}
+    if actual != expected or unmatched or duplicate_targets or len(restore_plan) != sum(expected.values()):
+        raise RuntimeError(
+            "Dynamic LoSATok FSDP warm-start checkpoint does not match the adapter contract: "
+            f"expected={expected} actual={actual} restored={len(restore_plan)} "
+            f"unmatched={unmatched[:10]} duplicate_targets={duplicate_targets[:5]}"
+        )
+
+    for index, (source_key, target_key, shape, source_dtype) in enumerate(restore_plan, start=1):
+        streamed = torch.empty(shape, dtype=source_dtype, device="cpu")
+        dcp.load({source_key: streamed}, checkpoint_id=str(source_dir))
+        target = target_state[target_key]
+        if target.device.type == "meta":
+            raise RuntimeError(
+                "Dynamic LoSATok FSDP warm-start encountered a meta target before FSDP preparation: "
+                f"target={target_key}. This route requires materialized CPU adapter parameters."
+            )
+        with torch.no_grad():
+            target.copy_(streamed.to(dtype=target.dtype))
+        del streamed
+        if index == 1 or index % 25 == 0 or index == len(restore_plan):
+            print(
+                "[HuginnLoSATokSwift] dynamic FSDP DCP warm-start restored "
+                f"tensors={index}/{len(restore_plan)} rank={os.environ.get('RANK', '0')}",
+                flush=True,
+            )
+
+    report = {
+        "checkpoint_dir": str(checkpoint_dir),
+        "dcp_source_dir": str(source_dir),
+        "source_tensor_groups": actual,
+        "restored_tensor_count": len(restore_plan),
+        "restored_lora_tensor_count": len(source_groups["lora"]),
+        "restored_aligner_tensor_count": len(source_groups["aligner"]),
+        "source_key_preview": [source_key for source_key, _, _, _ in restore_plan[:12]],
+    }
+    print(f"[HuginnLoSATokSwift] dynamic FSDP DCP weight warm-start complete report={report}")
+    return report
 
 
 def audit_modules_to_save_topology(model: torch.nn.Module, *, stage: str = "first_forward") -> None:
@@ -935,6 +1117,9 @@ def patch_peft_adapter_restore() -> None:
                 checkpoint_dir,
                 adapter_name=adapter_name,
             )
+            if _dynamic_fsdp_dcp_weight_warmstart_requested(checkpoint_dir):
+                report = load_dynamic_fsdp_dcp_adapter_warmstart(restored, checkpoint_dir)
+                print(f"[HuginnLoSATokSwift] applied dynamic FSDP DCP weight warm-start report={report}")
         else:
             restored = original(*args, **kwargs)
         force_aligner_trainable(restored)
