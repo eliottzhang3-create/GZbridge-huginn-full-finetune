@@ -340,6 +340,9 @@ class HrmTextAudioForConditionalGeneration(HrmTextForCausalLM):
     def _cache_is_initialized(past_key_values: Any) -> bool:
         if past_key_values is None:
             return False
+        get_seq_length = getattr(past_key_values, "get_seq_length", None)
+        if callable(get_seq_length):
+            return int(get_seq_length()) > 0
         initialized = getattr(past_key_values, "is_initialized", None)
         if initialized is not None:
             return bool(initialized)
@@ -347,6 +350,93 @@ class HrmTextAudioForConditionalGeneration(HrmTextForCausalLM):
             return len(past_key_values) > 0
         except TypeError:
             return True
+
+    def prepare_inputs_for_generation(
+        self,
+        input_ids: torch.LongTensor,
+        past_key_values=None,
+        attention_mask: torch.Tensor | None = None,
+        inputs_embeds: torch.FloatTensor | None = None,
+        cache_position: torch.LongTensor | None = None,
+        audio_input_features: torch.Tensor | None = None,
+        audio_attention_mask: torch.Tensor | None = None,
+        **kwargs,
+    ) -> dict[str, Any]:
+        if cache_position is not None:
+            kwargs["cache_position"] = cache_position
+        model_inputs = super().prepare_inputs_for_generation(
+            input_ids=input_ids,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            **kwargs,
+        )
+        if audio_input_features is not None:
+            model_inputs["audio_input_features"] = audio_input_features
+        if audio_attention_mask is not None:
+            model_inputs["audio_attention_mask"] = audio_attention_mask
+
+        if audio_input_features is None:
+            return model_inputs
+
+        cache_initialized = self._cache_is_initialized(past_key_values)
+        current_input = model_inputs.get("input_ids")
+        if current_input is None:
+            current_input = model_inputs.get("inputs_embeds")
+        if current_input is None:
+            raise RuntimeError("Generation prepare produced neither input_ids nor inputs_embeds")
+        batch_size, sequence_length = current_input.shape[:2]
+
+        if not cache_initialized:
+            # Generic generation derives text-only positions before the wrapper
+            # inserts its 34-token prefix. Let native HRM rebuild position_ids,
+            # and expand legacy cache_position when that argument is present.
+            model_inputs.pop("position_ids", None)
+            if "cache_position" in model_inputs:
+                model_inputs["cache_position"] = torch.arange(
+                    self.audio_prefix_length + sequence_length,
+                    dtype=torch.long,
+                    device=current_input.device,
+                )
+            return model_inputs
+
+        cache_length = int(past_key_values.get_seq_length())
+        positions = torch.arange(
+            cache_length,
+            cache_length + sequence_length,
+            dtype=torch.long,
+            device=current_input.device,
+        )
+        model_inputs["position_ids"] = positions.unsqueeze(0).expand(batch_size, -1)
+        if "cache_position" in model_inputs:
+            model_inputs["cache_position"] = positions
+
+        # Generated response tokens are causal, even though generic generation
+        # would otherwise repeat the prompt's final PrefixLM type id (1).
+        model_inputs["token_type_ids"] = torch.zeros(
+            (batch_size, sequence_length),
+            dtype=torch.long,
+            device=current_input.device,
+        )
+
+        generation_attention = model_inputs.get("attention_mask")
+        if generation_attention is not None and generation_attention.ndim == 2:
+            expected_combined_length = cache_length + sequence_length
+            if generation_attention.shape[1] + self.audio_prefix_length == expected_combined_length:
+                prefix_attention = torch.ones(
+                    (batch_size, self.audio_prefix_length),
+                    dtype=generation_attention.dtype,
+                    device=generation_attention.device,
+                )
+                generation_attention = torch.cat([prefix_attention, generation_attention], dim=1)
+            if generation_attention.shape[1] != expected_combined_length:
+                raise RuntimeError(
+                    "Audio generation attention length mismatch after cache alignment: "
+                    f"attention={generation_attention.shape[1]} expected={expected_combined_length} "
+                    f"cache={cache_length} current={sequence_length}"
+                )
+            model_inputs["attention_mask"] = generation_attention
+        return model_inputs
 
     def _prepare_audio_labels(
         self,
