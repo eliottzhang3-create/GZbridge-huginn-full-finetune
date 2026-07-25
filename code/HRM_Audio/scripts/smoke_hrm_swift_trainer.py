@@ -311,6 +311,10 @@ def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, Any]:
         raise RuntimeError(f"Trainer checkpoint is incomplete: missing={missing}")
     with safe_open(str(adapter_path), framework="pt", device="cpu") as handle:
         keys = list(handle.keys())
+        adapter_dtype_counts: dict[str, int] = {}
+        for key in keys:
+            dtype = str(handle.get_tensor(key).dtype)
+            adapter_dtype_counts[dtype] = adapter_dtype_counts.get(dtype, 0) + 1
     non_lora = [key for key in keys if "lora_" not in key]
     h_keys = [key for key in keys if ".H_module." in key]
     l_keys = [key for key in keys if ".L_module." in key]
@@ -341,6 +345,7 @@ def inspect_checkpoint(checkpoint_dir: Path) -> dict[str, Any]:
         "L_adapter_tensor_count": len(l_keys),
         "non_lora_tensor_count": len(non_lora),
         "adapter_key_preview": keys[:20],
+        "adapter_dtype_counts": adapter_dtype_counts,
         "trainer_state_global_step": int(state["global_step"]),
     }
 
@@ -353,14 +358,71 @@ def compare_adapter_states(left_model: torch.nn.Module, right_model: torch.nn.Mo
     if set(left) != set(right):
         raise RuntimeError("Trainer model and reloaded adapter keys differ")
     max_abs_diff = 0.0
+    dtype_mismatches: list[dict[str, str]] = []
     for key in left:
+        if left[key].dtype != right[key].dtype:
+            dtype_mismatches.append(
+                {"key": key, "trained": str(left[key].dtype), "reloaded": str(right[key].dtype)}
+            )
         difference = float(
             (left[key].detach().float().cpu() - right[key].detach().float().cpu()).abs().max().item()
         )
         max_abs_diff = max(max_abs_diff, difference)
+    if dtype_mismatches:
+        raise RuntimeError(f"Trainer/reloaded adapter dtype mismatch: {dtype_mismatches[:20]}")
     if max_abs_diff != 0.0:
         raise RuntimeError(f"Trainer model and reloaded adapter tensors differ: max_abs_diff={max_abs_diff}")
-    return {"tensor_count": len(left), "max_abs_diff": max_abs_diff}
+    dtype_counts: dict[str, int] = {}
+    for tensor in left.values():
+        dtype = str(tensor.dtype)
+        dtype_counts[dtype] = dtype_counts.get(dtype, 0) + 1
+    return {
+        "tensor_count": len(left),
+        "max_abs_diff": max_abs_diff,
+        "dtype_counts": dtype_counts,
+        "dtype_mismatches": dtype_mismatches,
+    }
+
+
+def compare_frozen_base_parameters(
+    trained_hrm_model: torch.nn.Module,
+    fresh_hrm_model: torch.nn.Module,
+) -> dict[str, Any]:
+    def normalize_trained_name(name: str) -> str:
+        return name.replace(".base_layer.", ".")
+
+    trained = {
+        normalize_trained_name(name): parameter
+        for name, parameter in trained_hrm_model.named_parameters()
+        if "lora_" not in name
+    }
+    fresh = dict(fresh_hrm_model.named_parameters())
+    if set(trained) != set(fresh):
+        raise RuntimeError(
+            "Trained/fresh frozen-base parameter keys differ: "
+            f"trained_only={sorted(set(trained) - set(fresh))[:20]} "
+            f"fresh_only={sorted(set(fresh) - set(trained))[:20]}"
+        )
+    dtype_mismatches: list[dict[str, str]] = []
+    value_mismatches: list[str] = []
+    for name in sorted(trained):
+        if trained[name].dtype != fresh[name].dtype:
+            dtype_mismatches.append(
+                {"name": name, "trained": str(trained[name].dtype), "fresh": str(fresh[name].dtype)}
+            )
+        if not torch.equal(trained[name].detach(), fresh[name].detach()):
+            value_mismatches.append(name)
+    if dtype_mismatches or value_mismatches:
+        raise RuntimeError(
+            "Frozen HRM base changed or reloaded differently: "
+            f"dtype_mismatches={dtype_mismatches[:20]} value_mismatches={value_mismatches[:20]}"
+        )
+    return {
+        "parameter_tensor_count": len(trained),
+        "dtype_mismatches": dtype_mismatches,
+        "value_mismatches": value_mismatches,
+        "exact": True,
+    }
 
 
 def main() -> None:
@@ -385,8 +447,8 @@ def main() -> None:
     if output_dir.exists():
         raise FileExistsError(f"Output directory already exists; refusing to overwrite: {output_dir}")
 
-    from peft import PeftModel
     from swift.pipelines.train.sft import SwiftSft
+    from swift.tuners import Swift
 
     argv = [
         "--model", str(model_path),
@@ -479,7 +541,8 @@ def main() -> None:
             print(f"[trainer] output_dir={trainer.args.output_dir}", flush=True)
             print(
                 f"[trainables] total={parameter_report_before['total']} "
-                f"trainable={parameter_report_before['trainable']} frozen={parameter_report_before['frozen']}",
+                f"trainable={parameter_report_before['trainable']} frozen={parameter_report_before['frozen']} "
+                f"dtypes={parameter_report_before['trainable_dtypes']}",
                 flush=True,
             )
             print(f"[lora] {json.dumps(lora_report, ensure_ascii=False)}", flush=True)
@@ -539,7 +602,21 @@ def main() -> None:
             if fresh_base is None:
                 raise RuntimeError("Fresh Swift model load returned None during checkpoint restore")
             fresh_base.config.use_cache = False
-            reloaded_model = PeftModel.from_pretrained(fresh_base, checkpoint_dir, is_trainable=False).eval()
+            fresh_base.eval()
+            base_state_report = compare_frozen_base_parameters(hrm_model, fresh_base)
+            # Match ms-swift's own generic-LoRA resume path exactly. The model
+            # was constructed and saved through Swift.prepare_model/Trainer,
+            # so restoring it through bare PEFT is not the framework contract
+            # this smoke is intended to validate.
+            reloaded_model = Swift.from_pretrained(
+                fresh_base,
+                str(checkpoint_dir),
+                is_trainable=False,
+                # PEFT defaults this to True and promotes BF16/FP16 adapters
+                # to FP32 at load time. Preserve the exact training/checkpoint
+                # dtype so recurrent numerical parity is a meaningful test.
+                autocast_adapter_dtype=False,
+            ).eval()
             state_report = compare_adapter_states(model, reloaded_model)
             with torch.inference_mode():
                 reloaded_logits = reloaded_model(**captured_batch, use_cache=False).logits
@@ -590,6 +667,7 @@ def main() -> None:
                 "checkpoint": checkpoint_report,
                 "checkpoint_reload": {
                     **state_report,
+                    "frozen_base": base_state_report,
                     "logits_max_abs_diff": logits_max_abs_diff,
                 },
                 "cuda_memory": {
@@ -608,12 +686,14 @@ def main() -> None:
             print(f"[updates] {json.dumps(update_report, ensure_ascii=False)}", flush=True)
             print(
                 f"[checkpoint] path={checkpoint_dir} tensors={checkpoint_report['adapter_tensor_count']} "
-                f"H={checkpoint_report['H_adapter_tensor_count']} L={checkpoint_report['L_adapter_tensor_count']}",
+                f"H={checkpoint_report['H_adapter_tensor_count']} L={checkpoint_report['L_adapter_tensor_count']} "
+                f"dtypes={checkpoint_report['adapter_dtype_counts']}",
                 flush=True,
             )
             print(
                 f"[checkpoint-reload] tensors={state_report['tensor_count']} "
-                f"state_max_abs_diff={state_report['max_abs_diff']} logits_max_abs_diff={logits_max_abs_diff}",
+                f"dtypes={state_report['dtype_counts']} state_max_abs_diff={state_report['max_abs_diff']} "
+                f"frozen_base_exact={base_state_report['exact']} logits_max_abs_diff={logits_max_abs_diff}",
                 flush=True,
             )
             print(f"[memory] {json.dumps(report['cuda_memory'], ensure_ascii=False)}", flush=True)
