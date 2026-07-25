@@ -1,0 +1,4 @@
+{"messages":[{"role":"user","content":"What is 1 + 1?"},{"role":"assistant","content":"2."}]}
+{"messages":[{"role":"user","content":"What is 2 + 3?"},{"role":"assistant","content":"5."}]}
+{"messages":[{"role":"user","content":"Complete the sentence: Water freezes at zero degrees ___."},{"role":"assistant","content":"Celsius."}]}
+{"messages":[{"role":"user","content":"Answer briefly: What color is a clear daytime sky?"},{"role":"assistant","content":"Blue."}]}
