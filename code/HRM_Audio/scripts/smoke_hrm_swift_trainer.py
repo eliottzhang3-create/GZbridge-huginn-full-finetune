@@ -425,6 +425,175 @@ def compare_frozen_base_parameters(
     }
 
 
+def compare_model_buffers(
+    trained_hrm_model: torch.nn.Module,
+    fresh_hrm_model: torch.nn.Module,
+) -> dict[str, Any]:
+    trained = dict(trained_hrm_model.named_buffers())
+    fresh = dict(fresh_hrm_model.named_buffers())
+    if set(trained) != set(fresh):
+        raise RuntimeError(
+            "Trained/fresh HRM buffer keys differ: "
+            f"trained_only={sorted(set(trained) - set(fresh))[:20]} "
+            f"fresh_only={sorted(set(fresh) - set(trained))[:20]}"
+        )
+    mismatches: list[dict[str, Any]] = []
+    for name in sorted(trained):
+        left = trained[name].detach()
+        right = fresh[name].detach()
+        if left.shape != right.shape or left.dtype != right.dtype or not torch.equal(left, right):
+            mismatches.append(
+                {
+                    "name": name,
+                    "trained_shape": list(left.shape),
+                    "fresh_shape": list(right.shape),
+                    "trained_dtype": str(left.dtype),
+                    "fresh_dtype": str(right.dtype),
+                }
+            )
+    if mismatches:
+        raise RuntimeError(f"Trained/fresh HRM buffers differ: {mismatches[:20]}")
+    return {"tensor_count": len(trained), "mismatches": mismatches, "exact": True}
+
+
+def compare_runtime_semantics(
+    trained_model: torch.nn.Module,
+    reloaded_model: torch.nn.Module,
+    trained_hrm_model: torch.nn.Module,
+    fresh_hrm_model: torch.nn.Module,
+) -> dict[str, Any]:
+    config_fields = (
+        "H_cycles",
+        "L_cycles",
+        "L_bp_cycles",
+        "num_layers_per_stack",
+        "prefix_lm",
+        "embedding_scale",
+        "attention_dropout",
+        "_attn_implementation",
+    )
+
+    def config_report(model: torch.nn.Module) -> dict[str, Any]:
+        report: dict[str, Any] = {}
+        for field in config_fields:
+            value = getattr(model.config, field, None)
+            if isinstance(value, tuple):
+                value = list(value)
+            report[field] = value
+        return report
+
+    def peft_report(model: torch.nn.Module) -> dict[str, Any]:
+        configs: dict[str, Any] = {}
+        for adapter_name, config in sorted(model.peft_config.items()):
+            target_modules = getattr(config, "target_modules", None)
+            configs[adapter_name] = {
+                "r": int(config.r),
+                "lora_alpha": int(config.lora_alpha),
+                "lora_dropout": float(config.lora_dropout),
+                "bias": str(config.bias),
+                "task_type": str(config.task_type),
+                "inference_mode": bool(config.inference_mode),
+                "use_dora": bool(getattr(config, "use_dora", False)),
+                "use_rslora": bool(getattr(config, "use_rslora", False)),
+                "target_modules": sorted(target_modules) if target_modules is not None else None,
+            }
+        modules: dict[str, Any] = {}
+        for name, module in model.named_modules():
+            if not (hasattr(module, "lora_A") and hasattr(module, "lora_B")):
+                continue
+            modules[name] = {
+                "active_adapters": list(module.active_adapters),
+                "disable_adapters": bool(module.disable_adapters),
+                "merged_adapters": list(module.merged_adapters),
+                "scaling": {key: float(value) for key, value in sorted(module.scaling.items())},
+            }
+        return {"configs": configs, "modules": modules}
+
+    trained_config = config_report(trained_hrm_model)
+    fresh_config = config_report(fresh_hrm_model)
+    if trained_config != fresh_config:
+        raise RuntimeError(f"Trainer/reloaded HRM runtime config differs: {trained_config} vs {fresh_config}")
+    trained_peft = peft_report(trained_model)
+    reloaded_peft = peft_report(reloaded_model)
+    if trained_peft != reloaded_peft:
+        raise RuntimeError("Trainer/reloaded PEFT runtime semantics differ")
+    return {"hrm_config": trained_config, "peft": trained_peft, "exact": True}
+
+
+def logits_difference_report(left: torch.Tensor, right: torch.Tensor) -> dict[str, Any]:
+    if left.shape != right.shape:
+        raise RuntimeError(f"Logits shapes differ: left={tuple(left.shape)} right={tuple(right.shape)}")
+    if not bool(torch.isfinite(left).all().item()) or not bool(torch.isfinite(right).all().item()):
+        raise RuntimeError("Non-finite logits encountered during checkpoint reload audit")
+    difference = (left.float() - right.float()).abs()
+    return {
+        "shape": list(left.shape),
+        "max_abs_diff": float(difference.max().item()),
+        "mean_abs_diff": float(difference.mean().item()),
+        "rmse": float(difference.square().mean().sqrt().item()),
+        "left_max_abs": float(left.float().abs().max().item()),
+        "right_max_abs": float(right.float().abs().max().item()),
+        "top1_agreement": float((left.argmax(dim=-1) == right.argmax(dim=-1)).float().mean().item()),
+        "exact": bool(torch.equal(left, right)),
+    }
+
+
+def recurrent_forward_trace(
+    model: torch.nn.Module,
+    batch: dict[str, torch.Tensor],
+) -> tuple[torch.Tensor, list[dict[str, Any]]]:
+    hrm_model = find_unique_module(model, "HrmTextForCausalLM")
+    trace: list[dict[str, Any]] = []
+    handles = []
+
+    def make_hook(stack_name: str):
+        def hook(_module, _args, output):
+            trace.append(
+                {
+                    "stack": stack_name,
+                    "output": output.detach().float().cpu().clone(),
+                }
+            )
+
+        return hook
+
+    handles.append(hrm_model.model.L_module.register_forward_hook(make_hook("L")))
+    handles.append(hrm_model.model.H_module.register_forward_hook(make_hook("H")))
+    try:
+        with torch.inference_mode():
+            logits = model(**batch, use_cache=False).logits.detach().clone()
+    finally:
+        for handle in handles:
+            handle.remove()
+    return logits, trace
+
+
+def compare_recurrent_traces(
+    trained_trace: list[dict[str, Any]],
+    reloaded_trace: list[dict[str, Any]],
+) -> dict[str, Any]:
+    trained_sequence = [item["stack"] for item in trained_trace]
+    reloaded_sequence = [item["stack"] for item in reloaded_trace]
+    if trained_sequence != reloaded_sequence:
+        raise RuntimeError(
+            f"Trainer/reloaded recurrence sequences differ: {trained_sequence} vs {reloaded_sequence}"
+        )
+    calls: list[dict[str, Any]] = []
+    first_mismatch = None
+    for index, (trained_item, reloaded_item) in enumerate(zip(trained_trace, reloaded_trace)):
+        report = logits_difference_report(trained_item["output"], reloaded_item["output"])
+        call = {"index": index, "stack": trained_item["stack"], **report}
+        calls.append(call)
+        if first_mismatch is None and report["max_abs_diff"] > 1e-5:
+            first_mismatch = call
+    return {
+        "sequence": trained_sequence,
+        "calls": calls,
+        "first_mismatch": first_mismatch,
+        "exact": first_mismatch is None,
+    }
+
+
 def main() -> None:
     args = parse_args()
     expected_versions = {"ms-swift": "4.4.2", "transformers": "5.9.0", "peft": "0.18.1"}
@@ -584,6 +753,7 @@ def main() -> None:
             model.eval()
             with torch.inference_mode():
                 reference_logits = model(**captured_batch, use_cache=False).logits
+                reference_repeat_logits = model(**captured_batch, use_cache=False).logits
 
             try:
                 from swift import get_model_processor
@@ -604,6 +774,7 @@ def main() -> None:
             fresh_base.config.use_cache = False
             fresh_base.eval()
             base_state_report = compare_frozen_base_parameters(hrm_model, fresh_base)
+            buffer_report = compare_model_buffers(hrm_model, fresh_base)
             # Match ms-swift's own generic-LoRA resume path exactly. The model
             # was constructed and saved through Swift.prepare_model/Trainer,
             # so restoring it through bare PEFT is not the framework contract
@@ -617,11 +788,48 @@ def main() -> None:
                 is_trainable=True,
             ).eval()
             state_report = compare_adapter_states(model, reloaded_model)
+            runtime_report = compare_runtime_semantics(model, reloaded_model, hrm_model, fresh_base)
             with torch.inference_mode():
                 reloaded_logits = reloaded_model(**captured_batch, use_cache=False).logits
-            logits_max_abs_diff = float((reference_logits.float() - reloaded_logits.float()).abs().max().item())
-            if logits_max_abs_diff > 1e-5:
-                raise RuntimeError(f"Trainer checkpoint reload logits differ: max_abs_diff={logits_max_abs_diff}")
+                reloaded_repeat_logits = reloaded_model(**captured_batch, use_cache=False).logits
+            default_sdpa_report = {
+                "trained_self_repeat": logits_difference_report(reference_logits, reference_repeat_logits),
+                "reloaded_self_repeat": logits_difference_report(reloaded_logits, reloaded_repeat_logits),
+                "cross_instance": logits_difference_report(reference_logits, reloaded_logits),
+            }
+
+            # Fused SDPA kernels are allowed to choose implementation details
+            # based on each independently loaded module instance. For a strict
+            # checkpoint fingerprint, pin both forwards to the same math
+            # backend and compare every recurrent H/L output as well as logits.
+            from torch.nn.attention import SDPBackend, sdpa_kernel
+
+            with sdpa_kernel([SDPBackend.MATH]):
+                reference_math_logits, reference_trace = recurrent_forward_trace(model, captured_batch)
+                reloaded_math_logits, reloaded_trace = recurrent_forward_trace(reloaded_model, captured_batch)
+            math_sdpa_report = logits_difference_report(reference_math_logits, reloaded_math_logits)
+            recurrence_reload_report = compare_recurrent_traces(reference_trace, reloaded_trace)
+            print(
+                f"[checkpoint-reload-runtime] frozen_base_exact={base_state_report['exact']} "
+                f"buffers_exact={buffer_report['exact']} runtime_exact={runtime_report['exact']}",
+                flush=True,
+            )
+            print(
+                f"[checkpoint-reload-default-sdpa] {json.dumps(default_sdpa_report, ensure_ascii=False)}",
+                flush=True,
+            )
+            print(
+                f"[checkpoint-reload-math-sdpa] logits={json.dumps(math_sdpa_report, ensure_ascii=False)} "
+                f"recurrence_exact={recurrence_reload_report['exact']} "
+                f"first_mismatch={json.dumps(recurrence_reload_report['first_mismatch'], ensure_ascii=False)}",
+                flush=True,
+            )
+            if math_sdpa_report["max_abs_diff"] > 1e-5 or not recurrence_reload_report["exact"]:
+                raise RuntimeError(
+                    "Trainer checkpoint deterministic-math reload differs: "
+                    f"logits={math_sdpa_report} "
+                    f"first_recurrent_mismatch={recurrence_reload_report['first_mismatch']}"
+                )
 
             log_history = trainer.state.log_history
             finite_losses = [
@@ -667,7 +875,11 @@ def main() -> None:
                 "checkpoint_reload": {
                     **state_report,
                     "frozen_base": base_state_report,
-                    "logits_max_abs_diff": logits_max_abs_diff,
+                    "buffers": buffer_report,
+                    "runtime_semantics": runtime_report,
+                    "default_sdpa": default_sdpa_report,
+                    "deterministic_math_sdpa": math_sdpa_report,
+                    "deterministic_math_recurrence": recurrence_reload_report,
                 },
                 "cuda_memory": {
                     "device_index": device_index,
@@ -692,9 +904,11 @@ def main() -> None:
             print(
                 f"[checkpoint-reload] tensors={state_report['tensor_count']} "
                 f"dtypes={state_report['dtype_counts']} state_max_abs_diff={state_report['max_abs_diff']} "
-                f"frozen_base_exact={base_state_report['exact']} logits_max_abs_diff={logits_max_abs_diff}",
+                f"frozen_base_exact={base_state_report['exact']} buffers_exact={buffer_report['exact']} "
+                f"runtime_exact={runtime_report['exact']}",
                 flush=True,
             )
+            print(f"[checkpoint-reload-recurrence] sequence={recurrence_reload_report['sequence']}", flush=True)
             print(f"[memory] {json.dumps(report['cuda_memory'], ensure_ascii=False)}", flush=True)
             print(f"[result] status=OK output_report={output_report}", flush=True)
             return train_result
