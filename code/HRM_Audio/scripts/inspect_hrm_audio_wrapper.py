@@ -297,6 +297,7 @@ def main() -> None:
     print(f"[hrm-model] {hrm_model_path}", flush=True)
     print(f"[whisper-model] {whisper_model_path}", flush=True)
     print(f"[wrapper-model] {wrapper_model_path}", flush=True)
+    print("[load-strategy] native-hrm-strict -> wrapper-upgrade -> aligner-init -> whisper-encoder", flush=True)
     print(
         f"[cuda] device={device} name={properties.name!r} total_gib={properties.total_memory / (1024**3):.3f}",
         flush=True,
@@ -316,6 +317,11 @@ def main() -> None:
     model.eval()
     torch.cuda.synchronize(device_index)
     load_seconds = time.perf_counter() - load_started
+    if model.__class__ is not package.HrmTextAudioForConditionalGeneration:
+        raise RuntimeError(
+            "Native HRM instance was not upgraded to the audio wrapper: "
+            f"actual={model.__class__.__module__}.{model.__class__.__name__}"
+        )
     if model.audio_encoder is None:
         raise RuntimeError("Wrapper load did not attach Whisper encoder")
     if model.audio_encoder.training:

@@ -34,7 +34,7 @@ It is also the **authoritative project memory** for future Codex / AI-agent chat
 
 ---
 
-## Independent HRM-Text Audio Exploration (updated 2026-07-25)
+## Independent HRM-Text Audio Exploration (updated 2026-07-26)
 
 This is an **additional experimental line with HRM-Text-1B as the recurrent text backbone**. It is not a rename,
 continuation, replacement, or status update of any Huginn experiment below. The Huginn and HRM-Text lines have separate
@@ -115,6 +115,10 @@ owners, environments, model code, checkpoints, outputs, and progress records.
 
 1. The first local Whisper-large fixed-32 `HrmTextAudioForConditionalGeneration` and config are implemented in
    `models/hrm-text-audio-v1/`, reusing Transformers 5.9.0 native HRM classes rather than copying or modifying HRM loops.
+   The published checkpoint stores fused `gqkv_proj`/`gate_up_proj` tensors, so initialization must first use native
+   `HrmTextForCausalLM.from_pretrained` (which performs the official conversion) and only then upgrade that same loaded
+   instance with the audio modules. Direct base-checkpoint loading under the custom audio `model_type` is invalid because
+   it bypasses the HRM conversion and leaves the H/L backbone missing.
 2. The wrapper-only audit is implemented in `code/HRM_Audio/scripts/inspect_hrm_audio_wrapper.py`, with remote launcher
    `code/HRM_Audio/run_inspect_hrm_audio_wrapper_5090.sh`. It must still remotely pass exact text-only passthrough, strict
    HRM/Whisper loading, frozen Whisper, `[B,34,1536]` audio prefix, full and compact labels/NTP shift, unchanged static K=5

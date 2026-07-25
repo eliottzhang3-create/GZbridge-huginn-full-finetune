@@ -15,13 +15,6 @@ from transformers import HrmTextConfig, HrmTextForCausalLM, WhisperModel
 from .configuration_hrm_text_audio import HrmTextAudioConfig
 
 
-ALIGNER_PREFIXES = (
-    "temporal_compressor.",
-    "audio_projector.",
-    "audio_boundary_embeddings.",
-)
-
-
 class TrainableTemporalCompressor(nn.Module):
     def __init__(
         self,
@@ -102,26 +95,44 @@ class HrmTextAudioForConditionalGeneration(HrmTextForCausalLM):
     def __init__(self, config: HrmTextAudioConfig):
         super().__init__(config)
         self.config = config
+        self._initialize_audio_modules()
+        self._freeze_requested_modules()
+
+    def _initialize_audio_modules(
+        self,
+        *,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> None:
         self.audio_encoder: nn.Module | None = None
         self.temporal_compressor = TrainableTemporalCompressor(
-            hidden_size=int(config.audio_encoder_hidden_size),
-            target_token_count=int(config.audio_target_token_count),
-            intermediate_size=int(config.audio_compressor_intermediate_size),
-            kernel_size=int(config.audio_compressor_kernel_size),
-            stride=int(config.audio_compressor_stride),
+            hidden_size=int(self.config.audio_encoder_hidden_size),
+            target_token_count=int(self.config.audio_target_token_count),
+            intermediate_size=int(self.config.audio_compressor_intermediate_size),
+            kernel_size=int(self.config.audio_compressor_kernel_size),
+            stride=int(self.config.audio_compressor_stride),
         )
         self.audio_projector = AudioProjector(
-            input_dim=int(config.audio_encoder_hidden_size),
-            hidden_dim=int(config.audio_projector_hidden_size),
-            output_dim=int(config.hidden_size),
+            input_dim=int(self.config.audio_encoder_hidden_size),
+            hidden_dim=int(self.config.audio_projector_hidden_size),
+            output_dim=int(self.config.hidden_size),
         )
         self.audio_boundary_embeddings = (
-            AudioBoundaryEmbeddings(int(config.hidden_size), float(config.initializer_range))
-            if bool(config.use_audio_boundary_embeddings)
+            AudioBoundaryEmbeddings(int(self.config.hidden_size), float(self.config.initializer_range))
+            if bool(self.config.use_audio_boundary_embeddings)
             else None
         )
         self._reset_aligner_parameters()
-        self._freeze_requested_modules()
+        if device is not None or dtype is not None:
+            move_kwargs: dict[str, Any] = {}
+            if device is not None:
+                move_kwargs["device"] = device
+            if dtype is not None:
+                move_kwargs["dtype"] = dtype
+            self.temporal_compressor.to(**move_kwargs)
+            self.audio_projector.to(**move_kwargs)
+            if self.audio_boundary_embeddings is not None:
+                self.audio_boundary_embeddings.to(**move_kwargs)
 
     @property
     def audio_bos(self) -> torch.Tensor | None:
@@ -223,9 +234,15 @@ class HrmTextAudioForConditionalGeneration(HrmTextForCausalLM):
         if mismatches:
             raise RuntimeError(f"HRM audio/base config mismatch: {mismatches}")
 
-        model, loading_info = cls.from_pretrained(
+        # The published HRM checkpoint stores fused gqkv/gate_up tensors. Its
+        # official Transformers conversion is selected from the native
+        # ``hrm_text`` config model type, so load natively before upgrading the
+        # same instance to this subclass. Loading directly with the custom
+        # audio model type would bypass that conversion and randomly initialize
+        # the complete H/L backbone.
+        model, loading_info = HrmTextForCausalLM.from_pretrained(
             hrm_model_path,
-            config=config,
+            config=base_config,
             local_files_only=local_files_only,
             dtype=dtype,
             attn_implementation=attn_implementation,
@@ -234,25 +251,21 @@ class HrmTextAudioForConditionalGeneration(HrmTextForCausalLM):
             output_loading_info=True,
         )
         normalized_hrm_info = _normalized_loading_info(loading_info)
-        expected_missing = {
-            name for name, _ in model.named_parameters() if name.startswith(ALIGNER_PREFIXES)
-        }
-        actual_missing = set(normalized_hrm_info["missing_keys"])
-        if actual_missing != expected_missing:
-            raise RuntimeError(
-                "Base HRM load must miss exactly the new aligner parameters: "
-                f"expected_only={sorted(expected_missing - actual_missing)[:20]} "
-                f"actual_only={sorted(actual_missing - expected_missing)[:20]}"
-            )
-        non_missing_errors = {
-            key: value for key, value in normalized_hrm_info.items() if key != "missing_keys" and value
-        }
-        if non_missing_errors:
-            raise RuntimeError(f"Unexpected HRM checkpoint loading issues: {non_missing_errors}")
-        # Missing aligner tensors were materialized by the HF loader rather
-        # than read from the HRM checkpoint. Initialize them explicitly after
-        # materialization so Conv1d and boundary parameters are unambiguous.
-        model._reset_aligner_parameters()
+        if any(normalized_hrm_info.values()):
+            raise RuntimeError(f"Native HRM checkpoint did not load strictly: {normalized_hrm_info}")
+
+        runtime_config = model.config
+        model.__class__ = cls
+        model.config = config
+        model.config.name_or_path = hrm_model_path
+        for attribute in ("_attn_implementation", "_attn_implementation_internal"):
+            if hasattr(runtime_config, attribute):
+                setattr(model.config, attribute, getattr(runtime_config, attribute))
+        reference_parameter = next(model.parameters())
+        model._initialize_audio_modules(
+            device=reference_parameter.device,
+            dtype=reference_parameter.dtype,
+        )
 
         whisper, whisper_loading_info = WhisperModel.from_pretrained(
             audio_encoder_path,
