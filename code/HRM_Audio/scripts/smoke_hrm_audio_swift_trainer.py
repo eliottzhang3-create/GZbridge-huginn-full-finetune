@@ -793,6 +793,132 @@ def read_safetensors(path: Path) -> dict[str, torch.Tensor]:
         return {key: handle.get_tensor(key) for key in handle.keys()}
 
 
+def audit_lora_runtime_hyperparameters(
+    model: torch.nn.Module,
+    *,
+    expected_rank: int,
+    expected_alpha: int,
+    expected_dropout: float,
+) -> dict[str, Any]:
+    """Verify both PEFT metadata and the LoRA modules that execute at runtime."""
+    peft_config = getattr(model, "peft_config", None)
+    if not isinstance(peft_config, dict) or not peft_config:
+        raise RuntimeError(f"Expected a non-empty PEFT config mapping, got {type(peft_config)}")
+
+    config_records = []
+    config_mismatches = []
+    for adapter_name, config in sorted(peft_config.items()):
+        record = {
+            "adapter": adapter_name,
+            "rank": int(config.r),
+            "alpha": int(config.lora_alpha),
+            "dropout": float(config.lora_dropout),
+        }
+        config_records.append(record)
+        expected = {
+            "rank": expected_rank,
+            "alpha": expected_alpha,
+            "dropout": expected_dropout,
+        }
+        for key, expected_value in expected.items():
+            actual = record[key]
+            matches = (
+                math.isclose(float(actual), float(expected_value), rel_tol=0.0, abs_tol=1e-12)
+                if key == "dropout"
+                else actual == expected_value
+            )
+            if not matches:
+                config_mismatches.append(
+                    {"adapter": adapter_name, "field": key, "expected": expected_value, "actual": actual}
+                )
+
+    module_count = 0
+    adapter_instance_count = 0
+    rank_counts: Counter[str] = Counter()
+    alpha_counts: Counter[str] = Counter()
+    scaling_counts: Counter[str] = Counter()
+    dropout_counts: Counter[str] = Counter()
+    dropout_classes: Counter[str] = Counter()
+    module_mismatches = []
+    expected_scaling = expected_alpha / expected_rank
+    for module_name, module in model.named_modules():
+        if not all(hasattr(module, field) for field in ("lora_A", "lora_B", "lora_dropout", "r", "lora_alpha", "scaling")):
+            continue
+        module_count += 1
+        adapter_names = sorted(set(module.lora_A) | set(module.lora_B))
+        if not adapter_names:
+            module_mismatches.append({"module": module_name, "error": "no_adapter"})
+            continue
+        for adapter_name in adapter_names:
+            adapter_instance_count += 1
+            rank = int(module.r[adapter_name])
+            alpha = int(module.lora_alpha[adapter_name])
+            scaling = float(module.scaling[adapter_name])
+            dropout_module = module.lora_dropout[adapter_name]
+            if isinstance(dropout_module, torch.nn.Identity):
+                dropout = 0.0
+            elif hasattr(dropout_module, "p"):
+                dropout = float(dropout_module.p)
+            else:
+                raise RuntimeError(
+                    f"Unsupported LoRA dropout module at {module_name}/{adapter_name}: {type(dropout_module)}"
+                )
+            rank_counts[str(rank)] += 1
+            alpha_counts[str(alpha)] += 1
+            scaling_counts[f"{scaling:.12g}"] += 1
+            dropout_counts[f"{dropout:.12g}"] += 1
+            dropout_classes[f"{type(dropout_module).__module__}.{type(dropout_module).__name__}"] += 1
+            actual = {"rank": rank, "alpha": alpha, "scaling": scaling, "dropout": dropout}
+            expected = {
+                "rank": expected_rank,
+                "alpha": expected_alpha,
+                "scaling": expected_scaling,
+                "dropout": expected_dropout,
+            }
+            bad_fields = {
+                key: {"expected": expected[key], "actual": value}
+                for key, value in actual.items()
+                if not (
+                    math.isclose(float(value), float(expected[key]), rel_tol=0.0, abs_tol=1e-12)
+                    if key in {"scaling", "dropout"}
+                    else value == expected[key]
+                )
+            }
+            if bad_fields and len(module_mismatches) < 20:
+                module_mismatches.append(
+                    {"module": module_name, "adapter": adapter_name, "fields": bad_fields}
+                )
+
+    if config_mismatches or module_mismatches or module_count != 256 or adapter_instance_count != 256:
+        hint = (
+            "ms-swift 4.4.2 LoRALLMTuner does not forward lora_dropout into PEFT; "
+            "use expected_dropout=0.0 unless that upstream tuner is deliberately patched."
+            if expected_dropout != 0.0
+            else None
+        )
+        raise RuntimeError(
+            "LoRA runtime hyperparameter mismatch: "
+            f"config={config_mismatches[:20]} modules={module_mismatches[:20]} "
+            f"module_count={module_count} adapter_instances={adapter_instance_count} hint={hint}"
+        )
+    return {
+        "peft_configs": config_records,
+        "module_count": module_count,
+        "adapter_instance_count": adapter_instance_count,
+        "rank_counts": dict(rank_counts),
+        "alpha_counts": dict(alpha_counts),
+        "scaling_counts": dict(scaling_counts),
+        "dropout_counts": dict(dropout_counts),
+        "dropout_classes": dict(dropout_classes),
+        "expected": {
+            "rank": expected_rank,
+            "alpha": expected_alpha,
+            "scaling": expected_scaling,
+            "dropout": expected_dropout,
+        },
+    }
+
+
 def inspect_checkpoint(
     checkpoint: Path,
     model: torch.nn.Module,
@@ -1097,6 +1223,27 @@ def main() -> None:
             wrapper.config.use_cache = False
             if hasattr(model, "gradient_checkpointing_disable"):
                 model.gradient_checkpointing_disable()
+            parsed_lora_hyperparameters = {
+                "rank": int(self.args.lora_rank),
+                "alpha": int(self.args.lora_alpha),
+                "dropout": float(self.args.lora_dropout),
+            }
+            expected_parsed_lora_hyperparameters = {
+                "rank": args.lora_rank,
+                "alpha": args.lora_alpha,
+                "dropout": args.lora_dropout,
+            }
+            if parsed_lora_hyperparameters != expected_parsed_lora_hyperparameters:
+                raise RuntimeError(
+                    "Swift LoRA argument parsing mismatch: "
+                    f"expected={expected_parsed_lora_hyperparameters} actual={parsed_lora_hyperparameters}"
+                )
+            lora_runtime_before = audit_lora_runtime_hyperparameters(
+                model,
+                expected_rank=args.lora_rank,
+                expected_alpha=args.lora_alpha,
+                expected_dropout=args.lora_dropout,
+            )
             parameter_report_before = trainability_audit.audit_parameters(
                 model,
                 wrapper,
@@ -1120,6 +1267,7 @@ def main() -> None:
             print(f"[trainer] type={type(trainer).__module__}.{type(trainer).__name__}", flush=True)
             print(f"[trainer] output_dir={trainer.args.output_dir}", flush=True)
             print(f"[dataset] {json.dumps(dataset_report, ensure_ascii=False)}", flush=True)
+            print(f"[lora-runtime] {json.dumps(lora_runtime_before, ensure_ascii=False)}", flush=True)
             print(
                 f"[trainables] total={parameter_report_before['total']} "
                 f"trainable={parameter_report_before['trainable']} groups={parameter_report_before['groups']}",
@@ -1207,6 +1355,17 @@ def main() -> None:
                 wrapper,
                 expected_lora_rank=args.lora_rank,
             )
+            lora_runtime_after = audit_lora_runtime_hyperparameters(
+                model,
+                expected_rank=args.lora_rank,
+                expected_alpha=args.lora_alpha,
+                expected_dropout=args.lora_dropout,
+            )
+            if lora_runtime_after != lora_runtime_before:
+                raise RuntimeError(
+                    f"LoRA runtime hyperparameters changed during training: before={lora_runtime_before} "
+                    f"after={lora_runtime_after}"
+                )
             frozen_after = {name: parameter_group_digest(entries) for name, entries in frozen_groups.items()}
             if frozen_before != frozen_after:
                 raise RuntimeError(f"Frozen Whisper/HRM weights changed: before={frozen_before} after={frozen_after}")
@@ -1312,6 +1471,10 @@ def main() -> None:
                 str(reload_report_path),
                 "--expected-lora-rank",
                 str(args.lora_rank),
+                "--expected-lora-alpha",
+                str(args.lora_alpha),
+                "--expected-lora-dropout",
+                str(args.lora_dropout),
             ]
             reload_env = dict(os.environ)
             reload_env.update(
@@ -1356,6 +1519,8 @@ def main() -> None:
                 },
                 "parameters_before": parameter_report_before,
                 "parameters_after": parameter_report_after,
+                "lora_runtime_before": lora_runtime_before,
+                "lora_runtime_after": lora_runtime_after,
                 "frozen_before": frozen_before,
                 "frozen_after": frozen_after,
                 "forwards": forward_reports,

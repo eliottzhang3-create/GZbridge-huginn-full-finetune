@@ -151,7 +151,9 @@ owners, environments, model code, checkpoints, outputs, and progress records.
    numerical checks.
 7. The next gate is the final-configuration one-update smoke, submitted independently through
    `code/HRM_Audio/run_smoke_hrm_audio_swift_trainer_formal_config_5090.sh`. It fixes B8/GA4 (effective batch `32`), rank-16
-   H/L LoRA (`alpha=32`, dropout `0.05`), and LoRA/aligner learning rates `1e-4`. It selects 32 distinct real AudioCaps-v2
+   H/L LoRA (`alpha=32`, effective dropout `0.0`), and LoRA/aligner learning rates `1e-4`. The dropout value follows the
+   actual ms-swift 4.4.2 `LoRALLMTuner` implementation, which does not forward the generic `lora_dropout` argument into
+   PEFT (the Huginn `lora_llm` route has the same effective behavior). It selects 32 distinct real AudioCaps-v2
    records and audits four complete forward/backward micro-steps, three accumulation substeps, one optimizer/global step,
    per-micro-step PrefixLM/NTP/static-K5 semantics, rank-16 parameter/checkpoint counts, frozen weights, memory, and fresh
    reload. It is implemented locally and awaits remote execution; Trainer resume and tiny overfit remain subsequent gates.

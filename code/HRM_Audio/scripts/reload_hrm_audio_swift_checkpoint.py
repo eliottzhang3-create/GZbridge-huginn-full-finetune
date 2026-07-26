@@ -16,6 +16,7 @@ from safetensors import safe_open
 
 import inspect_hrm_audio_swift_trainability as trainability_audit
 from smoke_hrm_audio_swift_trainer import (
+    audit_lora_runtime_hyperparameters,
     buffer_digest,
     frozen_parameter_groups,
     parameter_group_digest,
@@ -38,6 +39,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reference-payload", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
     parser.add_argument("--expected-lora-rank", type=int, default=8)
+    parser.add_argument("--expected-lora-alpha", type=int, default=16)
+    parser.add_argument("--expected-lora-dropout", type=float, default=0.0)
     return parser.parse_args()
 
 
@@ -337,6 +340,10 @@ def main() -> None:
     args = parse_args()
     if args.expected_lora_rank <= 0:
         raise ValueError(f"Expected LoRA rank must be positive, got {args.expected_lora_rank}")
+    if args.expected_lora_alpha <= 0:
+        raise ValueError(f"Expected LoRA alpha must be positive, got {args.expected_lora_alpha}")
+    if not 0.0 <= args.expected_lora_dropout < 1.0:
+        raise ValueError(f"Expected LoRA dropout must be in [0, 1), got {args.expected_lora_dropout}")
     wrapper_model_path = args.wrapper_model_path.resolve()
     plugin_path = args.plugin_path.resolve()
     checkpoint = args.checkpoint.resolve()
@@ -382,6 +389,12 @@ def main() -> None:
         reloaded_model,
         wrapper,
         expected_lora_rank=args.expected_lora_rank,
+    )
+    lora_runtime_report = audit_lora_runtime_hyperparameters(
+        reloaded_model,
+        expected_rank=args.expected_lora_rank,
+        expected_alpha=args.expected_lora_alpha,
+        expected_dropout=args.expected_lora_dropout,
     )
     adapter_report = audit_adapter_state(reloaded_model, checkpoint / "adapter_model.safetensors")
     aligner_report = audit_aligner_state(reloaded_model, checkpoint / "vit.safetensors")
@@ -494,6 +507,9 @@ def main() -> None:
         "status": "OK",
         "checkpoint": str(checkpoint),
         "expected_lora_rank": args.expected_lora_rank,
+        "expected_lora_alpha": args.expected_lora_alpha,
+        "expected_lora_dropout": args.expected_lora_dropout,
+        "lora_runtime": lora_runtime_report,
         "aligner_load": aligner_load_report,
         "parameters": parameter_report,
         "adapter": adapter_report,
@@ -527,6 +543,7 @@ def main() -> None:
     print(f"[adapter] {adapter_report}", flush=True)
     print(f"[aligner] {aligner_report}", flush=True)
     print(f"[trainables] total={parameter_report['trainable']} groups={parameter_report['groups']}", flush=True)
+    print(f"[lora-runtime] {lora_runtime_report}", flush=True)
     print(f"[frozen-parameter-digests] {fresh_frozen_parameter_digests}", flush=True)
     print(f"[buffer-digest] {fresh_buffer_digest}", flush=True)
     print(f"[runtime-contract] {fresh_runtime_contract}", flush=True)
