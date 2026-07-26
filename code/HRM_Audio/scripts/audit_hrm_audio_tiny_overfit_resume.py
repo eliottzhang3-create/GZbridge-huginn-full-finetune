@@ -343,12 +343,16 @@ def inspect_checkpoint(
     checkpoint: Path,
     *,
     expected_step: int,
+    expected_max_steps: int | None = None,
     lora_rank: int,
     lora_alpha: int,
     lora_dropout: float,
     learning_rate: float,
 ) -> dict[str, Any]:
     import torch
+
+    if expected_max_steps is None:
+        expected_max_steps = expected_step
 
     checkpoint = checkpoint.expanduser().resolve()
     required_names = (
@@ -396,10 +400,10 @@ def inspect_checkpoint(
             f"Trainer state global_step mismatch in {checkpoint}: "
             f"expected={expected_step} actual={trainer_state.get('global_step')}"
         )
-    if int(trainer_state.get("max_steps", -1)) != expected_step:
+    if int(trainer_state.get("max_steps", -1)) != expected_max_steps:
         raise RuntimeError(
             f"Trainer state max_steps mismatch in {checkpoint}: "
-            f"expected={expected_step} actual={trainer_state.get('max_steps')}"
+            f"expected={expected_max_steps} actual={trainer_state.get('max_steps')}"
         )
     optimizer_payload = torch.load(checkpoint / "optimizer.pt", map_location="cpu", weights_only=False)
     scheduler_payload = torch.load(checkpoint / "scheduler.pt", map_location="cpu", weights_only=False)

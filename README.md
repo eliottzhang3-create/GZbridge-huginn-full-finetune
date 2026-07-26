@@ -180,15 +180,31 @@ owners, environments, model code, checkpoints, outputs, and progress records.
    Trainer global step 12 before any new update, then continues through checkpoint 24. The final gate requires complete
    `512`-LoRA/`20`-aligner checkpoints, continued H/L/aligner updates, optimizer/scheduler/RNG advancement, all 24 finite
    per-step losses, and at least a 10% reduction from the first-three-step mean to the last-three-step mean. It is
-   implemented locally and awaits remote execution. No separate throughput-only gate is planned.
+   implemented and has passed remotely. The exact checkpoint-12 boundary values, optimizer/scheduler step 12, and Trainer
+   global step 12 were restored before resumed optimization; checkpoint 24 was complete; all 256 H-stack and 256 L-stack
+   LoRA tensors continued updating; 18 of 20 aligner tensors changed; and the loss fell from a first-three-step mean of
+   `4.427666` to a last-three-step mean of `0.002329` (`99.9474%` reduction). No separate throughput-only gate is planned.
+10. Formal two-epoch AudioCaps-v2 training is implemented in
+    `code/HRM_Audio/scripts/train_audiocaps_v2_hrm_audio_swift_5090.sh`, submitted through
+    `code/HRM_Audio/run_train_audiocaps_v2_hrm_audio_swift_5090.sh`, with full-manifest preflight and epoch-checkpoint
+    auditing in `code/HRM_Audio/scripts/audit_hrm_audio_formal_training.py`. It fixes B8/GA4 (effective batch `32`), two
+    epochs, rank-16/alpha-32 H/L LoRA, effective LoRA dropout `0.0`, and `1e-4` LoRA/aligner learning rates; Whisper and
+    the HRM base remain frozen. The `89,658`-record dataset gives exactly `2,802` optimizer steps per epoch and `5,604`
+    total steps, with epoch checkpoints expected at `checkpoint-2802` and `checkpoint-5604`. Formal data loading uses
+    Swift lazy tokenization so the full corpus does not materialize every `[80,3000]` Whisper feature tensor in host
+    memory. Both dataset and DataLoader shuffling are enabled, checkpoints retain optimizer/scheduler/RNG state, and an
+    optional resume is deliberately restricted to the complete epoch-1 checkpoint. The post-run audit requires both
+    complete `512`-LoRA/`20`-aligner checkpoints, exact optimizer/scheduler steps, finite improving loss history, continued
+    H/L/aligner updates in epoch 2, and RNG advancement. It is ready for its first remote launch.
 
 **Current exact status:** the text-only HRM-Text Swift/LoRA/Trainer foundation is complete. The first audio wrapper has
 passed remote forward/backward and generation/cache audits, and the independent multimodal Swift registration,
 processor/template/collator, model load, and audio-prefill audit has also passed remotely. The exact `lora_llm`
 trainability audit and the real B2/GA1/rank-8 AudioCaps-v2 one-update Trainer/save/fresh-reload smoke have passed remotely.
-The B8/GA4/rank-16 final-configuration smoke and full HRM-specific AudioCaps-v2 manifest preparation have also passed
-remotely. The combined tiny-overfit plus fresh-process Trainer-resume gate is implemented and awaits remote execution;
-there is no separate throughput-only stage. Formal two-epoch AudioCaps-v2 training has not started.
+The B8/GA4/rank-16 final-configuration smoke, full HRM-specific AudioCaps-v2 manifest preparation, and combined
+tiny-overfit plus fresh-process Trainer-resume gate have all passed remotely. There is no separate throughput-only stage.
+The formal two-epoch AudioCaps-v2 Swift job and strict epoch-checkpoint audit are implemented and ready to launch; formal
+training has not started yet.
 
 ---
 
