@@ -58,7 +58,7 @@ owners, environments, model code, checkpoints, outputs, and progress records.
 - First compression policy: mono 16 kHz, first 30 seconds, fixed 32 compressed audio tokens; the complete prefix is
   `audio_bos + 32 audio tokens + audio_eos` (34 tokens).
 - Final trainability policy: Whisper-large fully frozen; HRM-Text base fully frozen; aligner fully trainable; LoRA on both
-  HRM H/L stacks trainable. Swift `lora_llm` and a dedicated multimodal `model_arch` are planned for this split.
+  HRM H/L stacks trainable. Swift `lora_llm` and the dedicated multimodal `model_arch` implement this split.
 - The Huginn aligner architecture is a reference, not a shape-compatible checkpoint. Huginn uses hidden size `5280`,
   while HRM-Text-1B uses `1536`; the HRM audio projector output layer must be newly initialized and trained.
 
@@ -135,18 +135,23 @@ owners, environments, model code, checkpoints, outputs, and progress records.
    separate and were not replaced.
 5. The independent Swift `lora_llm` trainability audit and 5090 launcher are implemented in
    `code/HRM_Audio/scripts/inspect_hrm_audio_swift_trainability.py` and
-   `code/HRM_Audio/run_inspect_hrm_audio_swift_trainability_5090.sh`. This gate requires exact trainable counts of
+   `code/HRM_Audio/run_inspect_hrm_audio_swift_trainability_5090.sh`. This gate passed remotely with exact counts of
    Whisper `0`, HRM base `0`, aligner `39,538,176`, and rank-8 H/L LoRA `8,257,536` (256 modules, 128 per stack), with
-   `47,795,712` total trainable parameters and no unclassified parameters. It does not execute an optimizer update and is
-   awaiting remote execution.
-6. Run one real audio Trainer update, then strictly audit save/fresh-process reload of every LoRA, compressor, projector,
-   and boundary tensor. Only after this gate may the line proceed to tiny overfit and formal audio training.
+   `47,795,712` total trainable parameters and no unclassified parameters.
+6. The real-audio one-update Trainer gate is implemented in
+   `code/HRM_Audio/scripts/smoke_hrm_audio_swift_trainer.py`, with fresh-process reload in
+   `code/HRM_Audio/scripts/reload_hrm_audio_swift_checkpoint.py` and submission through
+   `code/HRM_Audio/run_smoke_hrm_audio_swift_trainer_5090.sh`. It uses the first two distinct records from the verified
+   `89,658`-record AudioCaps-v2 train manifest without rewriting their messages. The gate audits the actual native
+   PrefixLM mask, compact-label NTP loss, static K=5 recurrence, aligner/H/L LoRA gradients and updates, exact frozen
+   Whisper/HRM hashes, `512` LoRA plus `20` aligner checkpoint tensors, and a second-process reload. It is awaiting remote
+   execution. Only after it passes may the line proceed to tiny overfit and the planned two-epoch AudioCaps-v2 run.
 
 **Current exact status:** the text-only HRM-Text Swift/LoRA/Trainer foundation is complete. The first audio wrapper has
 passed remote forward/backward and generation/cache audits, and the independent multimodal Swift registration,
 processor/template/collator, model load, and audio-prefill audit has also passed remotely. The exact `lora_llm`
-trainability audit is implemented and awaiting remote execution. Audio Trainer update, checkpoint save/reload, tiny
-overfit, and formal audio training have not started.
+trainability audit has passed remotely. The real AudioCaps-v2 one-update Trainer/save/fresh-reload smoke is implemented
+and awaiting remote execution. Tiny overfit and formal two-epoch AudioCaps-v2 training have not started.
 
 ---
 
