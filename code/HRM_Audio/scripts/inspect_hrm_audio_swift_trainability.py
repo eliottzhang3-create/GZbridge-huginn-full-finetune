@@ -23,10 +23,9 @@ TEMPLATE_TYPE = "hrm_text_audio"
 EXPECTED_HRM_PARAMETERS = 1_182_795_264
 EXPECTED_ALIGNER_PARAMETERS = 39_538_176
 EXPECTED_ALIGNER_TENSORS = 20
-EXPECTED_LORA_PARAMETERS = 8_257_536
+RANK8_LORA_PARAMETERS = 8_257_536
 EXPECTED_LORA_MODULES = 256
 EXPECTED_LORA_TENSORS = EXPECTED_LORA_MODULES * 2
-EXPECTED_TOTAL_TRAINABLE = EXPECTED_ALIGNER_PARAMETERS + EXPECTED_LORA_PARAMETERS
 EXPECTED_PROJECTION_SUFFIXES = (
     "self_attn.q_proj",
     "self_attn.k_proj",
@@ -116,7 +115,20 @@ def canonical_aligner_name(name: str) -> str:
     return suffix.replace("original_module.", "").replace("modules_to_save.default.", "")
 
 
-def lora_module_report(model: torch.nn.Module) -> tuple[dict[str, Any], set[int]]:
+def expected_lora_parameters(rank: int) -> int:
+    if rank <= 0:
+        raise ValueError(f"LoRA rank must be positive, got {rank}")
+    numerator = RANK8_LORA_PARAMETERS * rank
+    if numerator % 8:
+        raise RuntimeError(f"Unable to derive exact HRM audio LoRA parameter count for rank={rank}")
+    return numerator // 8
+
+
+def lora_module_report(
+    model: torch.nn.Module,
+    *,
+    expected_rank: int = 8,
+) -> tuple[dict[str, Any], set[int]]:
     modules = [
         (name, module)
         for name, module in model.named_modules()
@@ -156,7 +168,7 @@ def lora_module_report(model: torch.nn.Module) -> tuple[dict[str, Any], set[int]
             f"count={len(modules)} invalid={invalid[:20]} missing={missing[:20]} "
             f"unexpected={unexpected[:20]} duplicates={duplicate_count}"
         )
-    if ranks != {8: EXPECTED_LORA_MODULES}:
+    if ranks != {expected_rank: EXPECTED_LORA_MODULES}:
         raise RuntimeError(f"Unexpected HRM audio LoRA ranks: {dict(ranks)}")
 
     report = {
@@ -171,8 +183,15 @@ def lora_module_report(model: torch.nn.Module) -> tuple[dict[str, Any], set[int]
     return report, lora_parameter_ids
 
 
-def audit_parameters(model: torch.nn.Module, wrapper: torch.nn.Module) -> dict[str, Any]:
-    lora_report, lora_ids = lora_module_report(model)
+def audit_parameters(
+    model: torch.nn.Module,
+    wrapper: torch.nn.Module,
+    *,
+    expected_lora_rank: int = 8,
+) -> dict[str, Any]:
+    expected_lora_count = expected_lora_parameters(expected_lora_rank)
+    expected_total_trainable = EXPECTED_ALIGNER_PARAMETERS + expected_lora_count
+    lora_report, lora_ids = lora_module_report(model, expected_rank=expected_lora_rank)
     audio_ids = parameter_ids(wrapper.audio_encoder)
     aligner_ids = set().union(
         parameter_ids(wrapper.temporal_compressor),
@@ -249,17 +268,17 @@ def audit_parameters(model: torch.nn.Module, wrapper: torch.nn.Module) -> dict[s
         "trainable_preview": [],
     }:
         failures.append(f"Original HRM base must be exact and frozen: {groups['hrm_base']}")
-    if groups["lora"]["total"] != EXPECTED_LORA_PARAMETERS:
-        failures.append(f"LoRA parameter count must be {EXPECTED_LORA_PARAMETERS}: {groups['lora']}")
-    if groups["lora"]["trainable"] != EXPECTED_LORA_PARAMETERS:
+    if groups["lora"]["total"] != expected_lora_count:
+        failures.append(f"LoRA parameter count must be {expected_lora_count}: {groups['lora']}")
+    if groups["lora"]["trainable"] != expected_lora_count:
         failures.append(f"Every LoRA parameter must be trainable: {groups['lora']}")
     if groups["lora"]["trainable_tensors"] != EXPECTED_LORA_TENSORS:
         failures.append(f"LoRA trainable tensor count must be {EXPECTED_LORA_TENSORS}: {groups['lora']}")
     if groups["other"]["total"] != 0:
         failures.append(f"Unclassified parameters are forbidden: {groups['other']}")
     total_trainable = sum(group["trainable"] for group in groups.values())
-    if total_trainable != EXPECTED_TOTAL_TRAINABLE:
-        failures.append(f"Total trainable count must be {EXPECTED_TOTAL_TRAINABLE}, got {total_trainable}")
+    if total_trainable != expected_total_trainable:
+        failures.append(f"Total trainable count must be {expected_total_trainable}, got {total_trainable}")
     if failures:
         raise RuntimeError("HRM audio Swift trainability mismatch: " + " | ".join(failures))
     return {

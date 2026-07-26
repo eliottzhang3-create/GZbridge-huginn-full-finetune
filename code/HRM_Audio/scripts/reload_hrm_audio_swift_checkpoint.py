@@ -37,6 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--reference-payload", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
+    parser.add_argument("--expected-lora-rank", type=int, default=8)
     return parser.parse_args()
 
 
@@ -334,6 +335,8 @@ def validate_long_prefix_hrm_cross_instance(
 
 def main() -> None:
     args = parse_args()
+    if args.expected_lora_rank <= 0:
+        raise ValueError(f"Expected LoRA rank must be positive, got {args.expected_lora_rank}")
     wrapper_model_path = args.wrapper_model_path.resolve()
     plugin_path = args.plugin_path.resolve()
     checkpoint = args.checkpoint.resolve()
@@ -375,7 +378,11 @@ def main() -> None:
     aligner_load_report = load_aligner_sidecar(base_model, checkpoint / "vit.safetensors")
     reloaded_model = Swift.from_pretrained(base_model, str(checkpoint), is_trainable=True)
     wrapper = force_expected_policy(reloaded_model)
-    parameter_report = trainability_audit.audit_parameters(reloaded_model, wrapper)
+    parameter_report = trainability_audit.audit_parameters(
+        reloaded_model,
+        wrapper,
+        expected_lora_rank=args.expected_lora_rank,
+    )
     adapter_report = audit_adapter_state(reloaded_model, checkpoint / "adapter_model.safetensors")
     aligner_report = audit_aligner_state(reloaded_model, checkpoint / "vit.safetensors")
 
@@ -404,7 +411,11 @@ def main() -> None:
     reloaded_model.eval()
     fresh_frozen_parameter_digests = {
         name: parameter_group_digest(entries)
-        for name, entries in frozen_parameter_groups(reloaded_model, wrapper).items()
+        for name, entries in frozen_parameter_groups(
+            reloaded_model,
+            wrapper,
+            expected_lora_rank=args.expected_lora_rank,
+        ).items()
     }
     if fresh_frozen_parameter_digests != payload["reference_frozen_parameter_digests"]:
         raise RuntimeError(
@@ -482,6 +493,7 @@ def main() -> None:
     report = {
         "status": "OK",
         "checkpoint": str(checkpoint),
+        "expected_lora_rank": args.expected_lora_rank,
         "aligner_load": aligner_load_report,
         "parameters": parameter_report,
         "adapter": adapter_report,

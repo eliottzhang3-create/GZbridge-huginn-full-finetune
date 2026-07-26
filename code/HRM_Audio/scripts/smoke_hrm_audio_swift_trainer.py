@@ -34,9 +34,7 @@ EXPECTED_HRM_PARAMETERS = 1_182_795_264
 EXPECTED_AUDIO_ENCODER_PARAMETERS = 636_784_640
 EXPECTED_ALIGNER_PARAMETERS = 39_538_176
 EXPECTED_ALIGNER_TENSORS = 20
-EXPECTED_LORA_PARAMETERS = 8_257_536
 EXPECTED_LORA_TENSORS = 512
-EXPECTED_TOTAL_TRAINABLE = EXPECTED_ALIGNER_PARAMETERS + EXPECTED_LORA_PARAMETERS
 ALIGNER_MARKERS = ("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings.")
 RUNTIME_CONFIG_FIELDS = (
     "model_type",
@@ -79,6 +77,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
     parser.add_argument("--reload-script", type=Path, required=True)
+    parser.add_argument("--micro-batch-size", type=int, default=2)
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
+    parser.add_argument("--lora-rank", type=int, default=8)
+    parser.add_argument("--lora-alpha", type=int, default=16)
+    parser.add_argument("--lora-dropout", type=float, default=0.0)
+    parser.add_argument("--learning-rate", type=float, default=1e-4)
+    parser.add_argument("--aligner-learning-rate", type=float, default=1e-4)
     return parser.parse_args()
 
 
@@ -142,7 +147,12 @@ def validate_source_record(record: dict[str, Any], *, line_number: int) -> dict[
     }
 
 
-def prepare_smoke_manifest(source_manifest: Path, run_dir: Path) -> tuple[Path, dict[str, Any]]:
+def prepare_smoke_manifest(
+    source_manifest: Path,
+    run_dir: Path,
+    *,
+    sample_count: int,
+) -> tuple[Path, dict[str, Any]]:
     stats_path = source_manifest.with_suffix(f"{source_manifest.suffix}.stats.json")
     if not source_manifest.is_file() or not stats_path.is_file():
         raise FileNotFoundError(f"AudioCaps manifest/stats missing: manifest={source_manifest} stats={stats_path}")
@@ -178,11 +188,13 @@ def prepare_smoke_manifest(source_manifest: Path, run_dir: Path) -> tuple[Path, 
             selected.append(hrm_record)
             selected_reports.append(record_report)
             seen_audio.add(record_report["audio_path"])
-            if len(selected) == 2:
+            if len(selected) == sample_count:
                 break
-    if len(selected) != 2:
-        raise RuntimeError(f"Unable to select two distinct AudioCaps records, found {len(selected)}")
-    fixture_path = run_dir / "audiocaps_v2_first2_hrm_audio_smoke.jsonl"
+    if len(selected) != sample_count:
+        raise RuntimeError(
+            f"Unable to select {sample_count} distinct AudioCaps records, found {len(selected)}"
+        )
+    fixture_path = run_dir / f"audiocaps_v2_first{sample_count}_hrm_audio_smoke.jsonl"
     fixture_path.write_text(
         "".join(json.dumps(record, ensure_ascii=False) + "\n" for record in selected),
         encoding="utf-8",
@@ -192,6 +204,7 @@ def prepare_smoke_manifest(source_manifest: Path, run_dir: Path) -> tuple[Path, 
         "source_stats": str(stats_path),
         "source_record_count": int(stats["record_count"]),
         "fixture_manifest": str(fixture_path),
+        "fixture_record_count": len(selected_reports),
         "fixture_records": selected_reports,
         "audio_user_caption_metadata_preserved": True,
         "source_system_prompt_removed_for_hrm_direct_template": True,
@@ -203,8 +216,13 @@ def module_parameter_ids(module: torch.nn.Module | None) -> set[int]:
     return set() if module is None else {id(parameter) for parameter in module.parameters()}
 
 
-def frozen_parameter_groups(model: torch.nn.Module, wrapper: torch.nn.Module) -> dict[str, list[tuple[str, torch.Tensor]]]:
-    _, lora_ids = trainability_audit.lora_module_report(model)
+def frozen_parameter_groups(
+    model: torch.nn.Module,
+    wrapper: torch.nn.Module,
+    *,
+    expected_lora_rank: int = 8,
+) -> dict[str, list[tuple[str, torch.Tensor]]]:
+    _, lora_ids = trainability_audit.lora_module_report(model, expected_rank=expected_lora_rank)
     audio_ids = module_parameter_ids(wrapper.audio_encoder)
     hrm_ids = module_parameter_ids(wrapper.model) | module_parameter_ids(wrapper.lm_head)
     groups = {"audio_encoder": [], "hrm_base": []}
@@ -313,11 +331,25 @@ def install_gradient_audit(model: torch.nn.Module):
             def hook(gradient: torch.Tensor):
                 finite = bool(torch.isfinite(gradient).all().item())
                 norm = float(gradient.float().norm().item()) if finite else float("nan")
-                records[parameter_name] = {
-                    "finite": finite,
-                    "norm": norm,
-                    "max_abs": float(gradient.float().abs().max().item()) if finite else float("nan"),
-                }
+                record = records.setdefault(
+                    parameter_name,
+                    {
+                        "calls": 0,
+                        "all_finite": True,
+                        "nonzero_calls": 0,
+                        "norm_sum": 0.0,
+                        "max_abs": 0.0,
+                    },
+                )
+                record["calls"] += 1
+                record["all_finite"] = bool(record["all_finite"] and finite)
+                record["nonzero_calls"] += int(finite and norm > 0)
+                if finite:
+                    record["norm_sum"] += norm
+                    record["max_abs"] = max(
+                        float(record["max_abs"]),
+                        float(gradient.float().abs().max().item()),
+                    )
                 return gradient
             return hook
 
@@ -325,18 +357,34 @@ def install_gradient_audit(model: torch.nn.Module):
     return records, handles
 
 
-def summarize_gradients(model: torch.nn.Module, records: dict[str, dict[str, Any]]) -> dict[str, Any]:
+def summarize_gradients(
+    model: torch.nn.Module,
+    records: dict[str, dict[str, Any]],
+    *,
+    expected_backward_calls: int,
+) -> dict[str, Any]:
     trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     missing = sorted(set(trainable_names) - set(records))
-    nonfinite = sorted(name for name, values in records.items() if not values["finite"])
-    if missing or nonfinite:
-        raise RuntimeError(f"Gradient audit failed: missing={missing[:20]} nonfinite={nonfinite[:20]}")
-    groups: dict[str, dict[str, Any]] = defaultdict(lambda: {"tensors": 0, "nonzero": 0, "norm_sum": 0.0})
+    nonfinite = sorted(name for name, values in records.items() if not values["all_finite"])
+    wrong_calls = sorted(
+        (name, int(values["calls"]))
+        for name, values in records.items()
+        if int(values["calls"]) != expected_backward_calls
+    )
+    if missing or nonfinite or wrong_calls:
+        raise RuntimeError(
+            "Gradient audit failed: "
+            f"missing={missing[:20]} nonfinite={nonfinite[:20]} wrong_calls={wrong_calls[:20]}"
+        )
+    groups: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {"tensors": 0, "calls": 0, "nonzero_calls": 0, "norm_sum": 0.0}
+    )
     for name, values in records.items():
         group = classify_trainable(name)
         groups[group]["tensors"] += 1
-        groups[group]["nonzero"] += int(values["norm"] > 0)
-        groups[group]["norm_sum"] += values["norm"]
+        groups[group]["calls"] += int(values["calls"])
+        groups[group]["nonzero_calls"] += int(values["nonzero_calls"])
+        groups[group]["norm_sum"] += float(values["norm_sum"])
     required_nonzero = (
         "temporal_compressor",
         "audio_projector",
@@ -344,10 +392,14 @@ def summarize_gradients(model: torch.nn.Module, records: dict[str, dict[str, Any
         "lora_H_B",
         "lora_L_B",
     )
-    failures = [group for group in required_nonzero if groups[group]["nonzero"] <= 0]
+    failures = [group for group in required_nonzero if groups[group]["nonzero_calls"] <= 0]
     if failures or groups.get("other", {}).get("tensors", 0):
         raise RuntimeError(f"Required gradient groups missing/nonzero failure={failures} groups={dict(groups)}")
-    return {"tensor_count": len(records), "groups": dict(groups)}
+    return {
+        "tensor_count": len(records),
+        "expected_backward_calls_per_tensor": expected_backward_calls,
+        "groups": dict(groups),
+    }
 
 
 def compare_trainable_updates(before: dict[str, torch.Tensor], model: torch.nn.Module) -> dict[str, Any]:
@@ -381,32 +433,36 @@ def compare_trainable_updates(before: dict[str, torch.Tensor], model: torch.nn.M
 
 
 def capture_forward_audit(tokenizer: Any, wrapper: torch.nn.Module, outer_model: torch.nn.Module):
-    outer_capture: dict[str, Any] = {}
-    core_capture: dict[str, Any] = {}
-    attention_capture: dict[str, Any] = {}
+    captures: list[dict[str, dict[str, Any]]] = []
 
     def outer_pre(_module, _args, kwargs):
-        if outer_capture:
-            return
         required = ("input_ids", "attention_mask", "labels", "token_type_ids", "audio_input_features", "logits_to_keep")
         missing = [key for key in required if key not in kwargs]
         if missing:
             raise RuntimeError(f"Trainer forward dropped HRM audio fields: missing={missing} keys={sorted(kwargs)}")
+        outer_capture: dict[str, Any] = {}
         for key in required:
             value = kwargs[key]
             outer_capture[key] = value.detach().cpu().clone() if torch.is_tensor(value) else value
+        captures.append({"outer": outer_capture, "core": {}, "attention": {}})
 
     def outer_post(_module, _args, _kwargs, output):
-        if "logits" in outer_capture:
-            return
+        if not captures:
+            raise RuntimeError("Trainer outer post-hook ran before its pre-hook")
+        outer_capture = captures[-1]["outer"]
         if output.loss is None or not torch.is_tensor(output.logits):
             raise RuntimeError("Trainer HRM audio output lacks loss/logits")
+        if "logits" in outer_capture:
+            raise RuntimeError("Trainer outer forward was captured more than once for one micro-step")
         outer_capture["loss"] = float(output.loss.detach().float().cpu().item())
         outer_capture["logits"] = output.logits.detach().cpu().clone()
 
     def core_pre(_module, _args, kwargs):
+        if not captures:
+            raise RuntimeError("HRM core pre-hook ran before the Trainer outer pre-hook")
+        core_capture = captures[-1]["core"]
         if core_capture:
-            return
+            raise RuntimeError("HRM core was entered more than once in one Trainer micro-step")
         for key in ("inputs_embeds", "attention_mask", "token_type_ids"):
             value = kwargs.get(key)
             if not torch.is_tensor(value):
@@ -414,6 +470,9 @@ def capture_forward_audit(tokenizer: Any, wrapper: torch.nn.Module, outer_model:
             core_capture[key] = value.detach().cpu().clone()
 
     def attention_pre(_module, args, kwargs):
+        if not captures:
+            raise RuntimeError("HRM attention pre-hook ran before the Trainer outer pre-hook")
+        attention_capture = captures[-1]["attention"]
         if attention_capture:
             return
         mask = kwargs.get("attention_mask")
@@ -435,7 +494,7 @@ def capture_forward_audit(tokenizer: Any, wrapper: torch.nn.Module, outer_model:
         wrapper.model.register_forward_pre_hook(core_pre, with_kwargs=True),
         wrapper.model.L_module.layers[0].self_attn.register_forward_pre_hook(attention_pre, with_kwargs=True),
     ]
-    return outer_capture, core_capture, attention_capture, handles
+    return captures, handles
 
 
 def mask_allowed(mask: torch.Tensor, batch: int, query: int, key: int) -> bool:
@@ -461,11 +520,16 @@ def audit_forward_semantics(
     logits = outer["logits"]
     keep_value = outer["logits_to_keep"]
     keep = int(keep_value.item()) if torch.is_tensor(keep_value) else int(keep_value)
-    if tuple(audio_features.shape) != (2, 80, 3000) or not bool(torch.isfinite(audio_features).all().item()):
+    batch_size = int(input_ids.shape[0])
+    if batch_size != len(fixture_records):
+        raise RuntimeError(
+            f"Trainer batch/fixture size mismatch: batch={batch_size} fixtures={len(fixture_records)}"
+        )
+    if tuple(audio_features.shape) != (batch_size, 80, 3000) or not bool(torch.isfinite(audio_features).all().item()):
         raise RuntimeError(f"Trainer audio feature batch is invalid: {tuple(audio_features.shape)}")
     if not (input_ids.shape == text_attention.shape == text_types.shape):
         raise RuntimeError("Trainer text input/attention/token_type shapes disagree")
-    if labels.shape != (2, keep) or logits.shape[:2] != labels.shape:
+    if labels.shape != (batch_size, keep) or logits.shape[:2] != labels.shape:
         raise RuntimeError(
             f"Compact labels/logits mismatch: labels={tuple(labels.shape)} logits={tuple(logits.shape)} keep={keep}"
         )
@@ -474,11 +538,11 @@ def audit_forward_semantics(
     combined_attention = core["attention_mask"]
     combined_embeds = core["inputs_embeds"]
     expected_combined_width = input_ids.shape[1] + EXPECTED_AUDIO_PREFIX
-    if combined_types.shape != (2, expected_combined_width):
+    if combined_types.shape != (batch_size, expected_combined_width):
         raise RuntimeError(f"Combined PrefixLM token type shape mismatch: {tuple(combined_types.shape)}")
-    if combined_attention.shape != (2, expected_combined_width):
+    if combined_attention.shape != (batch_size, expected_combined_width):
         raise RuntimeError(f"Combined attention shape mismatch: {tuple(combined_attention.shape)}")
-    if combined_embeds.shape[:2] != (2, expected_combined_width) or combined_embeds.shape[2] != 1536:
+    if combined_embeds.shape[:2] != (batch_size, expected_combined_width) or combined_embeds.shape[2] != 1536:
         raise RuntimeError(f"Combined embedding shape mismatch: {tuple(combined_embeds.shape)}")
     if not bool((combined_types[:, :EXPECTED_AUDIO_PREFIX] == 1).all().item()):
         raise RuntimeError("Audio prefix token types are not entirely PrefixLM ones")
@@ -494,12 +558,12 @@ def audit_forward_semantics(
     compact_start = input_ids.shape[1] - keep
     rows = []
     actual_mask = attention["attention_mask"]
-    if actual_mask.ndim != 4 or actual_mask.shape[0] != 2 or actual_mask.shape[-2:] != (
+    if actual_mask.ndim != 4 or actual_mask.shape[0] != batch_size or actual_mask.shape[-2:] != (
         expected_combined_width,
         expected_combined_width,
     ):
         raise RuntimeError(f"Unexpected native HRM PrefixLM attention mask shape: {tuple(actual_mask.shape)}")
-    for row in range(2):
+    for row in range(batch_size):
         valid_text = int(text_attention[row].sum().item())
         valid_ids = input_ids[row, :valid_text].tolist()
         valid_types = text_types[row, :valid_text].tolist()
@@ -593,6 +657,7 @@ def audit_forward_semantics(
         )
     return {
         "audio_feature_shape": list(audio_features.shape),
+        "batch_size": batch_size,
         "text_shape": list(input_ids.shape),
         "combined_shape": list(combined_embeds.shape),
         "native_attention_mask_shape": list(actual_mask.shape),
@@ -606,7 +671,74 @@ def audit_forward_semantics(
     }
 
 
-def inspect_optimizer(trainer: Any, model: torch.nn.Module) -> dict[str, Any]:
+def audit_recurrence_microsteps(
+    *,
+    core_model: torch.nn.Module,
+    trace: list[dict[str, Any]],
+    layer_counts: dict[str, Counter[int]],
+    expected_microsteps: int,
+) -> dict[str, Any]:
+    calls_per_microstep = int(core_model.config.H_cycles) * (int(core_model.config.L_cycles) + 1)
+    expected_trace_length = expected_microsteps * calls_per_microstep
+    if len(trace) != expected_trace_length:
+        raise RuntimeError(
+            "Gradient-accumulation recurrent call count mismatch: "
+            f"expected={expected_trace_length} actual={len(trace)}"
+        )
+    layers_per_stack = int(core_model.config.num_layers_per_stack)
+    expected_per_microstep = {
+        "L": int(core_model.config.H_cycles) * int(core_model.config.L_cycles),
+        "H": int(core_model.config.H_cycles),
+    }
+    cumulative_layer_counts = {}
+    for stack_name in ("L", "H"):
+        expected_count = expected_per_microstep[stack_name] * expected_microsteps
+        wrong = {
+            index: count
+            for index, count in layer_counts[stack_name].items()
+            if count != expected_count
+        }
+        if set(layer_counts[stack_name]) != set(range(layers_per_stack)) or wrong:
+            raise RuntimeError(
+                f"{stack_name} cumulative physical-layer counts mismatch across micro-steps: "
+                f"expected_each={expected_count} actual={dict(layer_counts[stack_name])}"
+            )
+        cumulative_layer_counts[stack_name] = dict(layer_counts[stack_name])
+
+    microstep_reports = []
+    for microstep in range(expected_microsteps):
+        start = microstep * calls_per_microstep
+        chunk = []
+        for local_index, item in enumerate(trace[start : start + calls_per_microstep]):
+            normalized = dict(item)
+            normalized["index"] = local_index
+            chunk.append(normalized)
+        synthetic_layer_counts = {
+            "L": Counter({index: expected_per_microstep["L"] for index in range(layers_per_stack)}),
+            "H": Counter({index: expected_per_microstep["H"] for index in range(layers_per_stack)}),
+        }
+        report = recurrence_audit.validate_recurrence_trace(
+            core_model=core_model,
+            trace=chunk,
+            layer_counts=synthetic_layer_counts,
+        )
+        microstep_reports.append({"microstep": microstep, **report})
+    return {
+        "microstep_count": expected_microsteps,
+        "calls_per_microstep": calls_per_microstep,
+        "total_stack_invocations": len(trace),
+        "cumulative_layer_counts": cumulative_layer_counts,
+        "microsteps": microstep_reports,
+    }
+
+
+def inspect_optimizer(
+    trainer: Any,
+    model: torch.nn.Module,
+    *,
+    expected_total_trainable: int,
+    expected_learning_rates: tuple[float, ...],
+) -> dict[str, Any]:
     if trainer.optimizer is None or trainer.lr_scheduler is None:
         raise RuntimeError("Trainer optimizer/scheduler was not created")
     optimizer_parameters = {
@@ -622,11 +754,27 @@ def inspect_optimizer(trainer: Any, model: torch.nn.Module) -> dict[str, Any]:
             f"trainable_only={len(set(trainable_parameters) - set(optimizer_parameters))}"
         )
     parameter_count = sum(parameter.numel() for parameter in optimizer_parameters.values())
-    if parameter_count != EXPECTED_TOTAL_TRAINABLE:
+    if parameter_count != expected_total_trainable:
         raise RuntimeError(f"Optimizer parameter count mismatch: {parameter_count}")
     learning_rates = [float(group["lr"]) for group in trainer.optimizer.param_groups]
     if not learning_rates or any(not math.isfinite(value) or value <= 0 for value in learning_rates):
         raise RuntimeError(f"Invalid optimizer learning rates: {learning_rates}")
+    unexpected_learning_rates = [
+        value
+        for value in learning_rates
+        if not any(math.isclose(value, expected, rel_tol=0.0, abs_tol=1e-12) for expected in expected_learning_rates)
+    ]
+    missing_learning_rates = [
+        expected
+        for expected in set(expected_learning_rates)
+        if not any(math.isclose(value, expected, rel_tol=0.0, abs_tol=1e-12) for value in learning_rates)
+    ]
+    if unexpected_learning_rates or missing_learning_rates:
+        raise RuntimeError(
+            "Optimizer learning-rate groups mismatch: "
+            f"actual={learning_rates} expected={expected_learning_rates} "
+            f"unexpected={unexpected_learning_rates} missing={missing_learning_rates}"
+        )
     return {
         "class": f"{type(trainer.optimizer).__module__}.{type(trainer.optimizer).__name__}",
         "parameter_tensor_count": len(optimizer_parameters),
@@ -645,7 +793,15 @@ def read_safetensors(path: Path) -> dict[str, torch.Tensor]:
         return {key: handle.get_tensor(key) for key in handle.keys()}
 
 
-def inspect_checkpoint(checkpoint: Path, model: torch.nn.Module, wrapper: torch.nn.Module) -> dict[str, Any]:
+def inspect_checkpoint(
+    checkpoint: Path,
+    model: torch.nn.Module,
+    wrapper: torch.nn.Module,
+    *,
+    expected_lora_rank: int,
+    expected_lora_alpha: int,
+    expected_lora_dropout: float,
+) -> dict[str, Any]:
     required = (
         checkpoint / "adapter_model.safetensors",
         checkpoint / "adapter_config.json",
@@ -658,6 +814,25 @@ def inspect_checkpoint(checkpoint: Path, model: torch.nn.Module, wrapper: torch.
     missing = [path.name for path in required if not path.is_file()]
     if missing:
         raise RuntimeError(f"HRM audio checkpoint is incomplete: missing={missing}")
+    adapter_config = json.loads((checkpoint / "adapter_config.json").read_text(encoding="utf-8"))
+    adapter_config_mismatches = {}
+    expected_adapter_config = {
+        "r": expected_lora_rank,
+        "lora_alpha": expected_lora_alpha,
+        "lora_dropout": expected_lora_dropout,
+    }
+    for key, expected in expected_adapter_config.items():
+        actual = adapter_config.get(key)
+        if isinstance(expected, float):
+            matches = isinstance(actual, (int, float)) and math.isclose(
+                float(actual), expected, rel_tol=0.0, abs_tol=1e-12
+            )
+        else:
+            matches = actual == expected
+        if not matches:
+            adapter_config_mismatches[key] = {"expected": expected, "actual": actual}
+    if adapter_config_mismatches:
+        raise RuntimeError(f"Adapter config mismatch: {adapter_config_mismatches}")
     adapter = read_safetensors(checkpoint / "adapter_model.safetensors")
     adapter_canonical = {canonical_adapter_key(key): tensor for key, tensor in adapter.items()}
     h_count = sum(key.startswith("H_module.") for key in adapter_canonical)
@@ -713,6 +888,7 @@ def inspect_checkpoint(checkpoint: Path, model: torch.nn.Module, wrapper: torch.
         "path": str(checkpoint),
         "files": files,
         "adapter": {
+            "config": {key: adapter_config.get(key) for key in expected_adapter_config},
             "tensor_count": len(adapter_canonical),
             "H_tensor_count": h_count,
             "L_tensor_count": l_count,
@@ -779,6 +955,22 @@ def build_controlled_prefix_batch(
 
 def main() -> None:
     args = parse_args()
+    if args.micro_batch_size <= 0 or args.gradient_accumulation_steps <= 0:
+        raise ValueError(
+            "micro-batch size and gradient-accumulation steps must be positive: "
+            f"B={args.micro_batch_size} GA={args.gradient_accumulation_steps}"
+        )
+    if args.lora_rank <= 0 or args.lora_alpha <= 0:
+        raise ValueError(f"LoRA rank/alpha must be positive: rank={args.lora_rank} alpha={args.lora_alpha}")
+    if not 0.0 <= args.lora_dropout < 1.0:
+        raise ValueError(f"LoRA dropout must be in [0, 1), got {args.lora_dropout}")
+    if not math.isfinite(args.learning_rate) or args.learning_rate <= 0:
+        raise ValueError(f"Learning rate must be finite and positive, got {args.learning_rate}")
+    if not math.isfinite(args.aligner_learning_rate) or args.aligner_learning_rate <= 0:
+        raise ValueError(f"Aligner learning rate must be finite and positive, got {args.aligner_learning_rate}")
+    effective_batch_size = args.micro_batch_size * args.gradient_accumulation_steps
+    expected_lora_parameters = trainability_audit.expected_lora_parameters(args.lora_rank)
+    expected_total_trainable = EXPECTED_ALIGNER_PARAMETERS + expected_lora_parameters
     expected_versions = {
         "ms-swift": "4.4.2",
         "transformers": "5.9.0",
@@ -813,7 +1005,11 @@ def main() -> None:
     if run_dir.exists():
         raise FileExistsError(f"Run directory already exists; refusing to overwrite: {run_dir}")
     run_dir.mkdir(parents=True)
-    fixture_path, dataset_report = prepare_smoke_manifest(source_manifest, run_dir)
+    fixture_path, dataset_report = prepare_smoke_manifest(
+        source_manifest,
+        run_dir,
+        sample_count=effective_batch_size,
+    )
     swift_output_dir = run_dir / "swift_output"
     reference_payload_path = run_dir / "post_update_reference.pt"
     reload_report_path = run_dir / "fresh_reload_report.json"
@@ -839,16 +1035,16 @@ def main() -> None:
         "--freeze_llm", "true",
         "--freeze_vit", "true",
         "--freeze_aligner", "false",
-        "--lora_rank", "8",
-        "--lora_alpha", "16",
-        "--lora_dropout", "0",
-        "--learning_rate", "1e-4",
-        "--aligner_lr", "1e-4",
+        "--lora_rank", str(args.lora_rank),
+        "--lora_alpha", str(args.lora_alpha),
+        "--lora_dropout", str(args.lora_dropout),
+        "--learning_rate", str(args.learning_rate),
+        "--aligner_lr", str(args.aligner_learning_rate),
         "--lr_scheduler_type", "constant",
         "--warmup_ratio", "0",
         "--max_steps", "1",
-        "--per_device_train_batch_size", "2",
-        "--gradient_accumulation_steps", "1",
+        "--per_device_train_batch_size", str(args.micro_batch_size),
+        "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
         "--gradient_checkpointing", "false",
         "--logging_steps", "1",
         "--save_strategy", "steps",
@@ -867,6 +1063,32 @@ def main() -> None:
         "--report_to", "none",
     ]
 
+    from transformers import TrainerCallback
+
+    accumulation_events = {
+        "step_begin": 0,
+        "substep_end": 0,
+        "pre_optimizer_step": 0,
+        "optimizer_step": 0,
+        "step_end": 0,
+    }
+
+    class AccumulationAuditCallback(TrainerCallback):
+        def on_step_begin(self, *callback_args, **callback_kwargs):
+            accumulation_events["step_begin"] += 1
+
+        def on_substep_end(self, *callback_args, **callback_kwargs):
+            accumulation_events["substep_end"] += 1
+
+        def on_pre_optimizer_step(self, *callback_args, **callback_kwargs):
+            accumulation_events["pre_optimizer_step"] += 1
+
+        def on_optimizer_step(self, *callback_args, **callback_kwargs):
+            accumulation_events["optimizer_step"] += 1
+
+        def on_step_end(self, *callback_args, **callback_kwargs):
+            accumulation_events["step_end"] += 1
+
     class AuditedSwiftSft(SwiftSft):
         def train(self, trainer):
             model = trainer.model
@@ -875,15 +1097,24 @@ def main() -> None:
             wrapper.config.use_cache = False
             if hasattr(model, "gradient_checkpointing_disable"):
                 model.gradient_checkpointing_disable()
-            parameter_report_before = trainability_audit.audit_parameters(model, wrapper)
-            frozen_groups = frozen_parameter_groups(model, wrapper)
+            parameter_report_before = trainability_audit.audit_parameters(
+                model,
+                wrapper,
+                expected_lora_rank=args.lora_rank,
+            )
+            frozen_groups = frozen_parameter_groups(
+                model,
+                wrapper,
+                expected_lora_rank=args.lora_rank,
+            )
             frozen_before = {name: parameter_group_digest(entries) for name, entries in frozen_groups.items()}
             trainable_before = snapshot_trainables(model)
             gradient_records, gradient_handles = install_gradient_audit(model)
-            outer_capture, core_capture, attention_capture, forward_handles = capture_forward_audit(
+            forward_captures, forward_handles = capture_forward_audit(
                 tokenizer, wrapper, model
             )
             recurrence_trace, layer_counts, recurrence_handles = recurrence_audit.install_recurrence_hooks(wrapper.model)
+            trainer.add_callback(AccumulationAuditCallback())
 
             print("========== HRM AUDIO SWIFT TRAINER PRE-TRAIN AUDIT ==========", flush=True)
             print(f"[trainer] type={type(trainer).__module__}.{type(trainer).__name__}", flush=True)
@@ -907,23 +1138,49 @@ def main() -> None:
             elapsed = time.perf_counter() - started
             if int(trainer.state.global_step) != 1:
                 raise RuntimeError(f"Trainer global_step mismatch: {trainer.state.global_step}")
-            if not outer_capture or not core_capture or not attention_capture:
+            expected_accumulation_events = {
+                "step_begin": 1,
+                "substep_end": args.gradient_accumulation_steps - 1,
+                "step_end": 1,
+            }
+            event_mismatches = {
+                name: {"expected": expected, "actual": accumulation_events[name]}
+                for name, expected in expected_accumulation_events.items()
+                if accumulation_events[name] != expected
+            }
+            if event_mismatches:
                 raise RuntimeError(
-                    f"Incomplete real-forward capture: outer={bool(outer_capture)} core={bool(core_capture)} "
-                    f"attention={bool(attention_capture)}"
+                    f"Trainer gradient-accumulation callback mismatch: {event_mismatches} "
+                    f"all_events={accumulation_events}"
                 )
-
-            forward_report = audit_forward_semantics(
-                tokenizer,
-                outer_capture,
-                core_capture,
-                attention_capture,
-                dataset_report["fixture_records"],
-            )
-            recurrence_report = recurrence_audit.validate_recurrence_trace(
+            if len(forward_captures) != args.gradient_accumulation_steps:
+                raise RuntimeError(
+                    "Trainer forward/micro-step count mismatch: "
+                    f"expected={args.gradient_accumulation_steps} actual={len(forward_captures)}"
+                )
+            forward_reports = []
+            for microstep, capture in enumerate(forward_captures):
+                if not capture["outer"] or not capture["core"] or not capture["attention"]:
+                    raise RuntimeError(
+                        f"Incomplete real-forward capture at microstep={microstep}: "
+                        f"outer={bool(capture['outer'])} core={bool(capture['core'])} "
+                        f"attention={bool(capture['attention'])}"
+                    )
+                start = microstep * args.micro_batch_size
+                end = start + args.micro_batch_size
+                report = audit_forward_semantics(
+                    tokenizer,
+                    capture["outer"],
+                    capture["core"],
+                    capture["attention"],
+                    dataset_report["fixture_records"][start:end],
+                )
+                forward_reports.append({"microstep": microstep, **report})
+            recurrence_report = audit_recurrence_microsteps(
                 core_model=wrapper.model,
                 trace=recurrence_trace,
                 layer_counts=layer_counts,
+                expected_microsteps=args.gradient_accumulation_steps,
             )
             grad_enabled_outputs = [item for item in recurrence_trace if item["grad_enabled"]]
             missing_recurrent_grads = [
@@ -933,16 +1190,37 @@ def main() -> None:
             ]
             if missing_recurrent_grads:
                 raise RuntimeError(f"Static-K recurrent outputs lack gradients: {missing_recurrent_grads}")
-            gradient_report = summarize_gradients(model, gradient_records)
+            gradient_report = summarize_gradients(
+                model,
+                gradient_records,
+                expected_backward_calls=args.gradient_accumulation_steps,
+            )
             update_report = compare_trainable_updates(trainable_before, model)
-            optimizer_report = inspect_optimizer(trainer, model)
-            parameter_report_after = trainability_audit.audit_parameters(model, wrapper)
+            optimizer_report = inspect_optimizer(
+                trainer,
+                model,
+                expected_total_trainable=expected_total_trainable,
+                expected_learning_rates=(args.learning_rate, args.aligner_learning_rate),
+            )
+            parameter_report_after = trainability_audit.audit_parameters(
+                model,
+                wrapper,
+                expected_lora_rank=args.lora_rank,
+            )
             frozen_after = {name: parameter_group_digest(entries) for name, entries in frozen_groups.items()}
             if frozen_before != frozen_after:
                 raise RuntimeError(f"Frozen Whisper/HRM weights changed: before={frozen_before} after={frozen_after}")
 
             checkpoint = Path(trainer.args.output_dir) / "checkpoint-1"
-            checkpoint_report = inspect_checkpoint(checkpoint, model, wrapper)
+            checkpoint_report = inspect_checkpoint(
+                checkpoint,
+                model,
+                wrapper,
+                expected_lora_rank=args.lora_rank,
+                expected_lora_alpha=args.lora_alpha,
+                expected_lora_dropout=args.lora_dropout,
+            )
+            outer_capture = forward_captures[0]["outer"]
             inference_batch = {
                 key: value
                 for key, value in outer_capture.items()
@@ -1032,6 +1310,8 @@ def main() -> None:
                 str(reference_payload_path),
                 "--output-report",
                 str(reload_report_path),
+                "--expected-lora-rank",
+                str(args.lora_rank),
             ]
             reload_env = dict(os.environ)
             reload_env.update(
@@ -1069,12 +1349,16 @@ def main() -> None:
                     "finite_losses": finite_losses,
                     "log_history": trainer.state.log_history,
                     "result_type": f"{type(train_result).__module__}.{type(train_result).__name__}",
+                    "micro_batch_size": args.micro_batch_size,
+                    "gradient_accumulation_steps": args.gradient_accumulation_steps,
+                    "effective_batch_size": effective_batch_size,
+                    "accumulation_events": dict(accumulation_events),
                 },
                 "parameters_before": parameter_report_before,
                 "parameters_after": parameter_report_after,
                 "frozen_before": frozen_before,
                 "frozen_after": frozen_after,
-                "forward": forward_report,
+                "forwards": forward_reports,
                 "recurrence": recurrence_report,
                 "gradients": gradient_report,
                 "updates": update_report,
@@ -1091,11 +1375,14 @@ def main() -> None:
             atomic_write_json(output_report, report)
             print("========== HRM AUDIO SWIFT TRAINER POST-TRAIN AUDIT ==========", flush=True)
             print(f"[trainer] global_step=1 finite_losses={finite_losses} elapsed_seconds={elapsed:.3f}", flush=True)
-            print(f"[forward] {json.dumps(forward_report, ensure_ascii=False)}", flush=True)
+            print(f"[accumulation] {accumulation_events}", flush=True)
+            print(f"[forwards] {json.dumps(forward_reports, ensure_ascii=False)}", flush=True)
+            first_recurrence = recurrence_report["microsteps"][0]
             print(
-                f"[recurrence] sequence={[item['stack'] for item in recurrence_report['trace']]} "
-                f"static_K={recurrence_report['runtime_static_K']} "
-                f"grad_indices={recurrence_report['runtime_grad_stack_indices']}",
+                f"[recurrence] microsteps={recurrence_report['microstep_count']} "
+                f"sequence={[item['stack'] for item in first_recurrence['trace']]} "
+                f"static_K={first_recurrence['runtime_static_K']} "
+                f"grad_indices={first_recurrence['runtime_grad_stack_indices']}",
                 flush=True,
             )
             print(f"[gradients] {json.dumps(gradient_report, ensure_ascii=False)}", flush=True)
@@ -1118,8 +1405,18 @@ def main() -> None:
     print(f"[run-dir] {run_dir}", flush=True)
     print(f"[output-report] {output_report}", flush=True)
     print(
-        "[policy] real AudioCaps-v2 B=2 GA=1 one update; frozen Whisper+HRM; "
-        "trainable aligner+rank8 H/L LoRA; strict PrefixLM/NTP/save/fresh-reload audit",
+        f"[policy] real AudioCaps-v2 B={args.micro_batch_size} "
+        f"GA={args.gradient_accumulation_steps} effective_batch={effective_batch_size} one update; "
+        f"frozen Whisper+HRM; trainable aligner+rank{args.lora_rank} H/L LoRA; "
+        "strict per-microstep PrefixLM/NTP/recurrence/gradient-accumulation/save/fresh-reload audit",
+        flush=True,
+    )
+    print(
+        f"[optimization] learning_rate={args.learning_rate} "
+        f"aligner_learning_rate={args.aligner_learning_rate} "
+        f"lora_alpha={args.lora_alpha} lora_dropout={args.lora_dropout} "
+        f"expected_lora_parameters={expected_lora_parameters} "
+        f"expected_total_trainable={expected_total_trainable}",
         flush=True,
     )
     print("[argv] " + " ".join(argv), flush=True)
