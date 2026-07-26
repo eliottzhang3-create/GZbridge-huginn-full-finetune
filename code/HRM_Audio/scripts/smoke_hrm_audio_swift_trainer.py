@@ -38,6 +38,37 @@ EXPECTED_LORA_PARAMETERS = 8_257_536
 EXPECTED_LORA_TENSORS = 512
 EXPECTED_TOTAL_TRAINABLE = EXPECTED_ALIGNER_PARAMETERS + EXPECTED_LORA_PARAMETERS
 ALIGNER_MARKERS = ("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings.")
+RUNTIME_CONFIG_FIELDS = (
+    "model_type",
+    "vocab_size",
+    "hidden_size",
+    "intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "H_cycles",
+    "L_cycles",
+    "L_bp_cycles",
+    "max_position_embeddings",
+    "rms_norm_eps",
+    "rope_theta",
+    "tie_word_embeddings",
+    "embedding_scale",
+    "prefix_lm",
+    "audio_encoder_hidden_size",
+    "audio_feature_size",
+    "audio_sample_rate",
+    "audio_max_seconds",
+    "audio_target_token_count",
+    "audio_compressor_intermediate_size",
+    "audio_compressor_kernel_size",
+    "audio_compressor_stride",
+    "audio_projector_hidden_size",
+    "freeze_audio_encoder",
+    "freeze_text_backbone",
+    "use_audio_boundary_embeddings",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -213,6 +244,40 @@ def parameter_group_digest(entries: list[tuple[str, torch.Tensor]]) -> dict[str,
         digest.update(str(parameter.dtype).encode("ascii"))
         update_hash_with_tensor(digest, parameter)
     return {"sha256": digest.hexdigest(), "parameter_count": total, "tensor_count": len(entries)}
+
+
+def buffer_digest(model: torch.nn.Module) -> dict[str, Any]:
+    digest = hashlib.sha256()
+    total = 0
+    entries = sorted(model.named_buffers(), key=lambda item: item[0])
+    for name, buffer in entries:
+        total += buffer.numel()
+        digest.update(name.encode("utf-8"))
+        digest.update(str(tuple(buffer.shape)).encode("ascii"))
+        digest.update(str(buffer.dtype).encode("ascii"))
+        update_hash_with_tensor(digest, buffer)
+    return {"sha256": digest.hexdigest(), "element_count": total, "tensor_count": len(entries)}
+
+
+def runtime_contract(model: torch.nn.Module, wrapper: torch.nn.Module) -> dict[str, Any]:
+    config = wrapper.config
+    config_values = {}
+    for name in RUNTIME_CONFIG_FIELDS:
+        value = getattr(config, name, None)
+        if isinstance(value, tuple):
+            value = list(value)
+        config_values[name] = value
+    return {
+        "model_class": f"{type(model).__module__}.{type(model).__name__}",
+        "wrapper_class": f"{type(wrapper).__module__}.{type(wrapper).__name__}",
+        "model_training": bool(model.training),
+        "wrapper_training": bool(wrapper.training),
+        "audio_encoder_training": bool(wrapper.audio_encoder.training),
+        "audio_prefix_length": int(wrapper.audio_prefix_length),
+        "attention_implementation": getattr(config, "_attn_implementation", None),
+        "use_cache": bool(config.use_cache),
+        "config": config_values,
+    }
 
 
 def snapshot_trainables(model: torch.nn.Module) -> dict[str, torch.Tensor]:
@@ -891,6 +956,8 @@ def main() -> None:
             }
             if torch.is_floating_point(model_batch["audio_input_features"]):
                 model_batch["audio_input_features"] = model_batch["audio_input_features"].to(dtype=torch.bfloat16)
+            reference_runtime_contract = runtime_contract(model, wrapper)
+            reference_buffer_digest = buffer_digest(model)
             with torch.inference_mode():
                 reference_logits = model(**model_batch, use_cache=False).logits.detach().cpu()
                 reference_repeat = model(**model_batch, use_cache=False).logits.detach().cpu()
@@ -934,6 +1001,9 @@ def main() -> None:
                     "reference_logits": reference_logits,
                     "reference_audio_prefix": reference_audio_prefix.detach().cpu(),
                     "reference_controlled_logits": reference_controlled_logits,
+                    "reference_frozen_parameter_digests": frozen_after,
+                    "reference_buffer_digest": reference_buffer_digest,
+                    "reference_runtime_contract": reference_runtime_contract,
                     "checkpoint": str(checkpoint),
                 },
                 reference_payload_path,
@@ -971,6 +1041,9 @@ def main() -> None:
                     "TOKENIZERS_PARALLELISM": "false",
                 }
             )
+            print(f"[reference-frozen-parameter-digests] {frozen_after}", flush=True)
+            print(f"[reference-buffer-digest] {reference_buffer_digest}", flush=True)
+            print(f"[reference-runtime-contract] {reference_runtime_contract}", flush=True)
             print(f"[fresh-reload-command] {' '.join(reload_command)}", flush=True)
             subprocess.run(reload_command, cwd=str(wrapper_model_path.parents[1]), env=reload_env, check=True)
             fresh_reload_report = json.loads(reload_report_path.read_text(encoding="utf-8"))
@@ -1010,6 +1083,8 @@ def main() -> None:
                 "post_update_self_repeat": self_repeat,
                 "post_update_audio_prefix_self_repeat": audio_prefix_self_repeat,
                 "post_update_controlled_self_repeat": controlled_self_repeat,
+                "post_update_buffer_digest": reference_buffer_digest,
+                "post_update_runtime_contract": reference_runtime_contract,
                 "fresh_process_reload": fresh_reload_report,
                 "memory_before_fresh_reload": memory_before_reload,
             }
