@@ -165,16 +165,30 @@ owners, environments, model code, checkpoints, outputs, and progress records.
    fixed generic system message and preserving the user prompt, caption, audio path, and metadata exactly. The gate
    requires exact schema/role/prompt/count/uniqueness checks, reopens every WAV as mono 32-kHz PCM16, hashes both source
    files before and after conversion, writes atomically, and accepts an existing output only when its hashes agree. The
-   source Huginn manifest is read-only. This preparation code is complete locally and awaits its full remote run.
+   source Huginn manifest is read-only. This gate has passed remotely: all `89,658` records, audio paths, and sample IDs
+   are unique; every WAV header passed; the source manifest SHA-256 is
+   `5e1539480932d9348630c1007ba162977c03441f5c0bac4c2814cef99eb6270c`; and the derived HRM manifest SHA-256 is
+   `e3f81f068710a32f903d8326973e73c6b156c1f0ad939647bb89d0550380caef`.
+9. The former tiny-overfit and Trainer-resume gates are intentionally merged. The implementation is
+   `code/HRM_Audio/scripts/smoke_hrm_audio_tiny_overfit_resume.sh`, with fixture/final auditing in
+   `code/HRM_Audio/scripts/audit_hrm_audio_tiny_overfit_resume.py`, the fresh-process audited Swift resume in
+   `code/HRM_Audio/scripts/resume_hrm_audio_tiny_overfit_swift.py`, and submission through
+   `code/HRM_Audio/run_smoke_hrm_audio_tiny_overfit_resume_5090.sh`. It uses four real records from the verified
+   HRM-specific manifest, repeated deterministically into exactly one formal effective batch of 32. Phase 1 runs
+   `swift sft` for 12 optimizer steps at B8/GA4, rank-16/alpha-32, and `1e-4` LoRA/aligner learning rates. Phase 2 starts
+   a separate process, requires exact checkpoint-12 LoRA/aligner values plus optimizer step 12, scheduler step 12, and
+   Trainer global step 12 before any new update, then continues through checkpoint 24. The final gate requires complete
+   `512`-LoRA/`20`-aligner checkpoints, continued H/L/aligner updates, optimizer/scheduler/RNG advancement, all 24 finite
+   per-step losses, and at least a 10% reduction from the first-three-step mean to the last-three-step mean. It is
+   implemented locally and awaits remote execution. No separate throughput-only gate is planned.
 
 **Current exact status:** the text-only HRM-Text Swift/LoRA/Trainer foundation is complete. The first audio wrapper has
 passed remote forward/backward and generation/cache audits, and the independent multimodal Swift registration,
 processor/template/collator, model load, and audio-prefill audit has also passed remotely. The exact `lora_llm`
 trainability audit and the real B2/GA1/rank-8 AudioCaps-v2 one-update Trainer/save/fresh-reload smoke have passed remotely.
-The B8/GA4/rank-16 final-configuration smoke has also passed remotely. The full HRM-specific AudioCaps-v2 manifest
-preparation gate is implemented and awaits remote execution. After it passes, tiny-overfit and checkpoint-resume will be
-handled as one combined validation stage; there is no separate throughput-only stage. Formal two-epoch AudioCaps-v2
-training has not started.
+The B8/GA4/rank-16 final-configuration smoke and full HRM-specific AudioCaps-v2 manifest preparation have also passed
+remotely. The combined tiny-overfit plus fresh-process Trainer-resume gate is implemented and awaits remote execution;
+there is no separate throughput-only stage. Formal two-epoch AudioCaps-v2 training has not started.
 
 ---
 
