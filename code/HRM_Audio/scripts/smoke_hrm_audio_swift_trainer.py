@@ -142,7 +142,9 @@ def prepare_smoke_manifest(source_manifest: Path, run_dir: Path) -> tuple[Path, 
             record_report = validate_source_record(record, line_number=line_number)
             if record_report["audio_path"] in seen_audio:
                 continue
-            selected.append(record)
+            hrm_record = dict(record)
+            hrm_record["messages"] = [dict(record["messages"][1]), dict(record["messages"][2])]
+            selected.append(hrm_record)
             selected_reports.append(record_report)
             seen_audio.add(record_report["audio_path"])
             if len(selected) == 2:
@@ -160,7 +162,9 @@ def prepare_smoke_manifest(source_manifest: Path, run_dir: Path) -> tuple[Path, 
         "source_record_count": int(stats["record_count"]),
         "fixture_manifest": str(fixture_path),
         "fixture_records": selected_reports,
-        "messages_preserved_without_rewrite": True,
+        "audio_user_caption_metadata_preserved": True,
+        "source_system_prompt_removed_for_hrm_direct_template": True,
+        "source_records_unchanged": True,
     }
 
 

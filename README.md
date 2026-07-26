@@ -142,7 +142,9 @@ owners, environments, model code, checkpoints, outputs, and progress records.
    `code/HRM_Audio/scripts/smoke_hrm_audio_swift_trainer.py`, with fresh-process reload in
    `code/HRM_Audio/scripts/reload_hrm_audio_swift_checkpoint.py` and submission through
    `code/HRM_Audio/run_smoke_hrm_audio_swift_trainer_5090.sh`. It uses the first two distinct records from the verified
-   `89,658`-record AudioCaps-v2 train manifest without rewriting their messages. The gate audits the actual native
+   `89,658`-record AudioCaps-v2 train manifest through an HRM-specific metadata-only view: WAV, user prompt, assistant
+   caption, and metadata are preserved, while the Huginn-specific system message is removed because the verified HRM
+   direct template intentionally does not support system prompts. The source manifest is unchanged. The gate audits the actual native
    PrefixLM mask, compact-label NTP loss, static K=5 recurrence, aligner/H/L LoRA gradients and updates, exact frozen
    Whisper/HRM hashes, `512` LoRA plus `20` aligner checkpoint tensors, and a second-process reload. It is awaiting remote
    execution. Only after it passes may the line proceed to tiny overfit and the planned two-epoch AudioCaps-v2 run.
