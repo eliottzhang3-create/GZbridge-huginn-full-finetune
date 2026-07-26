@@ -664,6 +664,54 @@ def inspect_checkpoint(checkpoint: Path, model: torch.nn.Module, wrapper: torch.
     }
 
 
+def build_controlled_prefix_batch(
+    wrapper: torch.nn.Module,
+    inference_batch: dict[str, Any],
+    audio_prefix: torch.Tensor,
+) -> dict[str, Any]:
+    input_ids = inference_batch["input_ids"]
+    attention_mask = inference_batch["attention_mask"]
+    token_type_ids = inference_batch["token_type_ids"]
+    text_embeds = wrapper.get_input_embeddings()(input_ids)
+    audio_prefix = audio_prefix.to(device=text_embeds.device, dtype=text_embeds.dtype)
+    if audio_prefix.shape != (input_ids.shape[0], EXPECTED_AUDIO_PREFIX, text_embeds.shape[-1]):
+        raise RuntimeError(f"Controlled audio prefix shape mismatch: {tuple(audio_prefix.shape)}")
+    prefix_attention = torch.ones(
+        (input_ids.shape[0], EXPECTED_AUDIO_PREFIX),
+        dtype=attention_mask.dtype,
+        device=attention_mask.device,
+    )
+    prefix_types = torch.ones(
+        (input_ids.shape[0], EXPECTED_AUDIO_PREFIX),
+        dtype=token_type_ids.dtype,
+        device=token_type_ids.device,
+    )
+    logits_to_keep = inference_batch["logits_to_keep"]
+    if torch.is_tensor(logits_to_keep):
+        if logits_to_keep.ndim != 1 or logits_to_keep.dtype != torch.bool:
+            raise RuntimeError(
+                "Controlled logits_to_keep must be a one-dimensional boolean mask, "
+                f"got shape={tuple(logits_to_keep.shape)} dtype={logits_to_keep.dtype}"
+            )
+        if logits_to_keep.numel() != input_ids.shape[1]:
+            raise RuntimeError(
+                "Controlled logits_to_keep/text length mismatch: "
+                f"mask={logits_to_keep.numel()} text={input_ids.shape[1]}"
+            )
+        prefix_keep = torch.zeros(
+            EXPECTED_AUDIO_PREFIX,
+            dtype=torch.bool,
+            device=logits_to_keep.device,
+        )
+        logits_to_keep = torch.cat([prefix_keep, logits_to_keep], dim=0)
+    return {
+        "inputs_embeds": torch.cat([audio_prefix, text_embeds], dim=1),
+        "attention_mask": torch.cat([prefix_attention, attention_mask], dim=1),
+        "token_type_ids": torch.cat([prefix_types, token_type_ids], dim=1),
+        "logits_to_keep": logits_to_keep,
+    }
+
+
 def main() -> None:
     args = parse_args()
     expected_versions = {
@@ -846,13 +894,46 @@ def main() -> None:
             with torch.inference_mode():
                 reference_logits = model(**model_batch, use_cache=False).logits.detach().cpu()
                 reference_repeat = model(**model_batch, use_cache=False).logits.detach().cpu()
+                reference_audio_prefix = wrapper.build_audio_prefix(
+                    model_batch["audio_input_features"]
+                ).detach()
+                reference_audio_prefix_repeat = wrapper.build_audio_prefix(
+                    model_batch["audio_input_features"]
+                ).detach()
+                controlled_batch = build_controlled_prefix_batch(
+                    wrapper,
+                    model_batch,
+                    reference_audio_prefix,
+                )
+                reference_controlled_logits = model(
+                    **controlled_batch,
+                    use_cache=False,
+                ).logits.detach().cpu()
+                reference_controlled_repeat = model(
+                    **controlled_batch,
+                    use_cache=False,
+                ).logits.detach().cpu()
             self_repeat = logits_difference_report(reference_logits, reference_repeat)
             if not self_repeat["exact"]:
                 raise RuntimeError(f"Post-update HRM audio model is not self-deterministic: {self_repeat}")
+            audio_prefix_self_repeat = logits_difference_report(
+                reference_audio_prefix.detach().cpu(),
+                reference_audio_prefix_repeat.detach().cpu(),
+            )
+            if not audio_prefix_self_repeat["exact"]:
+                raise RuntimeError(f"Post-update audio prefix is not self-deterministic: {audio_prefix_self_repeat}")
+            controlled_self_repeat = logits_difference_report(
+                reference_controlled_logits,
+                reference_controlled_repeat,
+            )
+            if not controlled_self_repeat["exact"]:
+                raise RuntimeError(f"Post-update controlled HRM path is not self-deterministic: {controlled_self_repeat}")
             torch.save(
                 {
                     "batch": inference_batch,
                     "reference_logits": reference_logits,
+                    "reference_audio_prefix": reference_audio_prefix.detach().cpu(),
+                    "reference_controlled_logits": reference_controlled_logits,
                     "checkpoint": str(checkpoint),
                 },
                 reference_payload_path,
@@ -927,6 +1008,8 @@ def main() -> None:
                 "optimizer": optimizer_report,
                 "checkpoint": checkpoint_report,
                 "post_update_self_repeat": self_repeat,
+                "post_update_audio_prefix_self_repeat": audio_prefix_self_repeat,
+                "post_update_controlled_self_repeat": controlled_self_repeat,
                 "fresh_process_reload": fresh_reload_report,
                 "memory_before_fresh_reload": memory_before_reload,
             }
