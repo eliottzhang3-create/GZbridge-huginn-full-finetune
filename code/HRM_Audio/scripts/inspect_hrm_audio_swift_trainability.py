@@ -131,8 +131,8 @@ def lora_module_report(model: torch.nn.Module) -> tuple[dict[str, Any], set[int]
         if match is None:
             invalid.append(name)
             continue
-        stack, layer, suffix = match.groups()
-        canonical.append(f"{stack}_module.layers.{layer}.{suffix}")
+        stack_module, layer, suffix = match.groups()
+        canonical.append(f"{stack_module}.layers.{layer}.{suffix}")
         for adapter_module_name in ("lora_A", "lora_B"):
             adapter_modules = getattr(module, adapter_module_name)
             for adapter_module in adapter_modules.values():
