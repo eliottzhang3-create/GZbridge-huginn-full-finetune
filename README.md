@@ -206,6 +206,27 @@ tiny-overfit plus fresh-process Trainer-resume gate have all passed remotely. Th
 The formal two-epoch AudioCaps-v2 Swift job and strict epoch-checkpoint audit are implemented and ready to launch; formal
 training has not started yet.
 
+**HRM-Text status update 2026-07-26 (this paragraph supersedes the immediately preceding
+`ready to launch / not started` sentence for the independent HRM line only):** Formal two-epoch AudioCaps-v2
+training completed remotely under Swift at B8/GA4 (effective batch `32`), rank-16/alpha-32 H/L LoRA, aligner learning
+rate `1e-4`, and frozen Whisper/HRM base. The verified epoch checkpoints are:
+
+- `.../audio_audiocaps_v2_train_e2_b8ga4_r16_5090/20260726-084202/swift_output/v0-20260726-084236/checkpoint-2802`
+- `.../audio_audiocaps_v2_train_e2_b8ga4_r16_5090/20260726-084202/swift_output/v0-20260726-084236/checkpoint-5604`
+
+An independent HRM MMAU `test_mini` evaluator is now implemented in
+`code/HRM_Audio/scripts/eval_mmau_test_mini_hrm_audio_swift.py`, with local wrapper
+`code/HRM_Audio/scripts/eval_mmau_test_mini_hrm_audio_swift.sh` and 5090 submitter
+`code/HRM_Audio/run_eval_mmau_test_mini_hrm_audio_swift_5090.sh`. It uses the HRM Swift checkpoint reload path,
+restores and audits `adapter_model.safetensors` plus `vit.safetensors`, decodes embedded MMAU audio bytes through
+ffmpeg into Whisper features, scores complete choices by mean conditional token log-probability using the HRM
+34-token audio-prefix/cache path, and writes one isolated resumable output directory per checkpoint. It does not
+import or modify any Huginn evaluator. Default evaluation is both checkpoints. Use a separate output root for the
+first smoke, for example `MMAU_MAX_SAMPLES=5 MMAU_OUTPUT_ROOT=.../outputs/hrm_text/mmau_test_mini_smoke`, then
+unset `MMAU_MAX_SAMPLES` and use a fresh `.../mmau_test_mini_full` root for the complete 1000-row mini
+evaluation; the strict run-config guard intentionally rejects mixing those ranges in one output directory. No MMAU
+score has been reported yet.
+
 ---
 
 ## Project Scope
