@@ -17,6 +17,7 @@ quote_env() {
 }
 
 for name in \
+  USER_CONDA_BASE \
   HRM_TEXT_MODEL_PATH \
   HRM_AUDIO_WHISPER_MODEL_PATH \
   HRM_AUDIO_WRAPPER_MODEL_PATH \

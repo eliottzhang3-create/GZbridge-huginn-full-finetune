@@ -5,6 +5,11 @@ set -euo pipefail
 # No Huginn evaluator is imported or modified by this route.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PYTHON="$(printenv HRM_MMAU_PYTHON 2>/dev/null || true)"
+CONDA_BASE="$(printenv USER_CONDA_BASE 2>/dev/null || echo /hpc_stor03/sjtu_home/jinwei.zhang/env/miniconda3)"
+HRM_ENV_PYTHON="$CONDA_BASE/envs/swift_HRM/bin/python"
+if [[ -z "$PYTHON" && -x "$HRM_ENV_PYTHON" ]]; then
+  PYTHON="$HRM_ENV_PYTHON"
+fi
 if [[ -z "$PYTHON" ]]; then
   PYTHON="$(printenv PYTHON 2>/dev/null || true)"
 fi
