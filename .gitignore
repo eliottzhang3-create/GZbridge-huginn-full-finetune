@@ -228,3 +228,7 @@ checkpoints/
 *.pkl
 *.safetensors
 model-*.safetensors
+
+# Remote-only derived HRM AudioCaps-v2 training data
+/data/audio_swift/audiocaps_v2/audiocaps_v2_train_hrm_audio.jsonl
+/data/audio_swift/audiocaps_v2/audiocaps_v2_train_hrm_audio.jsonl.stats.json

@@ -149,21 +149,32 @@ owners, environments, model code, checkpoints, outputs, and progress records.
    Whisper/HRM hashes, `512` LoRA plus `20` aligner checkpoint tensors, and a second-process reload. This B2/GA1/rank-8
    gate has passed remotely, including exact cross-process persistent-state/runtime checks and bounded long-PrefixLM BF16
    numerical checks.
-7. The next gate is the final-configuration one-update smoke, submitted independently through
+7. The final-configuration one-update smoke is submitted independently through
    `code/HRM_Audio/run_smoke_hrm_audio_swift_trainer_formal_config_5090.sh`. It fixes B8/GA4 (effective batch `32`), rank-16
    H/L LoRA (`alpha=32`, effective dropout `0.0`), and LoRA/aligner learning rates `1e-4`. The dropout value follows the
    actual ms-swift 4.4.2 `LoRALLMTuner` implementation, which does not forward the generic `lora_dropout` argument into
    PEFT (the Huginn `lora_llm` route has the same effective behavior). It selects 32 distinct real AudioCaps-v2
    records and audits four complete forward/backward micro-steps, three accumulation substeps, one optimizer/global step,
    per-micro-step PrefixLM/NTP/static-K5 semantics, rank-16 parameter/checkpoint counts, frozen weights, memory, and fresh
-   reload. It is implemented locally and awaits remote execution; Trainer resume and tiny overfit remain subsequent gates.
+   reload. This final-configuration gate has passed remotely.
+8. Stage 1 of formal data preparation is implemented in
+   `code/HRM_Audio/scripts/prepare_audiocaps_v2_hrm_audio_manifest.py`, with the remote environment wrapper
+   `code/HRM_Audio/scripts/prepare_audiocaps_v2_hrm_audio_manifest.sh` and cluster launcher
+   `code/HRM_Audio/run_prepare_audiocaps_v2_hrm_audio_manifest_5090.sh`. It streams the verified `89,658`-record source
+   manifest into the remote-only `data/audio_swift/audiocaps_v2/audiocaps_v2_train_hrm_audio.jsonl`, removing only the
+   fixed generic system message and preserving the user prompt, caption, audio path, and metadata exactly. The gate
+   requires exact schema/role/prompt/count/uniqueness checks, reopens every WAV as mono 32-kHz PCM16, hashes both source
+   files before and after conversion, writes atomically, and accepts an existing output only when its hashes agree. The
+   source Huginn manifest is read-only. This preparation code is complete locally and awaits its full remote run.
 
 **Current exact status:** the text-only HRM-Text Swift/LoRA/Trainer foundation is complete. The first audio wrapper has
 passed remote forward/backward and generation/cache audits, and the independent multimodal Swift registration,
 processor/template/collator, model load, and audio-prefill audit has also passed remotely. The exact `lora_llm`
 trainability audit and the real B2/GA1/rank-8 AudioCaps-v2 one-update Trainer/save/fresh-reload smoke have passed remotely.
-The B8/GA4/rank-16 final-configuration smoke is implemented and awaiting remote execution. Trainer resume, tiny overfit,
-and formal two-epoch AudioCaps-v2 training have not started.
+The B8/GA4/rank-16 final-configuration smoke has also passed remotely. The full HRM-specific AudioCaps-v2 manifest
+preparation gate is implemented and awaits remote execution. After it passes, tiny-overfit and checkpoint-resume will be
+handled as one combined validation stage; there is no separate throughput-only stage. Formal two-epoch AudioCaps-v2
+training has not started.
 
 ---
 
