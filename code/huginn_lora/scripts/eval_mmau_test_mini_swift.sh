@@ -11,7 +11,7 @@ cd "$REPO_ROOT"
 
 export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0
-export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
+export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE="${HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE:-1}"
 
 CHECKPOINT="${MMAU_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090/v0-20260713-155848/checkpoint-8406}"
 DATASET_PATH="${MMAU_TEST_MINI_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/data/MMAU test_mini/test_mini.parquet}"

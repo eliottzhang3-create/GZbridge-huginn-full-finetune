@@ -227,6 +227,17 @@ unset `MMAU_MAX_SAMPLES` and use a fresh `.../mmau_test_mini_full` root for the 
 evaluation; the strict run-config guard intentionally rejects mixing those ranges in one output directory. No MMAU
 score has been reported yet.
 
+An independent HRM Clotho-v2 qualitative generation evaluator is also implemented in
+`code/HRM_Audio/scripts/generate_clotho_caption_samples_hrm_audio_swift.py`, with environment wrapper
+`code/HRM_Audio/scripts/generate_clotho_caption_samples_hrm_audio_swift.sh` and 5090 submitter
+`code/HRM_Audio/run_generate_clotho_caption_samples_hrm_audio_swift_5090.sh`. It reads the same read-only
+`clotho_caption_huginn/test_expand.jsonl` evaluation convention used by the existing project data, selects the
+same three deterministic audio groups for both checkpoints by default (seed `74`), prints generated captions beside
+all reference captions, and saves one `clotho_caption_samples.json` per checkpoint. It restores HRM LoRA/aligner
+weights through the Swift route, uses the direct HRM prompt and manual audio-prefill/cache decoding, and verifies
+that the Whisper encoder and aligner execute exactly once per sample. This is a qualitative generation check; no
+caption metric or score is inferred from the three samples.
+
 ---
 
 ## Project Scope
