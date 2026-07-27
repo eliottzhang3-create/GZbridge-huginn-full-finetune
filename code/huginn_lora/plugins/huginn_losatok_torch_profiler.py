@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,12 @@ if _enabled():
     _ACTIVE = int(os.environ.get("HUGINN_TORCH_PROFILER_ACTIVE", "4"))
     _patched = False
     _CURRENT_PROFILER = None
+    # These are deliberately kept separate from the CUDA-sorted top-200 event
+    # list.  DataLoaderDispatcher is primarily a CPU-side event and can
+    # otherwise disappear from the compact JSON summary even though it is
+    # present in the full Chrome trace.
+    _DISPATCH_WALL_US = {"wait": [], "warmup": [], "active": [], "post_active": []}
+    _TRAINING_STEP_WALL_US = {"wait": [], "warmup": [], "active": [], "post_active": []}
 
     def _event_value(event: Any, *names: str) -> float:
         for name in names:
@@ -43,6 +50,84 @@ if _enabled():
                 except (TypeError, ValueError):
                     pass
         return 0.0
+
+    def _profiler_phase(profiler: Any) -> str:
+        """Return the schedule phase for the next operation.
+
+        ``profiler.step()`` is called after each Trainer.training_step in this
+        plugin, so ``step_num`` is a micro-batch counter.  The dispatcher
+        fetches the next batch before training_step, hence this phase is the
+        phase in which that fetch is recorded.
+        """
+        try:
+            step_num = int(getattr(profiler, "step_num", 0))
+        except (TypeError, ValueError):
+            step_num = 0
+        if step_num < _WAIT:
+            return "wait"
+        if step_num < _WAIT + _WARMUP:
+            return "warmup"
+        if step_num < _WAIT + _WARMUP + _ACTIVE:
+            return "active"
+        return "post_active"
+
+    def _record_wall_time(target: dict[str, list[float]], phase: str, elapsed_us: float) -> None:
+        # The profiler smoke is short, but keep a hard cap so an accidentally
+        # long profiling run cannot grow Python-side lists without bound.
+        values = target.setdefault(phase, [])
+        if len(values) < 10000:
+            values.append(float(elapsed_us))
+
+    def _percentile(values: list[float], fraction: float) -> float:
+        if not values:
+            return 0.0
+        ordered = sorted(values)
+        position = (len(ordered) - 1) * fraction
+        lower = int(position)
+        upper = min(lower + 1, len(ordered) - 1)
+        weight = position - lower
+        return ordered[lower] * (1.0 - weight) + ordered[upper] * weight
+
+    def _wall_stats_by_phase(values_by_phase: dict[str, list[float]]) -> dict[str, Any]:
+        result = {}
+        for phase, values in values_by_phase.items():
+            if not values:
+                result[phase] = {
+                    "count": 0,
+                    "total_us": 0.0,
+                    "mean_us": 0.0,
+                    "p50_us": 0.0,
+                    "p95_us": 0.0,
+                    "max_us": 0.0,
+                }
+                continue
+            result[phase] = {
+                "count": len(values),
+                "total_us": float(sum(values)),
+                "mean_us": float(sum(values) / len(values)),
+                "p50_us": float(_percentile(values, 0.50)),
+                "p95_us": float(_percentile(values, 0.95)),
+                "max_us": float(max(values)),
+            }
+        return result
+
+    def _is_selected_event(key: str) -> bool:
+        key_lower = key.lower()
+        return any(
+            pattern in key_lower
+            for pattern in (
+                "dataloader_dispatch",
+                "trainer_training_step",
+                "profilerstep",
+                "fsdp::all_gather",
+                "record_param_comms",
+                "nccl",
+                "allgather",
+                "all_gather",
+                "reduce_scatter",
+                "broadcast",
+            )
+        )
 
     def _write_summary(profiler: Any) -> None:
         events = []
@@ -61,6 +146,13 @@ if _enabled():
                 }
             )
         events.sort(key=lambda item: item["cuda_time_total_us"], reverse=True)
+        selected_events = [item for item in events if _is_selected_event(item["key"])]
+        selected_events.sort(
+            key=lambda item: (
+                item["key"].lower().find("dataloader_dispatch") < 0,
+                -item["cpu_time_total_us"],
+            )
+        )
         if torch.cuda.is_available():
             memory = {
                 "max_memory_allocated_bytes": int(torch.cuda.max_memory_allocated()),
@@ -75,7 +167,16 @@ if _enabled():
             "wait": _WAIT,
             "warmup": _WARMUP,
             "active": _ACTIVE,
+            "profiler_step_unit": "Trainer.training_step (one micro-batch)",
+            "event_count_total": len(events),
+            "event_summary_limit": 200,
             "events": events[:200],
+            # Unlike ``events``, this list is not truncated by CUDA ranking.
+            # It is intentionally restricted to data/FSDP/NCCL/training
+            # events so the summary remains small and directly actionable.
+            "selected_events": selected_events,
+            "data_loader_dispatch_wall_time_us": _wall_stats_by_phase(_DISPATCH_WALL_US),
+            "training_step_wall_time_us": _wall_stats_by_phase(_TRAINING_STEP_WALL_US),
             "memory": memory,
         }
         path = _OUTPUT_DIR / f"profiler_summary_rank{_RANK}.json"
@@ -92,6 +193,12 @@ if _enabled():
             ),
             flush=True,
         )
+        print(
+            f"[torch-profiler] rank={_RANK} dispatch_active_stats="
+            f"{summary['data_loader_dispatch_wall_time_us']['active']} "
+            f"training_step_active_stats={summary['training_step_wall_time_us']['active']}",
+            flush=True,
+        )
 
     def _patch_dispatcher() -> None:
         try:
@@ -105,16 +212,24 @@ if _enabled():
 
         def profiled_iter(self):
             iterator = original_iter(self)
-            profiler = _CURRENT_PROFILER
-            if profiler is None:
-                yield from iterator
-                return
             while True:
+                # Resolve the profiler dynamically rather than only at
+                # iterator construction time.  Swift/Transformers can create
+                # the iterator before the Trainer enters the profiler context.
+                profiler = _CURRENT_PROFILER
+                phase = _profiler_phase(profiler) if profiler is not None else "post_active"
+                start_ns = time.perf_counter_ns()
                 try:
-                    with torch.profiler.record_function(f"huginn.rank{_RANK}.dataloader_dispatch_next"):
+                    if profiler is None:
                         batch = next(iterator)
+                    else:
+                        with torch.profiler.record_function(f"huginn.rank{_RANK}.dataloader_dispatch_next"):
+                            batch = next(iterator)
                 except StopIteration:
                     return
+                elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
+                if profiler is not None:
+                    _record_wall_time(_DISPATCH_WALL_US, phase, elapsed_us)
                 yield batch
 
         profiled_iter._huginn_torch_profiler = True
@@ -127,8 +242,13 @@ if _enabled():
 
         def profiled_training_step(self, *args, **kwargs):
             profiler = getattr(self, "_huginn_active_profiler", None)
+            phase = _profiler_phase(profiler) if profiler is not None else "post_active"
+            start_ns = time.perf_counter_ns()
             with torch.profiler.record_function(f"huginn.rank{_RANK}.trainer_training_step"):
                 result = _original_training_step(self, *args, **kwargs)
+            if profiler is not None:
+                elapsed_us = (time.perf_counter_ns() - start_ns) / 1000.0
+                _record_wall_time(_TRAINING_STEP_WALL_US, phase, elapsed_us)
             if profiler is not None:
                 profiler.step()
             return result
