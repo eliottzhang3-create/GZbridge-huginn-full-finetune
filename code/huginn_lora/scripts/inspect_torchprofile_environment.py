@@ -107,15 +107,15 @@ def inspect_torchprofile() -> dict[str, Any]:
     toy = nn.Sequential(
         nn.Conv1d(4, 8, kernel_size=3, padding=1),
         nn.SiLU(),
-        nn.Linear(8, 2),
+        nn.Conv1d(8, 2, kernel_size=1),
     ).eval()
     toy_input = torch.randn(2, 4, 16)
     with torch.no_grad():
-        toy_output = toy(toy_input.transpose(1, 2))
+        toy_output = toy(toy_input)
     result["toy_output_shape"] = list(toy_output.shape)
     try:
         with torch.no_grad():
-            toy_macs = profile_macs(toy, args=(toy_input.transpose(1, 2),))
+            toy_macs = profile_macs(toy, args=(toy_input,))
         result["toy_profile_macs"] = safe_json(toy_macs)
         result["toy_profile_macs_status"] = "PASS"
     except Exception as exc:  # noqa: BLE001 - this is the compatibility report
@@ -125,7 +125,7 @@ def inspect_torchprofile() -> dict[str, Any]:
     if callable(profile_operators):
         try:
             with torch.no_grad():
-                operators = profile_operators(toy, args=(toy_input.transpose(1, 2),))
+                operators = profile_operators(toy, args=(toy_input,))
             result["toy_profile_operators"] = safe_json(operators)
             result["toy_profile_operators_status"] = "PASS"
         except Exception as exc:  # noqa: BLE001 - optional API report
