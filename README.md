@@ -759,7 +759,7 @@ Submit it only through:
 bash code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_data_pools_5090.sh
 ```
 
-The next mapping gate is implemented but not yet remote-verified. It creates only `16` metadata-only pilot records per
+The atomic mapping pilot has passed remotely. It creates only `16` metadata-only pilot records per
 pool, validates real source-field/audio-path mappings, excludes BBC by source, preserves grouped Clotho references with
 one-caption-per-training-occurrence policy, cleans GigaSpeech `text_tn` placeholders, and proves that all four pools use
 one atomic schema. It does not decode/copy audio or calculate tokens.
@@ -772,6 +772,23 @@ Submit it only through:
 
 ```bash
 bash code/huginn_lora/run_prepare_huginn_whisper_dynamic90s_atomic_pilot_5090.sh
+```
+
+The next gate is complete atomic-pool generation and is implemented but not yet remote-verified. It streams all four
+metadata pools into `data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/pools/*.jsonl`, with one little-endian
+uint64 byte-offset index per manifest, per-pool stats and SHA-256 values, `pool_registry.json`, and
+`full_pool_report.json`. All pool files remain temporary until every pool has completed and passed count checks. The
+GigaSpeech-L emitted count must exactly equal the passed inventory count `2,264,528`, and Clotho must exactly equal
+`3,839` grouped train audios. It still performs no audio decode/copy/full-path scan or token calculation.
+
+- implementation: `code/huginn_lora/scripts/prepare_huginn_whisper_dynamic90s_full_atomic_pools.py`;
+- runtime: `code/huginn_lora/scripts/prepare_huginn_whisper_dynamic90s_full_atomic_pools.sh`;
+- submit wrapper: `code/huginn_lora/run_prepare_huginn_whisper_dynamic90s_full_atomic_pools_5090.sh`.
+
+Submit it only through:
+
+```bash
+bash code/huginn_lora/run_prepare_huginn_whisper_dynamic90s_full_atomic_pools_5090.sh
 ```
 
 #### Historical but relevant routes
