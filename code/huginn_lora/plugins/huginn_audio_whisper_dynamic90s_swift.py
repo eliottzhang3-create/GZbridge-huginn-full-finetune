@@ -747,11 +747,59 @@ def decode_audio_with_ffmpeg_file(path: Path, target_sr: int) -> np.ndarray:
     return np.frombuffer(result.stdout, dtype=np.float32).astype(np.float32, copy=False)
 
 
+def decode_audio_segment_with_ffmpeg_file(
+    path: Path,
+    target_sr: int,
+    start_sec: float,
+    end_sec: float,
+    max_audio_seconds: float | None,
+) -> np.ndarray:
+    """Decode one metadata-defined segment without materializing a converted file."""
+    if not math.isfinite(start_sec) or not math.isfinite(end_sec) or start_sec < 0 or end_sec <= start_sec:
+        raise ValueError(f"Invalid audio segment bounds for {path}: start={start_sec} end={end_sec}")
+    duration = end_sec - start_sec
+    if max_audio_seconds is not None:
+        duration = min(duration, max_audio_seconds)
+    ffmpeg_path = get_ffmpeg_path()
+    if ffmpeg_path is None:
+        raise RuntimeError("ffmpeg is not available")
+    cmd = [
+        ffmpeg_path,
+        "-nostdin",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-ss",
+        f"{start_sec:.9f}",
+        "-i",
+        str(path),
+        "-t",
+        f"{duration:.9f}",
+        "-f",
+        "f32le",
+        "-ac",
+        "1",
+        "-ar",
+        str(target_sr),
+        "pipe:1",
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False)
+    if result.returncode != 0:
+        stderr = result.stderr.decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(
+            f"ffmpeg segment decode failed for {path}[{start_sec:.3f},{end_sec:.3f}]: "
+            f"{stderr or 'unknown error'}"
+        )
+    if not result.stdout:
+        raise RuntimeError(f"ffmpeg segment decode produced empty output for {path}")
+    return np.frombuffer(result.stdout, dtype=np.float32).astype(np.float32, copy=False)
+
+
 def load_audio_file(path: Path, target_sr: int, max_audio_seconds: float | None) -> np.ndarray:
     suffix = path.suffix.lower()
     if suffix == ".wav":
         return load_wav_mono(path, target_sr, max_audio_seconds)
-    if suffix in {".flac", ".ogg", ".mp3", ".m4a"}:
+    if suffix in {".flac", ".ogg", ".mp3", ".m4a", ".opus"}:
         errors: list[str] = []
         for backend_name, backend in (
             ("soundfile", _decode_audio_with_soundfile),
@@ -812,6 +860,46 @@ def load_audio_from_tar(
         except Exception as ffmpeg_exc:
             ffmpeg_errors.append(f"ffmpeg={type(ffmpeg_exc).__name__}: {ffmpeg_exc}")
             raise RuntimeError(f"Failed to decode tar audio {source_label}. Tried: {'; '.join(ffmpeg_errors)}")
+
+
+def resolve_audio_path(audio_item: Any) -> Path:
+    if isinstance(audio_item, str):
+        return Path(audio_item)
+    if isinstance(audio_item, dict):
+        if "audio" in audio_item and isinstance(audio_item["audio"], str):
+            return Path(audio_item["audio"])
+        if "path" in audio_item and isinstance(audio_item["path"], str):
+            return Path(audio_item["path"])
+    raise TypeError(f"Unsupported audio source type: {type(audio_item)}")
+
+
+def load_audio_item(
+    audio_item: Any,
+    target_sr: int,
+    max_audio_seconds: float | None,
+) -> np.ndarray:
+    """Load whole-file, tar-backed, or metadata-segment audio into one canonical waveform."""
+    if isinstance(audio_item, dict) and "tar_path" in audio_item and "audio_member" in audio_item:
+        return load_audio_from_tar(
+            Path(str(audio_item["tar_path"])),
+            str(audio_item["audio_member"]),
+            target_sr=target_sr,
+            max_audio_seconds=max_audio_seconds,
+        )
+    audio_path = resolve_audio_path(audio_item)
+    if isinstance(audio_item, dict) and (
+        audio_item.get("start_sec") is not None or audio_item.get("end_sec") is not None
+    ):
+        if audio_item.get("start_sec") is None or audio_item.get("end_sec") is None:
+            raise ValueError(f"Segment audio requires both start_sec and end_sec: {audio_item}")
+        return decode_audio_segment_with_ffmpeg_file(
+            audio_path,
+            target_sr=target_sr,
+            start_sec=float(audio_item["start_sec"]),
+            end_sec=float(audio_item["end_sec"]),
+            max_audio_seconds=max_audio_seconds,
+        )
+    return load_audio_file(audio_path, target_sr=target_sr, max_audio_seconds=max_audio_seconds)
 
 
 class HuginnAudioProcessor:
@@ -1340,30 +1428,9 @@ class HuginnAudioTemplate(Template):
             return []
         return super().replace_tag(media_type, index, inputs)
 
-    def _resolve_audio_path(self, audio_item: Any) -> Path:
-        if isinstance(audio_item, str):
-            return Path(audio_item)
-        if isinstance(audio_item, dict):
-            if "audio" in audio_item and isinstance(audio_item["audio"], str):
-                return Path(audio_item["audio"])
-            if "path" in audio_item and isinstance(audio_item["path"], str):
-                return Path(audio_item["path"])
-        raise TypeError(f"Unsupported audio source type: {type(audio_item)}")
-
     def _load_audio_item(self, audio_item: Any) -> np.ndarray:
-        if isinstance(audio_item, dict) and "tar_path" in audio_item and "audio_member" in audio_item:
-            tar_path = Path(str(audio_item["tar_path"]))
-            audio_member = str(audio_item["audio_member"])
-            return load_audio_from_tar(
-                tar_path,
-                audio_member,
-                target_sr=self.audio_sampling_rate,
-                max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
-            )
-
-        audio_path = self._resolve_audio_path(audio_item)
-        return load_audio_file(
-            audio_path,
+        return load_audio_item(
+            audio_item,
             target_sr=self.audio_sampling_rate,
             max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
         )

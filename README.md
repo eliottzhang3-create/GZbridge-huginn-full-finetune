@@ -2319,3 +2319,23 @@ training until its report has been reviewed and the canonical manifests and toke
 The current duration contract has no discard threshold: every input longer than 90 seconds, including inputs beyond
 120 seconds, is retained by truncating it to the first 90 seconds. Stage 0-2 sends a 120.01-second WAV through the real
 Swift path and separately checks the production planner with 180-second and one-hour inputs.
+
+### Huginn Whisper dynamic-90s data status update (2026-07-30)
+
+The four full atomic pools are complete: WavCaps excluding BBC Sound Effects, AudioCaps-v2, Clotho-v2 train grouped by
+audio, and GigaSpeech-L segment-level ASR. The deterministic indexed hierarchical mixture gate has passed with the
+required `AAC=60%` / `ASR=40%` task split and `WavCaps=60%` / `AudioCaps=30%` / `Clotho=10%` inside AAC. Sampling is by
+training occurrence, not by precomputed token count. Clotho selects exactly one deterministic caption per occurrence.
+
+The next gate is
+`code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_real_data_chain_5090.sh`. It registers the indexed mixture as a
+Swift `IterableDataset`, checks deterministic non-zero-position restart, and decodes exactly one real source item per
+pool without loading Whisper/Huginn or materializing converted audio. GigaSpeech Opus segments are decoded on demand
+from the read-only public source with ffmpeg segment bounds. Dynamic token counts remain runtime statistics.
+
+Formal-training constraints already fixed by the user, but not yet implemented or launched:
+
+- train for more than `4000` realized source-audio hours;
+- retain exactly two formal checkpoints, one at half of the final global-step count and one at completion;
+- before formal training, pass a four-GPU FSDP checkpoint smoke that saves, exits all training processes, starts a new
+  process group, resumes model/optimizer/scheduler/RNG/data position, and then performs additional finite updates.
