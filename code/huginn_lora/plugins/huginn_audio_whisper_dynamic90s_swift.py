@@ -1320,14 +1320,19 @@ def patch_realdata_stability_callback() -> None:
             return rank, world_size
 
         def _audio_statistics(self) -> dict[str, int]:
+            statistics_owner_key = "_huginn_audio_realdata_sample_count"
             matching_modules = [
                 module
                 for module in self.tracked_model.modules()
-                if hasattr(module, "_huginn_audio_realdata_sample_count")
+                # PEFT and FSDP wrappers proxy unknown attributes to their
+                # wrapped module. ``hasattr`` therefore sees the same counters
+                # through several wrapper levels. Only the module whose own
+                # __dict__ stores the counters is the real statistics owner.
+                if statistics_owner_key in vars(module)
             ]
             if len(matching_modules) != 1:
                 raise RuntimeError(
-                    "Real-data gate expected exactly one model with runtime audio statistics, "
+                    "Real-data gate expected exactly one direct owner of runtime audio statistics, "
                     f"found {len(matching_modules)}"
                 )
             module = matching_modules[0]
