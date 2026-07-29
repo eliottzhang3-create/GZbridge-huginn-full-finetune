@@ -16,6 +16,20 @@ EXPECTED_TRAINABLE_TENSORS = {
     "other": 0,
 }
 EXPECTED_FIRST_STEP_PREFIX_TOKENS = {10, 252, 502, 752}
+EXPECTED_FSDP_UNITS = {
+    "WhisperEncoderFSDPUnit",
+    "AudioAlignerFSDPUnit",
+    "HuginnPreludeFSDPUnit",
+    "HuginnRecurrentCoreFSDPUnit",
+    "HuginnCodaFSDPUnit",
+}
+EXPECTED_UNIT_TRAINABLE_TENSORS = {
+    "WhisperEncoderFSDPUnit": 0,
+    "AudioAlignerFSDPUnit": 14,
+    "HuginnPreludeFSDPUnit": 16,
+    "HuginnRecurrentCoreFSDPUnit": 34,
+    "HuginnCodaFSDPUnit": 16,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,6 +58,21 @@ def main() -> None:
             raise AssertionError(f"Rank {rank} exposes no FSDP2 DTensor parameters")
         if int(fsdp.get("dtensor_trainable_count", -1)) != 80:
             raise AssertionError(f"Rank {rank} DTensor trainable count is not 80: {fsdp}")
+        fsdp_units = fsdp.get("fsdp_units")
+        if not isinstance(fsdp_units, dict) or set(fsdp_units) != EXPECTED_FSDP_UNITS:
+            raise AssertionError(f"Rank {rank} FSDP unit topology mismatch: {fsdp_units}")
+        for unit_name, unit_audit in fsdp_units.items():
+            parameter_count = int(unit_audit.get("parameter_count", 0))
+            dtensor_count = int(unit_audit.get("dtensor_parameter_count", -1))
+            if parameter_count <= 0 or dtensor_count != parameter_count:
+                raise AssertionError(
+                    f"Rank {rank} unit {unit_name} is not completely sharded: {unit_audit}"
+                )
+            trainable_count = int(unit_audit.get("trainable_parameter_count", -1))
+            if trainable_count != EXPECTED_UNIT_TRAINABLE_TENSORS[unit_name]:
+                raise AssertionError(
+                    f"Rank {rank} unit {unit_name} trainable split mismatch: {unit_audit}"
+                )
         prefix_tokens = fsdp.get("valid_prefix_tokens")
         if not isinstance(prefix_tokens, list) or len(prefix_tokens) != 1:
             raise AssertionError(f"Rank {rank} expected one local sample, got {prefix_tokens}")
@@ -63,6 +92,7 @@ def main() -> None:
         print(
             f"[stage34-marker] rank={rank} cuda={fsdp['cuda_device']} "
             f"prefix_tokens={prefix_tokens[0]} dtensor_parameters={fsdp['dtensor_parameter_count']} "
+            f"fsdp_units={sorted(fsdp_units)} "
             f"optimizer={optimizer['optimizer_type']} global_step=1"
         )
 

@@ -44,6 +44,20 @@ CONTRACT_CASES = (
 )
 PLANNER_ONLY_LONG_DURATIONS = (180.0, 3600.0)
 EXPECTED_LORA_TENSOR_COUNT = 66
+EXPECTED_FSDP_UNIT_CLASS_NAMES = (
+    "WhisperEncoderFSDPUnit",
+    "AudioAlignerFSDPUnit",
+    "HuginnPreludeFSDPUnit",
+    "HuginnRecurrentCoreFSDPUnit",
+    "HuginnCodaFSDPUnit",
+)
+EXPECTED_UNIT_TRAINABLE_TENSORS = {
+    "WhisperEncoderFSDPUnit": 0,
+    "AudioAlignerFSDPUnit": 14,
+    "HuginnPreludeFSDPUnit": 16,
+    "HuginnRecurrentCoreFSDPUnit": 34,
+    "HuginnCodaFSDPUnit": 16,
+}
 EXPECTED_ALIGNER_TENSOR_COUNT = 14
 
 
@@ -243,6 +257,17 @@ def audit_lora_configuration(model: torch.nn.Module) -> None:
         raise AssertionError(
             f"LoRA tensor count mismatch: expected={EXPECTED_LORA_TENSOR_COUNT} actual={len(lora_parameters)}"
         )
+    forbidden_lora = [
+        name
+        for name, _ in lora_parameters
+        if "audio_encoder" in name or "audio_aligner" in name
+    ]
+    non_huginn_lora = [name for name, _ in lora_parameters if "transformer" not in name]
+    if forbidden_lora or non_huginn_lora:
+        raise AssertionError(
+            "LoRA must be restricted to the Huginn transformer: "
+            f"audio_or_aligner={forbidden_lora} non_huginn={non_huginn_lora}"
+        )
     for name, parameter in lora_parameters:
         if "lora_A" in name and parameter.ndim == 2 and parameter.shape[0] != 8:
             raise AssertionError(f"LoRA A rank is not 8: {name} shape={tuple(parameter.shape)}")
@@ -272,6 +297,58 @@ def audit_lora_configuration(model: torch.nn.Module) -> None:
     print(
         f"[lora] tensors={len(lora_parameters)} target_modules={target_modules} "
         "rank=8 alpha=16 dropout=0.05"
+    )
+
+
+def audit_fsdp_unit_topology(audio_model: torch.nn.Module) -> None:
+    actual_no_split = tuple(getattr(audio_model, "_no_split_modules", ()))
+    if actual_no_split != EXPECTED_FSDP_UNIT_CLASS_NAMES:
+        raise AssertionError(
+            f"Unexpected FSDP no-split topology: expected={EXPECTED_FSDP_UNIT_CLASS_NAMES} "
+            f"actual={actual_no_split}"
+        )
+    modules_by_class = {
+        class_name: [
+            module
+            for module in audio_model.modules()
+            if any(base.__name__ == class_name for base in type(module).__mro__)
+        ]
+        for class_name in EXPECTED_FSDP_UNIT_CLASS_NAMES
+    }
+    bad_counts = {name: len(modules) for name, modules in modules_by_class.items() if len(modules) != 1}
+    if bad_counts:
+        raise AssertionError(f"Expected exactly one instance of every FSDP unit: {bad_counts}")
+    expected_block_counts = {
+        "HuginnPreludeFSDPUnit": 2,
+        "HuginnRecurrentCoreFSDPUnit": 4,
+        "HuginnCodaFSDPUnit": 2,
+    }
+    for class_name, expected_count in expected_block_counts.items():
+        actual_count = len(modules_by_class[class_name][0])
+        if actual_count != expected_count:
+            raise AssertionError(
+                f"{class_name} physical block count mismatch: expected={expected_count} actual={actual_count}"
+            )
+    for class_name, expected_trainables in EXPECTED_UNIT_TRAINABLE_TENSORS.items():
+        actual_trainables = sum(
+            parameter.requires_grad for parameter in modules_by_class[class_name][0].parameters()
+        )
+        if actual_trainables != expected_trainables:
+            raise AssertionError(
+                f"{class_name} trainable tensor count mismatch: "
+                f"expected={expected_trainables} actual={actual_trainables}"
+            )
+    core_unit = modules_by_class["HuginnRecurrentCoreFSDPUnit"][0]
+    if not hasattr(core_unit, "adapter"):
+        raise AssertionError("Recurrent FSDP unit does not own Huginn's native adapter")
+    state_keys = set(audio_model.state_dict())
+    if any(key.startswith("transformer.adapter.") for key in state_keys):
+        raise AssertionError("Native recurrent adapter still exists outside the recurrent FSDP unit")
+    if not any(key.startswith("transformer.core_block.adapter.") for key in state_keys):
+        raise AssertionError("Recurrent FSDP unit state dict is missing its native adapter")
+    print(
+        "[fsdp-topology] units=whisper_whole,aligner_whole,prelude_2blocks,"
+        "core_adapter_plus_4blocks,coda_2blocks reshard_after_forward=true"
     )
 
 
@@ -320,6 +397,8 @@ def audit_real_prefix_batches(trainer: Any, plugin: Any, audio_model: torch.nn.M
     saw_padding = False
     batch_count = 0
     whisper_call_dtypes: list[torch.dtype] = []
+    whisper_call_batch_sizes: list[int] = []
+    aligner_call_batch_sizes: list[int] = []
     collator_dtypes: set[torch.dtype] = set()
 
     def capture_whisper_input_dtype(module, args, kwargs):
@@ -328,11 +407,19 @@ def audit_real_prefix_batches(trainer: Any, plugin: Any, audio_model: torch.nn.M
         if input_features is None:
             raise AssertionError("Whisper encoder call exposes no input_features keyword")
         whisper_call_dtypes.append(input_features.dtype)
+        whisper_call_batch_sizes.append(int(input_features.size(0)))
+
+    def capture_aligner_batch_size(module, args):
+        del module
+        if not args or not torch.is_tensor(args[0]):
+            raise AssertionError("Aligner unit call exposes no encoder hidden-state tensor")
+        aligner_call_batch_sizes.append(int(args[0].size(0)))
 
     dtype_hook = audio_model.audio_encoder.register_forward_pre_hook(
         capture_whisper_input_dtype,
         with_kwargs=True,
     )
+    aligner_hook = audio_model.audio_aligner.register_forward_pre_hook(capture_aligner_batch_size)
     try:
         for raw_batch in trainer.get_train_dataloader():
             batch = trainer._prepare_inputs(raw_batch)
@@ -349,11 +436,28 @@ def audit_real_prefix_batches(trainer: Any, plugin: Any, audio_model: torch.nn.M
                     f"Expected [B, segments, 80, frames], got {tuple(batch['audio_input_features'].shape)}"
                 )
             collator_dtypes.add(batch["audio_input_features"].dtype)
+            expected_segment_batch = int(batch["audio_segment_mask"].sum().item())
+            prior_whisper_calls = len(whisper_call_batch_sizes)
+            prior_aligner_calls = len(aligner_call_batch_sizes)
             with torch.no_grad():
                 prefix, prefix_mask = audio_model.build_audio_prefix(
                     batch["audio_input_features"],
                     audio_segment_feature_lengths=batch["audio_segment_feature_lengths"],
                     audio_segment_mask=batch["audio_segment_mask"],
+                )
+            if len(whisper_call_batch_sizes) != prior_whisper_calls + 1:
+                raise AssertionError("Whisper must be called exactly once for each local audio batch")
+            if len(aligner_call_batch_sizes) != prior_aligner_calls + 1:
+                raise AssertionError("Aligner must be called exactly once for each local audio batch")
+            if whisper_call_batch_sizes[-1] != expected_segment_batch:
+                raise AssertionError(
+                    f"Whisper did not receive all valid segments in one batch: "
+                    f"expected={expected_segment_batch} actual={whisper_call_batch_sizes[-1]}"
+                )
+            if aligner_call_batch_sizes[-1] != expected_segment_batch:
+                raise AssertionError(
+                    f"Aligner did not receive all valid segments in one batch: "
+                    f"expected={expected_segment_batch} actual={aligner_call_batch_sizes[-1]}"
                 )
             expected_lengths = expected_prefix_lengths(plugin, batch)
             actual_lengths = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
@@ -379,6 +483,7 @@ def audit_real_prefix_batches(trainer: Any, plugin: Any, audio_model: torch.nn.M
             torch.cuda.empty_cache()
     finally:
         dtype_hook.remove()
+        aligner_hook.remove()
     whisper_dtype = next(audio_model.audio_encoder.parameters()).dtype
     if collator_dtypes != {torch.float32}:
         raise AssertionError(f"Whisper log-mel features must remain FP32 in the collator: {collator_dtypes}")
@@ -393,6 +498,7 @@ def audit_real_prefix_batches(trainer: Any, plugin: Any, audio_model: torch.nn.M
     print(
         f"[prefix-batch] batches={batch_count} dynamic_sub_250=true padding_exercised=true "
         f"collator_dtypes={sorted(map(str, collator_dtypes))} whisper_input_dtype={whisper_dtype}"
+        f" whisper_calls={len(whisper_call_batch_sizes)} aligner_calls={len(aligner_call_batch_sizes)}"
     )
 
 
@@ -498,6 +604,7 @@ def run_real_swift_gate(repo_root: Path, plugin: Any, manifest_path: Path, work_
             print("========== REAL SWIFT STAGE 0-2 GATE ==========")
             audio_model = find_audio_model(trainer.model)
             audit_lora_configuration(trainer.model)
+            audit_fsdp_unit_topology(audio_model)
             audit_trainable_split(trainer.model, audio_model)
             audit_real_prefix_batches(trainer, plugin, audio_model)
             audit_backward(trainer, audio_model)

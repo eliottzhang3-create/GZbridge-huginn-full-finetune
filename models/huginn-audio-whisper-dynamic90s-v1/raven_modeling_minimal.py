@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gc
+from contextlib import nullcontext
 from typing import Optional
 
 import torch
@@ -80,17 +81,22 @@ class AudioBoundaryEmbeddings(nn.Module):
         nn.init.normal_(self.audio_eos, mean=0.0, std=init_std)
 
 
-class HuginnAudioForConditionalGeneration(RavenForCausalLM):
-    config_class = HuginnAudioConfig
+class WhisperEncoderFSDPUnit(nn.Module):
+    """One callable FSDP unit containing the complete Whisper encoder."""
+
+    def __init__(self, encoder: nn.Module):
+        super().__init__()
+        self.encoder = encoder
+
+    def forward(self, *args, **kwargs):
+        return self.encoder(*args, **kwargs)
+
+
+class AudioAlignerFSDPUnit(nn.Module):
+    """One callable FSDP unit containing every trainable audio aligner tensor."""
 
     def __init__(self, config: HuginnAudioConfig):
-        super().__init__(config)
-        self.config = config
-
-        whisper = WhisperModel.from_pretrained(config.audio_encoder_name)
-        self.audio_encoder = whisper.encoder
-        del whisper
-
+        super().__init__()
         self.temporal_compressor = TrainableTemporalCompressor(
             hidden_size=config.audio_encoder_hidden_size,
             kernel_size=config.audio_compressor_kernel_size,
@@ -101,14 +107,156 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
             hidden_dim=config.audio_projector_hidden_size,
             output_dim=config.n_embd,
         )
-
         self.audio_boundary_embeddings = (
             AudioBoundaryEmbeddings(config.n_embd, config.init_values["std"])
             if config.use_audio_boundary_embeddings
             else None
         )
 
+    def forward(
+        self,
+        audio_hidden: torch.Tensor,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        projected = self.audio_projector(self.temporal_compressor(audio_hidden))
+        if self.audio_boundary_embeddings is None:
+            return projected, None, None
+
+        # Materialize both parameters inside this wrapped forward. Accessing a
+        # sharded parameter directly after the unit has resharded is invalid.
+        audio_bos = self.audio_boundary_embeddings.audio_bos * 1.0
+        audio_eos = self.audio_boundary_embeddings.audio_eos * 1.0
+        return projected, audio_bos, audio_eos
+
+
+class _HuginnBlockFSDPUnit(nn.Module):
+    """Store blocks under their historical numeric state-dict paths."""
+
+    def __init__(self, blocks: list[nn.Module]):
+        super().__init__()
+        if not blocks:
+            raise ValueError(f"{type(self).__name__} requires at least one SandwichBlock")
+        self._block_count = len(blocks)
+        for index, block in enumerate(blocks):
+            self.add_module(str(index), block)
+
+    def __len__(self) -> int:
+        return self._block_count
+
+    def __getitem__(self, index: int) -> nn.Module:
+        if index < 0:
+            index += self._block_count
+        if index < 0 or index >= self._block_count:
+            raise IndexError(index)
+        return self._modules[str(index)]
+
+    def _blocks(self):
+        for index in range(self._block_count):
+            yield self[index]
+
+
+class HuginnPreludeFSDPUnit(_HuginnBlockFSDPUnit):
+    """Execute both prelude SandwichBlocks through one FSDP forward."""
+
+    def __iter__(self):
+        # Raven's inherited forward iterates ``transformer.prelude``. Yielding
+        # this callable container once ensures its FSDP hooks are not bypassed.
+        yield self
+
+    def forward(self, x, freqs_cis, block_idx, mask=None, past_key_values=None):
+        initial_block_idx = block_idx
+        for offset, block in enumerate(self._blocks()):
+            x = block(x, freqs_cis, initial_block_idx + offset, mask, past_key_values)
+        if self._block_count > 1:
+            # The inherited Raven loop owns block_idx. Update its CPU scalar
+            # only after all block calls so the next recurrent index is exact.
+            block_idx.add_(self._block_count - 1)
+        return x
+
+
+class HuginnCodaFSDPUnit(_HuginnBlockFSDPUnit):
+    """Execute both coda SandwichBlocks through one FSDP forward."""
+
+    def __iter__(self):
+        yield self
+
+    def forward(self, x, freqs_cis, block_idx, mask=None, past_key_values=None):
+        initial_block_idx = block_idx
+        for offset, block in enumerate(self._blocks()):
+            x = block(x, freqs_cis, initial_block_idx - offset, mask, past_key_values)
+        if self._block_count > 1:
+            block_idx.sub_(self._block_count - 1)
+        return x
+
+
+class HuginnRecurrentCoreFSDPUnit(_HuginnBlockFSDPUnit):
+    """One recurrent unit: native adapter plus all four reused core blocks."""
+
+    def __init__(self, adapter: nn.Module, blocks: list[nn.Module]):
+        super().__init__(blocks)
+        self.adapter = adapter
+
+    def __iter__(self):
+        # Compatibility for code that inspects the physical recurrent blocks.
+        return self._blocks()
+
+    @property
+    def norm_4(self):
+        return self[-1].norm_4
+
+    def forward(self, x, input_embeds, freqs_cis, block_idx, mask=None, past_key_values=None):
+        adapter_in = torch.cat([x, input_embeds.to(x.device)], dim=-1)
+        x = self.adapter(adapter_in)
+        for block in self._blocks():
+            block_idx = block_idx + 1
+            x = block(x, freqs_cis, block_idx, mask, past_key_values)
+        return x, block_idx
+
+
+class HuginnAudioForConditionalGeneration(RavenForCausalLM):
+    config_class = HuginnAudioConfig
+    _no_split_modules = [
+        "WhisperEncoderFSDPUnit",
+        "AudioAlignerFSDPUnit",
+        "HuginnPreludeFSDPUnit",
+        "HuginnRecurrentCoreFSDPUnit",
+        "HuginnCodaFSDPUnit",
+    ]
+
+    def __init__(self, config: HuginnAudioConfig):
+        super().__init__(config)
+        self.config = config
+
+        prelude_blocks = list(self.transformer.prelude)
+        recurrent_blocks = list(self.transformer.core_block)
+        coda_blocks = list(self.transformer.coda)
+        recurrent_adapter = self.transformer.adapter
+        del self.transformer["adapter"]
+        self.transformer["prelude"] = HuginnPreludeFSDPUnit(prelude_blocks)
+        self.transformer["core_block"] = HuginnRecurrentCoreFSDPUnit(
+            recurrent_adapter,
+            recurrent_blocks,
+        )
+        self.transformer["coda"] = HuginnCodaFSDPUnit(coda_blocks)
+
+        whisper = WhisperModel.from_pretrained(config.audio_encoder_name)
+        self.audio_encoder = WhisperEncoderFSDPUnit(whisper.encoder)
+        del whisper
+
+        self.audio_aligner = AudioAlignerFSDPUnit(config)
+
         self._freeze_requested_modules()
+
+    @property
+    def temporal_compressor(self):
+        return self.audio_aligner.temporal_compressor
+
+    @property
+    def audio_projector(self):
+        return self.audio_aligner.audio_projector
+
+    @property
+    def audio_boundary_embeddings(self):
+        return self.audio_aligner.audio_boundary_embeddings
 
     @property
     def audio_bos(self):
@@ -132,12 +280,15 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         unexpected_keys,
         error_msgs,
     ):
-        # Accept any legacy checkpoint that stored the boundary parameters at model root.
+        # Accept legacy root-level and pre-grouping aligner checkpoint paths.
         for name in ("audio_bos", "audio_eos"):
-            legacy_key = f"{prefix}{name}"
-            current_key = f"{prefix}audio_boundary_embeddings.{name}"
-            if legacy_key in state_dict and current_key not in state_dict:
-                state_dict[current_key] = state_dict.pop(legacy_key)
+            current_key = f"{prefix}audio_aligner.audio_boundary_embeddings.{name}"
+            for legacy_key in (
+                f"{prefix}{name}",
+                f"{prefix}audio_boundary_embeddings.{name}",
+            ):
+                if legacy_key in state_dict and current_key not in state_dict:
+                    state_dict[current_key] = state_dict.pop(legacy_key)
         super()._load_from_state_dict(
             state_dict,
             prefix,
@@ -185,11 +336,47 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
             # FSDP2 reconstructs this deterministic RoPE table separately. Do not
             # report the legacy persistent entry from the Huginn checkpoint as unexpected.
             backbone_state.pop("freqs_cis", None)
+        # The recurrent adapter now lives inside the single recurrent FSDP
+        # unit. All physical block keys deliberately retain their old paths.
+        for key in list(backbone_state):
+            if key.startswith("transformer.adapter."):
+                new_key = key.replace(
+                    "transformer.adapter.",
+                    "transformer.core_block.adapter.",
+                    1,
+                )
+                backbone_state[new_key] = backbone_state.pop(key)
         incompatible = self.load_state_dict(backbone_state, strict=False)
         del base_model
         gc.collect()
         self._freeze_requested_modules()
         return incompatible
+
+    def core_block_forward(
+        self,
+        x,
+        input_embeds,
+        freqs_cis,
+        mask,
+        past_key_values,
+        block_idx: torch.Tensor,
+        current_step,
+    ):
+        """Run adapter + four physical recurrent blocks as one callable unit."""
+        block_idx = block_idx.detach().clone()
+        self._debug_activation_stats("core_in", x, current_step)
+        x = self._maybe_inject_noise(x, current_step)
+        self._debug_activation_stats("after_noise", x, current_step)
+        x, block_idx = self.transformer.core_block(
+            x,
+            input_embeds,
+            freqs_cis,
+            block_idx,
+            mask,
+            past_key_values,
+        )
+        self._debug_activation_stats("core_unit_out", x, current_step)
+        return x, block_idx
 
     def build_audio_prefix(
         self,
@@ -247,73 +434,66 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         )
         audio_segment_mask = audio_segment_mask & audio_segment_feature_lengths.gt(0)
 
-        per_sample_audio_tokens: list[torch.Tensor] = []
         audio_encoder_parameter = next(self.audio_encoder.parameters())
         audio_encoder_dtype = audio_encoder_parameter.dtype
         audio_encoder_device = audio_encoder_parameter.device
-        aligner_dtype = next(self.temporal_compressor.parameters()).dtype
+        aligner_parameter = next(self.audio_aligner.parameters())
+        aligner_dtype = aligner_parameter.dtype
+        aligner_device = aligner_parameter.device
         compressor_kernel = int(self.temporal_compressor.kernel_size)
+        compressor_stride = int(self.temporal_compressor.stride)
         max_audio_token_count = int(getattr(self.config, "audio_max_token_count", 750))
 
-        for sample_index in range(batch_size):
-            sample_tokens: list[torch.Tensor] = []
-            for segment_index in range(segment_count):
-                if not bool(audio_segment_mask[sample_index, segment_index].item()):
-                    continue
+        valid_positions = audio_segment_mask.nonzero(as_tuple=False)
+        if valid_positions.size(0) == 0:
+            raise ValueError("Every audio batch must contain at least one valid segment")
 
-                valid_feature_frames = int(audio_segment_feature_lengths[sample_index, segment_index].item())
-                if valid_feature_frames <= 0:
-                    continue
+        # Flatten all local segments so each large FSDP unit is entered exactly
+        # once per model forward, independent of whether samples use 1, 2, or 3
+        # Whisper chunks.
+        segment_features = audio_input_features[audio_segment_mask].to(
+            device=audio_encoder_device,
+            dtype=audio_encoder_dtype,
+        )
+        valid_feature_lengths = audio_segment_feature_lengths[audio_segment_mask].to(
+            device=audio_encoder_device,
+        )
+        feature_mask = (
+            torch.arange(feature_frame_count, device=audio_encoder_device).unsqueeze(0)
+            < valid_feature_lengths.unsqueeze(1)
+        ).to(dtype=torch.long)
 
-                # Keep Whisper's native 3000-frame input shape. The feature
-                # extractor pads every segment to that shape; the attention
-                # mask prevents padded mel frames from participating in the
-                # encoder, and the valid encoder length below removes padded
-                # outputs from the compressor.
-                segment_features = audio_input_features[
-                    sample_index,
-                    segment_index,
-                    :,
-                ].unsqueeze(0).to(
-                    device=audio_encoder_device,
-                    dtype=audio_encoder_dtype,
-                )
-                feature_mask = torch.zeros(
-                    (1, segment_features.size(-1)),
-                    dtype=torch.long,
-                    device=audio_encoder_device,
-                )
-                feature_mask[:, :valid_feature_frames] = 1
+        encoder_context = torch.no_grad() if self.config.freeze_audio_encoder else nullcontext()
+        with encoder_context:
+            encoder_outputs = self.audio_encoder(
+                input_features=segment_features,
+                attention_mask=feature_mask,
+                return_dict=True,
+            )
+        audio_hidden = encoder_outputs.last_hidden_state.to(
+            device=aligner_device,
+            dtype=aligner_dtype,
+        )
+        projected_segments, audio_bos, audio_eos = self.audio_aligner(audio_hidden)
 
-                with torch.no_grad():
-                    encoder_outputs = self.audio_encoder(
-                        input_features=segment_features,
-                        attention_mask=feature_mask,
-                        return_dict=True,
-                    )
-                audio_hidden = encoder_outputs.last_hidden_state
-                # Keep only complete 20 ms encoder frames so the stride-6
-                # compressor emits complete 120 ms tokens. Any residual tail
-                # below 120 ms is intentionally dropped.
-                valid_encoder_frames = min(audio_hidden.size(1), valid_feature_frames // 2)
-                audio_hidden = audio_hidden[:, :valid_encoder_frames]
-                if audio_hidden.size(1) < compressor_kernel:
-                    continue
-
-                audio_hidden = audio_hidden.to(dtype=aligner_dtype)
-                compressed = self.temporal_compressor(audio_hidden)
-                projected = self.audio_projector(compressed).squeeze(0)
-                sample_tokens.append(projected)
-
-            if sample_tokens:
-                audio_tokens = torch.cat(sample_tokens, dim=0)
+        per_sample_segments: list[list[torch.Tensor]] = [[] for _ in range(batch_size)]
+        for flat_index, position in enumerate(valid_positions.tolist()):
+            sample_index, _segment_index = position
+            valid_feature_frames = int(valid_feature_lengths[flat_index].item())
+            valid_encoder_frames = min(audio_hidden.size(1), valid_feature_frames // 2)
+            if valid_encoder_frames < compressor_kernel:
+                token_count = 0
             else:
-                audio_tokens = torch.empty(
-                    (0, self.config.n_embd),
-                    device=audio_input_features.device,
-                    dtype=aligner_dtype,
-                )
+                token_count = (valid_encoder_frames - compressor_kernel) // compressor_stride + 1
+            if token_count > 0:
+                per_sample_segments[sample_index].append(projected_segments[flat_index, :token_count])
 
+        per_sample_audio_tokens: list[torch.Tensor] = []
+        for sample_segments in per_sample_segments:
+            if sample_segments:
+                audio_tokens = torch.cat(sample_segments, dim=0)
+            else:
+                audio_tokens = projected_segments.new_empty((0, self.config.n_embd))
             if audio_tokens.size(0) > max_audio_token_count:
                 raise ValueError(
                     "Audio prefix exceeds configured maximum token count: "
@@ -321,25 +501,22 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
                 )
             per_sample_audio_tokens.append(audio_tokens)
 
-        boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
+        boundary_tokens = int(audio_bos is not None) + int(audio_eos is not None)
         max_prefix_length = max((tokens.size(0) + boundary_tokens for tokens in per_sample_audio_tokens), default=0)
-        prefix = audio_input_features.new_zeros(
-            (batch_size, max_prefix_length, self.config.n_embd),
-            dtype=aligner_dtype,
-        )
+        prefix = projected_segments.new_zeros((batch_size, max_prefix_length, self.config.n_embd))
         prefix_mask = torch.zeros(
             (batch_size, max_prefix_length),
             dtype=torch.bool,
-            device=audio_input_features.device,
+            device=projected_segments.device,
         )
 
         for sample_index, audio_tokens in enumerate(per_sample_audio_tokens):
             chunks = []
-            if self.audio_bos is not None:
-                chunks.append(self.audio_bos.expand(1, -1, -1).squeeze(0).to(dtype=aligner_dtype))
+            if audio_bos is not None:
+                chunks.append(audio_bos.squeeze(0))
             chunks.append(audio_tokens)
-            if self.audio_eos is not None:
-                chunks.append(self.audio_eos.expand(1, -1, -1).squeeze(0).to(dtype=aligner_dtype))
+            if audio_eos is not None:
+                chunks.append(audio_eos.squeeze(0))
             sample_prefix = torch.cat(chunks, dim=0) if chunks else audio_tokens
             prefix_length = sample_prefix.size(0)
             if prefix_length:

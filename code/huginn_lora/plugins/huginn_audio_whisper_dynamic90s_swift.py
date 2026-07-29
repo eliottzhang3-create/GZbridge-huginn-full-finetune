@@ -72,6 +72,20 @@ FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT"
 STAGE34_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE34_AUDIT_DIR"
+FSDP_UNIT_CLASS_NAMES = (
+    "WhisperEncoderFSDPUnit",
+    "AudioAlignerFSDPUnit",
+    "HuginnPreludeFSDPUnit",
+    "HuginnRecurrentCoreFSDPUnit",
+    "HuginnCodaFSDPUnit",
+)
+FSDP_UNIT_EXPECTED_TRAINABLE_TENSORS = {
+    "WhisperEncoderFSDPUnit": 0,
+    "AudioAlignerFSDPUnit": 14,
+    "HuginnPreludeFSDPUnit": 16,
+    "HuginnRecurrentCoreFSDPUnit": 34,
+    "HuginnCodaFSDPUnit": 16,
+}
 
 
 def get_tarfile_cache_limit() -> int:
@@ -88,12 +102,31 @@ def get_tarfile_cache_limit() -> int:
 TARFILE_CACHE_LIMIT = get_tarfile_cache_limit()
 
 ALIGNER_PREFIXES = (
+    "audio_aligner",
     "temporal_compressor",
     "audio_projector",
     "audio_boundary_embeddings",
     "audio_bos",
     "audio_eos",
 )
+
+
+def normalize_parameter_name(name: str) -> str:
+    normalized = name
+    changed = True
+    while changed:
+        changed = False
+        for prefix in ("base_model.model.", "base_model.", "model.", "module."):
+            if normalized.startswith(prefix):
+                normalized = normalized[len(prefix):]
+                changed = True
+    normalized = normalized.replace(".modules_to_save.default.", ".")
+    normalized = normalized.replace(".original_module.", ".")
+    return normalized
+
+
+def is_aligner_parameter_name(name: str) -> bool:
+    return normalize_parameter_name(name).startswith(ALIGNER_PREFIXES)
 
 MODEL_TYPE = "huginn_audio_whisper_dynamic90s"
 TEMPLATE_TYPE = "huginn_audio_whisper_dynamic90s"
@@ -236,6 +269,10 @@ def checkpoint_key_aliases(key: str) -> list[str]:
         normalized.add(alias)
         normalized.add(alias.replace(".modules_to_save.default.", "."))
         normalized.add(alias.replace(".original_module.", "."))
+        if alias.startswith("audio_aligner."):
+            normalized.add(alias[len("audio_aligner."):])
+        elif alias.startswith(("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings.")):
+            normalized.add(f"audio_aligner.{alias}")
     return list(normalized)
 
 
@@ -311,24 +348,21 @@ def force_audio_aligner_trainable(model: torch.nn.Module) -> None:
         (
             module
             for module in model.modules()
-            if all(hasattr(module, name) for name in ("audio_encoder", "temporal_compressor", "audio_projector"))
+            if all(hasattr(module, name) for name in ("audio_encoder", "audio_aligner"))
         ),
         None,
     )
     if audio_model is None:
         raise RuntimeError("Unable to locate the Huginn audio model after PEFT adapter loading")
 
-    for module_name in ("temporal_compressor", "audio_projector", "audio_boundary_embeddings"):
-        module = getattr(audio_model, module_name, None)
-        if module is not None:
-            module.requires_grad_(True)
+    audio_model.audio_aligner.requires_grad_(True)
     if any(parameter.requires_grad for parameter in audio_model.audio_encoder.parameters()):
         raise RuntimeError("audio_encoder became trainable while restoring the WavCaps adapter")
 
     aligner_trainable = sum(
         parameter.numel()
         for name, parameter in audio_model.named_parameters()
-        if parameter.requires_grad and name.startswith(("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings."))
+        if parameter.requires_grad and is_aligner_parameter_name(name)
     )
     print(f"[HuginnAudioSwift] forced_aligner_trainable_parameters={aligner_trainable}")
 
@@ -843,6 +877,9 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
     if world_size != 4:
         raise RuntimeError(f"Stage 3-4 requires world_size=4, got {world_size}")
 
+    def is_dtensor(parameter: torch.Tensor) -> bool:
+        return all(hasattr(parameter, attribute) for attribute in ("device_mesh", "placements", "to_local"))
+
     trainable_tensors = {
         "lora": 0,
         "aligner": 0,
@@ -853,20 +890,25 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
     dtensor_parameter_count = 0
     dtensor_trainable_count = 0
     for name, parameter in model.named_parameters():
-        is_dtensor = all(hasattr(parameter, attribute) for attribute in ("device_mesh", "placements", "to_local"))
-        if is_dtensor:
+        parameter_is_dtensor = is_dtensor(parameter)
+        if parameter_is_dtensor:
             dtensor_parameter_count += 1
         if not parameter.requires_grad:
             continue
-        if is_dtensor:
+        if parameter_is_dtensor:
             dtensor_trainable_count += 1
         if "lora_" in name:
+            normalized_name = normalize_parameter_name(name)
+            if "audio_encoder" in normalized_name or is_aligner_parameter_name(normalized_name):
+                raise RuntimeError(f"LoRA must not be attached to Whisper or the aligner: {name}")
+            if not normalized_name.startswith("transformer."):
+                raise RuntimeError(f"LoRA target is outside the Huginn transformer: {name}")
             group = "lora"
-        elif name.startswith(("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings.")):
+        elif is_aligner_parameter_name(name):
             group = "aligner"
-        elif name.startswith("audio_encoder."):
+        elif normalize_parameter_name(name).startswith("audio_encoder."):
             group = "audio_encoder"
-        elif name.startswith(("transformer.", "lm_head.")):
+        elif normalize_parameter_name(name).startswith(("transformer.", "lm_head.")):
             group = "huginn_base"
         else:
             group = "other"
@@ -892,6 +934,37 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
             f"dtensor_trainables={dtensor_trainable_count} total_trainables={total_trainable_tensors}"
         )
 
+    unit_audits: dict[str, dict[str, int]] = {}
+    for expected_class_name in FSDP_UNIT_CLASS_NAMES:
+        matching_units = [
+            module
+            for module in model.modules()
+            if any(base.__name__ == expected_class_name for base in type(module).__mro__)
+        ]
+        if len(matching_units) != 1:
+            raise RuntimeError(
+                f"Expected exactly one {expected_class_name}, found {len(matching_units)}"
+            )
+        unit_parameters = list(matching_units[0].parameters())
+        unit_dtensors = sum(is_dtensor(parameter) for parameter in unit_parameters)
+        unit_trainables = sum(parameter.requires_grad for parameter in unit_parameters)
+        if not unit_parameters or unit_dtensors != len(unit_parameters):
+            raise RuntimeError(
+                f"FSDP unit is not completely sharded: class={expected_class_name} "
+                f"parameters={len(unit_parameters)} dtensors={unit_dtensors}"
+            )
+        expected_unit_trainables = FSDP_UNIT_EXPECTED_TRAINABLE_TENSORS[expected_class_name]
+        if unit_trainables != expected_unit_trainables:
+            raise RuntimeError(
+                f"Unexpected trainable tensor count inside {expected_class_name}: "
+                f"expected={expected_unit_trainables} actual={unit_trainables}"
+            )
+        unit_audits[expected_class_name] = {
+            "parameter_count": len(unit_parameters),
+            "dtensor_parameter_count": unit_dtensors,
+            "trainable_parameter_count": unit_trainables,
+        }
+
     payload = {
         "kind": "fsdp",
         "rank": rank,
@@ -900,6 +973,7 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
         "dtensor_parameter_count": dtensor_parameter_count,
         "dtensor_trainable_count": dtensor_trainable_count,
         "trainable_tensors": trainable_tensors,
+        "fsdp_units": unit_audits,
         "valid_prefix_tokens": [int(value) for value in prefix_mask.sum(dim=1).tolist()],
     }
     _write_stage34_rank_marker("fsdp", payload)
@@ -907,6 +981,7 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
         "[HuginnAudioDynamic90s] STAGE34_FSDP_RANK_AUDIT "
         f"rank={rank} world_size={world_size} dtensor_parameters={dtensor_parameter_count} "
         f"dtensor_trainables={dtensor_trainable_count} trainable_tensors={trainable_tensors} "
+        f"fsdp_units={unit_audits} "
         f"valid_prefix_tokens={payload['valid_prefix_tokens']}",
         flush=True,
     )
@@ -1034,11 +1109,12 @@ def print_train_chain_parameter_audit(model: torch.nn.Module) -> None:
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if name.startswith("audio_encoder."):
+        normalized_name = normalize_parameter_name(name)
+        if normalized_name.startswith("audio_encoder."):
             groups["audio_encoder"] += parameter.numel()
-        elif name.startswith(("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings.")):
+        elif is_aligner_parameter_name(name):
             groups["aligner"] += parameter.numel()
-        elif name.startswith(("transformer.", "lm_head.")):
+        elif normalized_name.startswith(("transformer.", "lm_head.")):
             groups["huginn_backbone"] += parameter.numel()
         else:
             groups["other"] += parameter.numel()
@@ -1256,7 +1332,7 @@ class HuginnAudioLoader(ModelLoader):
 def register_huginn_audio_model_arch():
     multi_model_kwargs = {
         "language_model": ["transformer", "lm_head"],
-        "aligner": ["temporal_compressor", "audio_projector", "audio_boundary_embeddings"],
+        "aligner": ["audio_aligner"],
         "generator": ["audio_encoder"],
     }
     try:

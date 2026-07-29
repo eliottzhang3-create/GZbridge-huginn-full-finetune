@@ -623,7 +623,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
 - FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming restore later completed a caption-generation run successfully.
 
-#### Current isolated Whisper-large dynamic-90s LoRA route (Stage 0-2 passed; merged Stage 3-4 FSDP4 prepared)
+#### Current isolated Whisper-large dynamic-90s LoRA route (coarse FSDP-unit revision prepared; remote revalidation pending)
 
 The new dynamic route is isolated from the historical fixed-32 Whisper route. Historical files remain at
 `models/huginn-audio-whisper-v1/` and `code/huginn_lora/plugins/huginn_audio_swift.py`; do not point historical
@@ -636,6 +636,14 @@ checkpoints or evaluation scripts at the dynamic package.
   dropout `0.05`. The installed ms-swift `LoRALLMTuner` does not forward the generic dropout argument into PEFT, so the
   isolated dynamic plugin patches `peft.LoraConfig` before LoRA-layer creation and the Stage 0-2 gate audits both the
   saved PEFT config value and every instantiated LoRA dropout module.
+- LoRA is restricted to the Huginn transformer only. Neither the complete Whisper encoder unit nor the complete audio
+  aligner unit may contain a LoRA tensor. Huginn's native recurrent adapter is the `Linear(2*n_embd -> n_embd)` that
+  combines the current recurrent latent with the fixed input embeddings; it is now owned by the recurrent-core FSDP
+  unit and remains one of the 33 Huginn LoRA targets.
+- FSDP transformer-based auto-wrap now targets exactly five callable coarse units: complete Whisper encoder; complete
+  aligner; both prelude SandwichBlocks together; recurrent adapter plus all four reused core SandwichBlocks together;
+  and both coda SandwichBlocks together. Every unit uses `reshard_after_forward=true`. The 1/2/3 Whisper segments in a
+  local batch are flattened so Whisper is called once and the aligner is called once per model forward.
 - the compressor is exactly one Conv1d with kernel `6`, stride `6`, and padding `0`.
 - audio token count is dynamic: each complete `120 ms` produces one token. Only a complete 30-second segment produces
   `250` tokens; shorter audio is never padded to 250 tokens. Complete 60/90-second inputs produce 500/750 tokens.
@@ -663,8 +671,9 @@ After Git sync, submit with:
 bash code/huginn_lora/run_inspect_huginn_audio_whisper_dynamic90s_stage02_5090.sh
 ```
 
-Stage 0-2 passed remotely with the terminal banner
-`HUGINN WHISPER DYNAMIC90S STAGE 0-2 VALIDATION PASSED`. The next gate merges Stage 3 (four-rank FSDP2 construction and
+The pre-grouping architecture passed Stage 0-2 remotely with the terminal banner
+`HUGINN WHISPER DYNAMIC90S STAGE 0-2 VALIDATION PASSED`. Because the forward/module topology has now changed, the same
+Stage 0-2 gate must be rerun before accepting the revised Stage 3-4 result. The next gate merges Stage 3 (four-rank FSDP2 construction and
 DTensor sharding) with Stage 4 (one real optimizer update) while continuing to use only generated synthetic WAV files.
 It uses Swift CLI's internal torchrun path, four RTX 5090 GPUs, the previously verified custom FSDP2 full-shard config,
 per-device batch size 1, gradient accumulation 1, and `max_steps=1`; it deliberately saves no checkpoint.
@@ -673,6 +682,10 @@ The first distributed step covers four different prefixes across the four ranks:
 seconds / 252, 60 seconds / 502, and 120.01 seconds truncated to 90 seconds / 752. Every rank must write both an FSDP
 marker and an optimizer-step marker. Post-run validation requires world size 4, CUDA devices 0-3, FSDP2 DTensors, the
 exact `66 LoRA + 14 aligner` trainable tensor split, frozen Whisper/Huginn base, and `global_step=1` on all ranks.
+It additionally requires all 80 trainable tensors to be DTensors and verifies that all parameters in each of the five
+coarse units are DTensors. The earlier per-SandwichBlock Stage 3-4 attempt failed correctly at `64/80` DTensor
+trainables: the 64 block LoRA tensors were sharded, while the recurrent-adapter LoRA pair and 14 aligner tensors were
+outside FSDP. That topology has been replaced rather than weakening the audit.
 
 - synthetic fixture preparation:
   `code/huginn_lora/scripts/prepare_huginn_audio_whisper_dynamic90s_stage34.py`
@@ -2181,9 +2194,12 @@ been restored to their original paths. The new route is isolated under
 `models/huginn-audio-whisper-dynamic90s-v1/` and
 `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`.
 
-Stage 0-2 has passed remotely, including the production duration contract, real Swift collator/prefix checks, effective
-rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and a real backward pass. The immediate gate is now
-the merged Stage 3-4 synthetic FSDP4 construction plus one-update smoke:
+The pre-grouping implementation passed Stage 0-2 remotely, including the production duration contract, real Swift
+collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and a real backward
+pass. The first Stage 3-4 attempt then exposed incomplete wrapping (`64/80` trainable DTensors). The implementation now
+uses five coarse callable FSDP units (Whisper whole, aligner whole, prelude 2 blocks, recurrent adapter + 4 blocks, coda
+2 blocks), all with `reshard_after_forward=true`; LoRA remains Huginn-only. Rerun Stage 0-2 first, then the merged
+Stage 3-4 synthetic FSDP4 construction plus one-update smoke:
 `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage34_fsdp4_5090.sh`. Do not create or launch a formal
 AudioCaps/ACAVCAPS/WavCaps training job for this route yet, and do not test checkpoint save/reload until Stage 3-4
 passes.
