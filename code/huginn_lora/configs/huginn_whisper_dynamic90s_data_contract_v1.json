@@ -108,7 +108,7 @@
     }
   },
   "sampling_contract": {
-    "unit": "effective_audio_tokens",
+    "unit": "hierarchical_sample_draw_probability",
     "task_weights": {
       "AAC": 0.6,
       "ASR": 0.4
@@ -124,6 +124,7 @@
       "clotho_v2_aac": 0.06,
       "gigaspeech_l_asr": 0.4
     },
+    "realized_token_accounting": "Accumulate actual dynamic audio-token counts during training for monitoring; do not precompute tokens or use them as the initial sampler unit.",
     "loss_weighting": "No additional task or dataset loss weights in the initial run."
   }
 }

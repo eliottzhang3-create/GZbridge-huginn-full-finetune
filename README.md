@@ -723,12 +723,13 @@ retained `640` DTensor parameters, used `AcceleratedOptimizer`, and reached `glo
 `HUGINN WHISPER DYNAMIC90S STAGE 5 STABILITY PASSED` and `exit_status=0`.
 
 The next active work is formal data preparation, before the intentionally deferred Stage 6 checkpoint gate. The fixed
-eligible pools and token-based sampling policy are:
+eligible pools and hierarchical sample-draw policy are:
 
 - AAC `60%`, composed of WavCaps without BBC Sound Effects `60%`, AudioCaps-v2 `30%`, and Clotho-v2 train only `10%`;
 - ASR `40%`, composed of GigaSpeech segment-level `{L}` records;
-- therefore global effective-audio-token targets are WavCaps `36%`, AudioCaps-v2 `18%`, Clotho-v2 `6%`, and
-  GigaSpeech-L `40%`;
+- therefore global draw probabilities are WavCaps `36%`, AudioCaps-v2 `18%`, Clotho-v2 `6%`, and GigaSpeech-L `40%`;
+- realized dynamic audio-token totals are accumulated and reported during training, rather than precomputed or used as
+  the initial sampler unit;
 - Clotho references remain grouped by audio, but each scheduled training occurrence emits exactly one caption;
 - all datasets share one atomic manifest schema and are normalized at the model input boundary to mono 16-kHz float32.
   Source WAV/FLAC/Opus files remain in place; public WavCaps and GigaSpeech roots are read-only.
@@ -774,7 +775,7 @@ Submit it only through:
 bash code/huginn_lora/run_prepare_huginn_whisper_dynamic90s_atomic_pilot_5090.sh
 ```
 
-The next gate is complete atomic-pool generation and is implemented but not yet remote-verified. It streams all four
+The complete atomic-pool generation gate has passed remotely. It streams all four
 metadata pools into `data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/pools/*.jsonl`, with one little-endian
 uint64 byte-offset index per manifest, per-pool stats and SHA-256 values, `pool_registry.json`, and
 `full_pool_report.json`. All pool files remain temporary until every pool has completed and passed count checks. The
@@ -789,6 +790,23 @@ Submit it only through:
 
 ```bash
 bash code/huginn_lora/run_prepare_huginn_whisper_dynamic90s_full_atomic_pools_5090.sh
+```
+
+The next gate is indexed random access plus deterministic hierarchical mixture validation and is implemented but not
+yet remote-verified. It validates random reads from every JSONL/uint64-index pair, simulates `1,000,000` global sample
+draws, audits both hierarchy levels (`AAC/ASR=60/40`, then AAC `60/30/10`), checks per-rank FSDP4 distributions, proves
+stateless resume from arbitrary global positions, and writes a `4,096`-entry metadata-only pilot schedule. It reads no
+audio and performs no token calculation.
+
+- reusable indexed mixture module: `code/huginn_lora/data_pipeline/indexed_atomic_mixture.py`;
+- inspector: `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_indexed_mixture.py`;
+- runtime: `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_indexed_mixture.sh`;
+- submit wrapper: `code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_indexed_mixture_5090.sh`.
+
+Submit it only through:
+
+```bash
+bash code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_indexed_mixture_5090.sh
 ```
 
 #### Historical but relevant routes
