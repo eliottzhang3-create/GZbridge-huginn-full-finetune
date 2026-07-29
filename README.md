@@ -733,7 +733,7 @@ eligible pools and token-based sampling policy are:
 - all datasets share one atomic manifest schema and are normalized at the model input boundary to mono 16-kHz float32.
   Source WAV/FLAC/Opus files remain in place; public WavCaps and GigaSpeech roots are read-only.
 
-The first read-only data gate is implemented but not yet remote-verified:
+The first read-only data gate has passed remotely:
 
 - contract: `code/huginn_lora/configs/huginn_whisper_dynamic90s_data_contract_v1.json`;
 - inspector: `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_data_pools.py`;
@@ -748,10 +748,30 @@ Clotho train captions by audio, and checks only a small deterministic sample of 
 every audio file. The remote-only JSON report is written under
 `data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/audits/`.
 
+The passed inventory reported `91,254` valid AudioCaps metadata rows, all four expected WavCaps sources,
+`18,364` Clotho train caption rows grouped into `3,839` audio samples, and `2,264,528` segment-level GigaSpeech-L
+records totaling `2,498.217` metadata hours. It ended with no blocking issues. Per-record dynamic token counts are not
+stored by this gate or required in the atomic manifest; realized token totals will be accumulated during training.
+
 Submit it only through:
 
 ```bash
 bash code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_data_pools_5090.sh
+```
+
+The next mapping gate is implemented but not yet remote-verified. It creates only `16` metadata-only pilot records per
+pool, validates real source-field/audio-path mappings, excludes BBC by source, preserves grouped Clotho references with
+one-caption-per-training-occurrence policy, cleans GigaSpeech `text_tn` placeholders, and proves that all four pools use
+one atomic schema. It does not decode/copy audio or calculate tokens.
+
+- implementation: `code/huginn_lora/scripts/prepare_huginn_whisper_dynamic90s_atomic_pilot.py`;
+- runtime: `code/huginn_lora/scripts/prepare_huginn_whisper_dynamic90s_atomic_pilot.sh`;
+- submit wrapper: `code/huginn_lora/run_prepare_huginn_whisper_dynamic90s_atomic_pilot_5090.sh`.
+
+Submit it only through:
+
+```bash
+bash code/huginn_lora/run_prepare_huginn_whisper_dynamic90s_atomic_pilot_5090.sh
 ```
 
 #### Historical but relevant routes

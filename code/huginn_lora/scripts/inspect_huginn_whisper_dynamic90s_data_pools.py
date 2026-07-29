@@ -103,10 +103,11 @@ def validate_contract(path: Path) -> dict[str, Any]:
         if runtime.get(key) != value
     }
     required = contract.get("atomic_record_schema", {}).get("required_fields", [])
+    optional = contract.get("atomic_record_schema", {}).get("optional_fields", [])
     if mismatches:
         raise ValueError(f"Data contract/runtime mismatch: {mismatches}")
-    if "targets" not in required or "effective_audio_tokens" not in required:
-        raise ValueError(f"Atomic record schema is incomplete: required_fields={required}")
+    if "targets" not in required or "effective_audio_tokens" not in optional:
+        raise ValueError(f"Atomic record schema is incomplete: required={required} optional={optional}")
     return {
         "path": str(path),
         "sha256": sha256_file(path),

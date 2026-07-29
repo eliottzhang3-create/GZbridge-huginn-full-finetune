@@ -30,10 +30,12 @@
       "task",
       "split",
       "audio",
-      "raw_duration_sec",
-      "effective_audio_tokens",
       "targets",
       "metadata"
+    ],
+    "optional_fields": [
+      "raw_duration_sec",
+      "effective_audio_tokens"
     ],
     "field_contracts": {
       "schema_version": "Must equal huginn_whisper_dynamic90s_atomic_v1.",
@@ -53,8 +55,8 @@
         ],
         "contract": "Path is source storage. Segment bounds are required for GigaSpeech and absent for whole-file AAC samples."
       },
-      "raw_duration_sec": "Positive source sample or segment duration before the 90-second cap.",
-      "effective_audio_tokens": "Exact dynamic token count under the canonical 16-kHz planner; never pad short samples to 250 tokens.",
+      "raw_duration_sec": "Optional positive source sample or segment duration when it is already present in metadata.",
+      "effective_audio_tokens": "Optional. Do not precompute it in metadata preparation; training-time statistics accumulate realized dynamic token counts.",
       "targets": "Non-empty list of valid references. Runtime emits exactly one selected target for each training occurrence.",
       "metadata": "Dataset-specific provenance only; training prompts/messages are rendered later by task."
     }
