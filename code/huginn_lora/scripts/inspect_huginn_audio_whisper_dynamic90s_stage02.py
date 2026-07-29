@@ -319,53 +319,81 @@ def audit_real_prefix_batches(trainer: Any, plugin: Any, audio_model: torch.nn.M
     saw_dynamic_sub_250 = False
     saw_padding = False
     batch_count = 0
-    for raw_batch in trainer.get_train_dataloader():
-        batch = trainer._prepare_inputs(raw_batch)
-        required = {
-            "audio_input_features",
-            "audio_segment_feature_lengths",
-            "audio_segment_mask",
-        }
-        missing = required - batch.keys()
-        if missing:
-            raise AssertionError(f"Swift collator batch is missing dynamic audio fields: {sorted(missing)}")
-        if batch["audio_input_features"].ndim != 4:
-            raise AssertionError(
-                f"Expected [B, segments, 80, frames], got {tuple(batch['audio_input_features'].shape)}"
+    whisper_call_dtypes: list[torch.dtype] = []
+    collator_dtypes: set[torch.dtype] = set()
+
+    def capture_whisper_input_dtype(module, args, kwargs):
+        del module, args
+        input_features = kwargs.get("input_features")
+        if input_features is None:
+            raise AssertionError("Whisper encoder call exposes no input_features keyword")
+        whisper_call_dtypes.append(input_features.dtype)
+
+    dtype_hook = audio_model.audio_encoder.register_forward_pre_hook(
+        capture_whisper_input_dtype,
+        with_kwargs=True,
+    )
+    try:
+        for raw_batch in trainer.get_train_dataloader():
+            batch = trainer._prepare_inputs(raw_batch)
+            required = {
+                "audio_input_features",
+                "audio_segment_feature_lengths",
+                "audio_segment_mask",
+            }
+            missing = required - batch.keys()
+            if missing:
+                raise AssertionError(f"Swift collator batch is missing dynamic audio fields: {sorted(missing)}")
+            if batch["audio_input_features"].ndim != 4:
+                raise AssertionError(
+                    f"Expected [B, segments, 80, frames], got {tuple(batch['audio_input_features'].shape)}"
+                )
+            collator_dtypes.add(batch["audio_input_features"].dtype)
+            with torch.no_grad():
+                prefix, prefix_mask = audio_model.build_audio_prefix(
+                    batch["audio_input_features"],
+                    audio_segment_feature_lengths=batch["audio_segment_feature_lengths"],
+                    audio_segment_mask=batch["audio_segment_mask"],
+                )
+            expected_lengths = expected_prefix_lengths(plugin, batch)
+            actual_lengths = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
+            if actual_lengths != expected_lengths:
+                raise AssertionError(
+                    f"Real prefix mismatch: expected={expected_lengths} actual={actual_lengths}"
+                )
+            for prefix_length in actual_lengths:
+                audio_token_count = prefix_length - 2
+                if 0 <= audio_token_count < 250:
+                    saw_dynamic_sub_250 = True
+            if any(length < prefix.size(1) for length in actual_lengths):
+                saw_padding = True
+                padded_values = prefix.masked_select(~prefix_mask.unsqueeze(-1))
+                if padded_values.numel() and not bool(padded_values.eq(0).all().item()):
+                    raise AssertionError("Padded audio prefix embeddings must be exactly zero")
+            print(
+                f"[prefix-batch] index={batch_count} features={tuple(batch['audio_input_features'].shape)} "
+                f"expected_prefix_lengths={expected_lengths} actual_prefix_lengths={actual_lengths}"
             )
-        with torch.no_grad():
-            prefix, prefix_mask = audio_model.build_audio_prefix(
-                batch["audio_input_features"],
-                audio_segment_feature_lengths=batch["audio_segment_feature_lengths"],
-                audio_segment_mask=batch["audio_segment_mask"],
-            )
-        expected_lengths = expected_prefix_lengths(plugin, batch)
-        actual_lengths = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
-        if actual_lengths != expected_lengths:
-            raise AssertionError(
-                f"Real prefix mismatch: expected={expected_lengths} actual={actual_lengths}"
-            )
-        for prefix_length in actual_lengths:
-            audio_token_count = prefix_length - 2
-            if 0 <= audio_token_count < 250:
-                saw_dynamic_sub_250 = True
-        if any(length < prefix.size(1) for length in actual_lengths):
-            saw_padding = True
-            padded_values = prefix.masked_select(~prefix_mask.unsqueeze(-1))
-            if padded_values.numel() and not bool(padded_values.eq(0).all().item()):
-                raise AssertionError("Padded audio prefix embeddings must be exactly zero")
-        print(
-            f"[prefix-batch] index={batch_count} features={tuple(batch['audio_input_features'].shape)} "
-            f"expected_prefix_lengths={expected_lengths} actual_prefix_lengths={actual_lengths}"
+            batch_count += 1
+            del prefix, prefix_mask, batch
+            torch.cuda.empty_cache()
+    finally:
+        dtype_hook.remove()
+    whisper_dtype = next(audio_model.audio_encoder.parameters()).dtype
+    if collator_dtypes != {torch.float32}:
+        raise AssertionError(f"Whisper log-mel features must remain FP32 in the collator: {collator_dtypes}")
+    if not whisper_call_dtypes or any(dtype != whisper_dtype for dtype in whisper_call_dtypes):
+        raise AssertionError(
+            f"Whisper input dtype mismatch: encoder={whisper_dtype} calls={whisper_call_dtypes}"
         )
-        batch_count += 1
-        del prefix, prefix_mask, batch
-        torch.cuda.empty_cache()
     if not saw_dynamic_sub_250:
         raise AssertionError("No real sub-30s sample produced a dynamic token count below 250")
     if not saw_padding:
         raise AssertionError("No real mixed-length batch exercised prefix padding")
-    print(f"[prefix-batch] batches={batch_count} dynamic_sub_250=true padding_exercised=true")
+    print(
+        f"[prefix-batch] batches={batch_count} dynamic_sub_250=true padding_exercised=true "
+        f"collator_dtypes={sorted(map(str, collator_dtypes))} whisper_input_dtype={whisper_dtype}"
+    )
 
 
 def audit_backward(trainer: Any, audio_model: torch.nn.Module) -> None:

@@ -33,18 +33,9 @@ except ImportError:
     from swift.llm import StdTemplateInputs, Template, TemplateMeta, register_template  # type: ignore
 
 try:
-    from swift.utils import Processor, to_float_dtype
+    from swift.utils import Processor
 except ImportError:
     Processor = Any  # type: ignore
-
-    def to_float_dtype(data: Any, dtype: torch.dtype | None):
-        if dtype is None:
-            return data
-        if torch.is_tensor(data):
-            return data.to(dtype=dtype) if torch.is_floating_point(data) else data
-        if isinstance(data, dict):
-            return {k: to_float_dtype(v, dtype) for k, v in data.items()}
-        return data
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -1016,8 +1007,11 @@ class HuginnAudioTemplate(Template):
             max_length=int(getattr(self.audio_feature_extractor, "n_samples", 480000)),
             return_tensors="pt",
         )
-        target_dtype = getattr(getattr(self, "model_info", None), "torch_dtype", None)
-        media_inputs = to_float_dtype(media_inputs, target_dtype)
+        # Whisper is currently frozen in FP32. Preserve the feature extractor's
+        # FP32 log-mel values instead of quantizing them to the LLM BF16 dtype.
+        # The model still performs a defensive dtype/device match immediately
+        # before every encoder call.
+        media_inputs["input_features"] = media_inputs["input_features"].float()
         encoded["audio_input_features"] = media_inputs["input_features"]
         encoded["audio_segment_feature_lengths"] = torch.tensor(audio_feature_lengths, dtype=torch.long)
         encoded["audio_segment_mask"] = torch.ones(len(audio_feature_lengths), dtype=torch.bool)

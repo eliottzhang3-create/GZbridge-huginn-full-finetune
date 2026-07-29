@@ -644,6 +644,10 @@ checkpoints or evaluation scripts at the dynamic package.
   seconds; this route has no duration-based discard threshold.
 - prefix embeddings are padded to the longest prefix in each collated batch; padding uses zero embeddings, attention
   mask `0`, and labels `-100`.
+- The plugin preserves Whisper log-mel features in FP32 instead of intentionally quantizing them to the LLM BF16 dtype.
+  The dynamic model also defensively casts each segment to the encoder parameter dtype/device immediately before the
+  Whisper call, then casts encoder outputs to the trainable aligner dtype. Stage 0-2 audits the dtype seen by every real
+  Whisper encoder invocation.
 
 The data-independent Stage 0-2 gate generates deterministic WAV fixtures inside its remote output directory and does
 not use AudioCaps, ACAVCAPS, WavCaps, or any future formal dataset. It checks the production duration planner, real Swift

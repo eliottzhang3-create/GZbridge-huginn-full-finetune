@@ -248,6 +248,9 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         audio_segment_mask = audio_segment_mask & audio_segment_feature_lengths.gt(0)
 
         per_sample_audio_tokens: list[torch.Tensor] = []
+        audio_encoder_parameter = next(self.audio_encoder.parameters())
+        audio_encoder_dtype = audio_encoder_parameter.dtype
+        audio_encoder_device = audio_encoder_parameter.device
         aligner_dtype = next(self.temporal_compressor.parameters()).dtype
         compressor_kernel = int(self.temporal_compressor.kernel_size)
         max_audio_token_count = int(getattr(self.config, "audio_max_token_count", 750))
@@ -271,11 +274,14 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
                     sample_index,
                     segment_index,
                     :,
-                ].unsqueeze(0)
+                ].unsqueeze(0).to(
+                    device=audio_encoder_device,
+                    dtype=audio_encoder_dtype,
+                )
                 feature_mask = torch.zeros(
                     (1, segment_features.size(-1)),
                     dtype=torch.long,
-                    device=segment_features.device,
+                    device=audio_encoder_device,
                 )
                 feature_mask[:, :valid_feature_frames] = 1
 
