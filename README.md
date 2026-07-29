@@ -2327,11 +2327,18 @@ audio, and GigaSpeech-L segment-level ASR. The deterministic indexed hierarchica
 required `AAC=60%` / `ASR=40%` task split and `WavCaps=60%` / `AudioCaps=30%` / `Clotho=10%` inside AAC. Sampling is by
 training occurrence, not by precomputed token count. Clotho selects exactly one deterministic caption per occurrence.
 
-The next gate is
+The real data-chain gate is
 `code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_real_data_chain_5090.sh`. It registers the indexed mixture as a
 Swift `IterableDataset`, checks deterministic non-zero-position restart, and decodes exactly one real source item per
 pool without loading Whisper/Huginn or materializing converted audio. GigaSpeech Opus segments are decoded on demand
 from the read-only public source with ffmpeg segment bounds. Dynamic token counts remain runtime statistics.
+
+That real data-chain gate has now passed. The next gate is
+`code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_realdata_fsdp4_5090.sh`: eight real optimizer steps on four
+GPUs with checkpoint saving disabled. It re-audits the five coarse FSDP units, frozen Whisper, Huginn-only rank-8 LoRA,
+trainable aligner, finite losses/gradient norms, and per-rank realized dynamic audio-token totals. Its deterministic
+global sample window is positions `0..31`, which covers all four pools (`11` WavCaps, `6` AudioCaps, `2` Clotho, and
+`13` GigaSpeech; `19` AAC and `13` ASR). Checkpoint save/restart remains the following separate gate.
 
 Formal-training constraints already fixed by the user, but not yet implemented or launched:
 

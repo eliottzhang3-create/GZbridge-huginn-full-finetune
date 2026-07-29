@@ -75,6 +75,8 @@ TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT"
 STAGE34_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE34_AUDIT_DIR"
 STAGE5_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_AUDIT_DIR"
 STAGE5_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_MAX_STEPS"
+REALDATA_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_AUDIT_DIR"
+REALDATA_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_MAX_STEPS"
 FSDP_UNIT_CLASS_NAMES = (
     "WhisperEncoderFSDPUnit",
     "AudioAlignerFSDPUnit",
@@ -949,6 +951,7 @@ def get_active_distributed_audit() -> tuple[Optional[str], Optional[str]]:
     configured = [
         ("stage34", os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip()),
         ("stage5", os.environ.get(STAGE5_AUDIT_DIR_ENV, "").strip()),
+        ("realdata", os.environ.get(REALDATA_AUDIT_DIR_ENV, "").strip()),
     ]
     active = [(stage, path) for stage, path in configured if path]
     if len(active) > 1:
@@ -1281,6 +1284,180 @@ def patch_stage5_stability_callback() -> None:
     )
 
 
+def patch_realdata_stability_callback() -> None:
+    """Audit a short FSDP4 run that consumes the real indexed mixture."""
+    if not os.environ.get(REALDATA_AUDIT_DIR_ENV, "").strip():
+        return
+    from transformers import Trainer, TrainerCallback
+
+    try:
+        expected_max_steps = int(os.environ.get(REALDATA_MAX_STEPS_ENV, "8"))
+    except ValueError as exc:
+        raise ValueError(f"{REALDATA_MAX_STEPS_ENV} must be an integer") from exc
+    if expected_max_steps <= 1:
+        raise ValueError(f"Real-data stability gate requires more than one optimizer step, got {expected_max_steps}")
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic90s_realdata_patched", False):
+        return
+
+    class RealDataStabilityCallback(TrainerCallback):
+        _huginn_audio_dynamic90s_realdata_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.finite_loss_log_count = 0
+            self.finite_grad_norm_log_count = 0
+            self.optimizer_type = None
+
+        def _distributed_identity(self) -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Real-data gate requires an initialized torch.distributed process group")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"Real-data gate requires world_size=4, got {world_size}")
+            return rank, world_size
+
+        def _audio_statistics(self) -> dict[str, int]:
+            matching_modules = [
+                module
+                for module in self.tracked_model.modules()
+                if hasattr(module, "_huginn_audio_realdata_sample_count")
+            ]
+            if len(matching_modules) != 1:
+                raise RuntimeError(
+                    "Real-data gate expected exactly one model with runtime audio statistics, "
+                    f"found {len(matching_modules)}"
+                )
+            module = matching_modules[0]
+            return {
+                "audio_batch_count": int(module._huginn_audio_realdata_batch_count),
+                "audio_sample_count": int(module._huginn_audio_realdata_sample_count),
+                "realized_prefix_tokens": int(module._huginn_audio_realdata_prefix_tokens),
+                "realized_audio_tokens": int(module._huginn_audio_realdata_audio_tokens),
+                "min_audio_tokens": int(module._huginn_audio_realdata_min_audio_tokens),
+                "max_audio_tokens": int(module._huginn_audio_realdata_max_audio_tokens),
+            }
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, state, kwargs
+            logs = logs or {}
+            for key in ("loss", "grad_norm"):
+                value = logs.get(key)
+                if value is None:
+                    continue
+                numeric_value = float(value)
+                if not math.isfinite(numeric_value):
+                    raise RuntimeError(f"Real-data gate observed non-finite {key}: {numeric_value}")
+                if key == "loss":
+                    self.finite_loss_log_count += 1
+                else:
+                    self.finite_grad_norm_log_count += 1
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):
+            del args
+            rank, world_size = self._distributed_identity()
+            if int(state.max_steps) != expected_max_steps:
+                raise RuntimeError(
+                    f"Real-data max_steps mismatch: expected={expected_max_steps} actual={state.max_steps}"
+                )
+            optimizer = kwargs.get("optimizer")
+            if optimizer is not None:
+                self.optimizer_type = type(optimizer).__name__
+            if int(state.global_step) == expected_max_steps:
+                payload = {
+                    "kind": "optimizer_step",
+                    "stage": "realdata",
+                    "rank": rank,
+                    "world_size": world_size,
+                    "global_step": int(state.global_step),
+                    "max_steps": int(state.max_steps),
+                    "optimizer_type": self.optimizer_type,
+                }
+                _write_distributed_rank_marker("optimizer-step", payload)
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            rank, world_size = self._distributed_identity()
+            if int(state.global_step) != expected_max_steps or int(state.max_steps) != expected_max_steps:
+                raise RuntimeError(
+                    "Real-data gate did not complete every optimizer step: "
+                    f"global_step={state.global_step} max_steps={state.max_steps} expected={expected_max_steps}"
+                )
+            if self.finite_loss_log_count != expected_max_steps:
+                raise RuntimeError(
+                    "Real-data gate did not audit one finite loss per optimizer step: "
+                    f"expected={expected_max_steps} actual={self.finite_loss_log_count}"
+                )
+            if self.finite_grad_norm_log_count != expected_max_steps:
+                raise RuntimeError(
+                    "Real-data gate did not audit one finite gradient norm per optimizer step: "
+                    f"expected={expected_max_steps} actual={self.finite_grad_norm_log_count}"
+                )
+            audio_statistics = self._audio_statistics()
+            if audio_statistics["audio_batch_count"] != expected_max_steps:
+                raise RuntimeError(
+                    "Real-data gate audio batch count mismatch: "
+                    f"expected={expected_max_steps} actual={audio_statistics['audio_batch_count']}"
+                )
+            if audio_statistics["audio_sample_count"] != expected_max_steps:
+                raise RuntimeError(
+                    "Real-data gate expects local batch size one on every step: "
+                    f"expected_samples={expected_max_steps} actual={audio_statistics['audio_sample_count']}"
+                )
+            if (
+                audio_statistics["realized_audio_tokens"] <= 0
+                or audio_statistics["min_audio_tokens"] < 0
+                or audio_statistics["max_audio_tokens"] > 750
+                or audio_statistics["min_audio_tokens"] > audio_statistics["max_audio_tokens"]
+            ):
+                raise RuntimeError(f"Invalid real-data dynamic audio-token statistics: {audio_statistics}")
+            payload = {
+                "kind": "realdata_stability",
+                "stage": "realdata",
+                "rank": rank,
+                "world_size": world_size,
+                "global_step": int(state.global_step),
+                "max_steps": int(state.max_steps),
+                "finite_loss_log_count": self.finite_loss_log_count,
+                "finite_grad_norm_log_count": self.finite_grad_norm_log_count,
+                "optimizer_type": self.optimizer_type,
+                **audio_statistics,
+            }
+            _write_distributed_rank_marker("realdata-stability", payload)
+            print(
+                "[HuginnAudioDynamic90s] REALDATA_STABILITY_AUDIT "
+                f"rank={rank} world_size={world_size} global_step={state.global_step} "
+                f"finite_losses={self.finite_loss_log_count} "
+                f"finite_grad_norms={self.finite_grad_norm_log_count} "
+                f"audio_samples={audio_statistics['audio_sample_count']} "
+                f"audio_tokens={audio_statistics['realized_audio_tokens']} "
+                f"audio_token_range=[{audio_statistics['min_audio_tokens']},"
+                f"{audio_statistics['max_audio_tokens']}] optimizer={self.optimizer_type}",
+                flush=True,
+            )
+            return control
+
+    @wraps(original_init)
+    def init_with_realdata_callback(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic90s_realdata_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(RealDataStabilityCallback(self.model))
+
+    init_with_realdata_callback._huginn_audio_dynamic90s_realdata_patched = True
+    Trainer.__init__ = init_with_realdata_callback
+    print(
+        "[HuginnAudioDynamic90s] installed real-data stability callback "
+        f"expected_max_steps={expected_max_steps}"
+    )
+
+
 def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
     """Log one actual audio-prefix pass for the distributed stability smoke."""
     requested = os.environ.get(TRAIN_CHAIN_AUDIT_ENV, "").strip().lower()
@@ -1305,6 +1482,35 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
         )
         if self.training:
             audit_stage34_fsdp_rank(self, prefix_mask)
+            audit_stage, _audit_dir = get_active_distributed_audit()
+            if audit_stage == "realdata":
+                boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
+                valid_prefix_tokens = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
+                valid_audio_tokens = [value - boundary_tokens for value in valid_prefix_tokens]
+                if not valid_audio_tokens or any(value < 0 or value > 750 for value in valid_audio_tokens):
+                    raise RuntimeError(
+                        "Real-data runtime audio-token count is outside [0, 750]: "
+                        f"prefix_tokens={valid_prefix_tokens} boundary_tokens={boundary_tokens}"
+                    )
+                if not hasattr(self, "_huginn_audio_realdata_sample_count"):
+                    self._huginn_audio_realdata_batch_count = 0
+                    self._huginn_audio_realdata_sample_count = 0
+                    self._huginn_audio_realdata_prefix_tokens = 0
+                    self._huginn_audio_realdata_audio_tokens = 0
+                    self._huginn_audio_realdata_min_audio_tokens = min(valid_audio_tokens)
+                    self._huginn_audio_realdata_max_audio_tokens = max(valid_audio_tokens)
+                self._huginn_audio_realdata_batch_count += 1
+                self._huginn_audio_realdata_sample_count += len(valid_audio_tokens)
+                self._huginn_audio_realdata_prefix_tokens += sum(valid_prefix_tokens)
+                self._huginn_audio_realdata_audio_tokens += sum(valid_audio_tokens)
+                self._huginn_audio_realdata_min_audio_tokens = min(
+                    self._huginn_audio_realdata_min_audio_tokens,
+                    min(valid_audio_tokens),
+                )
+                self._huginn_audio_realdata_max_audio_tokens = max(
+                    self._huginn_audio_realdata_max_audio_tokens,
+                    max(valid_audio_tokens),
+                )
         if self.training and os.environ.get("RANK", "0") == "0" and not getattr(
             self, "_huginn_audio_prefix_audit_logged", False
         ):
@@ -1588,6 +1794,7 @@ patch_peft_dynamic90s_lora_dropout()
 patch_peft_adapter_restore()
 patch_stage34_optimizer_step_callback()
 patch_stage5_stability_callback()
+patch_realdata_stability_callback()
 
 register_model(
     ModelMeta(
