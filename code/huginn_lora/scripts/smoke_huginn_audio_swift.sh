@@ -48,8 +48,8 @@ swift sft \
   --freeze_aligner false \
   --learning_rate 1e-4 \
   --aligner_lr 1e-4 \
-  --lora_rank 16 \
-  --lora_alpha 32 \
+  --lora_rank 8 \
+  --lora_alpha 16 \
   --lora_dropout 0.05 \
   --max_steps 4 \
   --per_device_train_batch_size 2 \

@@ -8,13 +8,20 @@ class HuginnAudioConfig(RavenConfig):
 
     def __init__(
         self,
-        audio_encoder_name: str = "/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-small",
-        audio_encoder_hidden_size: int = 768,
-        audio_pooling_type: str = "conv_gmlp_residual_avg32",
-        audio_target_token_count: int = 32,
+        audio_encoder_name: str = "/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large",
+        audio_encoder_hidden_size: int = 1280,
+        audio_pooling_type: str = "conv1d_stride6_dynamic90s",
+        audio_target_token_count: int = 250,
+        audio_dynamic_tokens: bool = True,
+        audio_max_token_count: int = 750,
+        audio_chunk_seconds: float = 30.0,
+        audio_max_seconds: float = 90.0,
+        audio_discard_seconds: float = 120.0,
+        audio_feature_hop_length: int = 160,
+        audio_encoder_frame_rate: int = 50,
         audio_compressor_intermediate_size: int | None = None,
-        audio_compressor_kernel_size: int = 7,
-        audio_compressor_stride: int = 12,
+        audio_compressor_kernel_size: int = 6,
+        audio_compressor_stride: int = 6,
         audio_projector_hidden_size: int = 2048,
         freeze_audio_encoder: bool = True,
         freeze_text_backbone: bool = True,
@@ -25,6 +32,13 @@ class HuginnAudioConfig(RavenConfig):
         self.audio_encoder_hidden_size = audio_encoder_hidden_size
         self.audio_pooling_type = audio_pooling_type
         self.audio_target_token_count = audio_target_token_count
+        self.audio_dynamic_tokens = audio_dynamic_tokens
+        self.audio_max_token_count = audio_max_token_count
+        self.audio_chunk_seconds = audio_chunk_seconds
+        self.audio_max_seconds = audio_max_seconds
+        self.audio_discard_seconds = audio_discard_seconds
+        self.audio_feature_hop_length = audio_feature_hop_length
+        self.audio_encoder_frame_rate = audio_encoder_frame_rate
         self.audio_compressor_intermediate_size = audio_compressor_intermediate_size
         self.audio_compressor_kernel_size = audio_compressor_kernel_size
         self.audio_compressor_stride = audio_compressor_stride

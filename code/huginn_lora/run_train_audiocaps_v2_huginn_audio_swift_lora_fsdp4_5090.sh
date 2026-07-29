@@ -33,4 +33,4 @@ vc submit \
   -j train-whisper-dynamic90s-lora-fsdp4-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.JOB.log" \
-  --cmd "${CMD_PREFIX}bash scripts/train_audiocaps_v2_huginn_audio_swift_5090.sh"
+  --cmd "${CMD_PREFIX}bash scripts/train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.sh"

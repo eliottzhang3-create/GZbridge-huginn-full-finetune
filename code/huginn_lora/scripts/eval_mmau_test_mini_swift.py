@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resumable full MMAU test-mini evaluation with Huginn audio choice likelihoods."""
+"""Resumable official-style generative evaluation on MMAU test-mini."""
 
 from __future__ import annotations
 
@@ -21,7 +21,9 @@ from generate_clotho_caption_samples_swift import (
 )
 from smoke_eval_mmau_test_mini_swift import (
     DEFAULT_DATASET_PATH,
+    OFFICIAL_OPTION_ORDER_COUNT,
     evaluate_row,
+    official_string_match,
 )
 
 
@@ -34,6 +36,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-offset", type=int, default=0)
     parser.add_argument("--max-samples", type=int, default=None, help="Default: evaluate to the end of test-mini.")
     parser.add_argument("--num-steps", type=int, default=None, help="Fixed Huginn recurrence count; default uses config.mean_recurrence.")
+    parser.add_argument("--max-new-tokens", type=int, default=64)
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--print-samples", action="store_true")
     parser.add_argument(
@@ -57,27 +61,6 @@ def iter_rows(parquet_path: Path, start_offset: int, end_offset: int) -> Iterato
             if index >= start_offset:
                 yield index, row
             index += 1
-
-
-def normalize_tokens(value: Any) -> set[str]:
-    import re
-
-    if isinstance(value, list):
-        value = " ".join(str(item) for item in value)
-    return set(re.findall(r"\b\w+\b", str(value).lower()))
-
-
-def official_string_match(answer: str, prediction: str, choices: list[str]) -> bool:
-    prediction_tokens = normalize_tokens(prediction)
-    answer_tokens = normalize_tokens(answer)
-    if not prediction_tokens:
-        return False
-    incorrect_tokens: set[str] = set()
-    for choice in choices:
-        choice_tokens = normalize_tokens(choice)
-        if choice_tokens != answer_tokens:
-            incorrect_tokens.update(choice_tokens - answer_tokens)
-    return answer_tokens.issubset(prediction_tokens) and prediction_tokens.isdisjoint(incorrect_tokens)
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -110,19 +93,41 @@ def write_summary(
     checkpoint: str,
     dataset_path: str,
     num_steps: int | None,
+    max_new_tokens: int,
+    seed: int,
 ) -> dict[str, Any]:
     correct = sum(result["official_match"] for result in results)
     exact_correct = sum(result["correct_exact_choice"] for result in results)
-    predictions = [
-        {"id": result["metadata"]["id"], "model_prediction": result["prediction"]}
-        for result in results
-    ]
+    # Keep the fields required by the official MMAU ``evaluation.py``.  The
+    # repository README historically calls this field ``model_prediction``,
+    # while the current official evaluator reads ``model_output``; emit both
+    # aliases so the artifact works with either official entry point.
+    predictions = []
+    for result in results:
+        metadata = result["metadata"]
+        predictions.append(
+            {
+                "id": metadata["id"],
+                "answer": result["answer"],
+                "choices": result["choices"],
+                "task": metadata.get("task"),
+                "difficulty": metadata.get("difficulty"),
+                "sub-category": metadata.get("sub-category"),
+                "model_output": result["prediction"],
+                "model_prediction": result["prediction"],
+            }
+        )
     predictions_path = output_dir / "mmau_test_mini_predictions.json"
     predictions_path.write_text(json.dumps(predictions, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     summary = {
         "checkpoint": checkpoint,
         "dataset_path": dataset_path,
         "num_steps": num_steps,
+        "scoring": "greedy generated response with official MMAU string_match",
+        "generation": "manual audio-prefix KV-cache greedy decode",
+        "option_order_count": OFFICIAL_OPTION_ORDER_COUNT,
+        "option_order_seed": seed,
+        "max_new_tokens": max_new_tokens,
         "completed_sample_count": len(results),
         "official_string_match_accuracy": correct / len(results) if results else 0.0,
         "official_string_match_correct": correct,
@@ -138,14 +143,25 @@ def write_summary(
     return summary
 
 
-def prepare_output_dir(output_dir: Path, checkpoint: str, dataset_path: str, num_steps: int | None) -> Path:
+def prepare_output_dir(
+    output_dir: Path,
+    checkpoint: str,
+    dataset_path: str,
+    num_steps: int | None,
+    max_new_tokens: int,
+    seed: int,
+) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
     config_path = output_dir / "run_config.json"
     expected = {
         "checkpoint": checkpoint,
         "dataset_path": dataset_path,
         "num_steps": num_steps,
-        "scoring": "mean per-token conditional log probability",
+        "scoring": "greedy generated response with official MMAU string_match",
+        "generation": "manual audio-prefix KV-cache greedy decode",
+        "option_order_count": OFFICIAL_OPTION_ORDER_COUNT,
+        "option_order_seed": seed,
+        "max_new_tokens": max_new_tokens,
     }
     if config_path.is_file():
         existing = json.loads(config_path.read_text(encoding="utf-8"))
@@ -162,8 +178,16 @@ def main() -> None:
     args = parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required")
-    if args.start_offset < 0 or args.log_every <= 0 or (args.num_steps is not None and args.num_steps <= 0):
-        raise ValueError("start_offset must be non-negative, log_every must be positive, and num_steps must be positive when provided")
+    if (
+        args.start_offset < 0
+        or args.log_every <= 0
+        or args.max_new_tokens <= 0
+        or (args.num_steps is not None and args.num_steps <= 0)
+    ):
+        raise ValueError(
+            "start_offset must be non-negative, log_every and max_new_tokens must be positive, "
+            "and num_steps must be positive when provided"
+        )
     parquet_path = Path(args.dataset_path)
     if not parquet_path.is_file():
         raise FileNotFoundError(f"MMAU test-mini parquet not found: {parquet_path}")
@@ -176,7 +200,14 @@ def main() -> None:
         raise ValueError(f"Requested range [{args.start_offset}, {end_offset}) is empty")
 
     output_dir = Path(args.output_dir)
-    results_path = prepare_output_dir(output_dir, args.checkpoint, str(parquet_path), args.num_steps)
+    results_path = prepare_output_dir(
+        output_dir,
+        args.checkpoint,
+        str(parquet_path),
+        args.num_steps,
+        args.max_new_tokens,
+        args.seed,
+    )
     existing_results = read_jsonl(results_path)
     completed_ids = {result["metadata"]["id"] for result in existing_results}
     device = torch.device(args.device)
@@ -186,6 +217,10 @@ def main() -> None:
     print(f"[config] dataset_path={parquet_path}")
     print(f"[config] requested_range=[{args.start_offset}, {end_offset}) total_dataset_rows={dataset_size}")
     print(f"[config] num_steps={args.num_steps if args.num_steps is not None else 'config.mean_recurrence'}")
+    print(
+        f"[config] generation=greedy_manual_audio_cache max_new_tokens={args.max_new_tokens} "
+        f"official_option_order_count={OFFICIAL_OPTION_ORDER_COUNT} seed={args.seed}"
+    )
     print(f"[config] output_dir={output_dir} resumed_completed={len(completed_ids)}")
     plugin = import_plugin(args.plugin_path)
     model, processor, restore = load_generation_model(
@@ -209,7 +244,17 @@ def main() -> None:
             if sample_id in completed_ids:
                 skipped += 1
                 continue
-            result = evaluate_row(row, plugin, model, processor, device, num_steps=args.num_steps)
+            result = evaluate_row(
+                row,
+                plugin,
+                model,
+                processor,
+                device,
+                num_steps=args.num_steps,
+                max_new_tokens=args.max_new_tokens,
+                option_order_count=OFFICIAL_OPTION_ORDER_COUNT,
+                seed=args.seed,
+            )
             result["dataset_row_index"] = row_index
             result["official_match"] = official_string_match(result["answer"], result["prediction"], result["choices"])
             append_jsonl(handle, result)
@@ -234,7 +279,15 @@ def main() -> None:
                     flush=True,
                 )
 
-    summary = write_summary(output_dir, existing_results, args.checkpoint, str(parquet_path), args.num_steps)
+    summary = write_summary(
+        output_dir,
+        existing_results,
+        args.checkpoint,
+        str(parquet_path),
+        args.num_steps,
+        args.max_new_tokens,
+        args.seed,
+    )
     print("========== MMAU TEST-MINI SWIFT FULL EVAL DONE ==========")
     print(
         f"[summary] completed={summary['completed_sample_count']} "

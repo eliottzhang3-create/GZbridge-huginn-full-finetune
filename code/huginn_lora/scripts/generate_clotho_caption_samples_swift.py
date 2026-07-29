@@ -564,9 +564,21 @@ def generate_caption(
     else:
         feature_extractor = processor.feature_extractor
         sample_rate = int(getattr(feature_extractor, "sampling_rate", plugin.DEFAULT_SAMPLE_RATE))
-        waveform = plugin.load_audio_file(audio_path, sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
-        features = feature_extractor([waveform], sampling_rate=sample_rate, return_tensors="pt")["input_features"]
-        audio_inputs = {"audio_input_features": features.to(device=device, dtype=torch.bfloat16)}
+        waveform = plugin.load_audio_file(audio_path, sample_rate, None)
+        audio_chunks, audio_feature_lengths = plugin.split_audio_for_whisper(waveform, sample_rate)
+        features = feature_extractor(
+            audio_chunks,
+            sampling_rate=sample_rate,
+            padding="max_length",
+            truncation=True,
+            max_length=int(getattr(feature_extractor, "n_samples", 480000)),
+            return_tensors="pt",
+        )["input_features"]
+        audio_inputs = {
+            "audio_input_features": features.unsqueeze(0).to(device=device, dtype=torch.bfloat16),
+            "audio_segment_feature_lengths": torch.tensor(audio_feature_lengths, device=device).unsqueeze(0),
+            "audio_segment_mask": torch.ones((1, len(audio_feature_lengths)), device=device, dtype=torch.bool),
+        }
     prompt = build_prompt(plugin)
     tokenized = tokenizer(prompt, return_tensors="pt", add_special_tokens=True)
     input_ids = tokenized["input_ids"].to(device)
@@ -582,7 +594,7 @@ def generate_caption(
 
     with torch.inference_mode():
         # Audio is injected exactly once into this prefill. The base forward creates
-        # a cache whose length includes the 34-token audio prefix and the text prompt.
+        # a cache whose length includes the dynamic audio prefix and the text prompt.
         outputs = model(
             input_ids=input_ids,
             attention_mask=attention_mask,
@@ -623,7 +635,10 @@ def generate_caption(
     new_token_tensor = torch.tensor(new_token_ids, device=device, dtype=torch.long)
     return {
         "prompt": prompt,
-        "audio_seconds_after_truncation": len(waveform) / float(sample_rate),
+        "audio_seconds_after_truncation": min(
+            len(waveform) / float(sample_rate),
+            float(getattr(plugin, "DEFAULT_MAX_AUDIO_SECONDS", 90.0)),
+        ),
         "text_prompt_token_count": int(input_ids.shape[1]),
         "audio_prefix_token_count": prefill_cache_length - int(input_ids.shape[1]),
         "prefill_cache_length": prefill_cache_length,

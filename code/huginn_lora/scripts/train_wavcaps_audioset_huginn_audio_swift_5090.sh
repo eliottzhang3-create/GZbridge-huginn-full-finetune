@@ -183,8 +183,8 @@ swift sft \
   --freeze_aligner false \
   --learning_rate "$LEARNING_RATE" \
   --aligner_lr "$ALIGNER_LR" \
-  --lora_rank 16 \
-  --lora_alpha 32 \
+  --lora_rank 8 \
+  --lora_alpha 16 \
   --lora_dropout 0.05 \
   --adapters "$INIT_CHECKPOINT" \
   --load_args false \

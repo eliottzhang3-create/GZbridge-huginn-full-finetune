@@ -17,16 +17,21 @@ DATASET_PATH="${MMAU_TEST_MINI_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/data/MMA
 OUTPUT_DIR="${MMAU_SMOKE_OUTPUT_DIR:-$REPO_ROOT/outputs/mmau_test_mini_smoke}"
 SAMPLE_COUNT="${MMAU_SMOKE_SAMPLE_COUNT:-5}"
 SAMPLE_OFFSET="${MMAU_SMOKE_SAMPLE_OFFSET:-0}"
+MAX_NEW_TOKENS="${MMAU_MAX_NEW_TOKENS:-64}"
+SEED="${MMAU_SEED:-0}"
 
 echo "========== RUN MMAU TEST-MINI SWIFT SMOKE =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "checkpoint=$CHECKPOINT"
 echo "dataset_path=$DATASET_PATH"
 echo "sample_count=$SAMPLE_COUNT sample_offset=$SAMPLE_OFFSET"
+echo "generation=greedy_manual_audio_cache max_new_tokens=$MAX_NEW_TOKENS option_order_count=5 seed=$SEED"
 
 python -u code/huginn_lora/scripts/smoke_eval_mmau_test_mini_swift.py \
   --checkpoint "$CHECKPOINT" \
   --dataset-path "$DATASET_PATH" \
   --output-dir "$OUTPUT_DIR" \
   --sample-count "$SAMPLE_COUNT" \
-  --sample-offset "$SAMPLE_OFFSET"
+  --sample-offset "$SAMPLE_OFFSET" \
+  --max-new-tokens "$MAX_NEW_TOKENS" \
+  --seed "$SEED"

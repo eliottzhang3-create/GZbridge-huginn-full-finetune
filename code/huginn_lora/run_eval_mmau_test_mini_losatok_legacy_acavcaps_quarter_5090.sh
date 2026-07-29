@@ -17,4 +17,4 @@ vc submit \
   -j eval-mmau-losatok-legacy32-acav-quarter-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/eval_mmau_test_mini_losatok_legacy_acavcaps_quarter_5090.JOB.log" \
-  --cmd "HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS=0 HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=0 MMAU_CHECKPOINT='$CHECKPOINT' MMAU_OUTPUT_DIR='$OUTPUT_DIR' MMAU_PLUGIN_PATH='$PLUGIN_PATH' bash scripts/eval_mmau_test_mini_swift.sh"
+  --cmd "HUGINN_LOSATOK_DYNAMIC_AUDIO_TOKENS=0 HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=0 MMAU_CHECKPOINT='$CHECKPOINT' MMAU_OUTPUT_DIR='$OUTPUT_DIR' MMAU_MAX_NEW_TOKENS='${MMAU_MAX_NEW_TOKENS:-64}' MMAU_SEED='${MMAU_SEED:-0}' MMAU_PLUGIN_PATH='$PLUGIN_PATH' bash scripts/eval_mmau_test_mini_swift.sh"

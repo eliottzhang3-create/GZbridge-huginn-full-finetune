@@ -623,6 +623,45 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
 - FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming restore later completed a caption-generation run successfully.
 
+#### Current Whisper-large dynamic-90s LoRA/FSDP4 route (prepared locally; remote launch pending)
+
+This is the current Huginn Whisper mainline after replacing the historical fixed-32 aligner. It is a fresh run and does
+not load any previous checkpoint.
+
+- canonical runtime:
+  - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_5090.sh`
+- explicit runtime alias:
+  - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.sh`
+- matching 4-GPU submit wrapper:
+  - `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.sh`
+- the generic submit wrapper `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_5090.sh` is also configured for
+  this same 4-GPU route.
+- queue request: `pdgpu-5090`, `-c 32 -m 128G -g 4 -n 1`
+- FSDP basis retained from the verified Whisper full-training path: `full_shard auto_wrap`, FSDP2,
+  `TRANSFORMER_BASED_WRAP`, `SHARDED_STATE_DICT`, FSDP activation checkpointing disabled, and ordinary gradient
+  checkpointing disabled.
+- trainability: Whisper-large frozen; Huginn base covered by `lora_llm`; aligner trainable; LoRA rank `8`, alpha `16`,
+  dropout `0.05`; Huginn/aligner learning rates are both `1e-4`.
+- audio contract: one Conv1d downsampling layer with kernel/stride `6`, dynamic audio prefix, `250` audio tokens per
+  complete 30-second segment (`120 ms/token`), at most three segments/90 seconds, and per-batch longest-prefix padding
+  with attention-mask `0` and loss labels `-100`.
+- audio longer than `120` seconds is currently rejected by the explicit discard gate; dataset-level filtering can be
+  added when the next data revision is defined.
+
+Before remote submission, push the local changes to GitHub and pull them on the remote repository. Then submit with:
+
+```bash
+bash code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.sh
+```
+
+The standalone simulated contract check has its own runtime and submit wrapper:
+
+- `code/huginn_lora/scripts/validate_huginn_audio_dynamic90s.sh`
+- `code/huginn_lora/run_validate_huginn_audio_dynamic90s_5090.sh`
+
+It does not load remote weights or data; it checks the length split, 120-ms token arithmetic, batch padding, `-100`
+masking, and one differentiable backward pass in the remote `swift_huginn` environment.
+
 #### Historical but relevant routes
 
 - ACAVCAPS tar-backed LoRA curriculum route is validated historical infrastructure. It reads shared `.tar.gz` files directly without copying raw audio.

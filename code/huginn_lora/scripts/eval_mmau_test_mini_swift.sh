@@ -20,6 +20,8 @@ START_OFFSET="${MMAU_START_OFFSET:-0}"
 MAX_SAMPLES="${MMAU_MAX_SAMPLES:-}"
 LOG_EVERY="${MMAU_LOG_EVERY:-10}"
 NUM_STEPS="${MMAU_NUM_STEPS:-}"
+MAX_NEW_TOKENS="${MMAU_MAX_NEW_TOKENS:-64}"
+SEED="${MMAU_SEED:-0}"
 CHECKPOINTS_RAW="${MMAU_CHECKPOINTS:-}"
 FSDP_EXPORT_DIR="${HUGINN_AUDIO_FSDP_EVAL_EXPORT_DIR:-}"
 PLUGIN_PATH="${MMAU_PLUGIN_PATH:-$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_swift.py}"
@@ -32,6 +34,8 @@ NUM_STEPS_ARGS=()
 if [ -n "$NUM_STEPS" ]; then
   NUM_STEPS_ARGS=(--num-steps "$NUM_STEPS")
 fi
+MAX_NEW_TOKENS_ARGS=(--max-new-tokens "$MAX_NEW_TOKENS")
+SEED_ARGS=(--seed "$SEED")
 
 checkpoint_slug() {
   local checkpoint="${1%/}"
@@ -55,6 +59,7 @@ evaluate_one_checkpoint() {
   echo "output_dir=$output_dir"
   echo "start_offset=$START_OFFSET max_samples=${MAX_SAMPLES:-<all>} log_every=$LOG_EVERY"
   echo "num_steps=${NUM_STEPS:-<config.mean_recurrence>}"
+  echo "generation=greedy_manual_audio_cache max_new_tokens=$MAX_NEW_TOKENS option_order_count=5 seed=$SEED"
   echo "fsdp_export_dir=${FSDP_EXPORT_DIR:-<checkpoint-sibling-default>}"
   echo "plugin_path=$PLUGIN_PATH"
 
@@ -66,7 +71,9 @@ evaluate_one_checkpoint() {
     --start-offset "$START_OFFSET" \
     --log-every "$LOG_EVERY" \
     "${MAX_SAMPLES_ARGS[@]}" \
-    "${NUM_STEPS_ARGS[@]}")
+    "${NUM_STEPS_ARGS[@]}" \
+    "${MAX_NEW_TOKENS_ARGS[@]}" \
+    "${SEED_ARGS[@]}")
   if [ -n "$FSDP_EXPORT_DIR" ]; then
     CMD+=(--fsdp-export-dir "$FSDP_EXPORT_DIR")
   fi
