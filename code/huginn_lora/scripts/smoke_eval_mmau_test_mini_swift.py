@@ -127,23 +127,9 @@ def prepare_audio_inputs(
     feature_extractor = processor.feature_extractor
     sample_rate = int(getattr(feature_extractor, "sampling_rate", plugin.DEFAULT_SAMPLE_RATE))
     waveform = plugin.decode_audio_with_ffmpeg_bytes(audio_bytes, source_label, sample_rate)
-    audio_chunks, audio_feature_lengths = plugin.split_audio_for_whisper(waveform, sample_rate)
-    features = feature_extractor(
-        audio_chunks,
-        sampling_rate=sample_rate,
-        padding="max_length",
-        truncation=True,
-        max_length=int(getattr(feature_extractor, "n_samples", 480000)),
-        return_tensors="pt",
-    )["input_features"]
-    return {
-        "audio_input_features": features.unsqueeze(0).to(device=device, dtype=torch.bfloat16),
-        "audio_segment_feature_lengths": torch.tensor(audio_feature_lengths, device=device).unsqueeze(0),
-        "audio_segment_mask": torch.ones((1, len(audio_feature_lengths)), device=device, dtype=torch.bool),
-    }, min(
-        len(waveform) / float(sample_rate),
-        float(getattr(plugin, "DEFAULT_MAX_AUDIO_SECONDS", 90.0)),
-    )
+    waveform = plugin.trim_audio(waveform, sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
+    features = feature_extractor([waveform], sampling_rate=sample_rate, return_tensors="pt")["input_features"]
+    return {"audio_input_features": features.to(device=device, dtype=torch.bfloat16)}, len(waveform) / float(sample_rate)
 
 
 def generate_response(

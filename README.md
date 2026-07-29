@@ -623,44 +623,43 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
 - FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming restore later completed a caption-generation run successfully.
 
-#### Current Whisper-large dynamic-90s LoRA/FSDP4 route (prepared locally; remote launch pending)
+#### Current isolated Whisper-large dynamic-90s LoRA route (Stage 0-2 prepared; FSDP4 not yet implemented)
 
-This is the current Huginn Whisper mainline after replacing the historical fixed-32 aligner. It is a fresh run and does
-not load any previous checkpoint.
+The new dynamic route is isolated from the historical fixed-32 Whisper route. Historical files remain at
+`models/huginn-audio-whisper-v1/` and `code/huginn_lora/plugins/huginn_audio_swift.py`; do not point historical
+checkpoints or evaluation scripts at the dynamic package.
 
-- canonical runtime:
-  - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_5090.sh`
-- explicit runtime alias:
-  - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.sh`
-- matching 4-GPU submit wrapper:
-  - `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.sh`
-- the generic submit wrapper `code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_5090.sh` is also configured for
-  this same 4-GPU route.
-- queue request: `pdgpu-5090`, `-c 32 -m 128G -g 4 -n 1`
-- FSDP basis retained from the verified Whisper full-training path: `full_shard auto_wrap`, FSDP2,
-  `TRANSFORMER_BASED_WRAP`, `SHARDED_STATE_DICT`, FSDP activation checkpointing disabled, and ordinary gradient
-  checkpointing disabled.
-- trainability: Whisper-large frozen; Huginn base covered by `lora_llm`; aligner trainable; LoRA rank `8`, alpha `16`,
-  dropout `0.05`; Huginn/aligner learning rates are both `1e-4`.
-- audio contract: one Conv1d downsampling layer with kernel/stride `6`, dynamic audio prefix, `250` audio tokens per
-  complete 30-second segment (`120 ms/token`), at most three segments/90 seconds, and per-batch longest-prefix padding
-  with attention-mask `0` and loss labels `-100`.
-- audio longer than `120` seconds is currently rejected by the explicit discard gate; dataset-level filtering can be
-  added when the next data revision is defined.
+- dynamic model package: `models/huginn-audio-whisper-dynamic90s-v1/`
+- dynamic Swift plugin: `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`
+- model type/template/model arch: `huginn_audio_whisper_dynamic90s`
+- Whisper-large remains frozen; the aligner is trainable; Huginn uses `lora_llm` with rank `8`, alpha `16`, and requested
+  effective dropout `0.05`.
+- the compressor is exactly one Conv1d with kernel `6`, stride `6`, and padding `0`.
+- audio token count is dynamic: each complete `120 ms` produces one token. Only a complete 30-second segment produces
+  `250` tokens; shorter audio is never padded to 250 tokens. Complete 60/90-second inputs produce 500/750 tokens.
+- audio is split into non-overlapping windows of at most 30 seconds; at most the first 90 seconds are included. Inputs
+  longer than 90 seconds and at most 120 seconds are truncated to 90 seconds. Inputs longer than 120 seconds must be
+  filtered before Swift template/collator processing; a template-side exception remains only as an integrity guard.
+- prefix embeddings are padded to the longest prefix in each collated batch; padding uses zero embeddings, attention
+  mask `0`, and labels `-100`.
 
-Before remote submission, push the local changes to GitHub and pull them on the remote repository. Then submit with:
+The data-independent Stage 0-2 gate generates deterministic WAV fixtures inside its remote output directory and does
+not use AudioCaps, ACAVCAPS, WavCaps, or any future formal dataset. It checks the production duration planner, real Swift
+template/collator, real Whisper-large/Huginn loading, effective LoRA configuration, trainable split, dynamic prefix
+lengths, padding masks/labels, and one real backward pass on one RTX 5090.
+
+- runtime: `code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic90s_stage02.sh`
+- submit wrapper: `code/huginn_lora/run_inspect_huginn_audio_whisper_dynamic90s_stage02_5090.sh`
+
+After Git sync, submit with:
 
 ```bash
-bash code/huginn_lora/run_train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.sh
+bash code/huginn_lora/run_inspect_huginn_audio_whisper_dynamic90s_stage02_5090.sh
 ```
 
-The standalone simulated contract check has its own runtime and submit wrapper:
-
-- `code/huginn_lora/scripts/validate_huginn_audio_dynamic90s.sh`
-- `code/huginn_lora/run_validate_huginn_audio_dynamic90s_5090.sh`
-
-It does not load remote weights or data; it checks the length split, 120-ms token arithmetic, batch padding, `-100`
-masking, and one differentiable backward pass in the remote `swift_huginn` environment.
+No FSDP4 training launcher should be created or used until this Stage 0-2 gate passes remotely. The next gate after a
+pass is a separate synthetic-data FSDP4 construction and one-update smoke based on the previously verified Whisper
+FSDP2 configuration.
 
 #### Historical but relevant routes
 
@@ -1174,6 +1173,8 @@ For `models/huginn-audio-losatok-v1` and `huginn_losatok_swift.py`:
 - `models/huginn-audio-whisper-v1/raven_modeling_minimal.py`
 - `models/huginn-audio-whisper-v1/raven_config_minimal.py`
 - `models/huginn-audio-whisper-v1/_base.py`
+- `models/huginn-audio-whisper-dynamic90s-v1/raven_modeling_minimal.py`
+- `models/huginn-audio-whisper-dynamic90s-v1/raven_config_minimal.py`
 
 ### LoSATok model replacement files
 
@@ -1880,6 +1881,9 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 ### Swift multimodal LoRA path
 
 - `code/huginn_lora/plugins/huginn_audio_swift.py`
+- `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`
+- `code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic90s_stage02.py`
+- `code/huginn_lora/run_inspect_huginn_audio_whisper_dynamic90s_stage02_5090.sh`
 - `code/huginn_lora/plugins/huginn_losatok_swift.py`
 - **Dynamic-90s LoSATok FSDP2 model, save/restore, and continuation:**
   - `code/huginn_lora/scripts/inspect_losatok_dynamic_fsdp_checkpoint.py`
@@ -2144,3 +2148,18 @@ Before any long remote run:
   - actual formal training
   - checkpoint audit/save-reload validation
   - retrieval / generation / benchmark evaluation
+
+### Huginn Whisper dynamic-90s status update (2026-07-29; supersedes the immediate next step for the active Huginn task)
+
+The active Huginn task is now the isolated Whisper-large dynamic-90s route, not a LoSATok continuation and not formal
+dataset training. The historical fixed-32 Whisper model/plugin and its dataset-specific training/evaluation scripts have
+been restored to their original paths. The new route is isolated under
+`models/huginn-audio-whisper-dynamic90s-v1/` and
+`code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`.
+
+The immediate gate is Stage 0-2 only: submit
+`code/huginn_lora/run_inspect_huginn_audio_whisper_dynamic90s_stage02_5090.sh`, which uses generated synthetic WAV files
+and no formal dataset. Do not create or launch a formal AudioCaps/ACAVCAPS/WavCaps training job for this route yet. Do
+not proceed to the four-GPU FSDP2 gate until the Stage 0-2 remote log reports the production duration contract, real
+Swift collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and real
+backward pass as successful.

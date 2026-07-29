@@ -10,17 +10,13 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 cd "$REPO_ROOT"
 
 export PYTHONUNBUFFERED=1
-export CUDA_VISIBLE_DEVICES="${HUGINN_AUDIO_CUDA_VISIBLE_DEVICES:-0,1,2,3}"
-export NPROC_PER_NODE=4
-export OMP_NUM_THREADS=4
-export HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE=1
-export HUGINN_AUDIO_TRAIN_CHAIN_AUDIT=1
+export CUDA_VISIBLE_DEVICES=0
 
 TRAIN_MANIFEST="${AUDIOCAPS_TRAIN_MANIFEST:-$REPO_ROOT/data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl}"
 TRAIN_STATS="$TRAIN_MANIFEST.stats.json"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_swift.py"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-v1"
-OUTPUT_DIR="${AUDIOCAPS_OUTPUT_DIR:-outputs/huginn_audio_audiocaps_v2_dynamic90s_lora_fsdp4_fresh}"
+OUTPUT_DIR="${AUDIOCAPS_OUTPUT_DIR:-outputs/huginn_audio_audiocaps_v2_train_e5_b8ga4_5090}"
 LOGGING_DIR="${AUDIOCAPS_LOGGING_DIR:-$OUTPUT_DIR/tensorboard}"
 NUM_TRAIN_EPOCHS="${AUDIOCAPS_NUM_TRAIN_EPOCHS:-5}"
 MAX_STEPS="${AUDIOCAPS_MAX_STEPS:-}"
@@ -29,20 +25,7 @@ SAVE_STEPS="${AUDIOCAPS_SAVE_STEPS:-20}"
 SAVE_TOTAL_LIMIT="${AUDIOCAPS_SAVE_TOTAL_LIMIT:-5}"
 LOGGING_STEPS="${AUDIOCAPS_LOGGING_STEPS:-10}"
 REPORT_TO="${AUDIOCAPS_REPORT_TO:-tensorboard}"
-
-WORLD_SIZE=4
-MICRO_BATCH_SIZE=1
-GRADIENT_ACCUMULATION_STEPS=8
-LEARNING_RATE=1e-4
-ALIGNER_LR=1e-4
-LORA_RANK=8
-LORA_ALPHA=16
-LORA_DROPOUT=0.05
-# This is the same FSDP2 configuration used by the previously verified
-# Whisper full-parameter route. LoRA changes trainability, not the sharding
-# topology. Activation recomputation stays disabled for Huginn's recurrent
-# forward path.
-FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":false,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
+RESUME_FROM_CHECKPOINT="${AUDIOCAPS_RESUME_FROM_CHECKPOINT:-}"
 
 if [ ! -s "$TRAIN_MANIFEST" ]; then
   echo "AudioCaps train manifest is missing or empty: $TRAIN_MANIFEST" >&2
@@ -90,12 +73,6 @@ if missing_fields:
 PY
 
 mkdir -p "$OUTPUT_DIR" "$LOGGING_DIR"
-if find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print -quit | grep -q .; then
-  echo "Fresh-training output directory already contains a checkpoint; choose a new AUDIOCAPS_OUTPUT_DIR: $OUTPUT_DIR" >&2
-  exit 1
-fi
-FSDP_CONFIG_PATH="$OUTPUT_DIR/fsdp2_lora_no_activation.json"
-printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
 echo "========== AUDIOCAPS V2 HUGINN AUDIO SWIFT TRAIN 5090 =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "mode=lora_llm generator_frozen_audio_encoder aligner_trainable"
@@ -104,21 +81,10 @@ echo "output_dir=$OUTPUT_DIR"
 echo "logging_dir=$LOGGING_DIR"
 echo "num_train_epochs=$NUM_TRAIN_EPOCHS"
 echo "max_steps=${MAX_STEPS:-<unset>}"
-echo "cuda_visible_devices=$CUDA_VISIBLE_DEVICES"
-echo "nproc_per_node=$NPROC_PER_NODE"
-echo "world_size=$WORLD_SIZE"
-echo "per_device_train_batch_size=$MICRO_BATCH_SIZE"
-echo "gradient_accumulation_steps=$GRADIENT_ACCUMULATION_STEPS"
-echo "effective_batch_size=$((WORLD_SIZE * MICRO_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
-echo "audio_dynamic_tokens=true audio_chunk_seconds=30 audio_max_seconds=90 audio_discard_seconds=120"
-echo "audio_token_rate=120ms_per_token full_30s_tokens=250 max_audio_tokens=750"
-echo "audio_batch_padding=per_batch_max_prefix attention_mask_zero labels_minus_100"
-echo "audio_gt120_policy=discard_gate"
-echo "fsdp=custom_fsdp2_json world_size=$WORLD_SIZE"
-echo "whisper_audio_encoder=frozen"
-echo "lora_rank=$LORA_RANK lora_alpha=$LORA_ALPHA lora_dropout=$LORA_DROPOUT"
-echo "learning_rate=$LEARNING_RATE aligner_lr=$ALIGNER_LR"
-echo "manifest_invalid_rows_prechecked=true"
+echo "per_device_train_batch_size=8"
+echo "gradient_accumulation_steps=4"
+echo "effective_batch_size=32"
+echo "invalid_rows_are_filtered_in_manifest=true"
 echo "dataset_shuffle=true"
 echo "train_dataloader_shuffle=true"
 echo "save_strategy=$SAVE_STRATEGY"
@@ -127,6 +93,9 @@ echo "save_total_limit=$SAVE_TOTAL_LIMIT"
 echo "logging_steps=$LOGGING_STEPS"
 echo "report_to=$REPORT_TO"
 echo "save_only_model=false"
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+  echo "resume_from_checkpoint=$RESUME_FROM_CHECKPOINT"
+fi
 
 TRAIN_LENGTH_ARGS=(--num_train_epochs "$NUM_TRAIN_EPOCHS")
 if [ -n "$MAX_STEPS" ]; then
@@ -135,6 +104,14 @@ fi
 SAVE_ARGS=(--save_strategy "$SAVE_STRATEGY" --save_total_limit "$SAVE_TOTAL_LIMIT")
 if [ "$SAVE_STRATEGY" = "steps" ]; then
   SAVE_ARGS+=(--save_steps "$SAVE_STEPS")
+fi
+RESUME_ARGS=()
+if [ -n "$RESUME_FROM_CHECKPOINT" ]; then
+  if [ ! -d "$RESUME_FROM_CHECKPOINT" ]; then
+    echo "Resume checkpoint directory does not exist: $RESUME_FROM_CHECKPOINT" >&2
+    exit 1
+  fi
+  RESUME_ARGS+=(--resume_from_checkpoint "$RESUME_FROM_CHECKPOINT")
 fi
 
 TRAIN_PID=""
@@ -211,18 +188,15 @@ swift sft \
   --output_dir "$OUTPUT_DIR" \
   --logging_dir "$LOGGING_DIR" \
   --tuner_type lora_llm \
-  --freeze_vit true \
   --freeze_aligner false \
-  --learning_rate "$LEARNING_RATE" \
-  --aligner_lr "$ALIGNER_LR" \
-  --lora_rank "$LORA_RANK" \
-  --lora_alpha "$LORA_ALPHA" \
-  --lora_dropout "$LORA_DROPOUT" \
-  --fsdp "$FSDP_CONFIG_PATH" \
+  --learning_rate 1e-4 \
+  --aligner_lr 1e-4 \
+  --lora_rank 16 \
+  --lora_alpha 32 \
+  --lora_dropout 0.05 \
   "${TRAIN_LENGTH_ARGS[@]}" \
-  --per_device_train_batch_size "$MICRO_BATCH_SIZE" \
-  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
-  --gradient_checkpointing false \
+  --per_device_train_batch_size 8 \
+  --gradient_accumulation_steps 4 \
   --logging_steps "$LOGGING_STEPS" \
   "${SAVE_ARGS[@]}" \
   --dataloader_num_workers 0 \
@@ -230,7 +204,7 @@ swift sft \
   --dataset_num_proc 1 \
   --save_only_model false \
   --report_to "$REPORT_TO" \
-  --bf16 true &
+  --bf16 true "${RESUME_ARGS[@]}" &
 TRAIN_PID=$!
 resource_monitor &
 MONITOR_PID=$!

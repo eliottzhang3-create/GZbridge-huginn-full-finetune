@@ -1,3 +1,5 @@
+"""Swift registration for isolated Whisper-large dynamic-90s Huginn audio."""
+
 from __future__ import annotations
 
 import io
@@ -7,6 +9,7 @@ import subprocess
 import tarfile
 import wave
 from collections import OrderedDict
+from dataclasses import dataclass
 from pathlib import Path
 from types import MethodType
 from typing import Any, Optional
@@ -44,17 +47,37 @@ except ImportError:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-AUDIO_MODEL_DIR = REPO_ROOT / "models" / "huginn-audio-whisper-v1"
+AUDIO_MODEL_DIR = REPO_ROOT / "models" / "huginn-audio-whisper-dynamic90s-v1"
 HUGINN_MODEL_DIR = Path("/hpc_stor03/sjtu_home/jinwei.zhang/models/huginn-0125")
 WHISPER_MODEL_DIR = Path("/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large")
 
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio and respond accurately."
 DEFAULT_SAMPLE_RATE = 16000
-DEFAULT_MAX_AUDIO_SECONDS = 30.0
-INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_INIT_ALIGNER_CHECKPOINT"
-FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_FORCE_ALIGNER_TRAINABLE"
-FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_FSDP2_NONPERSISTENT_ROPE"
-TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_TRAIN_CHAIN_AUDIT"
+DEFAULT_AUDIO_CHUNK_SECONDS = 30.0
+DEFAULT_MAX_AUDIO_SECONDS = 90.0
+DEFAULT_DISCARD_AUDIO_SECONDS = 120.0
+WHISPER_MAX_FEATURE_FRAMES = 3000
+WHISPER_FEATURE_HOP_LENGTH = 160
+WHISPER_ENCODER_DOWNSAMPLE = 2
+DYNAMIC_COMPRESSOR_KERNEL = 6
+DYNAMIC_COMPRESSOR_STRIDE = 6
+AUDIO_TOKEN_DURATION_MS = 120
+_DERIVED_AUDIO_TOKEN_DURATION_MS = (
+    WHISPER_FEATURE_HOP_LENGTH
+    * WHISPER_ENCODER_DOWNSAMPLE
+    * DYNAMIC_COMPRESSOR_STRIDE
+    * 1000
+    // DEFAULT_SAMPLE_RATE
+)
+if _DERIVED_AUDIO_TOKEN_DURATION_MS != AUDIO_TOKEN_DURATION_MS:
+    raise RuntimeError(
+        "Whisper dynamic token contract is inconsistent: "
+        f"derived={_DERIVED_AUDIO_TOKEN_DURATION_MS}ms configured={AUDIO_TOKEN_DURATION_MS}ms"
+    )
+INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT"
+FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FORCE_ALIGNER_TRAINABLE"
+FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FSDP2_NONPERSISTENT_ROPE"
+TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT"
 
 
 def get_tarfile_cache_limit() -> int:
@@ -78,7 +101,9 @@ ALIGNER_PREFIXES = (
     "audio_eos",
 )
 
-MODEL_ARCH_NAME = "huginn_audio_whisper"
+MODEL_TYPE = "huginn_audio_whisper_dynamic90s"
+TEMPLATE_TYPE = "huginn_audio_whisper_dynamic90s"
+MODEL_ARCH_NAME = "huginn_audio_whisper_dynamic90s"
 _TARFILE_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
 print(f"[HuginnAudioSwift] tarfile_cache_limit={TARFILE_CACHE_LIMIT}")
 
@@ -131,11 +156,29 @@ def patch_huginn_audio_shift_loss(model):
                     device=labels.device,
                 )
                 full_labels = torch.cat([prefix_labels, labels], dim=1).to(logits.device)
+                prefix_mask = getattr(self, "_last_audio_prefix_mask", None)
+                if prefix_mask is not None:
+                    prefix_mask = prefix_mask.to(device=full_labels.device, dtype=torch.bool)
+                    if prefix_mask.shape != (labels.size(0), prefix_len):
+                        raise RuntimeError(
+                            "Audio prefix mask shape mismatch: "
+                            f"mask={tuple(prefix_mask.shape)} expected={(labels.size(0), prefix_len)}"
+                        )
+                    has_audio_padding = prefix_mask.sum(dim=1).lt(prefix_len)
+                    if labels.size(1) > 0 and bool(has_audio_padding.any().item()):
+                        full_labels[has_audio_padding, prefix_len] = -100
+                        if bool(full_labels[has_audio_padding, prefix_len].ne(-100).any().item()):
+                            raise RuntimeError(
+                                "The first text target after an audio padding region must be masked with -100"
+                            )
 
         shift_logits = logits[:, :-1, :].contiguous()
         shift_labels = full_labels[:, 1:].contiguous()
 
         audit_requested = os.environ.get(TRAIN_CHAIN_AUDIT_ENV, "").strip().lower() in {"1", "true", "yes"}
+        if audit_requested:
+            self._last_dynamic90s_full_labels = full_labels.detach()
+            self._last_dynamic90s_shift_labels = shift_labels.detach()
         if audit_requested and os.environ.get("RANK", "0") == "0" and not getattr(
             self, "_huginn_audio_shift_loss_audit_logged", False
         ):
@@ -375,7 +418,150 @@ def normalize_audio_array(audio: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported audio ndim={audio.ndim}")
 
 
-def trim_audio(audio: np.ndarray, target_sr: int, max_audio_seconds: float) -> np.ndarray:
+class AudioDiscardedError(ValueError):
+    """Integrity guard for an over-limit sample that escaped manifest filtering."""
+
+
+@dataclass(frozen=True)
+class WhisperAudioPlan:
+    """Production duration plan shared by preprocessing and validation.
+
+    Token counts are dynamic. A complete 120 ms block produces one audio
+    token; shorter residual tails are not padded into an additional token.
+    """
+
+    total_samples: int
+    included_samples: int
+    chunk_ranges: tuple[tuple[int, int], ...]
+    feature_lengths: tuple[int, ...]
+    encoder_lengths: tuple[int, ...]
+    token_counts: tuple[int, ...]
+    discarded: bool
+
+    @property
+    def total_audio_tokens(self) -> int:
+        return sum(self.token_counts)
+
+    @property
+    def segment_count(self) -> int:
+        return len(self.chunk_ranges)
+
+
+def plan_audio_for_whisper(
+    total_samples: int,
+    sample_rate: int,
+    chunk_seconds: float = DEFAULT_AUDIO_CHUNK_SECONDS,
+    max_audio_seconds: float = DEFAULT_MAX_AUDIO_SECONDS,
+    discard_audio_seconds: float = DEFAULT_DISCARD_AUDIO_SECONDS,
+) -> WhisperAudioPlan:
+    """Plan non-overlapping Whisper chunks without loading model weights."""
+    if total_samples <= 0:
+        raise ValueError(f"total_samples must be positive, got {total_samples}")
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+
+    discard_samples = int(round(discard_audio_seconds * sample_rate))
+    if total_samples > discard_samples:
+        return WhisperAudioPlan(
+            total_samples=total_samples,
+            included_samples=0,
+            chunk_ranges=(),
+            feature_lengths=(),
+            encoder_lengths=(),
+            token_counts=(),
+            discarded=True,
+        )
+
+    chunk_samples = int(round(chunk_seconds * sample_rate))
+    included_samples = min(total_samples, int(round(max_audio_seconds * sample_rate)))
+    if chunk_samples <= 0 or included_samples <= 0:
+        raise ValueError(
+            f"Invalid audio split configuration: {chunk_samples=} {included_samples=}"
+        )
+
+    chunk_ranges: list[tuple[int, int]] = []
+    feature_lengths: list[int] = []
+    encoder_lengths: list[int] = []
+    token_counts: list[int] = []
+    for start in range(0, included_samples, chunk_samples):
+        end = min(start + chunk_samples, included_samples)
+        chunk_size = end - start
+        if chunk_size <= 0:
+            continue
+        feature_length = min(
+            WHISPER_MAX_FEATURE_FRAMES,
+            max(1, chunk_size // WHISPER_FEATURE_HOP_LENGTH),
+        )
+        encoder_length = feature_length // WHISPER_ENCODER_DOWNSAMPLE
+        token_count = (
+            0
+            if encoder_length < DYNAMIC_COMPRESSOR_KERNEL
+            else (encoder_length - DYNAMIC_COMPRESSOR_KERNEL) // DYNAMIC_COMPRESSOR_STRIDE + 1
+        )
+        chunk_ranges.append((start, end))
+        feature_lengths.append(feature_length)
+        encoder_lengths.append(encoder_length)
+        token_counts.append(token_count)
+
+    return WhisperAudioPlan(
+        total_samples=total_samples,
+        included_samples=included_samples,
+        chunk_ranges=tuple(chunk_ranges),
+        feature_lengths=tuple(feature_lengths),
+        encoder_lengths=tuple(encoder_lengths),
+        token_counts=tuple(token_counts),
+        discarded=False,
+    )
+
+
+def split_audio_for_whisper(
+    audio: np.ndarray,
+    sample_rate: int,
+    chunk_seconds: float = DEFAULT_AUDIO_CHUNK_SECONDS,
+    max_audio_seconds: float = DEFAULT_MAX_AUDIO_SECONDS,
+    discard_audio_seconds: float = DEFAULT_DISCARD_AUDIO_SECONDS,
+) -> tuple[list[np.ndarray], list[int]]:
+    """Split audio into Whisper windows and return true mel-frame lengths.
+
+    Each returned waveform is at most one Whisper window. The feature extractor
+    later pads every window to 3000 mel frames, while the returned lengths keep
+    the padding out of the encoder attention and compressed token sequence.
+    """
+    if audio.ndim != 1:
+        raise ValueError(f"Expected mono waveform with shape [samples], got {audio.shape}")
+    if sample_rate <= 0:
+        raise ValueError(f"sample_rate must be positive, got {sample_rate}")
+    if audio.size == 0:
+        raise ValueError("Audio waveform is empty")
+
+    plan = plan_audio_for_whisper(
+        total_samples=int(audio.shape[0]),
+        sample_rate=sample_rate,
+        chunk_seconds=chunk_seconds,
+        max_audio_seconds=max_audio_seconds,
+        discard_audio_seconds=discard_audio_seconds,
+    )
+    if plan.discarded:
+        raise AudioDiscardedError(
+            f"Audio duration {audio.shape[0] / sample_rate:.3f}s exceeds the discard threshold "
+            f"{discard_audio_seconds:.3f}s"
+        )
+
+    chunks: list[np.ndarray] = []
+    for start, end in plan.chunk_ranges:
+        chunk = audio[start:end].astype(np.float32, copy=False)
+        if chunk.size == 0:
+            continue
+        chunks.append(chunk)
+
+    if not chunks:
+        raise ValueError("Audio split produced no usable chunks")
+    return chunks, list(plan.feature_lengths)
+
+
+def trim_audio(audio: np.ndarray, target_sr: int, max_audio_seconds: float | None) -> np.ndarray:
+    if max_audio_seconds is None:
+        return audio.astype(np.float32, copy=False)
     max_samples = int(round(max_audio_seconds * target_sr))
     if audio.shape[0] > max_samples:
         audio = audio[:max_samples]
@@ -386,7 +572,7 @@ def get_ffmpeg_path() -> str | None:
     return shutil.which("ffmpeg")
 
 
-def load_wav_mono(path: Path, target_sr: int, max_audio_seconds: float) -> np.ndarray:
+def load_wav_mono(path: Path, target_sr: int, max_audio_seconds: float | None) -> np.ndarray:
     with wave.open(str(path), "rb") as wf:
         num_channels = wf.getnchannels()
         sample_width = wf.getsampwidth()
@@ -514,7 +700,7 @@ def decode_audio_with_ffmpeg_file(path: Path, target_sr: int) -> np.ndarray:
     return np.frombuffer(result.stdout, dtype=np.float32).astype(np.float32, copy=False)
 
 
-def load_audio_file(path: Path, target_sr: int, max_audio_seconds: float) -> np.ndarray:
+def load_audio_file(path: Path, target_sr: int, max_audio_seconds: float | None) -> np.ndarray:
     suffix = path.suffix.lower()
     if suffix == ".wav":
         return load_wav_mono(path, target_sr, max_audio_seconds)
@@ -559,7 +745,7 @@ def load_audio_from_tar(
     tar_path: Path,
     member_name: str,
     target_sr: int,
-    max_audio_seconds: float,
+    max_audio_seconds: float | None,
 ) -> np.ndarray:
     tar_obj = get_cached_tarfile(tar_path)
     extracted = tar_obj.extractfile(member_name)
@@ -633,8 +819,19 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
         return
     original_build_audio_prefix = model.build_audio_prefix
 
-    def audited_build_audio_prefix(self, audio_input_features, audio_attention_mask=None):
-        prefix = original_build_audio_prefix(audio_input_features, audio_attention_mask)
+    def audited_build_audio_prefix(
+        self,
+        audio_input_features,
+        audio_attention_mask=None,
+        audio_segment_feature_lengths=None,
+        audio_segment_mask=None,
+    ):
+        prefix, prefix_mask = original_build_audio_prefix(
+            audio_input_features,
+            audio_attention_mask,
+            audio_segment_feature_lengths,
+            audio_segment_mask,
+        )
         if self.training and os.environ.get("RANK", "0") == "0" and not getattr(
             self, "_huginn_audio_prefix_audit_logged", False
         ):
@@ -642,11 +839,12 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
                 parameter.numel() for parameter in self.audio_encoder.parameters() if parameter.requires_grad
             )
             boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
-            expected_prefix_tokens = int(self.config.audio_target_token_count) + boundary_tokens
-            if prefix.size(1) != expected_prefix_tokens:
+            valid_prefix_tokens = prefix_mask.sum(dim=1).tolist()
+            max_audio_tokens = int(getattr(self.config, "audio_max_token_count", 750))
+            if any(tokens < boundary_tokens or tokens - boundary_tokens > max_audio_tokens for tokens in valid_prefix_tokens):
                 raise RuntimeError(
-                    "Audio prefix token count mismatch: "
-                    f"got={prefix.size(1)} expected={expected_prefix_tokens}"
+                    "Audio prefix token count exceeds dynamic bounds: "
+                    f"valid_prefix_tokens={valid_prefix_tokens} max_audio_tokens={max_audio_tokens}"
                 )
             if audio_encoder_trainable != 0:
                 raise RuntimeError(
@@ -655,11 +853,11 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
             print(
                 "[HuginnAudioSwift] train_chain_audit_audio "
                 f"audio_features={tuple(audio_input_features.shape)} audio_prefix={tuple(prefix.shape)} "
-                f"audio_target_tokens={self.config.audio_target_token_count} "
+                f"valid_prefix_tokens={valid_prefix_tokens} max_audio_tokens={max_audio_tokens} "
                 f"boundary_tokens={boundary_tokens} audio_encoder_trainable={audio_encoder_trainable}"
             )
             self._huginn_audio_prefix_audit_logged = True
-        return prefix
+        return prefix, prefix_mask
 
     model.build_audio_prefix = MethodType(audited_build_audio_prefix, model)
     model._huginn_audio_train_chain_audit_patched = True
@@ -701,6 +899,15 @@ def build_huginn_audio_model(model_dir: str):
     )
     config.audio_encoder_name = str(WHISPER_MODEL_DIR)
     config.audio_encoder_hidden_size = int(getattr(whisper_config, "d_model", 1280))
+    config.audio_dynamic_tokens = True
+    config.audio_token_duration_ms = AUDIO_TOKEN_DURATION_MS
+    config.audio_reference_30s_token_count = 250
+    config.audio_max_token_count = 750
+    config.audio_chunk_seconds = DEFAULT_AUDIO_CHUNK_SECONDS
+    config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
+    config.audio_discard_seconds = DEFAULT_DISCARD_AUDIO_SECONDS
+    config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL
+    config.audio_compressor_stride = DYNAMIC_COMPRESSOR_STRIDE
     config.freeze_audio_encoder = True
     config.freeze_text_backbone = False
 
@@ -766,14 +973,14 @@ class HuginnAudioTemplate(Template):
                 tar_path,
                 audio_member,
                 target_sr=self.audio_sampling_rate,
-                max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
+                max_audio_seconds=None,
             )
 
         audio_path = self._resolve_audio_path(audio_item)
         return load_audio_file(
             audio_path,
             target_sr=self.audio_sampling_rate,
-            max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
+            max_audio_seconds=None,
         )
 
     def _encode(self, inputs: StdTemplateInputs) -> dict[str, Any]:
@@ -784,22 +991,58 @@ class HuginnAudioTemplate(Template):
             raise ValueError("Huginn audio Swift template currently supports exactly one audio clip per sample.")
 
         waveform = self._load_audio_item(inputs.audios[0])
+        audio_chunks, audio_feature_lengths = split_audio_for_whisper(
+            waveform,
+            sample_rate=self.audio_sampling_rate,
+        )
         media_inputs = self.audio_feature_extractor(
-            [waveform],
+            audio_chunks,
             sampling_rate=self.audio_sampling_rate,
+            padding="max_length",
+            truncation=True,
+            max_length=int(getattr(self.audio_feature_extractor, "n_samples", 480000)),
             return_tensors="pt",
         )
         target_dtype = getattr(getattr(self, "model_info", None), "torch_dtype", None)
         media_inputs = to_float_dtype(media_inputs, target_dtype)
-        encoded["audio_input_features"] = media_inputs["input_features"][0]
+        encoded["audio_input_features"] = media_inputs["input_features"]
+        encoded["audio_segment_feature_lengths"] = torch.tensor(audio_feature_lengths, dtype=torch.long)
+        encoded["audio_segment_mask"] = torch.ones(len(audio_feature_lengths), dtype=torch.bool)
         return encoded
 
     def _data_collator_mm_data(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
-        audio_input_features = [item["audio_input_features"] for item in batch if "audio_input_features" in item]
-        if not audio_input_features:
+        audio_items = [item for item in batch if "audio_input_features" in item]
+        if not audio_items:
             return {}
+        if len(audio_items) != len(batch):
+            raise RuntimeError("A batch mixes records with and without audio")
+
+        feature_batches = [item["audio_input_features"] for item in audio_items]
+        segment_lengths = [item["audio_segment_feature_lengths"] for item in audio_items]
+        segment_masks = [item["audio_segment_mask"] for item in audio_items]
+        if any(features.ndim != 3 for features in feature_batches):
+            raise RuntimeError(
+                "Each encoded audio_input_features item must have shape [segments, 80, frames]"
+            )
+        max_segments = max(int(features.shape[0]) for features in feature_batches)
+        mel_bins = int(feature_batches[0].shape[1])
+        max_feature_frames = max(int(features.shape[2]) for features in feature_batches)
+        feature_dtype = feature_batches[0].dtype
+        padded_features = torch.zeros(
+            (len(batch), max_segments, mel_bins, max_feature_frames),
+            dtype=feature_dtype,
+        )
+        padded_lengths = torch.zeros((len(batch), max_segments), dtype=torch.long)
+        padded_segment_mask = torch.zeros((len(batch), max_segments), dtype=torch.bool)
+        for index, (features, lengths, masks) in enumerate(zip(feature_batches, segment_lengths, segment_masks)):
+            segment_count = int(features.shape[0])
+            padded_features[index, :segment_count, :, : features.shape[2]] = features
+            padded_lengths[index, :segment_count] = lengths
+            padded_segment_mask[index, :segment_count] = masks
         return {
-            "audio_input_features": torch.stack(audio_input_features, dim=0),
+            "audio_input_features": padded_features,
+            "audio_segment_feature_lengths": padded_lengths,
+            "audio_segment_mask": padded_segment_mask,
         }
 
 
@@ -815,10 +1058,24 @@ class HuginnAudioLoader(ModelLoader):
         )
         config.audio_encoder_name = str(WHISPER_MODEL_DIR)
         config.audio_encoder_hidden_size = int(getattr(whisper_config, "d_model", 1280))
+        config.audio_dynamic_tokens = True
+        config.audio_token_duration_ms = AUDIO_TOKEN_DURATION_MS
+        config.audio_reference_30s_token_count = 250
+        config.audio_max_token_count = 750
+        config.audio_chunk_seconds = DEFAULT_AUDIO_CHUNK_SECONDS
+        config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
+        config.audio_discard_seconds = DEFAULT_DISCARD_AUDIO_SECONDS
+        config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL
+        config.audio_compressor_stride = DYNAMIC_COMPRESSOR_STRIDE
         config.freeze_audio_encoder = True
         config.freeze_text_backbone = False
         print(f"[HuginnAudioSwift] config.audio_encoder_name={config.audio_encoder_name}")
         print(f"[HuginnAudioSwift] config.audio_encoder_hidden_size={config.audio_encoder_hidden_size}")
+        print(f"[HuginnAudioSwift] config.audio_dynamic_tokens={config.audio_dynamic_tokens}")
+        print(f"[HuginnAudioSwift] config.audio_max_token_count={config.audio_max_token_count}")
+        print(f"[HuginnAudioSwift] config.audio_chunk_seconds={config.audio_chunk_seconds}")
+        print(f"[HuginnAudioSwift] config.audio_max_seconds={config.audio_max_seconds}")
+        print(f"[HuginnAudioSwift] config.audio_discard_seconds={config.audio_discard_seconds}")
         return config
 
     def get_processor(self, model_dir: str, config):
@@ -878,16 +1135,16 @@ patch_peft_adapter_restore()
 
 register_model(
     ModelMeta(
-        "huginn_audio_raven",
+        MODEL_TYPE,
         [
             ModelGroup(
                 [
-                    Model("huginn-audio-whisper-v1", str(AUDIO_MODEL_DIR)),
+                    Model("huginn-audio-whisper-dynamic90s-v1", str(AUDIO_MODEL_DIR)),
                 ]
             ),
         ],
         HuginnAudioLoader,
-        template="huginn_audio_text",
+        template=TEMPLATE_TYPE,
         model_arch=MODEL_ARCH_NAME,
         architectures=["HuginnAudioForConditionalGeneration"],
         is_multimodal=True,
@@ -899,7 +1156,7 @@ register_model(
 
 register_template(
     TemplateMeta(
-        template_type="huginn_audio_text",
+        template_type=TEMPLATE_TYPE,
         template_cls=HuginnAudioTemplate,
         prefix=[],
         system_prefix=["<|begin_header|>system<|end_header|>\n\n{{SYSTEM}}<|end_turn|>"],

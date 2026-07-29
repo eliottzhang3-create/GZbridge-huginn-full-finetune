@@ -52,33 +52,17 @@ def prepare_inputs(plugin: Any, processor: Any, audio_path: Path, device: torch.
     feature_extractor = processor.feature_extractor
     tokenizer = processor.tokenizer
     sample_rate = int(getattr(feature_extractor, "sampling_rate", plugin.DEFAULT_SAMPLE_RATE))
-    waveform = plugin.load_audio_file(audio_path, sample_rate, None)
-    audio_chunks, audio_feature_lengths = plugin.split_audio_for_whisper(waveform, sample_rate)
-    feature_inputs = feature_extractor(
-        audio_chunks,
-        sampling_rate=sample_rate,
-        padding="max_length",
-        truncation=True,
-        max_length=int(getattr(feature_extractor, "n_samples", 480000)),
-        return_tensors="pt",
-    )
+    waveform = plugin.load_audio_file(audio_path, sample_rate, plugin.DEFAULT_MAX_AUDIO_SECONDS)
+    feature_inputs = feature_extractor([waveform], sampling_rate=sample_rate, return_tensors="pt")
     tokenized = tokenizer(build_prompt(plugin), return_tensors="pt", add_special_tokens=True)
     inputs = {
         "input_ids": tokenized["input_ids"].to(device),
         "attention_mask": tokenized["attention_mask"].to(device),
-        "audio_input_features": feature_inputs["input_features"].unsqueeze(0).to(
-            device=device,
-            dtype=torch.bfloat16,
-        ),
-        "audio_segment_feature_lengths": torch.tensor(audio_feature_lengths, device=device).unsqueeze(0),
-        "audio_segment_mask": torch.ones((1, len(audio_feature_lengths)), device=device, dtype=torch.bool),
+        "audio_input_features": feature_inputs["input_features"].to(device=device, dtype=torch.bfloat16),
     }
     metadata = {
         "audio_path": str(audio_path),
-        "audio_seconds_after_truncation": min(
-            len(waveform) / float(sample_rate),
-            float(getattr(plugin, "DEFAULT_MAX_AUDIO_SECONDS", 90.0)),
-        ),
+        "audio_seconds_after_truncation": len(waveform) / float(sample_rate),
         "text_prompt_token_count": int(inputs["input_ids"].shape[1]),
         "feature_shape": tuple(inputs["audio_input_features"].shape),
     }

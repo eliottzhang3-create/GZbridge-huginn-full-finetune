@@ -17,20 +17,18 @@ for name in \
   AUDIOCAPS_SAVE_TOTAL_LIMIT \
   AUDIOCAPS_LOGGING_STEPS \
   AUDIOCAPS_REPORT_TO \
-  HUGINN_AUDIO_CUDA_VISIBLE_DEVICES; do
-  value="${!name:-}"
-  if [ -n "$value" ]; then
-    printf -v quoted_value '%q' "$value"
-    CMD_PREFIX="${CMD_PREFIX}${name}=${quoted_value} "
+  AUDIOCAPS_RESUME_FROM_CHECKPOINT; do
+  if [ -n "${!name:-}" ]; then
+    CMD_PREFIX="${CMD_PREFIX}${name}=${!name} "
   fi
 done
 
 vc submit \
   -p pdgpu-5090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
-  -c 32 -m 128G -g 4 \
+  -c 8 -m 32G -g 1 \
   -n 1 \
-  -j train-whisper-dynamic90s-lora-fsdp4-5090-$(date +%m%d%H%M) \
+  -j train-audiocaps-v2-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
-  JOB=1:1 "$SCRIPT_DIR/log/train_audiocaps_v2_huginn_audio_swift_lora_fsdp4_5090.JOB.log" \
+  JOB=1:1 "$SCRIPT_DIR/log/train_audiocaps_v2_huginn_audio_swift_5090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/train_audiocaps_v2_huginn_audio_swift_5090.sh"

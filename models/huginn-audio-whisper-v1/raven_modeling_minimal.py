@@ -18,36 +18,52 @@ class TrainableTemporalCompressor(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        kernel_size: int = 6,
-        stride: int = 6,
+        target_token_count: int,
+        intermediate_size: int | None = None,
+        kernel_size: int = 7,
+        stride: int = 12,
     ):
         super().__init__()
-        if kernel_size <= 0 or stride <= 0:
-            raise ValueError(f"kernel_size and stride must be positive, got {kernel_size=} {stride=}")
-
-        self.kernel_size = kernel_size
+        intermediate_size = intermediate_size or hidden_size * 2
+        padding = kernel_size // 2
+        self.target_token_count = target_token_count
         self.stride = stride
-        self.downsample = nn.Conv1d(
+
+        self.gate_proj = nn.Conv1d(
             hidden_size,
-            hidden_size,
+            intermediate_size,
             kernel_size=kernel_size,
             stride=stride,
-            padding=0,
+            padding=padding,
         )
+        self.up_proj = nn.Conv1d(
+            hidden_size,
+            intermediate_size,
+            kernel_size=kernel_size,
+            stride=stride,
+            padding=padding,
+        )
+        self.down_proj = nn.Conv1d(intermediate_size, hidden_size, kernel_size=1)
+
+        self.shortcut_pool = nn.AvgPool1d(kernel_size=stride, stride=stride, ceil_mode=True)
+        self.shortcut_proj = nn.Conv1d(hidden_size, hidden_size, kernel_size=1)
+        self.output_pool = nn.AdaptiveAvgPool1d(target_token_count)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim != 3:
-            raise ValueError(f"Expected compressor input with shape [batch, time, hidden], got {tuple(x.shape)}")
-        if x.size(1) < self.kernel_size:
-            raise ValueError(
-                "Audio encoder sequence is shorter than the compressor kernel: "
-                f"time={x.size(1)} kernel_size={self.kernel_size}"
-            )
-
-        # Whisper-large emits approximately 20 ms per encoder frame.  A
-        # kernel/stride of 6 therefore produces one audio token per 120 ms.
         x = x.transpose(1, 2)
-        x = self.downsample(x)
+        gate = torch.sigmoid(self.gate_proj(x))
+        value = self.up_proj(x)
+        x_conv = self.down_proj(value * gate)
+
+        x_shortcut = self.shortcut_proj(self.shortcut_pool(x))
+
+        if x_conv.size(-1) != x_shortcut.size(-1):
+            target_len = min(x_conv.size(-1), x_shortcut.size(-1))
+            x_conv = x_conv[..., :target_len]
+            x_shortcut = x_shortcut[..., :target_len]
+
+        x = x_conv + x_shortcut
+        x = self.output_pool(x)
         return x.transpose(1, 2)
 
 
@@ -93,6 +109,8 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
 
         self.temporal_compressor = TrainableTemporalCompressor(
             hidden_size=config.audio_encoder_hidden_size,
+            target_token_count=config.audio_target_token_count,
+            intermediate_size=config.audio_compressor_intermediate_size,
             kernel_size=config.audio_compressor_kernel_size,
             stride=config.audio_compressor_stride,
         )
@@ -158,15 +176,6 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         if self.config.freeze_audio_encoder:
             for param in self.audio_encoder.parameters():
                 param.requires_grad = False
-            self.audio_encoder.eval()
-
-    def train(self, mode: bool = True):
-        super().train(mode)
-        if self.config.freeze_audio_encoder:
-            # ``Module.train`` recursively switches the frozen Whisper encoder
-            # back to train mode. Keep its dropout/statistics behavior frozen.
-            self.audio_encoder.eval()
-        return self
 
     @torch.no_grad()
     def load_huginn_backbone_from_pretrained(
@@ -195,152 +204,23 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         self,
         audio_input_features: torch.Tensor,
         audio_attention_mask: Optional[torch.Tensor] = None,
-        audio_segment_feature_lengths: Optional[torch.Tensor] = None,
-        audio_segment_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> torch.Tensor:
         del audio_attention_mask
-
-        if audio_input_features.ndim == 3:
-            # Backward-compatible single-segment input: [B, 80, 3000].
-            audio_input_features = audio_input_features.unsqueeze(1)
-        elif audio_input_features.ndim != 4:
-            raise ValueError(
-                "audio_input_features must have shape [B, 80, frames] or "
-                f"[B, segments, 80, frames], got {tuple(audio_input_features.shape)}"
-            )
-
-        batch_size, segment_count, _, feature_frame_count = audio_input_features.shape
-        if audio_segment_feature_lengths is None:
-            audio_segment_feature_lengths = torch.full(
-                (batch_size, segment_count),
-                fill_value=feature_frame_count,
-                dtype=torch.long,
-                device=audio_input_features.device,
-            )
-        else:
-            if tuple(audio_segment_feature_lengths.shape) != (batch_size, segment_count):
-                raise ValueError(
-                    "audio_segment_feature_lengths must have shape "
-                    f"[{batch_size}, {segment_count}], got {tuple(audio_segment_feature_lengths.shape)}"
-                )
-            audio_segment_feature_lengths = audio_segment_feature_lengths.to(
-                device=audio_input_features.device,
-                dtype=torch.long,
-            )
-
-        if audio_segment_mask is None:
-            audio_segment_mask = audio_segment_feature_lengths.gt(0)
-        else:
-            if tuple(audio_segment_mask.shape) != (batch_size, segment_count):
-                raise ValueError(
-                    "audio_segment_mask must have shape "
-                    f"[{batch_size}, {segment_count}], got {tuple(audio_segment_mask.shape)}"
-                )
-            audio_segment_mask = audio_segment_mask.to(
-                device=audio_input_features.device,
-                dtype=torch.bool,
-            )
-
-        audio_segment_feature_lengths = audio_segment_feature_lengths.clamp(
-            min=0,
-            max=feature_frame_count,
+        encoder_outputs = self.audio_encoder(
+            input_features=audio_input_features,
+            return_dict=True,
         )
-        audio_segment_mask = audio_segment_mask & audio_segment_feature_lengths.gt(0)
+        audio_hidden = encoder_outputs.last_hidden_state
+        audio_hidden = self.temporal_compressor(audio_hidden)
+        audio_embeds = self.audio_projector(audio_hidden)
 
-        per_sample_audio_tokens: list[torch.Tensor] = []
-        aligner_dtype = next(self.temporal_compressor.parameters()).dtype
-        compressor_kernel = int(self.temporal_compressor.kernel_size)
-        max_audio_token_count = int(getattr(self.config, "audio_max_token_count", 750))
-
-        for sample_index in range(batch_size):
-            sample_tokens: list[torch.Tensor] = []
-            for segment_index in range(segment_count):
-                if not bool(audio_segment_mask[sample_index, segment_index].item()):
-                    continue
-
-                valid_feature_frames = int(audio_segment_feature_lengths[sample_index, segment_index].item())
-                if valid_feature_frames <= 0:
-                    continue
-
-                # Keep Whisper's native 3000-frame input shape. The feature
-                # extractor pads every segment to that shape; the attention
-                # mask prevents padded mel frames from participating in the
-                # encoder, and the valid encoder length below removes padded
-                # outputs from the compressor.
-                segment_features = audio_input_features[
-                    sample_index,
-                    segment_index,
-                    :,
-                ].unsqueeze(0)
-                feature_mask = torch.zeros(
-                    (1, segment_features.size(-1)),
-                    dtype=torch.long,
-                    device=segment_features.device,
-                )
-                feature_mask[:, :valid_feature_frames] = 1
-
-                with torch.no_grad():
-                    encoder_outputs = self.audio_encoder(
-                        input_features=segment_features,
-                        attention_mask=feature_mask,
-                        return_dict=True,
-                    )
-                audio_hidden = encoder_outputs.last_hidden_state
-                # Keep only complete 20 ms encoder frames so the stride-6
-                # compressor emits complete 120 ms tokens. Any residual tail
-                # below 120 ms is intentionally dropped.
-                valid_encoder_frames = min(audio_hidden.size(1), valid_feature_frames // 2)
-                audio_hidden = audio_hidden[:, :valid_encoder_frames]
-                if audio_hidden.size(1) < compressor_kernel:
-                    continue
-
-                audio_hidden = audio_hidden.to(dtype=aligner_dtype)
-                compressed = self.temporal_compressor(audio_hidden)
-                projected = self.audio_projector(compressed).squeeze(0)
-                sample_tokens.append(projected)
-
-            if sample_tokens:
-                audio_tokens = torch.cat(sample_tokens, dim=0)
-            else:
-                audio_tokens = torch.empty(
-                    (0, self.config.n_embd),
-                    device=audio_input_features.device,
-                    dtype=aligner_dtype,
-                )
-
-            if audio_tokens.size(0) > max_audio_token_count:
-                raise ValueError(
-                    "Audio prefix exceeds configured maximum token count: "
-                    f"tokens={audio_tokens.size(0)} max={max_audio_token_count}"
-                )
-            per_sample_audio_tokens.append(audio_tokens)
-
-        boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
-        max_prefix_length = max((tokens.size(0) + boundary_tokens for tokens in per_sample_audio_tokens), default=0)
-        prefix = audio_input_features.new_zeros(
-            (batch_size, max_prefix_length, self.config.n_embd),
-            dtype=aligner_dtype,
-        )
-        prefix_mask = torch.zeros(
-            (batch_size, max_prefix_length),
-            dtype=torch.bool,
-            device=audio_input_features.device,
-        )
-
-        for sample_index, audio_tokens in enumerate(per_sample_audio_tokens):
-            chunks = []
-            if self.audio_bos is not None:
-                chunks.append(self.audio_bos.expand(1, -1, -1).squeeze(0).to(dtype=aligner_dtype))
-            chunks.append(audio_tokens)
-            if self.audio_eos is not None:
-                chunks.append(self.audio_eos.expand(1, -1, -1).squeeze(0).to(dtype=aligner_dtype))
-            sample_prefix = torch.cat(chunks, dim=0) if chunks else audio_tokens
-            prefix_length = sample_prefix.size(0)
-            if prefix_length:
-                prefix[sample_index, :prefix_length] = sample_prefix
-                prefix_mask[sample_index, :prefix_length] = True
-
-        return prefix, prefix_mask
+        prefix_chunks = []
+        if self.audio_bos is not None:
+            prefix_chunks.append(self.audio_bos.expand(audio_embeds.size(0), -1, -1))
+        prefix_chunks.append(audio_embeds)
+        if self.audio_eos is not None:
+            prefix_chunks.append(self.audio_eos.expand(audio_embeds.size(0), -1, -1))
+        return torch.cat(prefix_chunks, dim=1)
 
     def trainable_parameter_summary(self):
         trainable = []
@@ -359,8 +239,6 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         cache_lookup_strategy: str = "full",
         audio_input_features: Optional[torch.Tensor] = None,
         audio_attention_mask: Optional[torch.Tensor] = None,
-        audio_segment_feature_lengths: Optional[torch.Tensor] = None,
-        audio_segment_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ):
         """Expose custom audio inputs to Transformers generation validation."""
@@ -377,10 +255,6 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
             model_inputs["audio_input_features"] = audio_input_features
         if audio_attention_mask is not None:
             model_inputs["audio_attention_mask"] = audio_attention_mask
-        if audio_segment_feature_lengths is not None:
-            model_inputs["audio_segment_feature_lengths"] = audio_segment_feature_lengths
-        if audio_segment_mask is not None:
-            model_inputs["audio_segment_mask"] = audio_segment_mask
         return model_inputs
 
     def forward(
@@ -404,27 +278,18 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         init_scale: float = 1.0,
         audio_input_features: Optional[torch.Tensor] = None,
         audio_attention_mask: Optional[torch.Tensor] = None,
-        audio_segment_feature_lengths: Optional[torch.Tensor] = None,
-        audio_segment_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> CausalLMOutputRecurrentLatents:
         model_input_ids = input_ids
         model_labels = labels
         model_attention_mask = attention_mask
-        self._last_audio_prefix_mask = None
 
         if audio_input_features is not None and past_key_values is None:
             if input_embeds is not None:
                 raise ValueError("Pass either input_embeds or audio_input_features, not both.")
 
             text_embeds = self.transformer.wte(input_ids)  # type: ignore[attr-defined]
-            audio_prefix, prefix_mask = self.build_audio_prefix(
-                audio_input_features,
-                audio_attention_mask,
-                audio_segment_feature_lengths,
-                audio_segment_mask,
-            )
-            self._last_audio_prefix_mask = prefix_mask
+            audio_prefix = self.build_audio_prefix(audio_input_features, audio_attention_mask)
             input_embeds = torch.cat([audio_prefix.to(text_embeds.dtype), text_embeds], dim=1)
 
             prefix_len = audio_prefix.shape[1]
@@ -434,10 +299,6 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
                 dtype=input_ids.dtype,
                 device=input_ids.device,
             )
-            # Huginn's compiled mask treats pad_token_id as invalid even when
-            # input_embeds are supplied. Valid audio positions therefore need
-            # a non-pad placeholder id; only batch padding stays as pad.
-            prefix_ids[prefix_mask.to(device=input_ids.device)] = self.config.bos_token_id
             model_input_ids = torch.cat([prefix_ids, input_ids], dim=1)
 
             if labels is not None:
@@ -447,21 +308,15 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
                     dtype=labels.dtype,
                     device=labels.device,
                 )
-                text_labels = labels.clone()
-                has_audio_padding = prefix_mask.sum(dim=1).lt(prefix_len)
-                if text_labels.size(1) > 0 and bool(has_audio_padding.any().item()):
-                    # The first text target after a padded audio prefix would
-                    # otherwise be predicted from a masked padding position.
-                    # Omit only that invalid transition; later text targets
-                    # remain normally supervised.
-                    text_labels[has_audio_padding.to(device=text_labels.device), 0] = -100
-                model_labels = torch.cat([prefix_labels, text_labels], dim=1)
+                model_labels = torch.cat([prefix_labels, labels], dim=1)
 
             if attention_mask is not None:
-                model_attention_mask = torch.cat(
-                    [prefix_mask.to(device=attention_mask.device, dtype=attention_mask.dtype), attention_mask],
-                    dim=1,
+                prefix_mask = torch.ones(
+                    (attention_mask.size(0), prefix_len),
+                    dtype=attention_mask.dtype,
+                    device=attention_mask.device,
                 )
+                model_attention_mask = torch.cat([prefix_mask, attention_mask], dim=1)
 
         return super().forward(
             input_ids=model_input_ids,
