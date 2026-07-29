@@ -10,6 +10,7 @@ import tarfile
 import wave
 from collections import OrderedDict
 from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
 from types import MethodType
 from typing import Any, Optional
@@ -62,6 +63,7 @@ WHISPER_ENCODER_DOWNSAMPLE = 2
 DYNAMIC_COMPRESSOR_KERNEL = 6
 DYNAMIC_COMPRESSOR_STRIDE = 6
 AUDIO_TOKEN_DURATION_MS = 120
+DYNAMIC_LORA_DROPOUT = 0.05
 _DERIVED_AUDIO_TOKEN_DURATION_MS = (
     WHISPER_FEATURE_HOP_LENGTH
     * WHISPER_ENCODER_DOWNSAMPLE
@@ -359,6 +361,45 @@ def patch_peft_adapter_restore() -> None:
     PeftModel.from_pretrained = from_pretrained_with_audio_aligner
     patch_peft_adapter_restore._patched = True
     print("[HuginnAudioSwift] installed PEFT adapter-restore aligner patch")
+
+
+def patch_peft_dynamic90s_lora_dropout() -> None:
+    """Force the requested dropout before PEFT creates LoRA layers.
+
+    The installed ms-swift ``LoRALLMTuner`` does not forward its generic
+    ``lora_dropout`` argument into ``peft.LoraConfig``. Patching the config
+    constructor is earlier and more reliable than replacing already-created
+    Identity modules, and it is scoped to jobs that explicitly load this
+    isolated dynamic-90s plugin.
+    """
+    try:
+        from peft import LoraConfig
+    except ImportError:  # pragma: no cover - depends on Swift runtime
+        return
+
+    patch_marker = "_huginn_audio_dynamic90s_dropout_patch"
+    existing = getattr(LoraConfig, patch_marker, None)
+    if existing is not None:
+        if float(existing) != DYNAMIC_LORA_DROPOUT:
+            raise RuntimeError(
+                "PEFT LoraConfig already has an incompatible dynamic-90s dropout patch: "
+                f"existing={existing} requested={DYNAMIC_LORA_DROPOUT}"
+            )
+        return
+
+    original_init = LoraConfig.__init__
+
+    @wraps(original_init)
+    def init_with_dynamic90s_dropout(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        self.lora_dropout = DYNAMIC_LORA_DROPOUT
+
+    LoraConfig.__init__ = init_with_dynamic90s_dropout
+    setattr(LoraConfig, patch_marker, DYNAMIC_LORA_DROPOUT)
+    print(
+        "[HuginnAudioDynamic90sSwift] patched PEFT LoraConfig "
+        f"effective_lora_dropout={DYNAMIC_LORA_DROPOUT}"
+    )
 
 
 def classify_missing_keys(missing_keys: list[str]) -> dict[str, list[str]]:
@@ -1131,6 +1172,7 @@ def register_huginn_audio_model_arch():
 
 
 register_huginn_audio_model_arch()
+patch_peft_dynamic90s_lora_dropout()
 patch_peft_adapter_restore()
 
 register_model(

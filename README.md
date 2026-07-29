@@ -632,8 +632,10 @@ checkpoints or evaluation scripts at the dynamic package.
 - dynamic model package: `models/huginn-audio-whisper-dynamic90s-v1/`
 - dynamic Swift plugin: `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`
 - model type/template/model arch: `huginn_audio_whisper_dynamic90s`
-- Whisper-large remains frozen; the aligner is trainable; Huginn uses `lora_llm` with rank `8`, alpha `16`, and requested
-  effective dropout `0.05`.
+- Whisper-large remains frozen; the aligner is trainable; Huginn uses `lora_llm` with rank `8`, alpha `16`, and effective
+  dropout `0.05`. The installed ms-swift `LoRALLMTuner` does not forward the generic dropout argument into PEFT, so the
+  isolated dynamic plugin patches `peft.LoraConfig` before LoRA-layer creation and the Stage 0-2 gate audits both the
+  saved PEFT config value and every instantiated LoRA dropout module.
 - the compressor is exactly one Conv1d with kernel `6`, stride `6`, and padding `0`.
 - audio token count is dynamic: each complete `120 ms` produces one token. Only a complete 30-second segment produces
   `250` tokens; shorter audio is never padded to 250 tokens. Complete 60/90-second inputs produce 500/750 tokens.

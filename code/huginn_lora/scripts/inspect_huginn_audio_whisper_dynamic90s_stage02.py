@@ -219,6 +219,21 @@ def expected_prefix_lengths(plugin: Any, batch: dict[str, torch.Tensor]) -> list
 
 
 def audit_lora_configuration(model: torch.nn.Module) -> None:
+    peft_configs = getattr(model, "peft_config", None)
+    if not peft_configs:
+        raise AssertionError("Final Swift model exposes no PEFT adapter configuration")
+    for adapter_name, config in peft_configs.items():
+        actual = {
+            "rank": int(config.r),
+            "alpha": float(config.lora_alpha),
+            "dropout": float(config.lora_dropout),
+        }
+        expected = {"rank": 8, "alpha": 16.0, "dropout": 0.05}
+        if actual != expected:
+            raise AssertionError(
+                f"PEFT config mismatch for adapter {adapter_name!r}: expected={expected} actual={actual}"
+            )
+
     lora_parameters = [(name, parameter) for name, parameter in model.named_parameters() if "lora_" in name]
     if len(lora_parameters) != EXPECTED_LORA_TENSOR_COUNT:
         raise AssertionError(
