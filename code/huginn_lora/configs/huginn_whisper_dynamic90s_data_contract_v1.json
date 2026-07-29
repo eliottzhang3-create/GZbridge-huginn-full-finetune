@@ -1,0 +1,127 @@
+{
+  "contract_version": "huginn_whisper_dynamic90s_data_v1",
+  "route": "huginn_audio_whisper_dynamic90s",
+  "scope": "Huginn only",
+  "audio_runtime_contract": {
+    "waveform_dtype": "float32",
+    "channels": 1,
+    "sample_rate_hz": 16000,
+    "chunk_seconds": 30.0,
+    "max_included_seconds": 90.0,
+    "long_audio_policy": "retain_first_90_seconds",
+    "whisper_feature_hop_samples": 160,
+    "whisper_encoder_downsample": 2,
+    "compressor_kernel": 6,
+    "compressor_stride": 6,
+    "audio_token_duration_ms": 120,
+    "storage_policy": "Keep source audio read-only and decode/resample at training time; any materialized cache must be private.",
+    "accepted_source_formats_for_inventory": [
+      ".wav",
+      ".flac",
+      ".opus"
+    ]
+  },
+  "atomic_record_schema": {
+    "required_fields": [
+      "schema_version",
+      "uid",
+      "dataset",
+      "source",
+      "task",
+      "split",
+      "audio",
+      "raw_duration_sec",
+      "effective_audio_tokens",
+      "targets",
+      "metadata"
+    ],
+    "field_contracts": {
+      "schema_version": "Must equal huginn_whisper_dynamic90s_atomic_v1.",
+      "uid": "Globally unique, deterministic sample identifier.",
+      "dataset": "Canonical dataset name.",
+      "source": "Canonical source/subset name within the dataset.",
+      "task": "Exactly one of AAC or ASR.",
+      "split": "Training eligibility split; current Clotho policy permits train only.",
+      "audio": {
+        "required_fields": [
+          "path",
+          "format"
+        ],
+        "optional_fields": [
+          "start_sec",
+          "end_sec"
+        ],
+        "contract": "Path is source storage. Segment bounds are required for GigaSpeech and absent for whole-file AAC samples."
+      },
+      "raw_duration_sec": "Positive source sample or segment duration before the 90-second cap.",
+      "effective_audio_tokens": "Exact dynamic token count under the canonical 16-kHz planner; never pad short samples to 250 tokens.",
+      "targets": "Non-empty list of valid references. Runtime emits exactly one selected target for each training occurrence.",
+      "metadata": "Dataset-specific provenance only; training prompts/messages are rendered later by task."
+    }
+  },
+  "pools": {
+    "wavcaps_no_bbc_aac": {
+      "task": "AAC",
+      "dataset": "WavCaps",
+      "eligible_sources": [
+        "FreeSound",
+        "AudioSet_SL",
+        "SoundBible"
+      ],
+      "excluded_sources": [
+        "BBC_Sound_Effects"
+      ],
+      "split_policy": "all eligible source records"
+    },
+    "audiocaps_v2_aac": {
+      "task": "AAC",
+      "dataset": "AudioCaps-v2",
+      "eligible_sources": [
+        "AudioCaps-v2"
+      ],
+      "excluded_sources": [],
+      "split_policy": "train"
+    },
+    "clotho_v2_aac": {
+      "task": "AAC",
+      "dataset": "Clotho-v2",
+      "eligible_sources": [
+        "Clotho-v2"
+      ],
+      "excluded_sources": [],
+      "split_policy": "train only",
+      "target_policy": "Keep references grouped per audio, but select exactly one caption for each training occurrence."
+    },
+    "gigaspeech_l_asr": {
+      "task": "ASR",
+      "dataset": "GigaSpeech",
+      "eligible_sources": [
+        "audiobook",
+        "podcast",
+        "youtube"
+      ],
+      "excluded_sources": [],
+      "split_policy": "segment-level membership containing {L}",
+      "target_policy": "Use cleaned non-empty text_tn transcript."
+    }
+  },
+  "sampling_contract": {
+    "unit": "effective_audio_tokens",
+    "task_weights": {
+      "AAC": 0.6,
+      "ASR": 0.4
+    },
+    "aac_source_weights": {
+      "wavcaps_no_bbc_aac": 0.6,
+      "audiocaps_v2_aac": 0.3,
+      "clotho_v2_aac": 0.1
+    },
+    "global_pool_weights": {
+      "wavcaps_no_bbc_aac": 0.36,
+      "audiocaps_v2_aac": 0.18,
+      "clotho_v2_aac": 0.06,
+      "gigaspeech_l_asr": 0.4
+    },
+    "loss_weighting": "No additional task or dataset loss weights in the initial run."
+  }
+}

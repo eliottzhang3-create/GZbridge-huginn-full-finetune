@@ -364,9 +364,11 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
     ):
         """Run adapter + four physical recurrent blocks as one callable unit."""
         block_idx = block_idx.detach().clone()
-        self._debug_activation_stats("core_in", x, current_step)
+        # Legacy activation-stat logging is intentionally disabled. Keep the
+        # recurrent computation and noise path unchanged.
+        # self._debug_activation_stats("core_in", x, current_step)
         x = self._maybe_inject_noise(x, current_step)
-        self._debug_activation_stats("after_noise", x, current_step)
+        # self._debug_activation_stats("after_noise", x, current_step)
         x, block_idx = self.transformer.core_block(
             x,
             input_embeds,
@@ -375,7 +377,7 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
             mask,
             past_key_values,
         )
-        self._debug_activation_stats("core_unit_out", x, current_step)
+        # self._debug_activation_stats("core_unit_out", x, current_step)
         return x, block_idx
 
     def build_audio_prefix(

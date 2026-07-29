@@ -623,7 +623,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
 - FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming restore later completed a caption-generation run successfully.
 
-#### Current isolated Whisper-large dynamic-90s LoRA route (coarse FSDP4 Stage 3-4 passed; Stage 5 prepared)
+#### Current isolated Whisper-large dynamic-90s LoRA route (FSDP4 Stage 5 passed; data inventory prepared)
 
 The new dynamic route is isolated from the historical fixed-32 Whisper route. Historical files remain at
 `models/huginn-audio-whisper-v1/` and `code/huginn_lora/plugins/huginn_audio_swift.py`; do not point historical
@@ -716,6 +716,40 @@ Submit Stage 5 only through:
 
 ```bash
 bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage5_stability_fsdp4_5090.sh
+```
+
+Stage 5 passed remotely on all four ranks. Every rank completed `20` finite losses and `20` finite gradient norms,
+retained `640` DTensor parameters, used `AcceleratedOptimizer`, and reached `global_step=20`; the job ended with
+`HUGINN WHISPER DYNAMIC90S STAGE 5 STABILITY PASSED` and `exit_status=0`.
+
+The next active work is formal data preparation, before the intentionally deferred Stage 6 checkpoint gate. The fixed
+eligible pools and token-based sampling policy are:
+
+- AAC `60%`, composed of WavCaps without BBC Sound Effects `60%`, AudioCaps-v2 `30%`, and Clotho-v2 train only `10%`;
+- ASR `40%`, composed of GigaSpeech segment-level `{L}` records;
+- therefore global effective-audio-token targets are WavCaps `36%`, AudioCaps-v2 `18%`, Clotho-v2 `6%`, and
+  GigaSpeech-L `40%`;
+- Clotho references remain grouped by audio, but each scheduled training occurrence emits exactly one caption;
+- all datasets share one atomic manifest schema and are normalized at the model input boundary to mono 16-kHz float32.
+  Source WAV/FLAC/Opus files remain in place; public WavCaps and GigaSpeech roots are read-only.
+
+The first read-only data gate is implemented but not yet remote-verified:
+
+- contract: `code/huginn_lora/configs/huginn_whisper_dynamic90s_data_contract_v1.json`;
+- inspector: `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_data_pools.py`;
+- runtime: `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_data_pools.sh`;
+- submit wrapper: `code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_data_pools_5090.sh`.
+
+It performs no model load, training-manifest generation, schedule generation, audio conversion, or public-root write.
+It inventories all four pools, streams the large GigaSpeech top-level `audios` array, proves segment-level `{L}`
+selection and extracted Opus availability, verifies source-level BBC exclusion, groups Clotho train captions by audio,
+audits AudioCaps train WAVs, probes source formats with `ffprobe`, and writes a remote-only JSON report under
+`data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/audits/`.
+
+Submit it only through:
+
+```bash
+bash code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_data_pools_5090.sh
 ```
 
 #### Historical but relevant routes
@@ -2219,11 +2253,11 @@ collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, froze
 pass. The first Stage 3-4 attempt then exposed incomplete wrapping (`64/80` trainable DTensors). The implementation now
 uses five coarse callable FSDP units (Whisper whole, aligner whole, prelude 2 blocks, recurrent adapter + 4 blocks, coda
 2 blocks), all with `reshard_after_forward=true`; LoRA remains Huginn-only. The revised merged Stage 3-4 FSDP4 gate has
-now passed on all four ranks with `640` DTensor parameters and one optimizer update. The immediate gate is the 20-step
-synthetic Stage 5 stability smoke:
-`code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage5_stability_fsdp4_5090.sh`. Do not create or launch a
-formal AudioCaps/ACAVCAPS/WavCaps training job for this route yet. Stage 6 checkpoint save/reload is intentionally
-deferred until after the upcoming data preparation work.
+now passed on all four ranks with `640` DTensor parameters and one optimizer update. The 20-step synthetic Stage 5
+stability smoke also passed on all ranks with finite losses/gradient norms through `global_step=20`. Stage 6 checkpoint
+save/reload remains intentionally deferred. The immediate gate is the read-only four-pool data inventory submitted by
+`code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_data_pools_5090.sh`; do not create or launch formal mixed-data
+training until its report has been reviewed and the canonical manifests and token-aware schedule have been prepared.
 
 The current duration contract has no discard threshold: every input longer than 90 seconds, including inputs beyond
 120 seconds, is retained by truncating it to the first 90 seconds. Stage 0-2 sends a 120.01-second WAV through the real
