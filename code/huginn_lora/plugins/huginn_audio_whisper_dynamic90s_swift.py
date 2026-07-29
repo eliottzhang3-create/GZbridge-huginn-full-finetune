@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import shutil
 import subprocess
@@ -70,6 +71,7 @@ INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT"
 FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT"
+STAGE34_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE34_AUDIT_DIR"
 
 
 def get_tarfile_cache_limit() -> int:
@@ -815,6 +817,158 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
     print("[HuginnAudioSwift] FSDP2 compatibility: freqs_cis marked non-persistent")
 
 
+def _write_stage34_rank_marker(kind: str, payload: dict[str, Any]) -> None:
+    audit_dir_value = os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip()
+    if not audit_dir_value:
+        return
+    audit_dir = Path(audit_dir_value)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    rank = int(payload["rank"])
+    marker_path = audit_dir / f"{kind}-rank-{rank}.json"
+    temporary_path = marker_path.with_suffix(".json.tmp")
+    temporary_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+    os.replace(temporary_path, marker_path)
+
+
+def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -> None:
+    if not os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip():
+        return
+    if getattr(model, "_huginn_audio_dynamic90s_stage34_fsdp_audited", False):
+        return
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+        raise RuntimeError("Stage 3-4 requires an initialized torch.distributed process group")
+
+    rank = torch.distributed.get_rank()
+    world_size = torch.distributed.get_world_size()
+    if world_size != 4:
+        raise RuntimeError(f"Stage 3-4 requires world_size=4, got {world_size}")
+
+    trainable_tensors = {
+        "lora": 0,
+        "aligner": 0,
+        "audio_encoder": 0,
+        "huginn_base": 0,
+        "other": 0,
+    }
+    dtensor_parameter_count = 0
+    dtensor_trainable_count = 0
+    for name, parameter in model.named_parameters():
+        is_dtensor = all(hasattr(parameter, attribute) for attribute in ("device_mesh", "placements", "to_local"))
+        if is_dtensor:
+            dtensor_parameter_count += 1
+        if not parameter.requires_grad:
+            continue
+        if is_dtensor:
+            dtensor_trainable_count += 1
+        if "lora_" in name:
+            group = "lora"
+        elif name.startswith(("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings.")):
+            group = "aligner"
+        elif name.startswith("audio_encoder."):
+            group = "audio_encoder"
+        elif name.startswith(("transformer.", "lm_head.")):
+            group = "huginn_base"
+        else:
+            group = "other"
+        trainable_tensors[group] += 1
+
+    expected_trainables = {
+        "lora": 66,
+        "aligner": 14,
+        "audio_encoder": 0,
+        "huginn_base": 0,
+        "other": 0,
+    }
+    if trainable_tensors != expected_trainables:
+        raise RuntimeError(
+            f"Stage 3-4 post-FSDP trainable split mismatch: expected={expected_trainables} "
+            f"actual={trainable_tensors}"
+        )
+    total_trainable_tensors = sum(trainable_tensors.values())
+    if dtensor_parameter_count <= 0 or dtensor_trainable_count != total_trainable_tensors:
+        raise RuntimeError(
+            "Stage 3-4 did not observe complete FSDP2 DTensor sharding: "
+            f"dtensor_parameters={dtensor_parameter_count} "
+            f"dtensor_trainables={dtensor_trainable_count} total_trainables={total_trainable_tensors}"
+        )
+
+    payload = {
+        "kind": "fsdp",
+        "rank": rank,
+        "world_size": world_size,
+        "cuda_device": torch.cuda.current_device(),
+        "dtensor_parameter_count": dtensor_parameter_count,
+        "dtensor_trainable_count": dtensor_trainable_count,
+        "trainable_tensors": trainable_tensors,
+        "valid_prefix_tokens": [int(value) for value in prefix_mask.sum(dim=1).tolist()],
+    }
+    _write_stage34_rank_marker("fsdp", payload)
+    print(
+        "[HuginnAudioDynamic90s] STAGE34_FSDP_RANK_AUDIT "
+        f"rank={rank} world_size={world_size} dtensor_parameters={dtensor_parameter_count} "
+        f"dtensor_trainables={dtensor_trainable_count} trainable_tensors={trainable_tensors} "
+        f"valid_prefix_tokens={payload['valid_prefix_tokens']}",
+        flush=True,
+    )
+    model._huginn_audio_dynamic90s_stage34_fsdp_audited = True
+
+
+def patch_stage34_optimizer_step_callback() -> None:
+    if not os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip():
+        return
+    from transformers import Trainer, TrainerCallback
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic90s_stage34_patched", False):
+        return
+
+    class Stage34OptimizerStepCallback(TrainerCallback):
+        _huginn_audio_dynamic90s_stage34_callback = True
+
+        def on_step_end(self, args, state, control, **kwargs):
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Stage 3-4 optimizer callback requires initialized torch.distributed")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"Stage 3-4 optimizer callback requires world_size=4, got {world_size}")
+            if int(state.global_step) != 1 or int(state.max_steps) != 1:
+                raise RuntimeError(
+                    "Stage 3-4 optimizer callback expected global_step=max_steps=1, "
+                    f"got global_step={state.global_step} max_steps={state.max_steps}"
+                )
+            optimizer = kwargs.get("optimizer")
+            payload = {
+                "kind": "optimizer_step",
+                "rank": rank,
+                "world_size": world_size,
+                "global_step": int(state.global_step),
+                "max_steps": int(state.max_steps),
+                "optimizer_type": type(optimizer).__name__ if optimizer is not None else None,
+            }
+            _write_stage34_rank_marker("optimizer-step", payload)
+            print(
+                "[HuginnAudioDynamic90s] STAGE34_OPTIMIZER_STEP_AUDIT "
+                f"rank={rank} world_size={world_size} global_step={state.global_step} "
+                f"max_steps={state.max_steps} optimizer={payload['optimizer_type']}",
+                flush=True,
+            )
+            return control
+
+    @wraps(original_init)
+    def init_with_stage34_callback(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic90s_stage34_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(Stage34OptimizerStepCallback())
+
+    init_with_stage34_callback._huginn_audio_dynamic90s_stage34_patched = True
+    Trainer.__init__ = init_with_stage34_callback
+    print("[HuginnAudioDynamic90s] installed Stage 3-4 optimizer-step callback")
+
+
 def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
     """Log one actual audio-prefix pass for the distributed stability smoke."""
     requested = os.environ.get(TRAIN_CHAIN_AUDIT_ENV, "").strip().lower()
@@ -837,6 +991,8 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
             audio_segment_feature_lengths,
             audio_segment_mask,
         )
+        if self.training:
+            audit_stage34_fsdp_rank(self, prefix_mask)
         if self.training and os.environ.get("RANK", "0") == "0" and not getattr(
             self, "_huginn_audio_prefix_audit_logged", False
         ):
@@ -1138,6 +1294,7 @@ def register_huginn_audio_model_arch():
 register_huginn_audio_model_arch()
 patch_peft_dynamic90s_lora_dropout()
 patch_peft_adapter_restore()
+patch_stage34_optimizer_step_callback()
 
 register_model(
     ModelMeta(

@@ -623,7 +623,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
 - FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming restore later completed a caption-generation run successfully.
 
-#### Current isolated Whisper-large dynamic-90s LoRA route (Stage 0-2 prepared; FSDP4 not yet implemented)
+#### Current isolated Whisper-large dynamic-90s LoRA route (Stage 0-2 passed; merged Stage 3-4 FSDP4 prepared)
 
 The new dynamic route is isolated from the historical fixed-32 Whisper route. Historical files remain at
 `models/huginn-audio-whisper-v1/` and `code/huginn_lora/plugins/huginn_audio_swift.py`; do not point historical
@@ -663,9 +663,27 @@ After Git sync, submit with:
 bash code/huginn_lora/run_inspect_huginn_audio_whisper_dynamic90s_stage02_5090.sh
 ```
 
-No FSDP4 training launcher should be created or used until this Stage 0-2 gate passes remotely. The next gate after a
-pass is a separate synthetic-data FSDP4 construction and one-update smoke based on the previously verified Whisper
-FSDP2 configuration.
+Stage 0-2 passed remotely with the terminal banner
+`HUGINN WHISPER DYNAMIC90S STAGE 0-2 VALIDATION PASSED`. The next gate merges Stage 3 (four-rank FSDP2 construction and
+DTensor sharding) with Stage 4 (one real optimizer update) while continuing to use only generated synthetic WAV files.
+It uses Swift CLI's internal torchrun path, four RTX 5090 GPUs, the previously verified custom FSDP2 full-shard config,
+per-device batch size 1, gradient accumulation 1, and `max_steps=1`; it deliberately saves no checkpoint.
+
+The first distributed step covers four different prefixes across the four ranks: 1 second / 10 prefix tokens, 30
+seconds / 252, 60 seconds / 502, and 120.01 seconds truncated to 90 seconds / 752. Every rank must write both an FSDP
+marker and an optimizer-step marker. Post-run validation requires world size 4, CUDA devices 0-3, FSDP2 DTensors, the
+exact `66 LoRA + 14 aligner` trainable tensor split, frozen Whisper/Huginn base, and `global_step=1` on all ranks.
+
+- synthetic fixture preparation:
+  `code/huginn_lora/scripts/prepare_huginn_audio_whisper_dynamic90s_stage34.py`
+- runtime: `code/huginn_lora/scripts/smoke_huginn_audio_whisper_dynamic90s_stage34_fsdp4.sh`
+- submit wrapper: `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage34_fsdp4_5090.sh`
+
+After Git sync, submit with:
+
+```bash
+bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage34_fsdp4_5090.sh
+```
 
 #### Historical but relevant routes
 
@@ -2163,12 +2181,12 @@ been restored to their original paths. The new route is isolated under
 `models/huginn-audio-whisper-dynamic90s-v1/` and
 `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`.
 
-The immediate gate is Stage 0-2 only: submit
-`code/huginn_lora/run_inspect_huginn_audio_whisper_dynamic90s_stage02_5090.sh`, which uses generated synthetic WAV files
-and no formal dataset. Do not create or launch a formal AudioCaps/ACAVCAPS/WavCaps training job for this route yet. Do
-not proceed to the four-GPU FSDP2 gate until the Stage 0-2 remote log reports the production duration contract, real
-Swift collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and real
-backward pass as successful.
+Stage 0-2 has passed remotely, including the production duration contract, real Swift collator/prefix checks, effective
+rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and a real backward pass. The immediate gate is now
+the merged Stage 3-4 synthetic FSDP4 construction plus one-update smoke:
+`code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage34_fsdp4_5090.sh`. Do not create or launch a formal
+AudioCaps/ACAVCAPS/WavCaps training job for this route yet, and do not test checkpoint save/reload until Stage 3-4
+passes.
 
 The current duration contract has no discard threshold: every input longer than 90 seconds, including inputs beyond
 120 seconds, is retained by truncating it to the first 90 seconds. Stage 0-2 sends a 120.01-second WAV through the real
