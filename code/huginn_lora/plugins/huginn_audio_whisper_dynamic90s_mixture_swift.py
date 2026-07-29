@@ -37,11 +37,24 @@ from data_pipeline.dynamic90s_mixture_rows import (  # noqa: E402
 
 
 def _load_base_plugin() -> Any:
-    spec = importlib.util.spec_from_file_location("huginn_audio_whisper_dynamic90s_base", BASE_PLUGIN_PATH)
+    module_name = "huginn_audio_whisper_dynamic90s_base"
+    existing = sys.modules.get(module_name)
+    if existing is not None:
+        return existing
+    spec = importlib.util.spec_from_file_location(module_name, BASE_PLUGIN_PATH)
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to load dynamic-90s base plugin: {BASE_PLUGIN_PATH}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # Python 3.10 dataclasses resolve postponed annotations through
+    # sys.modules[cls.__module__] while the class body is being processed.
+    # Register before exec_module, matching the already-passed Stage 0-2 loader.
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if sys.modules.get(module_name) is module:
+            sys.modules.pop(module_name, None)
+        raise
     return module
 
 

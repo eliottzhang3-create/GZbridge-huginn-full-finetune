@@ -68,11 +68,22 @@ def parse_args() -> argparse.Namespace:
 
 
 def load_plugin(path: Path) -> Any:
-    spec = importlib.util.spec_from_file_location("huginn_audio_whisper_dynamic90s_mixture_swift", path)
+    module_name = "huginn_audio_whisper_dynamic90s_mixture_swift"
+    spec = importlib.util.spec_from_file_location(module_name, path)
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to load Swift plugin: {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    previous = sys.modules.get(module_name)
+    sys.modules[module_name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if previous is None:
+            if sys.modules.get(module_name) is module:
+                sys.modules.pop(module_name, None)
+        else:
+            sys.modules[module_name] = previous
+        raise
     return module
 
 
