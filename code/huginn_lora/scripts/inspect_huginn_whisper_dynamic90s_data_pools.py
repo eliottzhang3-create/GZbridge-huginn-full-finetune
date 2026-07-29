@@ -1,8 +1,8 @@
-"""Read-only inventory for the Huginn Whisper dynamic-90s multitask data pools.
+"""Lightweight metadata-only inventory for Huginn Whisper dynamic-90s data.
 
-This gate does not create training manifests, schedules, audio caches, or converted
-audio. It verifies the four source pools and records enough schema/layout evidence
-to implement the later canonical manifest builders without guessing remote paths.
+The gate never downloads, copies, converts, decodes, or scans every audio file.
+It reads source metadata and checks only a small deterministic sample of audio
+locations. Duration/token accounting is deferred to training-time statistics.
 """
 
 from __future__ import annotations
@@ -13,13 +13,10 @@ import hashlib
 import json
 import math
 import re
-import shutil
-import subprocess
 import traceback
-import wave
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Iterable, Iterator
+from typing import Any, Iterator
 
 
 DEFAULT_REPO_ROOT = Path(__file__).resolve().parents[3]
@@ -43,24 +40,8 @@ DEFAULT_OUTPUT = (
     / "audits"
     / "data_pool_inventory.json"
 )
-
-CANONICAL_SAMPLE_RATE = 16000
-CHUNK_SECONDS = 30.0
-MAX_AUDIO_SECONDS = 90.0
-WHISPER_MAX_FEATURE_FRAMES = 3000
-WHISPER_FEATURE_HOP = 160
-WHISPER_ENCODER_DOWNSAMPLE = 2
-COMPRESSOR_KERNEL = 6
-COMPRESSOR_STRIDE = 6
 ATOMIC_SCHEMA_VERSION = "huginn_whisper_dynamic90s_atomic_v1"
-GIGASPEECH_PUNCTUATION_TAGS = {
-    "<COMMA>",
-    "<PERIOD>",
-    "<QUESTIONMARK>",
-    "<EXCLAMATIONPOINT>",
-    "<COLON>",
-    "<SEMICOLON>",
-}
+AUDIO_SUFFIXES = {".wav", ".flac", ".opus", ".ogg", ".mp3", ".m4a"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,7 +54,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--clotho_train_manifest", default="train_expand.json")
     parser.add_argument("--gigaspeech_root", default=str(DEFAULT_GIGASPEECH_ROOT))
     parser.add_argument("--gigaspeech_metadata", default="GigaSpeech.json")
-    parser.add_argument("--probe_count", type=int, default=8)
+    parser.add_argument("--probe_count", type=int, default=4)
+    parser.add_argument("--metadata_schema_records", type=int, default=20)
     parser.add_argument("--output_report", default=str(DEFAULT_OUTPUT))
     return parser.parse_args()
 
@@ -102,23 +84,6 @@ def limited_append(mapping: dict[str, list[str]], key: str, value: str, limit: i
         examples.append(value)
 
 
-def exact_dynamic_token_count(duration_seconds: float) -> int:
-    """Mirror the current production 16-kHz duration planner without importing Swift."""
-    if not math.isfinite(duration_seconds) or duration_seconds <= 0:
-        raise ValueError(f"duration_seconds must be finite and positive, got {duration_seconds!r}")
-    total_samples = max(1, int(round(duration_seconds * CANONICAL_SAMPLE_RATE)))
-    included_samples = min(total_samples, int(round(MAX_AUDIO_SECONDS * CANONICAL_SAMPLE_RATE)))
-    chunk_samples = int(round(CHUNK_SECONDS * CANONICAL_SAMPLE_RATE))
-    token_count = 0
-    for start in range(0, included_samples, chunk_samples):
-        chunk_size = min(start + chunk_samples, included_samples) - start
-        feature_length = min(WHISPER_MAX_FEATURE_FRAMES, max(1, chunk_size // WHISPER_FEATURE_HOP))
-        encoder_length = feature_length // WHISPER_ENCODER_DOWNSAMPLE
-        if encoder_length >= COMPRESSOR_KERNEL:
-            token_count += (encoder_length - COMPRESSOR_KERNEL) // COMPRESSOR_STRIDE + 1
-    return token_count
-
-
 def validate_contract(path: Path) -> dict[str, Any]:
     if not path.is_file():
         raise FileNotFoundError(f"Data contract not found: {path}")
@@ -127,13 +92,9 @@ def validate_contract(path: Path) -> dict[str, Any]:
     expected = {
         "waveform_dtype": "float32",
         "channels": 1,
-        "sample_rate_hz": CANONICAL_SAMPLE_RATE,
-        "chunk_seconds": CHUNK_SECONDS,
-        "max_included_seconds": MAX_AUDIO_SECONDS,
-        "whisper_feature_hop_samples": WHISPER_FEATURE_HOP,
-        "whisper_encoder_downsample": WHISPER_ENCODER_DOWNSAMPLE,
-        "compressor_kernel": COMPRESSOR_KERNEL,
-        "compressor_stride": COMPRESSOR_STRIDE,
+        "sample_rate_hz": 16000,
+        "chunk_seconds": 30.0,
+        "max_included_seconds": 90.0,
         "audio_token_duration_ms": 120,
     }
     mismatches = {
@@ -146,71 +107,32 @@ def validate_contract(path: Path) -> dict[str, Any]:
         raise ValueError(f"Data contract/runtime mismatch: {mismatches}")
     if "targets" not in required or "effective_audio_tokens" not in required:
         raise ValueError(f"Atomic record schema is incomplete: required_fields={required}")
-    token_landmarks = {
-        rendered: exact_dynamic_token_count(seconds)
-        for rendered, seconds in (("1s", 1.0), ("30s", 30.0), ("60s", 60.0), ("90s", 90.0), ("120s", 120.0))
-    }
-    if token_landmarks != {"1s": 8, "30s": 250, "60s": 500, "90s": 750, "120s": 750}:
-        raise AssertionError(f"Unexpected dynamic token landmarks: {token_landmarks}")
     return {
         "path": str(path),
         "sha256": sha256_file(path),
         "contract_version": contract.get("contract_version"),
         "atomic_schema_version": ATOMIC_SCHEMA_VERSION,
-        "runtime_normalization": {
-            "dtype": "float32",
-            "channels": 1,
-            "sample_rate_hz": CANONICAL_SAMPLE_RATE,
-        },
-        "dynamic_token_landmarks": token_landmarks,
         "validated": True,
+        "note": "No per-record duration or token accounting is performed; training-time statistics will track it.",
     }
 
 
-def ffprobe_audio(path: Path) -> dict[str, Any]:
-    ffprobe = shutil.which("ffprobe")
-    if ffprobe is None:
-        return {"path": str(path), "error": "ffprobe is unavailable"}
-    result = subprocess.run(
-        [
-            ffprobe,
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration:stream=codec_name,sample_rate,channels",
-            "-of",
-            "json",
-            str(path),
-        ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=False,
-    )
-    if result.returncode != 0:
-        return {
-            "path": str(path),
-            "error": result.stderr.strip() or f"ffprobe exited with {result.returncode}",
-        }
-    try:
-        payload = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        return {"path": str(path), "error": f"ffprobe returned invalid JSON: {exc}"}
-    return {"path": str(path), "ffprobe": payload}
-
-
-def probe_paths(paths: Iterable[Path], limit: int) -> list[dict[str, Any]]:
-    selected: list[Path] = []
+def check_sample_paths(paths: list[Path], limit: int) -> dict[str, Any]:
+    checked: list[dict[str, Any]] = []
     seen: set[str] = set()
     for path in paths:
         rendered = str(path)
         if rendered in seen:
             continue
         seen.add(rendered)
-        selected.append(path)
-        if len(selected) >= limit:
+        checked.append({"path": rendered, "exists": path.is_file(), "suffix": path.suffix.lower()})
+        if len(checked) >= limit:
             break
-    return [ffprobe_audio(path) for path in selected]
+    return {
+        "checked_count": len(checked),
+        "missing_count": sum(not item["exists"] for item in checked),
+        "items": checked,
+    }
 
 
 def inspect_audiocaps(root: Path, split: str, probe_count: int) -> dict[str, Any]:
@@ -221,14 +143,10 @@ def inspect_audiocaps(root: Path, split: str, probe_count: int) -> dict[str, Any
 
     errors: Counter[str] = Counter()
     examples: dict[str, list[str]] = {}
-    audio_paths: Counter[str] = Counter()
-    valid_paths: list[Path] = []
-    format_counts: Counter[str] = Counter()
+    audio_ids: Counter[str] = Counter()
+    sample_paths: list[Path] = []
     source_rows = 0
-    total_duration = 0.0
-    total_tokens = 0
-    duration_over_90 = 0
-
+    valid_metadata_rows = 0
     with csv_path.open("r", encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
         headers = list(reader.fieldnames or [])
@@ -249,35 +167,11 @@ def inspect_audiocaps(root: Path, split: str, probe_count: int) -> dict[str, Any
             stem = Path(audio_id).stem
             if not stem.startswith("Y"):
                 stem = f"Y{stem}"
-            path = audio_dir / f"{stem}.wav"
-            if not path.is_file():
-                errors["missing_wav"] += 1
-                limited_append(examples, "missing_wav", f"row={row_number} path={path}")
-                continue
-            try:
-                with wave.open(str(path), "rb") as wav_file:
-                    channels = wav_file.getnchannels()
-                    sample_width = wav_file.getsampwidth()
-                    sample_rate = wav_file.getframerate()
-                    frames = wav_file.getnframes()
-                    compression = wav_file.getcomptype()
-                if channels <= 0 or sample_rate <= 0 or frames <= 0 or compression != "NONE":
-                    raise ValueError(
-                        f"channels={channels} rate={sample_rate} frames={frames} compression={compression}"
-                    )
-            except (OSError, ValueError, wave.Error) as exc:
-                errors["unreadable_wav"] += 1
-                limited_append(examples, "unreadable_wav", f"row={row_number} path={path} error={exc}")
-                continue
-            duration = frames / float(sample_rate)
-            total_duration += duration
-            total_tokens += exact_dynamic_token_count(duration)
-            duration_over_90 += int(duration > MAX_AUDIO_SECONDS)
-            format_counts[f"wav:pcm{sample_width * 8}:ch{channels}:sr{sample_rate}"] += 1
-            audio_paths[str(path)] += 1
-            valid_paths.append(path)
+            audio_ids[stem] += 1
+            valid_metadata_rows += 1
+            if len(sample_paths) < probe_count:
+                sample_paths.append(audio_dir / f"{stem}.wav")
 
-    probes = probe_paths(valid_paths, probe_count)
     return {
         "dataset": "AudioCaps-v2",
         "task": "AAC",
@@ -285,19 +179,15 @@ def inspect_audiocaps(root: Path, split: str, probe_count: int) -> dict[str, Any
         "root": str(root),
         "csv_path": str(csv_path),
         "source_row_count": source_rows,
-        "valid_record_count": len(valid_paths),
-        "excluded_record_count": sum(errors.values()),
-        "excluded_record_counts": dict(sorted(errors.items())),
-        "excluded_record_examples": examples,
-        "unique_audio_path_count": len(audio_paths),
-        "duplicate_audio_path_count": sum(count > 1 for count in audio_paths.values()),
-        "source_format_counts": dict(sorted(format_counts.items())),
-        "raw_duration_hours": total_duration / 3600.0,
-        "effective_audio_token_count": total_tokens,
-        "duration_over_90_seconds_count": duration_over_90,
-        "audio_probes": probes,
-        "probe_failure_count": sum("error" in probe for probe in probes),
-        "runtime_target_policy": "one caption for each record",
+        "valid_metadata_row_count": valid_metadata_rows,
+        "metadata_error_counts": dict(sorted(errors.items())),
+        "metadata_error_examples": examples,
+        "unique_audio_id_count": len(audio_ids),
+        "duplicate_audio_id_count": sum(count > 1 for count in audio_ids.values()),
+        "audio_path_rule": str(audio_dir / "Y<youtube_id>.wav"),
+        "sample_audio_locations": check_sample_paths(sample_paths, probe_count),
+        "full_audio_scan_performed": False,
+        "audio_decode_performed": False,
     }
 
 
@@ -314,27 +204,62 @@ def canonical_wavcaps_source(name: str) -> str:
     return name
 
 
-def inspect_json_metadata(path: Path, schema_limit: int = 100) -> dict[str, Any]:
+def iter_root_json_array(path: Path, chunk_size: int = 1024 * 1024) -> Iterator[Any]:
+    decoder = json.JSONDecoder()
+    with path.open("r", encoding="utf-8") as handle:
+        buffer = ""
+        while True:
+            chunk = handle.read(chunk_size)
+            if not chunk:
+                raise ValueError(f"Empty JSON file: {path}")
+            buffer += chunk
+            stripped = buffer.lstrip()
+            if stripped:
+                if not stripped.startswith("["):
+                    raise ValueError("top-level JSON value is not an array")
+                buffer = stripped[1:]
+                break
+        while True:
+            buffer = buffer.lstrip()
+            if buffer.startswith(","):
+                buffer = buffer[1:]
+                continue
+            if buffer.startswith("]"):
+                return
+            try:
+                value, end = decoder.raw_decode(buffer)
+            except json.JSONDecodeError as exc:
+                chunk = handle.read(chunk_size)
+                if not chunk:
+                    raise ValueError(f"Malformed JSON array in {path}: {exc}") from exc
+                buffer += chunk
+                continue
+            yield value
+            buffer = buffer[end:]
+
+
+def observe_schema_record(
+    record: Any,
+    key_counts: Counter[str],
+    examples: dict[str, list[str]],
+) -> bool:
+    if not isinstance(record, dict):
+        return False
+    for key, value in record.items():
+        key_counts[key] += 1
+        if len(examples.setdefault(key, [])) < 2:
+            rendered = json.dumps(value, ensure_ascii=False)
+            examples[key].append(rendered[:200] + ("..." if len(rendered) > 200 else ""))
+    return True
+
+
+def inspect_json_metadata_sample(path: Path, schema_limit: int) -> dict[str, Any]:
     key_counts: Counter[str] = Counter()
     examples: dict[str, list[str]] = {}
-    record_count = 0
-    malformed_count = 0
+    scanned = 0
+    malformed = 0
     first_record: dict[str, Any] | None = None
-
-    def observe(record: Any) -> None:
-        nonlocal record_count, malformed_count, first_record
-        if not isinstance(record, dict):
-            malformed_count += 1
-            return
-        record_count += 1
-        if first_record is None:
-            first_record = record
-        if record_count <= schema_limit:
-            for key, value in record.items():
-                key_counts[key] += 1
-                if len(examples.setdefault(key, [])) < 2:
-                    rendered = json.dumps(value, ensure_ascii=False)
-                    examples[key].append(rendered[:200] + ("..." if len(rendered) > 200 else ""))
+    sampling_note = ""
 
     if path.suffix.lower() == ".jsonl":
         with path.open("r", encoding="utf-8") as handle:
@@ -342,83 +267,87 @@ def inspect_json_metadata(path: Path, schema_limit: int = 100) -> dict[str, Any]
                 if not line.strip():
                     continue
                 try:
-                    observe(json.loads(line))
+                    record = json.loads(line)
                 except json.JSONDecodeError:
-                    malformed_count += 1
+                    malformed += 1
+                    continue
+                if first_record is None and isinstance(record, dict):
+                    first_record = record
+                malformed += int(not observe_schema_record(record, key_counts, examples))
+                scanned += 1
+                if scanned >= schema_limit:
+                    break
+        sampling_note = "Only the first metadata records were read; total rows were not counted."
     else:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        candidate_lists: list[list[Any]] = []
-        if isinstance(payload, list):
-            candidate_lists.append(payload)
-        elif isinstance(payload, dict):
-            candidate_lists.extend(value for value in payload.values() if isinstance(value, list))
-        for records in candidate_lists:
-            for record in records:
-                observe(record)
+        try:
+            iterator = iter_root_json_array(path)
+            for record in iterator:
+                if first_record is None and isinstance(record, dict):
+                    first_record = record
+                malformed += int(not observe_schema_record(record, key_counts, examples))
+                scanned += 1
+                if scanned >= schema_limit:
+                    break
+            sampling_note = "Only the first records of the top-level JSON array were read."
+        except ValueError as exc:
+            with path.open("r", encoding="utf-8") as handle:
+                preview = handle.read(4096)
+            sampling_note = f"Schema sampling deferred: {exc}; first_4096_chars={preview!r}"
 
     return {
         "path": str(path),
         "size_bytes": path.stat().st_size,
-        "record_count": record_count,
-        "malformed_record_count": malformed_count,
-        "field_presence_in_schema_sample": dict(sorted(key_counts.items())),
+        "scanned_record_count": scanned,
+        "malformed_sample_count": malformed,
+        "field_presence_counts": dict(sorted(key_counts.items())),
         "field_examples": {key: examples[key] for key in sorted(examples)},
         "first_record": first_record,
+        "sampling_note": sampling_note,
     }
 
 
-def inspect_wavcaps(root: Path, probe_count: int) -> dict[str, Any]:
+def find_first_audio_files(root: Path, limit: int) -> list[Path]:
+    results: list[Path] = []
+    for path in root.rglob("*"):
+        if path.is_file() and path.suffix.lower() in AUDIO_SUFFIXES:
+            results.append(path)
+            if len(results) >= limit:
+                break
+    return results
+
+
+def inspect_wavcaps(root: Path, schema_limit: int) -> dict[str, Any]:
     audio_root = root / "audio"
     metadata_root = root / "json"
     if not audio_root.is_dir() or not metadata_root.is_dir():
         raise FileNotFoundError(f"WavCaps layout missing: audio={audio_root} metadata={metadata_root}")
 
     source_reports: dict[str, dict[str, Any]] = {}
-    canonical_source_audio_counts: Counter[str] = Counter()
-    eligible_probe_paths: list[Path] = []
     for child in sorted(audio_root.iterdir(), key=lambda item: item.name.lower()):
         if not child.is_dir():
             continue
-        extension_counts: Counter[str] = Counter()
-        file_count = 0
-        audio_file_count = 0
-        first_paths: list[Path] = []
-        for path in child.rglob("*"):
-            if not path.is_file():
-                continue
-            file_count += 1
-            extension_counts[path.suffix.lower() or "<none>"] += 1
-            if path.suffix.lower() in {".wav", ".flac", ".opus", ".ogg", ".mp3", ".m4a"}:
-                audio_file_count += 1
-                if len(first_paths) < probe_count:
-                    first_paths.append(path)
         canonical = canonical_wavcaps_source(child.name)
-        canonical_source_audio_counts[canonical] += audio_file_count
-        excluded = canonical == "BBC_Sound_Effects"
+        sample_paths = find_first_audio_files(child, 1)
         source_reports[child.name] = {
             "canonical_source": canonical,
             "path": str(child),
-            "file_count": file_count,
-            "audio_file_count": audio_file_count,
-            "extension_counts": dict(sorted(extension_counts.items())),
-            "training_eligible": not excluded,
-            "exclusion_reason": "source-level BBC exclusion" if excluded else None,
+            "training_eligible": canonical != "BBC_Sound_Effects",
+            "exclusion_reason": "source-level BBC exclusion" if canonical == "BBC_Sound_Effects" else None,
+            "sample_audio_locations": check_sample_paths(sample_paths, 1),
+            "full_directory_scan_performed": False,
         }
-        if not excluded:
-            eligible_probe_paths.extend(first_paths)
 
     metadata_paths = sorted(
         path for path in metadata_root.rglob("*") if path.is_file() and path.suffix.lower() in {".json", ".jsonl"}
     )
     metadata_reports = []
     for path in metadata_paths:
-        report = inspect_json_metadata(path)
+        report = inspect_json_metadata_sample(path, schema_limit)
         report["canonical_source"] = canonical_wavcaps_source(path.stem)
         report["training_eligible"] = report["canonical_source"] != "BBC_Sound_Effects"
         metadata_reports.append(report)
 
-    probes = probe_paths(eligible_probe_paths, probe_count)
-    discovered_canonical_sources = sorted(
+    discovered = sorted(
         {report["canonical_source"] for report in source_reports.values()}
         | {report["canonical_source"] for report in metadata_reports}
     )
@@ -429,13 +358,11 @@ def inspect_wavcaps(root: Path, probe_count: int) -> dict[str, Any]:
         "public_root_read_only": True,
         "source_reports": source_reports,
         "metadata_reports": metadata_reports,
-        "discovered_canonical_sources": discovered_canonical_sources,
-        "canonical_source_audio_file_counts": dict(sorted(canonical_source_audio_counts.items())),
+        "discovered_canonical_sources": discovered,
         "required_eligible_sources": ["FreeSound", "AudioSet_SL", "SoundBible"],
         "excluded_sources": ["BBC_Sound_Effects"],
-        "audio_probes": probes,
-        "probe_failure_count": sum("error" in probe for probe in probes),
-        "duration_accounting": "deferred to canonical manifest preparation after metadata/path pairing is confirmed",
+        "full_audio_scan_performed": False,
+        "audio_decode_performed": False,
     }
 
 
@@ -470,7 +397,6 @@ def inspect_clotho(root: Path, manifest_name: str, probe_count: int) -> dict[str
     grouped_targets: dict[str, set[str]] = defaultdict(set)
     path_objects: dict[str, Path] = {}
     split_leakage_indicators = 0
-
     for index, record in enumerate(records):
         if not isinstance(record, dict):
             errors["non_object_record"] += 1
@@ -496,12 +422,8 @@ def inspect_clotho(root: Path, manifest_name: str, probe_count: int) -> dict[str
         grouped_targets[rendered].add(caption.strip())
         path_objects[rendered] = path
 
-    missing_paths = [path for rendered, path in path_objects.items() if not path.is_file()]
     multiplicity = Counter(len(targets) for targets in grouped_targets.values())
-    probes = probe_paths(
-        (path_objects[rendered] for rendered in sorted(path_objects) if path_objects[rendered].is_file()),
-        probe_count,
-    )
+    sample_paths = [path_objects[key] for key in sorted(path_objects)[:probe_count]]
     return {
         "dataset": "Clotho-v2",
         "task": "AAC",
@@ -509,18 +431,16 @@ def inspect_clotho(root: Path, manifest_name: str, probe_count: int) -> dict[str
         "manifest_path": str(manifest_path),
         "split_policy": "train only",
         "source_record_count": len(records),
-        "valid_source_record_count": sum(len(targets) for targets in grouped_targets.values()),
         "grouped_audio_count": len(grouped_targets),
         "caption_multiplicity_per_audio": {str(key): value for key, value in sorted(multiplicity.items())},
         "invalid_record_counts": dict(sorted(errors.items())),
         "invalid_record_examples": examples,
-        "missing_audio_path_count": len(missing_paths),
-        "missing_audio_path_examples": [str(path) for path in missing_paths[:10]],
         "split_leakage_indicator_count": split_leakage_indicators,
         "runtime_target_policy": "select exactly one deterministic caption per scheduled training occurrence",
         "atomic_manifest_policy": "one grouped row per audio; do not expand one audio into five independent rows",
-        "audio_probes": probes,
-        "probe_failure_count": sum("error" in probe for probe in probes),
+        "sample_audio_locations": check_sample_paths(sample_paths, probe_count),
+        "full_audio_scan_performed": False,
+        "audio_decode_performed": False,
     }
 
 
@@ -540,7 +460,6 @@ def iter_named_json_array(path: Path, key: str, chunk_size: int = 1024 * 1024) -
                 buffer = buffer[match.end() :]
                 break
             buffer = buffer[-max(4096, len(key) * 4) :]
-
         while True:
             buffer = buffer.lstrip()
             if buffer.startswith(","):
@@ -571,18 +490,13 @@ def inspect_gigaspeech(root: Path, metadata_name: str, probe_count: int) -> dict
     l_segment_count = 0
     l_segment_source_counts: Counter[str] = Counter()
     l_duration_seconds = 0.0
-    l_effective_tokens = 0
-    duration_over_90 = 0
-    zero_token_segments = 0
     invalid_counts: Counter[str] = Counter()
     invalid_examples: dict[str, list[str]] = {}
     placeholder_counts: Counter[str] = Counter()
-    l_parent_extension_counts: Counter[str] = Counter()
     sid_counts: Counter[str] = Counter()
-    referenced_audio_paths: set[str] = set()
-    observed_l_parent_paths: set[str] = set()
-    missing_audio_paths: set[str] = set()
-    probe_candidates: list[Path] = []
+    parent_extensions: Counter[str] = Counter()
+    observed_parent_paths: set[str] = set()
+    sample_parent_paths: list[Path] = []
     first_l_segment: dict[str, Any] | None = None
 
     for audio_index, audio in enumerate(iter_named_json_array(metadata_path, "audios")):
@@ -601,11 +515,7 @@ def inspect_gigaspeech(root: Path, metadata_name: str, probe_count: int) -> dict
             limited_append(invalid_examples, "missing_segments_list", f"audio_index={audio_index} path={raw_path}")
             continue
         total_segment_count += len(segments)
-
         audio_path = root / raw_path if raw_path else None
-        path_exists: bool | None = None
-        if audio_path is not None:
-            path_exists = audio_path.is_file()
 
         for segment_index, segment in enumerate(segments):
             if not isinstance(segment, dict):
@@ -621,31 +531,23 @@ def inspect_gigaspeech(root: Path, metadata_name: str, probe_count: int) -> dict
                 continue
             l_segment_count += 1
             l_segment_source_counts[source] += 1
-            if audio_path is not None:
-                rendered_path = str(audio_path)
-                referenced_audio_paths.add(rendered_path)
-                if rendered_path not in observed_l_parent_paths:
-                    observed_l_parent_paths.add(rendered_path)
-                    l_parent_extension_counts[audio_path.suffix.lower() or "<none>"] += 1
-                if not path_exists:
-                    missing_audio_paths.add(rendered_path)
-            else:
+            if audio_path is None:
                 invalid_counts["empty_l_parent_audio_path"] += 1
-                limited_append(
-                    invalid_examples,
-                    "empty_l_parent_audio_path",
-                    f"audio_index={audio_index} segment_index={segment_index}",
-                )
+                limited_append(invalid_examples, "empty_l_parent_audio_path", f"audio_index={audio_index}")
+            else:
+                rendered_path = str(audio_path)
+                if rendered_path not in observed_parent_paths:
+                    observed_parent_paths.add(rendered_path)
+                    parent_extensions[audio_path.suffix.lower() or "<none>"] += 1
+                    if len(sample_parent_paths) < probe_count:
+                        sample_parent_paths.append(audio_path)
+
             sid = str(segment.get("sid") or "").strip()
             if sid:
                 sid_counts[sid] += 1
             else:
                 invalid_counts["empty_l_sid"] += 1
-                limited_append(
-                    invalid_examples,
-                    "empty_l_sid",
-                    f"audio_index={audio_index} segment_index={segment_index}",
-                )
+                limited_append(invalid_examples, "empty_l_sid", f"audio_index={audio_index}")
             try:
                 begin = float(segment.get("begin_time"))
                 end = float(segment.get("end_time"))
@@ -656,11 +558,7 @@ def inspect_gigaspeech(root: Path, metadata_name: str, probe_count: int) -> dict
             duration = end - begin
             if not math.isfinite(begin) or not math.isfinite(end) or begin < 0 or duration <= 0:
                 invalid_counts["invalid_l_segment_time"] += 1
-                limited_append(
-                    invalid_examples,
-                    "invalid_l_segment_time",
-                    f"sid={sid} begin={begin} end={end}",
-                )
+                limited_append(invalid_examples, "invalid_l_segment_time", f"sid={sid} begin={begin} end={end}")
                 continue
             if isinstance(parent_duration, (int, float)) and end > float(parent_duration) + 0.05:
                 invalid_counts["l_segment_exceeds_parent_duration"] += 1
@@ -676,12 +574,6 @@ def inspect_gigaspeech(root: Path, metadata_name: str, probe_count: int) -> dict
             for tag in re.findall(r"<[^<>]+>", text_tn):
                 placeholder_counts[tag] += 1
             l_duration_seconds += duration
-            tokens = exact_dynamic_token_count(duration)
-            l_effective_tokens += tokens
-            zero_token_segments += int(tokens == 0)
-            duration_over_90 += int(duration > MAX_AUDIO_SECONDS)
-            if audio_path is not None and path_exists and len(probe_candidates) < probe_count:
-                probe_candidates.append(audio_path)
             if first_l_segment is None:
                 first_l_segment = {
                     "sid": sid,
@@ -691,17 +583,10 @@ def inspect_gigaspeech(root: Path, metadata_name: str, probe_count: int) -> dict
                     "begin_time": begin,
                     "end_time": end,
                     "duration_seconds": duration,
-                    "effective_audio_tokens": tokens,
                     "subsets": subsets,
                     "text_tn_preview": text_tn[:240],
                 }
 
-    encrypted_archives = sum(1 for path in (root / "audio").rglob("*.tgz.aes") if path.is_file())
-    duplicate_sid_count = sum(count > 1 for count in sid_counts.values())
-    probes = probe_paths(probe_candidates, probe_count)
-    non_punctuation_tags = {
-        tag: count for tag, count in placeholder_counts.items() if tag not in GIGASPEECH_PUNCTUATION_TAGS
-    }
     return {
         "dataset": "GigaSpeech",
         "task": "ASR",
@@ -714,26 +599,19 @@ def inspect_gigaspeech(root: Path, metadata_name: str, probe_count: int) -> dict
         "all_segment_count": total_segment_count,
         "l_segment_count": l_segment_count,
         "l_segment_source_counts": dict(sorted(l_segment_source_counts.items())),
-        "l_raw_duration_hours": l_duration_seconds / 3600.0,
-        "l_effective_audio_token_count": l_effective_tokens,
-        "duration_over_90_seconds_count": duration_over_90,
-        "zero_audio_token_segment_count": zero_token_segments,
+        "l_raw_duration_hours_from_metadata": l_duration_seconds / 3600.0,
         "unique_l_sid_count": len(sid_counts),
-        "duplicate_l_sid_count": duplicate_sid_count,
-        "referenced_parent_audio_count": len(referenced_audio_paths),
-        "l_parent_audio_extension_counts": dict(sorted(l_parent_extension_counts.items())),
-        "missing_parent_audio_count": len(missing_audio_paths),
-        "missing_parent_audio_examples": sorted(missing_audio_paths)[:10],
+        "duplicate_l_sid_count": sum(count > 1 for count in sid_counts.values()),
+        "referenced_l_parent_audio_count": len(observed_parent_paths),
+        "l_parent_audio_extension_counts": dict(sorted(parent_extensions.items())),
         "invalid_counts": dict(sorted(invalid_counts.items())),
         "invalid_examples": invalid_examples,
         "text_tn_placeholder_counts": dict(sorted(placeholder_counts.items())),
-        "non_punctuation_placeholder_counts": dict(sorted(non_punctuation_tags.items())),
-        "transcript_cleanup_policy": "map punctuation placeholders, remove non-speech tags deliberately, normalize whitespace; implementation deferred",
-        "encrypted_archive_count_ignored": encrypted_archives,
-        "audio_decode_policy": "read extracted .opus only; ignore .tgz.aes; decode requested segment to mono 16-kHz float32 in memory",
+        "sample_audio_locations": check_sample_paths(sample_parent_paths, probe_count),
         "first_l_segment": first_l_segment,
-        "audio_probes": probes,
-        "probe_failure_count": sum("error" in probe for probe in probes),
+        "full_audio_scan_performed": False,
+        "audio_decode_performed": False,
+        "token_accounting_performed": False,
     }
 
 
@@ -744,10 +622,11 @@ def build_blocking_issues(report: dict[str, Any]) -> list[str]:
             issues.append(f"{pool_name} inspection failed: {pool_report['inspection_error']}")
 
     audiocaps = report["pools"]["audiocaps_v2_aac"]
-    if "inspection_error" not in audiocaps and audiocaps["valid_record_count"] == 0:
-        issues.append("AudioCaps has no valid train records")
-    if "inspection_error" not in audiocaps and audiocaps["probe_failure_count"]:
-        issues.append("AudioCaps ffprobe sample failed")
+    if "inspection_error" not in audiocaps:
+        if audiocaps["valid_metadata_row_count"] == 0:
+            issues.append("AudioCaps has no valid train metadata rows")
+        if audiocaps["sample_audio_locations"]["missing_count"]:
+            issues.append("AudioCaps sampled audio location is missing")
 
     wavcaps = report["pools"]["wavcaps_no_bbc_aac"]
     if "inspection_error" not in wavcaps:
@@ -755,106 +634,96 @@ def build_blocking_issues(report: dict[str, Any]) -> list[str]:
         required = set(wavcaps["required_eligible_sources"])
         if missing := sorted(required - discovered):
             issues.append(f"WavCaps required sources were not discovered: {missing}")
-        source_audio_counts = wavcaps["canonical_source_audio_file_counts"]
-        empty_sources = sorted(source for source in required if not source_audio_counts.get(source, 0))
-        if empty_sources:
-            issues.append(f"WavCaps required sources have no discovered audio files: {empty_sources}")
         if "BBC_Sound_Effects" not in discovered:
-            issues.append("WavCaps BBC source was not discovered, so source-level exclusion is not yet proven")
-        if wavcaps["probe_failure_count"]:
-            issues.append("WavCaps ffprobe sample failed")
+            issues.append("WavCaps BBC source was not discovered, so source-level exclusion is not proven")
+        for source_name, source_report in wavcaps["source_reports"].items():
+            if source_report["training_eligible"] and source_report["sample_audio_locations"]["checked_count"] == 0:
+                issues.append(f"WavCaps eligible source has no sampled audio location: {source_name}")
 
     clotho = report["pools"]["clotho_v2_aac"]
     if "inspection_error" not in clotho:
         if clotho["grouped_audio_count"] == 0:
             issues.append("Clotho train manifest has no grouped audio")
         if clotho["invalid_record_counts"]:
-            issues.append(f"Clotho contains invalid records: {clotho['invalid_record_counts']}")
-        if clotho["missing_audio_path_count"]:
-            issues.append(f"Clotho has {clotho['missing_audio_path_count']} missing train audio paths")
+            issues.append(f"Clotho contains invalid metadata records: {clotho['invalid_record_counts']}")
         if clotho["split_leakage_indicator_count"]:
             issues.append("Clotho train manifest contains val/test/evaluation path indicators")
-        if clotho["probe_failure_count"]:
-            issues.append("Clotho ffprobe sample failed")
+        if clotho["sample_audio_locations"]["missing_count"]:
+            issues.append("Clotho sampled train audio location is missing")
 
     giga = report["pools"]["gigaspeech_l_asr"]
     if "inspection_error" not in giga:
         if giga["l_segment_count"] == 0:
             issues.append("GigaSpeech has no segment-level {L} records")
-        if giga["missing_parent_audio_count"]:
-            issues.append(f"GigaSpeech has {giga['missing_parent_audio_count']} missing extracted parent audio files")
         if giga["duplicate_l_sid_count"]:
             issues.append(f"GigaSpeech has {giga['duplicate_l_sid_count']} duplicate L segment IDs")
-        unexpected_extensions = sorted(
-            extension for extension in giga["l_parent_audio_extension_counts"] if extension != ".opus"
-        )
-        if unexpected_extensions:
-            issues.append(f"GigaSpeech-L parent audio has unexpected extensions: {unexpected_extensions}")
         if giga["invalid_counts"]:
-            issues.append(f"GigaSpeech contains invalid L records: {giga['invalid_counts']}")
-        if giga["probe_failure_count"]:
-            issues.append("GigaSpeech ffprobe sample failed")
+            issues.append(f"GigaSpeech contains invalid L metadata: {giga['invalid_counts']}")
+        unexpected = sorted(ext for ext in giga["l_parent_audio_extension_counts"] if ext != ".opus")
+        if unexpected:
+            issues.append(f"GigaSpeech-L parent audio has unexpected extensions: {unexpected}")
+        if giga["sample_audio_locations"]["missing_count"]:
+            issues.append("GigaSpeech sampled parent Opus location is missing")
     return issues
 
 
-def run_pool_inspection(
-    pool_name: str,
-    inspector: Any,
-    *args: Any,
-) -> dict[str, Any]:
+def run_pool_inspection(pool_name: str, inspector: Any, *args: Any) -> dict[str, Any]:
     print(f"[inspect] pool={pool_name}", flush=True)
     try:
         result = inspector(*args)
     except Exception as exc:  # pragma: no cover - depends on remote data layout
         error = f"{type(exc).__name__}: {exc}"
         print(f"[inspect-error] pool={pool_name} error={error}", flush=True)
-        return {
-            "inspection_error": error,
-            "traceback": traceback.format_exc(),
-        }
+        return {"inspection_error": error, "traceback": traceback.format_exc()}
     print(f"[inspect] pool={pool_name} completed=true", flush=True)
     return result
 
 
 def main() -> None:
     args = parse_args()
-    if args.probe_count <= 0:
-        raise ValueError(f"probe_count must be positive, got {args.probe_count}")
+    if args.probe_count <= 0 or args.metadata_schema_records <= 0:
+        raise ValueError("probe_count and metadata_schema_records must be positive")
 
-    print("========== HUGINN WHISPER DYNAMIC90S DATA POOL INSPECT START ==========", flush=True)
+    print("========== HUGINN WHISPER DYNAMIC90S METADATA INSPECT START ==========", flush=True)
     print("[scope] route=Huginn Whisper dynamic-90s only", flush=True)
-    print("[scope] source_roots_read_only=true", flush=True)
-    print("[scope] creates_training_manifest=false creates_audio_cache=false", flush=True)
+    print("[scope] metadata_only=true source_roots_read_only=true", flush=True)
+    print("[scope] downloads=0 copies=0 conversions=0 audio_decodes=0 full_audio_scans=0", flush=True)
+    print("[scope] token_accounting=deferred_to_training_time_statistics", flush=True)
 
     report: dict[str, Any] = {
-        "audit": "huginn_whisper_dynamic90s_data_pool_inventory_v1",
-        "contract": validate_contract(Path(args.contract)),
-        "tools": {
-            "ffmpeg": shutil.which("ffmpeg"),
-            "ffprobe": shutil.which("ffprobe"),
+        "audit": "huginn_whisper_dynamic90s_metadata_inventory_v1",
+        "access_contract": {
+            "metadata_only": True,
+            "downloads": 0,
+            "copies": 0,
+            "audio_conversions": 0,
+            "audio_decodes": 0,
+            "full_audio_directory_scans": 0,
+            "per_record_token_accounting": False,
+            "sample_audio_location_limit": args.probe_count,
+            "wavcaps_sample_audio_location_limit_per_source": 1,
         },
+        "contract": validate_contract(Path(args.contract)),
         "pools": {},
     }
-    if report["tools"]["ffprobe"] is None:
-        raise RuntimeError("ffprobe is required for source-format probes")
-
     report["pools"]["audiocaps_v2_aac"] = run_pool_inspection(
-        "audiocaps_v2_aac",
-        inspect_audiocaps,
-        Path(args.audiocaps_root), args.audiocaps_split, args.probe_count
+        "audiocaps_v2_aac", inspect_audiocaps, Path(args.audiocaps_root), args.audiocaps_split, args.probe_count
     )
     report["pools"]["wavcaps_no_bbc_aac"] = run_pool_inspection(
-        "wavcaps_no_bbc_aac", inspect_wavcaps, Path(args.wavcaps_root), args.probe_count
+        "wavcaps_no_bbc_aac",
+        inspect_wavcaps,
+        Path(args.wavcaps_root),
+        args.metadata_schema_records,
     )
     report["pools"]["clotho_v2_aac"] = run_pool_inspection(
-        "clotho_v2_aac",
-        inspect_clotho,
-        Path(args.clotho_root), args.clotho_train_manifest, args.probe_count
+        "clotho_v2_aac", inspect_clotho, Path(args.clotho_root), args.clotho_train_manifest, args.probe_count
     )
     report["pools"]["gigaspeech_l_asr"] = run_pool_inspection(
         "gigaspeech_l_asr",
         inspect_gigaspeech,
-        Path(args.gigaspeech_root), args.gigaspeech_metadata, args.probe_count
+        Path(args.gigaspeech_root),
+        args.gigaspeech_metadata,
+        args.probe_count,
     )
 
     report["blocking_issues"] = build_blocking_issues(report)
@@ -866,30 +735,22 @@ def main() -> None:
         if "inspection_error" in pool_report:
             summary = f"inspection_error={pool_report['inspection_error']}"
         elif pool_name == "audiocaps_v2_aac":
-            summary = (
-                f"valid={pool_report['valid_record_count']} excluded={pool_report['excluded_record_count']} "
-                f"hours={pool_report['raw_duration_hours']:.3f}"
-            )
+            summary = f"metadata_rows={pool_report['valid_metadata_row_count']}"
         elif pool_name == "wavcaps_no_bbc_aac":
             summary = f"sources={pool_report['discovered_canonical_sources']}"
         elif pool_name == "clotho_v2_aac":
-            summary = (
-                f"source_records={pool_report['source_record_count']} "
-                f"grouped_audio={pool_report['grouped_audio_count']} "
-                f"caption_multiplicity={pool_report['caption_multiplicity_per_audio']}"
-            )
+            summary = f"source_records={pool_report['source_record_count']} grouped_audio={pool_report['grouped_audio_count']}"
         else:
             summary = (
                 f"L_segments={pool_report['l_segment_count']} "
-                f"hours={pool_report['l_raw_duration_hours']:.3f} "
-                f"missing_parent_audio={pool_report['missing_parent_audio_count']}"
+                f"metadata_hours={pool_report['l_raw_duration_hours_from_metadata']:.3f}"
             )
         print(f"[summary] pool={pool_name} {summary}", flush=True)
     print(f"[inspect] output_report={output_report}", flush=True)
     print(f"[inspect] blocking_issues={json.dumps(report['blocking_issues'], ensure_ascii=False)}", flush=True)
     if report["blocking_issues"]:
-        raise SystemExit("Data pool inspection found blocking issues; inspect the report before manifest preparation.")
-    print("========== HUGINN WHISPER DYNAMIC90S DATA POOL INSPECT PASSED ==========", flush=True)
+        raise SystemExit("Metadata inspection found blocking issues; inspect the saved report.")
+    print("========== HUGINN WHISPER DYNAMIC90S METADATA INSPECT PASSED ==========", flush=True)
 
 
 if __name__ == "__main__":

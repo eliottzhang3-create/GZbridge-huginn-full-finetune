@@ -740,10 +740,12 @@ The first read-only data gate is implemented but not yet remote-verified:
 - runtime: `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_data_pools.sh`;
 - submit wrapper: `code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_data_pools_5090.sh`.
 
-It performs no model load, training-manifest generation, schedule generation, audio conversion, or public-root write.
-It inventories all four pools, streams the large GigaSpeech top-level `audios` array, proves segment-level `{L}`
-selection and extracted Opus availability, verifies source-level BBC exclusion, groups Clotho train captions by audio,
-audits AudioCaps train WAVs, probes source formats with `ffprobe`, and writes a remote-only JSON report under
+It performs no model load, training-manifest generation, schedule generation, token accumulation, audio conversion,
+audio decoding, download, copy, or public-root write. The first heavy implementation was simplified after its audio-side
+I/O proved unnecessary. The current gate reads AudioCaps/Clotho/WavCaps/GigaSpeech metadata, streams the large
+GigaSpeech top-level `audios` array to identify segment-level `{L}` records, verifies source-level BBC exclusion, groups
+Clotho train captions by audio, and checks only a small deterministic sample of audio locations. It never scans or opens
+every audio file. The remote-only JSON report is written under
 `data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/audits/`.
 
 Submit it only through:

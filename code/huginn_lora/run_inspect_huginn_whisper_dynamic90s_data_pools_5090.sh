@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 mkdir -p log
 
-# This is a CPU/I/O-only read-only inventory. The current pdgpu submission path
-# still requires a GPU-shaped job, but the allocated GPU is intentionally unused.
+# This is a lightweight metadata-only read. It performs no audio decoding or
+# full audio-directory scan. The pdgpu submit path still allocates one unused GPU.
 vc submit \
   -p pdgpu-5090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \

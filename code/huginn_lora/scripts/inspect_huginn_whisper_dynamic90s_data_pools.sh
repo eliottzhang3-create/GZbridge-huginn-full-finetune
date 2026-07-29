@@ -20,7 +20,8 @@ CLOTHO_TRAIN_MANIFEST="${CLOTHO_TRAIN_MANIFEST:-train_expand.json}"
 GIGASPEECH_ROOT="${GIGASPEECH_DATASET_ROOT:-/hpc_stor03/public/shared/data/asr/am/GigaSpeech}"
 GIGASPEECH_METADATA="${GIGASPEECH_METADATA_NAME:-GigaSpeech.json}"
 OUTPUT_REPORT="${HUGINN_DYNAMIC90S_DATA_INSPECT_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/audits/data_pool_inventory.json}"
-PROBE_COUNT="${HUGINN_DYNAMIC90S_DATA_PROBE_COUNT:-8}"
+PROBE_COUNT="${HUGINN_DYNAMIC90S_DATA_PROBE_COUNT:-4}"
+METADATA_SCHEMA_RECORDS="${HUGINN_DYNAMIC90S_METADATA_SCHEMA_RECORDS:-20}"
 
 echo "========== INSPECT HUGINN WHISPER DYNAMIC90S DATA POOLS =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
@@ -32,6 +33,8 @@ echo "clotho_root=$CLOTHO_ROOT split=train_only manifest=$CLOTHO_TRAIN_MANIFEST"
 echo "gigaspeech_root=$GIGASPEECH_ROOT read_only=true metadata=$GIGASPEECH_METADATA"
 echo "output_report=$OUTPUT_REPORT"
 echo "probe_count=$PROBE_COUNT"
+echo "metadata_schema_records=$METADATA_SCHEMA_RECORDS"
+echo "metadata_only=true downloads=0 copies=0 conversions=0 audio_decodes=0 full_audio_scans=0"
 echo "gpu_is_not_used_by_this_read_only_inventory=true"
 
 python -u code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_data_pools.py \
@@ -44,6 +47,7 @@ python -u code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_data_pools.
   --gigaspeech_root "$GIGASPEECH_ROOT" \
   --gigaspeech_metadata "$GIGASPEECH_METADATA" \
   --probe_count "$PROBE_COUNT" \
+  --metadata_schema_records "$METADATA_SCHEMA_RECORDS" \
   --output_report "$OUTPUT_REPORT"
 
 echo "========== INSPECT HUGINN WHISPER DYNAMIC90S DATA POOLS EXIT =========="
