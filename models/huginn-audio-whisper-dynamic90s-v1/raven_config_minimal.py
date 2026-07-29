@@ -17,7 +17,6 @@ class HuginnAudioConfig(RavenConfig):
         audio_max_token_count: int = 750,
         audio_chunk_seconds: float = 30.0,
         audio_max_seconds: float = 90.0,
-        audio_discard_seconds: float = 120.0,
         audio_feature_hop_length: int = 160,
         audio_encoder_frame_rate: int = 50,
         audio_compressor_kernel_size: int = 6,
@@ -37,7 +36,6 @@ class HuginnAudioConfig(RavenConfig):
         self.audio_max_token_count = audio_max_token_count
         self.audio_chunk_seconds = audio_chunk_seconds
         self.audio_max_seconds = audio_max_seconds
-        self.audio_discard_seconds = audio_discard_seconds
         self.audio_feature_hop_length = audio_feature_hop_length
         self.audio_encoder_frame_rate = audio_encoder_frame_rate
         self.audio_compressor_kernel_size = audio_compressor_kernel_size

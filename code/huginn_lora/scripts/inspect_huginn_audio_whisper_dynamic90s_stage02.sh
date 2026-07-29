@@ -24,6 +24,7 @@ echo "formal_dataset_dependency=none"
 echo "whisper_encoder=frozen"
 echo "lora_rank=8 lora_alpha=16 lora_dropout=0.05"
 echo "audio_tokens=dynamic complete_120ms_per_token"
+echo "audio_over_90s=retain_first_90s no_duration_discard=true"
 
 python -u code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic90s_stage02.py \
   --work-dir "$WORK_DIR"

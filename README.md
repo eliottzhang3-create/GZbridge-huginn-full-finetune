@@ -639,9 +639,9 @@ checkpoints or evaluation scripts at the dynamic package.
 - the compressor is exactly one Conv1d with kernel `6`, stride `6`, and padding `0`.
 - audio token count is dynamic: each complete `120 ms` produces one token. Only a complete 30-second segment produces
   `250` tokens; shorter audio is never padded to 250 tokens. Complete 60/90-second inputs produce 500/750 tokens.
-- audio is split into non-overlapping windows of at most 30 seconds; at most the first 90 seconds are included. Inputs
-  longer than 90 seconds and at most 120 seconds are truncated to 90 seconds. Inputs longer than 120 seconds must be
-  filtered before Swift template/collator processing; a template-side exception remains only as an integrity guard.
+- audio is split into non-overlapping windows of at most 30 seconds; at most the first 90 seconds are included. Every
+  input longer than 90 seconds is retained and truncated to exactly 90 seconds, including inputs longer than 120
+  seconds; this route has no duration-based discard threshold.
 - prefix embeddings are padded to the longest prefix in each collated batch; padding uses zero embeddings, attention
   mask `0`, and labels `-100`.
 
@@ -2165,3 +2165,7 @@ and no formal dataset. Do not create or launch a formal AudioCaps/ACAVCAPS/WavCa
 not proceed to the four-GPU FSDP2 gate until the Stage 0-2 remote log reports the production duration contract, real
 Swift collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and real
 backward pass as successful.
+
+The current duration contract has no discard threshold: every input longer than 90 seconds, including inputs beyond
+120 seconds, is retained by truncating it to the first 90 seconds. Stage 0-2 sends a 120.01-second WAV through the real
+Swift path and separately checks the production planner with 180-second and one-hour inputs.

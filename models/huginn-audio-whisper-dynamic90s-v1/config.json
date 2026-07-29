@@ -16,7 +16,6 @@
   "audio_max_token_count": 750,
   "audio_chunk_seconds": 30.0,
   "audio_max_seconds": 90.0,
-  "audio_discard_seconds": 120.0,
   "audio_feature_hop_length": 160,
   "audio_encoder_frame_rate": 50,
   "auto_map": {

@@ -56,7 +56,6 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio a
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_AUDIO_CHUNK_SECONDS = 30.0
 DEFAULT_MAX_AUDIO_SECONDS = 90.0
-DEFAULT_DISCARD_AUDIO_SECONDS = 120.0
 WHISPER_MAX_FEATURE_FRAMES = 3000
 WHISPER_FEATURE_HOP_LENGTH = 160
 WHISPER_ENCODER_DOWNSAMPLE = 2
@@ -459,10 +458,6 @@ def normalize_audio_array(audio: np.ndarray) -> np.ndarray:
     raise ValueError(f"Unsupported audio ndim={audio.ndim}")
 
 
-class AudioDiscardedError(ValueError):
-    """Integrity guard for an over-limit sample that escaped manifest filtering."""
-
-
 @dataclass(frozen=True)
 class WhisperAudioPlan:
     """Production duration plan shared by preprocessing and validation.
@@ -477,7 +472,6 @@ class WhisperAudioPlan:
     feature_lengths: tuple[int, ...]
     encoder_lengths: tuple[int, ...]
     token_counts: tuple[int, ...]
-    discarded: bool
 
     @property
     def total_audio_tokens(self) -> int:
@@ -493,25 +487,12 @@ def plan_audio_for_whisper(
     sample_rate: int,
     chunk_seconds: float = DEFAULT_AUDIO_CHUNK_SECONDS,
     max_audio_seconds: float = DEFAULT_MAX_AUDIO_SECONDS,
-    discard_audio_seconds: float = DEFAULT_DISCARD_AUDIO_SECONDS,
 ) -> WhisperAudioPlan:
-    """Plan non-overlapping Whisper chunks without loading model weights."""
+    """Plan non-overlapping Whisper chunks, truncating every input to 90 seconds."""
     if total_samples <= 0:
         raise ValueError(f"total_samples must be positive, got {total_samples}")
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
-
-    discard_samples = int(round(discard_audio_seconds * sample_rate))
-    if total_samples > discard_samples:
-        return WhisperAudioPlan(
-            total_samples=total_samples,
-            included_samples=0,
-            chunk_ranges=(),
-            feature_lengths=(),
-            encoder_lengths=(),
-            token_counts=(),
-            discarded=True,
-        )
 
     chunk_samples = int(round(chunk_seconds * sample_rate))
     included_samples = min(total_samples, int(round(max_audio_seconds * sample_rate)))
@@ -551,7 +532,6 @@ def plan_audio_for_whisper(
         feature_lengths=tuple(feature_lengths),
         encoder_lengths=tuple(encoder_lengths),
         token_counts=tuple(token_counts),
-        discarded=False,
     )
 
 
@@ -560,7 +540,6 @@ def split_audio_for_whisper(
     sample_rate: int,
     chunk_seconds: float = DEFAULT_AUDIO_CHUNK_SECONDS,
     max_audio_seconds: float = DEFAULT_MAX_AUDIO_SECONDS,
-    discard_audio_seconds: float = DEFAULT_DISCARD_AUDIO_SECONDS,
 ) -> tuple[list[np.ndarray], list[int]]:
     """Split audio into Whisper windows and return true mel-frame lengths.
 
@@ -580,13 +559,7 @@ def split_audio_for_whisper(
         sample_rate=sample_rate,
         chunk_seconds=chunk_seconds,
         max_audio_seconds=max_audio_seconds,
-        discard_audio_seconds=discard_audio_seconds,
     )
-    if plan.discarded:
-        raise AudioDiscardedError(
-            f"Audio duration {audio.shape[0] / sample_rate:.3f}s exceeds the discard threshold "
-            f"{discard_audio_seconds:.3f}s"
-        )
 
     chunks: list[np.ndarray] = []
     for start, end in plan.chunk_ranges:
@@ -946,7 +919,6 @@ def build_huginn_audio_model(model_dir: str):
     config.audio_max_token_count = 750
     config.audio_chunk_seconds = DEFAULT_AUDIO_CHUNK_SECONDS
     config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
-    config.audio_discard_seconds = DEFAULT_DISCARD_AUDIO_SECONDS
     config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL
     config.audio_compressor_stride = DYNAMIC_COMPRESSOR_STRIDE
     config.freeze_audio_encoder = True
@@ -1014,14 +986,14 @@ class HuginnAudioTemplate(Template):
                 tar_path,
                 audio_member,
                 target_sr=self.audio_sampling_rate,
-                max_audio_seconds=None,
+                max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
             )
 
         audio_path = self._resolve_audio_path(audio_item)
         return load_audio_file(
             audio_path,
             target_sr=self.audio_sampling_rate,
-            max_audio_seconds=None,
+            max_audio_seconds=DEFAULT_MAX_AUDIO_SECONDS,
         )
 
     def _encode(self, inputs: StdTemplateInputs) -> dict[str, Any]:
@@ -1105,7 +1077,6 @@ class HuginnAudioLoader(ModelLoader):
         config.audio_max_token_count = 750
         config.audio_chunk_seconds = DEFAULT_AUDIO_CHUNK_SECONDS
         config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
-        config.audio_discard_seconds = DEFAULT_DISCARD_AUDIO_SECONDS
         config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL
         config.audio_compressor_stride = DYNAMIC_COMPRESSOR_STRIDE
         config.freeze_audio_encoder = True
@@ -1116,7 +1087,6 @@ class HuginnAudioLoader(ModelLoader):
         print(f"[HuginnAudioSwift] config.audio_max_token_count={config.audio_max_token_count}")
         print(f"[HuginnAudioSwift] config.audio_chunk_seconds={config.audio_chunk_seconds}")
         print(f"[HuginnAudioSwift] config.audio_max_seconds={config.audio_max_seconds}")
-        print(f"[HuginnAudioSwift] config.audio_discard_seconds={config.audio_discard_seconds}")
         return config
 
     def get_processor(self, model_dir: str, config):

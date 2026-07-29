@@ -2,10 +2,10 @@
 """Validate the isolated Whisper dynamic-90s route through a real Swift batch.
 
 This is a data-independent Stage 0-2 gate. It creates deterministic WAV files,
-filters over-limit records before manifest construction, loads the real remote
-Whisper-large and Huginn-0125 assets through the dynamic Swift plugin, audits
-the real collator/prefix path for multiple durations, and performs one real
-LoRA/aligner backward pass on a single GPU.
+including an input beyond 120 seconds that must be retained and truncated to
+90 seconds, loads the real remote Whisper-large and Huginn-0125 assets through
+the dynamic Swift plugin, audits the real collator/prefix path for multiple
+durations, and performs one real LoRA/aligner backward pass on a single GPU.
 """
 
 from __future__ import annotations
@@ -27,22 +27,22 @@ import torch
 
 SAMPLE_RATE = 16_000
 CONTRACT_CASES = (
-    (0.10, 0, 1, False),
-    (1.00, 8, 1, False),
-    (15.00, 125, 1, False),
-    (29.99, 249, 1, False),
-    (30.00, 250, 1, False),
-    (30.01, 250, 2, False),
-    (45.00, 375, 2, False),
-    (60.00, 500, 2, False),
-    (75.00, 625, 3, False),
-    (90.00, 750, 3, False),
-    (91.00, 750, 3, False),
-    (119.00, 750, 3, False),
-    (120.00, 750, 3, False),
-    (120.01, 0, 0, True),
+    (0.10, 0, 1),
+    (1.00, 8, 1),
+    (15.00, 125, 1),
+    (29.99, 249, 1),
+    (30.00, 250, 1),
+    (30.01, 250, 2),
+    (45.00, 375, 2),
+    (60.00, 500, 2),
+    (75.00, 625, 3),
+    (90.00, 750, 3),
+    (91.00, 750, 3),
+    (119.00, 750, 3),
+    (120.00, 750, 3),
+    (120.01, 750, 3),
 )
-TRAIN_DURATIONS = tuple(duration for duration, _, _, discarded in CONTRACT_CASES if not discarded)
+PLANNER_ONLY_LONG_DURATIONS = (180.0, 3600.0)
 EXPECTED_LORA_TENSOR_COUNT = 66
 EXPECTED_ALIGNER_TENSOR_COUNT = 14
 
@@ -88,14 +88,10 @@ def write_synthetic_wav(path: Path, duration_seconds: float) -> int:
 def assert_contract(plugin: Any) -> dict[float, Any]:
     plans: dict[float, Any] = {}
     print("========== DYNAMIC LENGTH CONTRACT ==========")
-    for duration, expected_tokens, expected_segments, expected_discarded in CONTRACT_CASES:
+    for duration, expected_tokens, expected_segments in CONTRACT_CASES:
         sample_count = int(round(duration * SAMPLE_RATE))
         plan = plugin.plan_audio_for_whisper(sample_count, SAMPLE_RATE)
         plans[duration] = plan
-        if bool(plan.discarded) != expected_discarded:
-            raise AssertionError(
-                f"discard mismatch for {duration}s: expected={expected_discarded} actual={plan.discarded}"
-            )
         if plan.total_audio_tokens != expected_tokens:
             raise AssertionError(
                 f"token mismatch for {duration}s: expected={expected_tokens} actual={plan.total_audio_tokens}"
@@ -104,14 +100,28 @@ def assert_contract(plugin: Any) -> dict[float, Any]:
             raise AssertionError(
                 f"segment mismatch for {duration}s: expected={expected_segments} actual={plan.segment_count}"
             )
-        if not plan.discarded and duration < 30.0 and plan.total_audio_tokens >= 250:
+        if duration < 30.0 and plan.total_audio_tokens >= 250:
             raise AssertionError(f"Sub-30s audio was incorrectly expanded to 250 tokens: {duration}s")
-        if 90.0 < duration <= 120.0 and plan.included_samples != 90 * SAMPLE_RATE:
+        if duration > 90.0 and plan.included_samples != 90 * SAMPLE_RATE:
             raise AssertionError(f"{duration}s must be truncated to exactly 90s")
         print(
-            f"[contract] duration={duration:.2f}s discarded={plan.discarded} "
+            f"[contract] duration={duration:.2f}s included_seconds={plan.included_samples / SAMPLE_RATE:.2f} "
             f"segments={plan.segment_count} feature_lengths={plan.feature_lengths} "
             f"token_counts={plan.token_counts} total_audio_tokens={plan.total_audio_tokens}"
+        )
+    for duration in PLANNER_ONLY_LONG_DURATIONS:
+        plan = plugin.plan_audio_for_whisper(int(round(duration * SAMPLE_RATE)), SAMPLE_RATE)
+        if (
+            plan.included_samples != 90 * SAMPLE_RATE
+            or plan.segment_count != 3
+            or plan.total_audio_tokens != 750
+        ):
+            raise AssertionError(
+                f"Long input {duration}s was not retained as exactly 90s/3 segments/750 tokens: {plan}"
+            )
+        print(
+            f"[contract-planner-only] duration={duration:.2f}s included_seconds=90.00 "
+            "segments=3 total_audio_tokens=750"
         )
     print("[contract] status=PASS dynamic_tokens=true token_duration_ms=120")
     return plans
@@ -120,11 +130,13 @@ def assert_contract(plugin: Any) -> dict[float, Any]:
 def build_fixture(plugin: Any, work_dir: Path, plans: dict[float, Any]) -> Path:
     fixture_dir = work_dir / "fixture"
     manifest_path = fixture_dir / "dynamic90s_stage02.jsonl"
-    discarded_records: list[dict[str, Any]] = []
-    accepted_records: list[dict[str, Any]] = []
+    legacy_discard_manifest = fixture_dir / "discarded_over_120s.json"
+    records: list[dict[str, Any]] = []
     fixture_dir.mkdir(parents=True, exist_ok=True)
+    if legacy_discard_manifest.exists():
+        legacy_discard_manifest.unlink()
 
-    for duration, _, _, _ in CONTRACT_CASES:
+    for duration, _, _ in CONTRACT_CASES:
         plan = plans[duration]
         wav_path = fixture_dir / f"duration_{duration:06.2f}s.wav"
         sample_count = write_synthetic_wav(wav_path, duration)
@@ -149,33 +161,25 @@ def build_fixture(plugin: Any, work_dir: Path, plans: dict[float, Any]) -> Path:
             "metadata": {
                 "dataset": "synthetic_dynamic90s_stage02",
                 "duration_seconds": duration,
+                "expected_included_seconds": plan.included_samples / SAMPLE_RATE,
                 "expected_audio_tokens": plan.total_audio_tokens,
                 "expected_segments": plan.segment_count,
             },
         }
-        if plan.discarded:
-            discarded_records.append(record)
-        else:
-            accepted_records.append(record)
+        records.append(record)
 
-    if len(discarded_records) != 1 or discarded_records[0]["metadata"]["duration_seconds"] != 120.01:
-        raise AssertionError(f"Unexpected discarded fixture records: {discarded_records}")
-    if len(accepted_records) != len(TRAIN_DURATIONS):
+    if len(records) != len(CONTRACT_CASES):
         raise AssertionError(
-            f"Accepted fixture count mismatch: expected={len(TRAIN_DURATIONS)} actual={len(accepted_records)}"
+            f"Fixture count mismatch: expected={len(CONTRACT_CASES)} actual={len(records)}"
         )
 
     with manifest_path.open("w", encoding="utf-8") as output_file:
-        for record in accepted_records:
+        for record in records:
             output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
-    (fixture_dir / "discarded_over_120s.json").write_text(
-        json.dumps(discarded_records, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
     print("========== SYNTHETIC FIXTURE ==========")
     print(f"[fixture] manifest={manifest_path}")
-    print(f"[fixture] accepted={len(accepted_records)} discarded={len(discarded_records)}")
-    print("[fixture] over_120s_filtered_before_swift=true")
+    print(f"[fixture] retained={len(records)} discarded=0")
+    print("[fixture] over_120s_retained_and_truncated_to_90s=true")
     return manifest_path
 
 
