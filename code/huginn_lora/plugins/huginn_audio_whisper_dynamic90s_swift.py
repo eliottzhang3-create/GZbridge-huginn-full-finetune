@@ -6,6 +6,7 @@ import io
 import json
 import math
 import os
+import random
 import shutil
 import subprocess
 import tarfile
@@ -77,6 +78,20 @@ STAGE5_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_AUDIT_DIR"
 STAGE5_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_MAX_STEPS"
 REALDATA_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_AUDIT_DIR"
 REALDATA_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_MAX_STEPS"
+DATA_POSITION_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR"
+DATA_POSITION_AUDIT_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_PHASE"
+PEFT_ALIGNER_MODULES_TO_SAVE_ENV = "HUGINN_AUDIO_DYNAMIC90S_PEFT_ALIGNER_MODULES_TO_SAVE"
+FSDP_SAVE_DEBUG_ENV = "HUGINN_AUDIO_DYNAMIC90S_FSDP_SAVE_DEBUG"
+CHECKPOINT_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_AUDIT_DIR"
+CHECKPOINT_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_PHASE"
+CHECKPOINT_START_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_START_STEP"
+CHECKPOINT_END_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_END_STEP"
+CHECKPOINT_LAUNCH_ID_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_LAUNCH_ID"
+ALIGNER_MODULES_TO_SAVE = (
+    "temporal_compressor",
+    "audio_projector",
+    "audio_boundary_embeddings",
+)
 FSDP_UNIT_CLASS_NAMES = (
     "WhisperEncoderFSDPUnit",
     "AudioAlignerFSDPUnit",
@@ -138,6 +153,10 @@ TEMPLATE_TYPE = "huginn_audio_whisper_dynamic90s"
 MODEL_ARCH_NAME = "huginn_audio_whisper_dynamic90s"
 _TARFILE_CACHE: "OrderedDict[str, tarfile.TarFile]" = OrderedDict()
 print(f"[HuginnAudioSwift] tarfile_cache_limit={TARFILE_CACHE_LIMIT}")
+
+
+def _requested(environment_name: str) -> bool:
+    return os.environ.get(environment_name, "").strip().lower() in {"1", "true", "yes"}
 
 
 def patch_huginn_audio_shift_loss(model):
@@ -277,6 +296,8 @@ def checkpoint_key_aliases(key: str) -> list[str]:
         normalized.add(alias)
         normalized.add(alias.replace(".modules_to_save.default.", "."))
         normalized.add(alias.replace(".original_module.", "."))
+        normalized.add(alias.replace(".lora_A.default.", ".lora_A."))
+        normalized.add(alias.replace(".lora_B.default.", ".lora_B."))
         if alias.startswith("audio_aligner."):
             normalized.add(alias[len("audio_aligner."):])
         elif alias.startswith(("temporal_compressor.", "audio_projector.", "audio_boundary_embeddings.")):
@@ -375,6 +396,233 @@ def force_audio_aligner_trainable(model: torch.nn.Module) -> None:
     print(f"[HuginnAudioSwift] forced_aligner_trainable_parameters={aligner_trainable}")
 
 
+def _active_modules_to_save_names(wrapper: torch.nn.Module) -> list[str]:
+    copies = getattr(wrapper, "modules_to_save", {})
+    available = [str(name) for name in copies]
+    active = getattr(wrapper, "active_adapter", None)
+    if isinstance(active, str):
+        requested = [active]
+    elif isinstance(active, (list, tuple, set)):
+        requested = [str(name) for name in active]
+    else:
+        requested = []
+    selected = [name for name in requested if name in copies]
+    if not selected and "default" in copies:
+        selected = ["default"]
+    if not selected and len(available) == 1:
+        selected = available
+    if not selected:
+        raise RuntimeError(
+            "Dynamic Whisper aligner ModulesToSaveWrapper has no selectable adapter copy: "
+            f"available={available} active={active}"
+        )
+    return selected
+
+
+def guard_peft_aligner_wrapper_trainability(wrapper: torch.nn.Module, *, module_name: str) -> None:
+    """Train only PEFT's checkpoint-owned aligner copy, never its original branch."""
+    if getattr(wrapper, "_huginn_whisper_dynamic90s_trainability_guarded", False):
+        return
+    if type(wrapper).__name__ != "ModulesToSaveWrapper":
+        raise RuntimeError(
+            "Expected PEFT ModulesToSaveWrapper for dynamic Whisper aligner, "
+            f"got module={module_name} type={type(wrapper)}"
+        )
+    if not hasattr(wrapper, "original_module") or not hasattr(wrapper, "modules_to_save"):
+        raise RuntimeError(f"PEFT ModulesToSaveWrapper lacks ownership fields: module={module_name}")
+
+    def guarded_requires_grad_(self, requires_grad: bool = True):
+        self.original_module.requires_grad_(False)
+        for copy in self.modules_to_save.values():
+            copy.requires_grad_(False)
+        if requires_grad:
+            for adapter_name in _active_modules_to_save_names(self):
+                self.modules_to_save[adapter_name].requires_grad_(True)
+        return self
+
+    wrapper.requires_grad_ = MethodType(guarded_requires_grad_, wrapper)
+    wrapper._huginn_whisper_dynamic90s_trainability_guarded = True
+    wrapper.requires_grad_(True)
+    original_trainable = sum(
+        parameter.numel() for parameter in wrapper.original_module.parameters() if parameter.requires_grad
+    )
+    saved_trainable = sum(
+        parameter.numel() for parameter in wrapper.modules_to_save.parameters() if parameter.requires_grad
+    )
+    if original_trainable or not saved_trainable:
+        raise RuntimeError(
+            "Failed to establish PEFT-owned dynamic Whisper aligner trainability: "
+            f"module={module_name} original_trainable={original_trainable} saved_trainable={saved_trainable}"
+        )
+
+
+def patch_peft_constructor_modules_to_save() -> None:
+    """Inject all 14 aligner tensors into PEFT's adapter-only FSDP state."""
+    force_modules_to_save = _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
+    if not force_modules_to_save and not _requested(FSDP_SAVE_DEBUG_ENV):
+        return
+    try:
+        from peft.peft_model import PeftModel
+    except Exception as exc:
+        raise RuntimeError("Unable to import PEFT for dynamic Whisper checkpoint ownership") from exc
+    original = PeftModel.__init__
+    if getattr(original, "_huginn_whisper_dynamic90s_constructor_patched", False):
+        return
+
+    def patched(self, *args, **kwargs):
+        peft_config = kwargs.get("peft_config")
+        if peft_config is None and len(args) >= 2:
+            peft_config = args[1]
+        if force_modules_to_save:
+            if peft_config is None or not hasattr(peft_config, "modules_to_save"):
+                raise RuntimeError(
+                    "Dynamic Whisper checkpointing requires a PEFT config with modules_to_save; "
+                    f"config_type={type(peft_config)}"
+                )
+            configured = list(getattr(peft_config, "modules_to_save", None) or [])
+            peft_config.modules_to_save = list(dict.fromkeys([*configured, *ALIGNER_MODULES_TO_SAVE]))
+            if os.environ.get("RANK", "0") == "0":
+                print(
+                    "[HuginnAudioDynamic90s] injected PEFT aligner modules_to_save "
+                    f"existing={configured} final={peft_config.modules_to_save}"
+                )
+        result = original(self, *args, **kwargs)
+        wrappers = {
+            name: module
+            for name, module in self.named_modules()
+            if type(module).__name__ == "ModulesToSaveWrapper"
+        }
+        if force_modules_to_save:
+            missing = [
+                name
+                for name in ALIGNER_MODULES_TO_SAVE
+                if not any(wrapper_name.endswith(name) for wrapper_name in wrappers)
+            ]
+            if missing:
+                raise RuntimeError(
+                    "PEFT did not wrap every dynamic Whisper aligner module: "
+                    f"missing={missing} wrappers={list(wrappers)}"
+                )
+            guarded = []
+            for aligner_name in ALIGNER_MODULES_TO_SAVE:
+                wrapper_name, wrapper = next(
+                    (item for item in wrappers.items() if item[0].endswith(aligner_name)),
+                    (None, None),
+                )
+                if wrapper_name is None or wrapper is None:
+                    raise RuntimeError(f"Unable to locate PEFT wrapper for {aligner_name}")
+                guard_peft_aligner_wrapper_trainability(wrapper, module_name=wrapper_name)
+                guarded.append(wrapper_name)
+            if os.environ.get("RANK", "0") == "0":
+                print(f"[HuginnAudioDynamic90s] guarded PEFT aligner wrappers={guarded}")
+        return result
+
+    patched._huginn_whisper_dynamic90s_constructor_patched = True
+    PeftModel.__init__ = patched
+    print(
+        "[HuginnAudioDynamic90s] installed PEFT modules-to-save constructor hook "
+        f"enabled={force_modules_to_save}"
+    )
+
+
+def _is_dynamic_fsdp_dcp_checkpoint(model_id: Any) -> tuple[bool, Path | None]:
+    checkpoint_dir = Path(model_id) if isinstance(model_id, (str, os.PathLike)) else None
+    enabled = (
+        _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
+        and checkpoint_dir is not None
+        and (checkpoint_dir / "pytorch_model_fsdp_0").is_dir()
+        and not (checkpoint_dir / "adapter_config.json").is_file()
+    )
+    return enabled, checkpoint_dir
+
+
+def _fsdp_dcp_lora_resume_model(
+    base_model: torch.nn.Module,
+    checkpoint_dir: Path,
+    *,
+    adapter_name: str,
+) -> torch.nn.Module:
+    """Recreate the PEFT topology; Accelerate later restores DCP tensors/state."""
+    source_dir = checkpoint_dir / "pytorch_model_fsdp_0"
+    try:
+        from peft import LoraConfig, TaskType, get_peft_model
+        from torch.distributed.checkpoint import FileSystemReader
+    except Exception as exc:
+        raise RuntimeError("Unable to import DCP/PEFT APIs for dynamic Whisper resume") from exc
+    metadata = FileSystemReader(str(source_dir)).read_metadata()
+    state_metadata = getattr(metadata, "state_dict_metadata", {})
+    checkpoint_groups = _fsdp_save_state_groups(state_metadata)
+    checkpoint_counts = {name: len(keys) for name, keys in checkpoint_groups.items()}
+    expected_counts = {"lora": 66, "aligner": 14, "other": 0}
+    if checkpoint_counts != expected_counts:
+        raise RuntimeError(
+            "Dynamic Whisper resume DCP does not match the adapter contract: "
+            f"expected={expected_counts} actual={checkpoint_counts}"
+        )
+    lora_entries = [
+        (str(key), entry)
+        for key, entry in state_metadata.items()
+        if ".lora_A." in str(key) or ".lora_B." in str(key)
+    ]
+    if not lora_entries:
+        raise RuntimeError(f"Dynamic Whisper DCP has no LoRA metadata: {source_dir}")
+    module_names = set(dict(base_model.named_modules()))
+    target_modules: set[str] = set()
+    ranks: set[int] = set()
+    unresolved: list[str] = []
+    for source_key, entry in lora_entries:
+        if ".lora_A." in source_key:
+            shape = tuple(int(value) for value in getattr(entry, "size", ()))
+            if not shape:
+                raise RuntimeError(f"LoRA-A DCP metadata has no shape: {source_key}")
+            ranks.add(shape[0])
+        matched = False
+        for candidate in checkpoint_key_aliases(source_key):
+            if ".lora_A." in candidate:
+                module_path = candidate.split(".lora_A.", 1)[0]
+            elif ".lora_B." in candidate:
+                module_path = candidate.split(".lora_B.", 1)[0]
+            else:
+                continue
+            if module_path in module_names:
+                target_modules.add(module_path)
+                matched = True
+                break
+        if not matched:
+            unresolved.append(source_key)
+    if unresolved or len(ranks) != 1 or len(target_modules) != 33:
+        raise RuntimeError(
+            "Unable to reconstruct dynamic Whisper LoRA topology from DCP: "
+            f"unresolved={unresolved[:10]} ranks={sorted(ranks)} targets={len(target_modules)}"
+        )
+    rank = next(iter(ranks))
+    if rank != 8:
+        raise RuntimeError(f"Dynamic Whisper resume DCP LoRA rank must be 8, got {rank}")
+    saved_args: dict[str, Any] = {}
+    args_path = checkpoint_dir.parent / "args.json"
+    if args_path.is_file():
+        payload = json.loads(args_path.read_text(encoding="utf-8"))
+        if isinstance(payload, dict):
+            saved_args = payload
+    config = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=rank,
+        lora_alpha=int(saved_args.get("lora_alpha", 16)),
+        lora_dropout=float(saved_args.get("lora_dropout", DYNAMIC_LORA_DROPOUT)),
+        target_modules=sorted(target_modules),
+        bias="none",
+        inference_mode=False,
+    )
+    restored = get_peft_model(base_model, config, adapter_name=adapter_name)
+    if os.environ.get("RANK", "0") == "0":
+        print(
+            "[HuginnAudioDynamic90s] recreated PEFT topology from FSDP DCP "
+            f"checkpoint={checkpoint_dir} target_count={len(target_modules)} "
+            f"rank={rank} alpha={config.lora_alpha} dropout={config.lora_dropout}"
+        )
+    return restored
+
+
 def patch_peft_adapter_restore() -> None:
     """PEFT freezes base modules on adapter load; re-enable our separately trained aligner."""
     if getattr(patch_peft_adapter_restore, "_patched", False):
@@ -388,13 +636,139 @@ def patch_peft_adapter_restore() -> None:
 
     @classmethod
     def from_pretrained_with_audio_aligner(cls, *args, **kwargs):
-        restored_model = original_from_pretrained(*args, **kwargs)
+        base_model = args[0] if args else kwargs.get("model")
+        model_id = args[1] if len(args) >= 2 else kwargs.get("model_id")
+        is_dynamic_dcp, checkpoint_dir = _is_dynamic_fsdp_dcp_checkpoint(model_id)
+        if is_dynamic_dcp:
+            if checkpoint_dir is None or not isinstance(base_model, torch.nn.Module):
+                raise RuntimeError(
+                    "Dynamic Whisper DCP resume did not receive a valid base model/checkpoint: "
+                    f"model_type={type(base_model)} checkpoint={checkpoint_dir}"
+                )
+            restored_model = _fsdp_dcp_lora_resume_model(
+                base_model,
+                checkpoint_dir,
+                adapter_name=str(kwargs.get("adapter_name", "default")),
+            )
+        else:
+            restored_model = original_from_pretrained(*args, **kwargs)
         force_audio_aligner_trainable(restored_model)
         return restored_model
 
     PeftModel.from_pretrained = from_pretrained_with_audio_aligner
     patch_peft_adapter_restore._patched = True
     print("[HuginnAudioSwift] installed PEFT adapter-restore aligner patch")
+
+
+def patch_swift_lora_llm_fsdp_dcp_resume() -> None:
+    """Bypass Swift's legacy vit.safetensors path for adapter-only DCP resume."""
+    if not _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV):
+        return
+    try:
+        import swift.tuner_plugin.lora_llm as lora_llm_module
+        from peft import PeftModel
+    except Exception as exc:
+        raise RuntimeError("Unable to import Swift lora_llm for dynamic Whisper DCP resume") from exc
+    if getattr(lora_llm_module, "_huginn_whisper_dynamic90s_dcp_resume_patched", False):
+        return
+    candidates: list[tuple[str, type, Any]] = []
+    for class_name, candidate in vars(lora_llm_module).items():
+        if not isinstance(candidate, type):
+            continue
+        method = candidate.__dict__.get("from_pretrained")
+        if method is None:
+            continue
+        function = method.__func__ if isinstance(method, (staticmethod, classmethod)) else method
+        code = getattr(function, "__code__", None)
+        if code is not None and "vit.safetensors" in repr(code.co_consts):
+            candidates.append((str(class_name), candidate, method))
+    if len(candidates) != 1:
+        raise RuntimeError(
+            "Expected one Swift legacy vit.safetensors loader for dynamic Whisper DCP resume, "
+            f"found={[name for name, _, _ in candidates]}"
+        )
+    class_name, tuner_class, descriptor = candidates[0]
+    original = descriptor.__func__ if isinstance(descriptor, (staticmethod, classmethod)) else descriptor
+
+    def maybe_restore(model, model_id, *args, **kwargs):
+        is_dynamic_dcp, checkpoint_dir = _is_dynamic_fsdp_dcp_checkpoint(model_id)
+        if not is_dynamic_dcp:
+            return False, None
+        if os.environ.get("RANK", "0") == "0":
+            print(
+                "[HuginnAudioDynamic90s] bypassing Swift legacy vit.safetensors reload "
+                f"for FSDP DCP checkpoint={checkpoint_dir}"
+            )
+        return True, PeftModel.from_pretrained(model, model_id, *args, **kwargs)
+
+    if isinstance(descriptor, staticmethod):
+        def patched(model, model_id, *args, **kwargs):
+            handled, result = maybe_restore(model, model_id, *args, **kwargs)
+            return result if handled else original(model, model_id, *args, **kwargs)
+
+        tuner_class.from_pretrained = staticmethod(patched)
+        descriptor_kind = "staticmethod"
+    elif isinstance(descriptor, classmethod):
+        def patched(cls, model, model_id, *args, **kwargs):
+            handled, result = maybe_restore(model, model_id, *args, **kwargs)
+            return result if handled else original(cls, model, model_id, *args, **kwargs)
+
+        tuner_class.from_pretrained = classmethod(patched)
+        descriptor_kind = "classmethod"
+    else:
+        def patched(self, model, model_id, *args, **kwargs):
+            handled, result = maybe_restore(model, model_id, *args, **kwargs)
+            return result if handled else original(self, model, model_id, *args, **kwargs)
+
+        tuner_class.from_pretrained = patched
+        descriptor_kind = "instance_method"
+    lora_llm_module._huginn_whisper_dynamic90s_dcp_resume_patched = True
+    print(
+        "[HuginnAudioDynamic90s] installed Swift DCP-resume patch "
+        f"tuner_class={class_name} descriptor={descriptor_kind}"
+    )
+
+
+def _fsdp_save_state_groups(state_dict: dict[str, Any]) -> dict[str, list[str]]:
+    groups: dict[str, list[str]] = {"lora": [], "aligner": [], "other": []}
+    for raw_key in state_dict:
+        key = str(raw_key)
+        aliases = checkpoint_key_aliases(key)
+        if any(".lora_A." in alias or ".lora_B." in alias for alias in aliases):
+            groups["lora"].append(key)
+        elif any(alias.startswith(ALIGNER_PREFIXES) for alias in aliases):
+            groups["aligner"].append(key)
+        else:
+            groups["other"].append(key)
+    return groups
+
+
+def patch_accelerate_fsdp2_save_state_audit() -> None:
+    if not _requested(FSDP_SAVE_DEBUG_ENV):
+        return
+    try:
+        from accelerate.utils import fsdp_utils
+    except ImportError as exc:
+        raise RuntimeError("Unable to import Accelerate FSDP save utilities") from exc
+    original = fsdp_utils._get_model_state_dict
+    if getattr(original, "_huginn_whisper_dynamic90s_save_audit_patched", False):
+        return
+
+    def patched(model, adapter_only=False, sd_options=None):
+        state_dict = original(model, adapter_only=adapter_only, sd_options=sd_options)
+        if os.environ.get("RANK", "0") == "0":
+            groups = _fsdp_save_state_groups(state_dict)
+            print(
+                "[HuginnAudioDynamic90s] FSDP2 pre-DCP save-state audit "
+                f"adapter_only={adapter_only} tensor_count={len(state_dict)} "
+                f"lora={len(groups['lora'])} aligner={len(groups['aligner'])} "
+                f"other={len(groups['other'])} aligner_preview={groups['aligner'][:8]}"
+            )
+        return state_dict
+
+    patched._huginn_whisper_dynamic90s_save_audit_patched = True
+    fsdp_utils._get_model_state_dict = patched
+    print("[HuginnAudioDynamic90s] installed Accelerate FSDP2 save-state audit")
 
 
 def patch_peft_dynamic90s_lora_dropout() -> None:
@@ -904,6 +1278,38 @@ def load_audio_item(
     return load_audio_file(audio_path, target_sr=target_sr, max_audio_seconds=max_audio_seconds)
 
 
+def audit_consumed_audio_position(audio_item: Any) -> None:
+    """Record the exact row entering template encoding for checkpoint gates."""
+    audit_dir_value = os.environ.get(DATA_POSITION_AUDIT_DIR_ENV, "").strip()
+    if not audit_dir_value:
+        return
+    phase = os.environ.get(DATA_POSITION_AUDIT_PHASE_ENV, "").strip()
+    if not phase:
+        raise RuntimeError(f"{DATA_POSITION_AUDIT_PHASE_ENV} is required when data-position audit is enabled")
+    if not isinstance(audio_item, dict):
+        raise TypeError(f"Data-position audit requires a dictionary audio item, got {type(audio_item)}")
+    required_fields = ("global_position", "pool_name", "task", "uid")
+    missing = [field for field in required_fields if audio_item.get(field) is None]
+    if missing:
+        raise RuntimeError(f"Data-position audit audio item is missing provenance fields: {missing}")
+    rank = int(os.environ.get("RANK", "0"))
+    payload = {
+        "phase": phase,
+        "rank": rank,
+        "global_position": int(audio_item["global_position"]),
+        "pool_name": str(audio_item["pool_name"]),
+        "task": str(audio_item["task"]),
+        "uid": str(audio_item["uid"]),
+    }
+    audit_dir = Path(audit_dir_value)
+    audit_dir.mkdir(parents=True, exist_ok=True)
+    path = audit_dir / f"data-{phase}-rank-{rank}.jsonl"
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload, sort_keys=True) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
 class HuginnAudioProcessor:
     def __init__(self, tokenizer, feature_extractor):
         self.tokenizer = tokenizer
@@ -952,6 +1358,7 @@ def get_active_distributed_audit() -> tuple[Optional[str], Optional[str]]:
         ("stage34", os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip()),
         ("stage5", os.environ.get(STAGE5_AUDIT_DIR_ENV, "").strip()),
         ("realdata", os.environ.get(REALDATA_AUDIT_DIR_ENV, "").strip()),
+        ("checkpoint", os.environ.get(CHECKPOINT_AUDIT_DIR_ENV, "").strip()),
     ]
     active = [(stage, path) for stage, path in configured if path]
     if len(active) > 1:
@@ -1463,6 +1870,290 @@ def patch_realdata_stability_callback() -> None:
     )
 
 
+def patch_checkpoint_resume_callback() -> None:
+    """Audit state restoration and new updates in each cold-start phase."""
+    audit_dir = os.environ.get(CHECKPOINT_AUDIT_DIR_ENV, "").strip()
+    if not audit_dir:
+        return
+    from transformers import Trainer, TrainerCallback
+
+    phase = os.environ.get(CHECKPOINT_PHASE_ENV, "").strip()
+    if phase not in {"save", "resume"}:
+        raise ValueError(f"{CHECKPOINT_PHASE_ENV} must be save or resume, got {phase!r}")
+    try:
+        expected_start_step = int(os.environ[CHECKPOINT_START_STEP_ENV])
+        expected_end_step = int(os.environ[CHECKPOINT_END_STEP_ENV])
+    except (KeyError, ValueError) as exc:
+        raise ValueError("Checkpoint audit start/end steps must be configured as integers") from exc
+    expected_updates = expected_end_step - expected_start_step
+    launch_id = os.environ.get(CHECKPOINT_LAUNCH_ID_ENV, "").strip()
+    if not launch_id:
+        raise ValueError(f"{CHECKPOINT_LAUNCH_ID_ENV} must identify the fresh process launch")
+    if expected_start_step < 0 or expected_updates <= 0:
+        raise ValueError(
+            f"Invalid checkpoint audit step window: start={expected_start_step} end={expected_end_step}"
+        )
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic90s_checkpoint_patched", False):
+        return
+
+    class CheckpointResumeCallback(TrainerCallback):
+        _huginn_audio_dynamic90s_checkpoint_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.finite_loss_log_count = 0
+            self.finite_grad_norm_log_count = 0
+            self.optimizer_type = None
+            self.observed_start_step = None
+
+        @staticmethod
+        def _identity() -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Checkpoint smoke requires initialized torch.distributed")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"Checkpoint smoke requires world_size=4, got {world_size}")
+            return rank, world_size
+
+        @staticmethod
+        def _optimizer_steps(optimizer: Any) -> list[int]:
+            inner = getattr(optimizer, "optimizer", optimizer)
+            values: list[int] = []
+            for state in getattr(inner, "state", {}).values():
+                if not isinstance(state, dict) or "step" not in state:
+                    continue
+                step = state["step"]
+                if torch.is_tensor(step):
+                    if step.numel() == 1:
+                        values.append(int(step.item()))
+                elif isinstance(step, (int, float)):
+                    values.append(int(step))
+            return values
+
+        def _audio_statistics(self) -> dict[str, int]:
+            owners = [
+                module
+                for module in self.tracked_model.modules()
+                if "_huginn_audio_realdata_sample_count" in vars(module)
+            ]
+            if len(owners) != 1:
+                raise RuntimeError(
+                    "Checkpoint smoke expected one direct runtime-statistics owner, "
+                    f"found {len(owners)}"
+                )
+            module = owners[0]
+            return {
+                "audio_batch_count": int(module._huginn_audio_realdata_batch_count),
+                "audio_sample_count": int(module._huginn_audio_realdata_sample_count),
+                "realized_prefix_tokens": int(module._huginn_audio_realdata_prefix_tokens),
+                "realized_audio_tokens": int(module._huginn_audio_realdata_audio_tokens),
+                "min_audio_tokens": int(module._huginn_audio_realdata_min_audio_tokens),
+                "max_audio_tokens": int(module._huginn_audio_realdata_max_audio_tokens),
+            }
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            del args
+            rank, world_size = self._identity()
+            self.observed_start_step = int(state.global_step)
+            if self.observed_start_step != expected_start_step:
+                raise RuntimeError(
+                    f"Checkpoint {phase} phase start step mismatch: "
+                    f"expected={expected_start_step} actual={self.observed_start_step}"
+                )
+            optimizer = kwargs.get("optimizer")
+            scheduler = kwargs.get("lr_scheduler")
+            self.optimizer_type = type(optimizer).__name__ if optimizer is not None else None
+            optimizer_steps = self._optimizer_steps(optimizer) if optimizer is not None else []
+            scheduler_last_epoch = int(getattr(scheduler, "last_epoch", -999)) if scheduler is not None else None
+            learning_rates = [float(group["lr"]) for group in optimizer.param_groups] if optimizer is not None else []
+            if phase == "resume":
+                if not optimizer_steps or min(optimizer_steps) != expected_start_step or max(optimizer_steps) != expected_start_step:
+                    raise RuntimeError(
+                        "Resume optimizer state was not restored to the checkpoint step: "
+                        f"expected={expected_start_step} observed={optimizer_steps[:20]}"
+                    )
+                if scheduler_last_epoch != expected_start_step:
+                    raise RuntimeError(
+                        "Resume scheduler state mismatch: "
+                        f"expected_last_epoch={expected_start_step} actual={scheduler_last_epoch}"
+                    )
+                if not learning_rates or any(value <= 0 for value in learning_rates):
+                    raise RuntimeError(f"Resume phase restored non-positive learning rates: {learning_rates}")
+            payload = {
+                "kind": "checkpoint_start",
+                "stage": "checkpoint",
+                "phase": phase,
+                "rank": rank,
+                "world_size": world_size,
+                "pid": os.getpid(),
+                "launch_id": launch_id,
+                "global_step": self.observed_start_step,
+                "optimizer_type": self.optimizer_type,
+                "optimizer_step_min": min(optimizer_steps) if optimizer_steps else None,
+                "optimizer_step_max": max(optimizer_steps) if optimizer_steps else None,
+                "optimizer_state_count": len(optimizer_steps),
+                "scheduler_last_epoch": scheduler_last_epoch,
+                "learning_rates": learning_rates,
+            }
+            _write_distributed_rank_marker("checkpoint-start", payload)
+            print(
+                "[HuginnAudioDynamic90s] CHECKPOINT_START_AUDIT "
+                f"phase={phase} rank={rank} global_step={self.observed_start_step} "
+                f"optimizer_steps=[{payload['optimizer_step_min']},{payload['optimizer_step_max']}] "
+                f"scheduler_last_epoch={scheduler_last_epoch} learning_rates={learning_rates}",
+                flush=True,
+            )
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, state, kwargs
+            for key in ("loss", "grad_norm"):
+                value = (logs or {}).get(key)
+                if value is None:
+                    continue
+                numeric = float(value)
+                if not math.isfinite(numeric):
+                    raise RuntimeError(f"Checkpoint {phase} phase observed non-finite {key}: {numeric}")
+                if key == "loss":
+                    self.finite_loss_log_count += 1
+                else:
+                    self.finite_grad_norm_log_count += 1
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            rank, world_size = self._identity()
+            if int(state.global_step) != expected_end_step:
+                raise RuntimeError(
+                    f"Checkpoint {phase} phase end step mismatch: "
+                    f"expected={expected_end_step} actual={state.global_step}"
+                )
+            if self.finite_loss_log_count != expected_updates or self.finite_grad_norm_log_count != expected_updates:
+                raise RuntimeError(
+                    f"Checkpoint {phase} finite-log count mismatch: updates={expected_updates} "
+                    f"losses={self.finite_loss_log_count} grad_norms={self.finite_grad_norm_log_count}"
+                )
+            audio = self._audio_statistics()
+            if audio["audio_batch_count"] != expected_updates or audio["audio_sample_count"] != expected_updates:
+                raise RuntimeError(
+                    f"Checkpoint {phase} runtime audio count mismatch: expected={expected_updates} actual={audio}"
+                )
+            payload = {
+                "kind": "checkpoint_end",
+                "stage": "checkpoint",
+                "phase": phase,
+                "rank": rank,
+                "world_size": world_size,
+                "start_global_step": self.observed_start_step,
+                "global_step": int(state.global_step),
+                "new_optimizer_steps": expected_updates,
+                "finite_loss_log_count": self.finite_loss_log_count,
+                "finite_grad_norm_log_count": self.finite_grad_norm_log_count,
+                "optimizer_type": self.optimizer_type,
+                **audio,
+            }
+            _write_distributed_rank_marker("checkpoint-end", payload)
+            print(
+                "[HuginnAudioDynamic90s] CHECKPOINT_END_AUDIT "
+                f"phase={phase} rank={rank} step_window=[{self.observed_start_step},{state.global_step}] "
+                f"finite_losses={self.finite_loss_log_count} finite_grad_norms={self.finite_grad_norm_log_count} "
+                f"audio_samples={audio['audio_sample_count']} audio_tokens={audio['realized_audio_tokens']}",
+                flush=True,
+            )
+            return control
+
+    @wraps(original_init)
+    def init_with_checkpoint_callback(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic90s_checkpoint_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(CheckpointResumeCallback(self.model))
+
+    init_with_checkpoint_callback._huginn_audio_dynamic90s_checkpoint_patched = True
+    Trainer.__init__ = init_with_checkpoint_callback
+    print(
+        "[HuginnAudioDynamic90s] installed checkpoint-resume callback "
+        f"phase={phase} step_window=[{expected_start_step},{expected_end_step}]"
+    )
+
+
+def patch_checkpoint_rng_restore_audit() -> None:
+    """Verify Trainer restored the exact per-rank RNG payload from checkpoint."""
+    if not os.environ.get(CHECKPOINT_AUDIT_DIR_ENV, "").strip():
+        return
+    if os.environ.get(CHECKPOINT_PHASE_ENV, "").strip() != "resume":
+        return
+    from transformers import Trainer
+
+    original = Trainer._load_rng_state
+    if getattr(original, "_huginn_audio_dynamic90s_rng_audit_patched", False):
+        return
+
+    def numpy_rng_equal(left: Any, right: Any) -> bool:
+        return (
+            isinstance(left, tuple)
+            and isinstance(right, tuple)
+            and len(left) == len(right) == 5
+            and left[0] == right[0]
+            and np.array_equal(left[1], right[1])
+            and left[2:] == right[2:]
+        )
+
+    @wraps(original)
+    def patched(self, resume_from_checkpoint):
+        original(self, resume_from_checkpoint)
+        checkpoint_dir = Path(resume_from_checkpoint)
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+        candidates = [checkpoint_dir / f"rng_state_{rank}.pth", checkpoint_dir / "rng_state.pth"]
+        rng_path = next((path for path in candidates if path.is_file()), None)
+        if rng_path is None:
+            raise FileNotFoundError(f"No RNG state file for rank {rank} in {checkpoint_dir}")
+        saved = torch.load(rng_path, map_location="cpu", weights_only=False)
+        saved_cpu = saved.get("cpu")
+        checks = {
+            "python": saved.get("python") == random.getstate(),
+            "numpy": numpy_rng_equal(saved.get("numpy"), np.random.get_state()),
+            "cpu": torch.is_tensor(saved_cpu) and torch.equal(saved_cpu, torch.random.get_rng_state()),
+        }
+        if "cuda" in saved:
+            current_cuda = torch.cuda.random.get_rng_state_all()
+            saved_cuda = saved["cuda"]
+            checks["cuda"] = (
+                isinstance(saved_cuda, (list, tuple))
+                and len(saved_cuda) == len(current_cuda)
+                and all(torch.equal(left.cpu(), right.cpu()) for left, right in zip(saved_cuda, current_cuda))
+            )
+        if not all(checks.values()):
+            raise RuntimeError(
+                f"Checkpoint RNG restoration mismatch for rank {rank}: path={rng_path} checks={checks}"
+            )
+        payload = {
+            "kind": "rng_restore",
+            "stage": "checkpoint",
+            "phase": "resume",
+            "rank": rank,
+            "world_size": world_size,
+            "rng_path": str(rng_path),
+            "checks": checks,
+        }
+        _write_distributed_rank_marker("rng-restore", payload)
+        print(
+            "[HuginnAudioDynamic90s] CHECKPOINT_RNG_RESTORE_AUDIT "
+            f"rank={rank} path={rng_path} checks={checks}",
+            flush=True,
+        )
+
+    patched._huginn_audio_dynamic90s_rng_audit_patched = True
+    Trainer._load_rng_state = patched
+    print("[HuginnAudioDynamic90s] installed checkpoint RNG-restore audit")
+
+
 def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
     """Log one actual audio-prefix pass for the distributed stability smoke."""
     requested = os.environ.get(TRAIN_CHAIN_AUDIT_ENV, "").strip().lower()
@@ -1488,7 +2179,7 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
         if self.training:
             audit_stage34_fsdp_rank(self, prefix_mask)
             audit_stage, _audit_dir = get_active_distributed_audit()
-            if audit_stage == "realdata":
+            if audit_stage in {"realdata", "checkpoint"}:
                 boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
                 valid_prefix_tokens = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
                 valid_audio_tokens = [value - boundary_tokens for value in valid_prefix_tokens]
@@ -1653,6 +2344,7 @@ class HuginnAudioTemplate(Template):
         if len(inputs.audios) != 1:
             raise ValueError("Huginn audio Swift template currently supports exactly one audio clip per sample.")
 
+        audit_consumed_audio_position(inputs.audios[0])
         waveform = self._load_audio_item(inputs.audios[0])
         audio_chunks, audio_feature_lengths = split_audio_for_whisper(
             waveform,
@@ -1759,7 +2451,14 @@ class HuginnAudioLoader(ModelLoader):
 def register_huginn_audio_model_arch():
     multi_model_kwargs = {
         "language_model": ["transformer", "lm_head"],
-        "aligner": ["audio_aligner"],
+        # During checkpoint runs PEFT wraps these three children, so Swift's
+        # unfreeze calls must reach their guarded wrapper methods. Preserve the
+        # already-passed whole-aligner registration in every ordinary run.
+        "aligner": (
+            list(ALIGNER_MODULES_TO_SAVE)
+            if _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
+            else ["audio_aligner"]
+        ),
         "generator": ["audio_encoder"],
     }
     try:
@@ -1796,10 +2495,15 @@ def register_huginn_audio_model_arch():
 
 register_huginn_audio_model_arch()
 patch_peft_dynamic90s_lora_dropout()
+patch_peft_constructor_modules_to_save()
 patch_peft_adapter_restore()
+patch_swift_lora_llm_fsdp_dcp_resume()
+patch_accelerate_fsdp2_save_state_audit()
 patch_stage34_optimizer_step_callback()
 patch_stage5_stability_callback()
 patch_realdata_stability_callback()
+patch_checkpoint_resume_callback()
+patch_checkpoint_rng_restore_audit()
 
 register_model(
     ModelMeta(

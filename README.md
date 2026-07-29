@@ -2340,6 +2340,16 @@ trainable aligner, finite losses/gradient norms, and per-rank realized dynamic a
 global sample window is positions `0..31`, which covers all four pools (`11` WavCaps, `6` AudioCaps, `2` Clotho, and
 `13` GigaSpeech; `19` AAC and `13` ASR). Checkpoint save/restart remains the following separate gate.
 
+The real-mixture FSDP4 gate has passed. The active next gate is
+`code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh`. Phase 1 uses one fresh
+four-rank process group to consume global mixture positions `0..15`, train through step `4`, and save a complete
+adapter-only FSDP DCP. Phase 2 starts a distinct four-rank process group, restores checkpoint `4`, starts the stateless
+mixture explicitly at position `16` with Trainer data skipping disabled, consumes positions `16..23`, and reaches step
+`6`. The gate requires exactly `66` Huginn LoRA plus `14` aligner tensors, restored optimizer step `4`, scheduler epoch
+`4`, exact per-rank Python/NumPy/CPU/CUDA RNG restoration, Trainer global step continuity, disjoint process-launch IDs,
+and actual LoRA plus aligner tensor changes between checkpoints `4` and `6`. Constant LR is used only for this short
+gate so the first phase cannot decay to zero before the resumed updates.
+
 Formal-training constraints already fixed by the user, but not yet implemented or launched:
 
 - train for more than `4000` realized source-audio hours;

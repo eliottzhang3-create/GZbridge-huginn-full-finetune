@@ -112,6 +112,13 @@ def render_training_row(
         "format": str(raw_audio.get("format", "")),
         "start_sec": float(raw_audio["start_sec"]) if raw_audio.get("start_sec") is not None else None,
         "end_sec": float(raw_audio["end_sec"]) if raw_audio.get("end_sec") is not None else None,
+        # These provenance fields survive the Swift/HF iterable boundary and
+        # let the checkpoint smoke audit the exact samples encoded after a
+        # cold resume. The production audio loader intentionally ignores them.
+        "global_position": int(global_position),
+        "pool_name": pool_name,
+        "task": task,
+        "uid": str(record["uid"]),
     }
     return {
         "messages": [
