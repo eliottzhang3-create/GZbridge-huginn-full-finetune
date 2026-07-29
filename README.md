@@ -623,7 +623,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
 - FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming restore later completed a caption-generation run successfully.
 
-#### Current isolated Whisper-large dynamic-90s LoRA route (coarse FSDP-unit revision prepared; remote revalidation pending)
+#### Current isolated Whisper-large dynamic-90s LoRA route (coarse FSDP4 Stage 3-4 passed; Stage 5 prepared)
 
 The new dynamic route is isolated from the historical fixed-32 Whisper route. Historical files remain at
 `models/huginn-audio-whisper-v1/` and `code/huginn_lora/plugins/huginn_audio_swift.py`; do not point historical
@@ -672,9 +672,8 @@ bash code/huginn_lora/run_inspect_huginn_audio_whisper_dynamic90s_stage02_5090.s
 ```
 
 The pre-grouping architecture passed Stage 0-2 remotely with the terminal banner
-`HUGINN WHISPER DYNAMIC90S STAGE 0-2 VALIDATION PASSED`. Because the forward/module topology has now changed, the same
-Stage 0-2 gate must be rerun before accepting the revised Stage 3-4 result. The next gate merges Stage 3 (four-rank FSDP2 construction and
-DTensor sharding) with Stage 4 (one real optimizer update) while continuing to use only generated synthetic WAV files.
+`HUGINN WHISPER DYNAMIC90S STAGE 0-2 VALIDATION PASSED`. The merged Stage 3 (four-rank FSDP2 construction and DTensor
+sharding) plus Stage 4 (one real optimizer update) gate uses only generated synthetic WAV files.
 It uses Swift CLI's internal torchrun path, four RTX 5090 GPUs, the previously verified custom FSDP2 full-shard config,
 per-device batch size 1, gradient accumulation 1, and `max_steps=1`; it deliberately saves no checkpoint.
 
@@ -696,6 +695,27 @@ After Git sync, submit with:
 
 ```bash
 bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage34_fsdp4_5090.sh
+```
+
+The revised coarse-unit Stage 3-4 gate passed remotely on four RTX 5090 GPUs. Every rank reported `640` DTensor
+parameters, all five expected FSDP units, the correct dynamic first-step prefixes (`10/252/502/752` across ranks), an
+`AcceleratedOptimizer` update at `global_step=1`, and `exit_status=0`.
+
+Stage 5 is the synthetic four-GPU multi-step stability gate. It deliberately remains data-independent and performs 20
+real optimizer updates with per-device batch size 1 and gradient accumulation 1. It keeps the exact Stage 3-4 model,
+LoRA, learning-rate, FSDP, and dynamic-audio contracts; checks raw training loss plus logged loss/gradient norms for
+non-finite values; requires one finite loss log per update on every rank; and revalidates the five FSDP units and all
+`80` trainable DTensors. It uses `save_strategy=no`: checkpoint save/reload belongs to the later Stage 6 and is not
+implemented or launched yet.
+
+- runtime: `code/huginn_lora/scripts/smoke_huginn_audio_whisper_dynamic90s_stage5_stability_fsdp4.sh`
+- marker inspector: `code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic90s_stage5_markers.py`
+- submit wrapper: `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage5_stability_fsdp4_5090.sh`
+
+Submit Stage 5 only through:
+
+```bash
+bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage5_stability_fsdp4_5090.sh
 ```
 
 #### Historical but relevant routes
@@ -2198,11 +2218,12 @@ The pre-grouping implementation passed Stage 0-2 remotely, including the product
 collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and a real backward
 pass. The first Stage 3-4 attempt then exposed incomplete wrapping (`64/80` trainable DTensors). The implementation now
 uses five coarse callable FSDP units (Whisper whole, aligner whole, prelude 2 blocks, recurrent adapter + 4 blocks, coda
-2 blocks), all with `reshard_after_forward=true`; LoRA remains Huginn-only. Rerun Stage 0-2 first, then the merged
-Stage 3-4 synthetic FSDP4 construction plus one-update smoke:
-`code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage34_fsdp4_5090.sh`. Do not create or launch a formal
-AudioCaps/ACAVCAPS/WavCaps training job for this route yet, and do not test checkpoint save/reload until Stage 3-4
-passes.
+2 blocks), all with `reshard_after_forward=true`; LoRA remains Huginn-only. The revised merged Stage 3-4 FSDP4 gate has
+now passed on all four ranks with `640` DTensor parameters and one optimizer update. The immediate gate is the 20-step
+synthetic Stage 5 stability smoke:
+`code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_stage5_stability_fsdp4_5090.sh`. Do not create or launch a
+formal AudioCaps/ACAVCAPS/WavCaps training job for this route yet. Stage 6 checkpoint save/reload is intentionally
+deferred until after the upcoming data preparation work.
 
 The current duration contract has no discard threshold: every input longer than 90 seconds, including inputs beyond
 120 seconds, is retained by truncating it to the first 90 seconds. Stage 0-2 sends a 120.01-second WAV through the real

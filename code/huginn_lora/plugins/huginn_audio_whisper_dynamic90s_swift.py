@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -72,6 +73,8 @@ FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT"
 STAGE34_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE34_AUDIT_DIR"
+STAGE5_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_AUDIT_DIR"
+STAGE5_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_MAX_STEPS"
 FSDP_UNIT_CLASS_NAMES = (
     "WhisperEncoderFSDPUnit",
     "AudioAlignerFSDPUnit",
@@ -240,6 +243,9 @@ def patch_huginn_audio_shift_loss(model):
             )
         else:
             loss = logits.new_tensor(0.0)
+
+        if os.environ.get(STAGE5_AUDIT_DIR_ENV, "").strip() and not bool(torch.isfinite(loss).item()):
+            raise RuntimeError(f"Stage 5 observed a non-finite raw training loss: {loss.detach()}")
 
         outputs.loss = loss
         if hasattr(outputs, "log_ppl"):
@@ -851,9 +857,20 @@ def enable_fsdp2_nonpersistent_rope_buffer(model: torch.nn.Module) -> None:
     print("[HuginnAudioSwift] FSDP2 compatibility: freqs_cis marked non-persistent")
 
 
-def _write_stage34_rank_marker(kind: str, payload: dict[str, Any]) -> None:
-    audit_dir_value = os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip()
-    if not audit_dir_value:
+def get_active_distributed_audit() -> tuple[Optional[str], Optional[str]]:
+    configured = [
+        ("stage34", os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip()),
+        ("stage5", os.environ.get(STAGE5_AUDIT_DIR_ENV, "").strip()),
+    ]
+    active = [(stage, path) for stage, path in configured if path]
+    if len(active) > 1:
+        raise RuntimeError(f"Only one distributed audit stage may be active: {active}")
+    return active[0] if active else (None, None)
+
+
+def _write_distributed_rank_marker(kind: str, payload: dict[str, Any]) -> None:
+    _stage, audit_dir_value = get_active_distributed_audit()
+    if audit_dir_value is None:
         return
     audit_dir = Path(audit_dir_value)
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -865,17 +882,18 @@ def _write_stage34_rank_marker(kind: str, payload: dict[str, Any]) -> None:
 
 
 def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -> None:
-    if not os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip():
+    audit_stage, audit_dir_value = get_active_distributed_audit()
+    if audit_dir_value is None:
         return
-    if getattr(model, "_huginn_audio_dynamic90s_stage34_fsdp_audited", False):
+    if getattr(model, "_huginn_audio_dynamic90s_distributed_fsdp_audited", False):
         return
     if not torch.distributed.is_available() or not torch.distributed.is_initialized():
-        raise RuntimeError("Stage 3-4 requires an initialized torch.distributed process group")
+        raise RuntimeError(f"{audit_stage} requires an initialized torch.distributed process group")
 
     rank = torch.distributed.get_rank()
     world_size = torch.distributed.get_world_size()
     if world_size != 4:
-        raise RuntimeError(f"Stage 3-4 requires world_size=4, got {world_size}")
+        raise RuntimeError(f"{audit_stage} requires world_size=4, got {world_size}")
 
     def is_dtensor(parameter: torch.Tensor) -> bool:
         return all(hasattr(parameter, attribute) for attribute in ("device_mesh", "placements", "to_local"))
@@ -923,13 +941,13 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
     }
     if trainable_tensors != expected_trainables:
         raise RuntimeError(
-            f"Stage 3-4 post-FSDP trainable split mismatch: expected={expected_trainables} "
+            f"{audit_stage} post-FSDP trainable split mismatch: expected={expected_trainables} "
             f"actual={trainable_tensors}"
         )
     total_trainable_tensors = sum(trainable_tensors.values())
     if dtensor_parameter_count <= 0 or dtensor_trainable_count != total_trainable_tensors:
         raise RuntimeError(
-            "Stage 3-4 did not observe complete FSDP2 DTensor sharding: "
+            f"{audit_stage} did not observe complete FSDP2 DTensor sharding: "
             f"dtensor_parameters={dtensor_parameter_count} "
             f"dtensor_trainables={dtensor_trainable_count} total_trainables={total_trainable_tensors}"
         )
@@ -967,6 +985,7 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
 
     payload = {
         "kind": "fsdp",
+        "stage": audit_stage,
         "rank": rank,
         "world_size": world_size,
         "cuda_device": torch.cuda.current_device(),
@@ -976,16 +995,16 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
         "fsdp_units": unit_audits,
         "valid_prefix_tokens": [int(value) for value in prefix_mask.sum(dim=1).tolist()],
     }
-    _write_stage34_rank_marker("fsdp", payload)
+    _write_distributed_rank_marker("fsdp", payload)
     print(
-        "[HuginnAudioDynamic90s] STAGE34_FSDP_RANK_AUDIT "
+        f"[HuginnAudioDynamic90s] {audit_stage.upper()}_FSDP_RANK_AUDIT "
         f"rank={rank} world_size={world_size} dtensor_parameters={dtensor_parameter_count} "
         f"dtensor_trainables={dtensor_trainable_count} trainable_tensors={trainable_tensors} "
         f"fsdp_units={unit_audits} "
         f"valid_prefix_tokens={payload['valid_prefix_tokens']}",
         flush=True,
     )
-    model._huginn_audio_dynamic90s_stage34_fsdp_audited = True
+    model._huginn_audio_dynamic90s_distributed_fsdp_audited = True
 
 
 def patch_stage34_optimizer_step_callback() -> None:
@@ -1021,7 +1040,7 @@ def patch_stage34_optimizer_step_callback() -> None:
                 "max_steps": int(state.max_steps),
                 "optimizer_type": type(optimizer).__name__ if optimizer is not None else None,
             }
-            _write_stage34_rank_marker("optimizer-step", payload)
+            _write_distributed_rank_marker("optimizer-step", payload)
             print(
                 "[HuginnAudioDynamic90s] STAGE34_OPTIMIZER_STEP_AUDIT "
                 f"rank={rank} world_size={world_size} global_step={state.global_step} "
@@ -1042,6 +1061,136 @@ def patch_stage34_optimizer_step_callback() -> None:
     init_with_stage34_callback._huginn_audio_dynamic90s_stage34_patched = True
     Trainer.__init__ = init_with_stage34_callback
     print("[HuginnAudioDynamic90s] installed Stage 3-4 optimizer-step callback")
+
+
+def patch_stage5_stability_callback() -> None:
+    if not os.environ.get(STAGE5_AUDIT_DIR_ENV, "").strip():
+        return
+    from transformers import Trainer, TrainerCallback
+
+    try:
+        expected_max_steps = int(os.environ.get(STAGE5_MAX_STEPS_ENV, "20"))
+    except ValueError as exc:
+        raise ValueError(f"{STAGE5_MAX_STEPS_ENV} must be an integer") from exc
+    if expected_max_steps <= 1:
+        raise ValueError(f"Stage 5 requires more than one optimizer step, got {expected_max_steps}")
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic90s_stage5_patched", False):
+        return
+
+    class Stage5StabilityCallback(TrainerCallback):
+        _huginn_audio_dynamic90s_stage5_callback = True
+
+        def __init__(self):
+            self.finite_loss_log_count = 0
+            self.finite_grad_norm_log_count = 0
+            self.optimizer_type = None
+
+        def _distributed_identity(self) -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Stage 5 requires an initialized torch.distributed process group")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"Stage 5 requires world_size=4, got {world_size}")
+            return rank, world_size
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, state, kwargs
+            logs = logs or {}
+            for key in ("loss", "grad_norm"):
+                value = logs.get(key)
+                if value is None:
+                    continue
+                numeric_value = float(value)
+                if not math.isfinite(numeric_value):
+                    raise RuntimeError(f"Stage 5 observed non-finite {key}: {numeric_value}")
+                if key == "loss":
+                    self.finite_loss_log_count += 1
+                else:
+                    self.finite_grad_norm_log_count += 1
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):
+            del args
+            rank, world_size = self._distributed_identity()
+            if int(state.max_steps) != expected_max_steps:
+                raise RuntimeError(
+                    f"Stage 5 max_steps mismatch: expected={expected_max_steps} actual={state.max_steps}"
+                )
+            optimizer = kwargs.get("optimizer")
+            if optimizer is not None:
+                self.optimizer_type = type(optimizer).__name__
+            if int(state.global_step) == expected_max_steps:
+                payload = {
+                    "kind": "optimizer_step",
+                    "stage": "stage5",
+                    "rank": rank,
+                    "world_size": world_size,
+                    "global_step": int(state.global_step),
+                    "max_steps": int(state.max_steps),
+                    "optimizer_type": self.optimizer_type,
+                }
+                _write_distributed_rank_marker("optimizer-step", payload)
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            rank, world_size = self._distributed_identity()
+            if int(state.global_step) != expected_max_steps or int(state.max_steps) != expected_max_steps:
+                raise RuntimeError(
+                    "Stage 5 did not complete every optimizer step: "
+                    f"global_step={state.global_step} max_steps={state.max_steps} "
+                    f"expected={expected_max_steps}"
+                )
+            if self.finite_loss_log_count != expected_max_steps:
+                raise RuntimeError(
+                    "Stage 5 did not audit one finite loss per optimizer step: "
+                    f"expected={expected_max_steps} actual={self.finite_loss_log_count}"
+                )
+            if self.finite_grad_norm_log_count != expected_max_steps:
+                raise RuntimeError(
+                    "Stage 5 did not audit one finite gradient norm per optimizer step: "
+                    f"expected={expected_max_steps} actual={self.finite_grad_norm_log_count}"
+                )
+            payload = {
+                "kind": "stability",
+                "stage": "stage5",
+                "rank": rank,
+                "world_size": world_size,
+                "global_step": int(state.global_step),
+                "max_steps": int(state.max_steps),
+                "finite_loss_log_count": self.finite_loss_log_count,
+                "finite_grad_norm_log_count": self.finite_grad_norm_log_count,
+                "optimizer_type": self.optimizer_type,
+            }
+            _write_distributed_rank_marker("stability", payload)
+            print(
+                "[HuginnAudioDynamic90s] STAGE5_STABILITY_AUDIT "
+                f"rank={rank} world_size={world_size} global_step={state.global_step} "
+                f"finite_losses={self.finite_loss_log_count} "
+                f"finite_grad_norms={self.finite_grad_norm_log_count} "
+                f"optimizer={self.optimizer_type}",
+                flush=True,
+            )
+            return control
+
+    @wraps(original_init)
+    def init_with_stage5_callback(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic90s_stage5_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(Stage5StabilityCallback())
+
+    init_with_stage5_callback._huginn_audio_dynamic90s_stage5_patched = True
+    Trainer.__init__ = init_with_stage5_callback
+    print(
+        "[HuginnAudioDynamic90s] installed Stage 5 stability callback "
+        f"expected_max_steps={expected_max_steps}"
+    )
 
 
 def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
@@ -1371,6 +1520,7 @@ register_huginn_audio_model_arch()
 patch_peft_dynamic90s_lora_dropout()
 patch_peft_adapter_restore()
 patch_stage34_optimizer_step_callback()
+patch_stage5_stability_callback()
 
 register_model(
     ModelMeta(
