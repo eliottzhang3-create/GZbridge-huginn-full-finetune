@@ -2200,15 +2200,31 @@ def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) ->
     }
     gradient_tensor_counts = {name: 0 for name in scalar_flags}
     boundary_gradients = {
-        name: {"gradient_tensors": 0, "finite_gradient_tensors": 0, "nonzero_gradient_tensors": 0}
+        name: {
+            "gradient_parameter_ranks": 0,
+            "local_elements": 0,
+            "nonfinite_local_tensors": 0,
+            "nonzero_local_tensors": 0,
+        }
         for name in AUDIO_BOUNDARY_PARAMETER_NAMES
     }
     for name, parameter in model.named_parameters():
+        boundary_name = audio_boundary_parameter_name(name)
         gradient = parameter.grad
         if gradient is None:
             continue
         group = _training_parameter_group(name)
         local_gradient = gradient.to_local() if hasattr(gradient, "to_local") else gradient
+        if boundary_name is not None:
+            boundary_gradients[boundary_name]["gradient_parameter_ranks"] += 1
+            boundary_gradients[boundary_name]["local_elements"] += local_gradient.numel()
+            if local_gradient.numel() > 0:
+                boundary_gradients[boundary_name]["nonfinite_local_tensors"] += int(
+                    not bool(torch.isfinite(local_gradient).all().item())
+                )
+                boundary_gradients[boundary_name]["nonzero_local_tensors"] += int(
+                    bool(torch.count_nonzero(local_gradient).gt(0).item())
+                )
         if local_gradient.numel() == 0:
             continue
         gradient_tensor_counts[group] += 1
@@ -2216,11 +2232,6 @@ def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) ->
         nonzero = torch.count_nonzero(local_gradient).gt(0)
         scalar_flags[group]["finite"].append(finite)
         scalar_flags[group]["nonzero"].append(nonzero)
-        boundary_name = audio_boundary_parameter_name(name)
-        if boundary_name is not None:
-            boundary_gradients[boundary_name]["gradient_tensors"] += 1
-            boundary_gradients[boundary_name]["finite_gradient_tensors"] += int(finite.item())
-            boundary_gradients[boundary_name]["nonzero_gradient_tensors"] += int(nonzero.item())
 
     result: dict[str, dict[str, int]] = {}
     for group, flags in scalar_flags.items():
@@ -2246,24 +2257,49 @@ def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) ->
         or result["other"]["gradient_tensors"] != 0
     ):
         raise RuntimeError(f"{context} gradient ownership mismatch: {result}")
+
+    boundary_fields = (
+        "gradient_parameter_ranks",
+        "local_elements",
+        "nonfinite_local_tensors",
+        "nonzero_local_tensors",
+    )
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        backend = str(torch.distributed.get_backend()).lower()
+        reduction_device = (
+            torch.device("cuda", torch.cuda.current_device())
+            if "nccl" in backend
+            else torch.device("cpu")
+        )
+        flattened = [
+            boundary_gradients[name][field]
+            for name in AUDIO_BOUNDARY_PARAMETER_NAMES
+            for field in boundary_fields
+        ]
+        reduced = torch.tensor(flattened, dtype=torch.long, device=reduction_device)
+        torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+        reduced_values = [int(value) for value in reduced.cpu().tolist()]
+        offset = 0
+        for name in AUDIO_BOUNDARY_PARAMETER_NAMES:
+            boundary_gradients[name] = {
+                field: reduced_values[offset + index]
+                for index, field in enumerate(boundary_fields)
+            }
+            offset += len(boundary_fields)
     invalid_boundaries = {
         name: audit
         for name, audit in boundary_gradients.items()
-        if audit != {
-            "gradient_tensors": 1,
-            "finite_gradient_tensors": 1,
-            "nonzero_gradient_tensors": 1,
-        }
+        if audit["gradient_parameter_ranks"] <= 0
+        or audit["local_elements"] <= 0
+        or audit["nonfinite_local_tensors"] != 0
+        or audit["nonzero_local_tensors"] <= 0
     }
     if invalid_boundaries:
         raise RuntimeError(
             f"{context} audio boundary gradient mismatch: "
             f"invalid={invalid_boundaries} all={boundary_gradients}"
         )
-    result["audio_boundaries"] = {
-        name: audit["nonzero_gradient_tensors"]
-        for name, audit in boundary_gradients.items()
-    }
+    result["audio_boundaries"] = boundary_gradients
     return result
 
 
