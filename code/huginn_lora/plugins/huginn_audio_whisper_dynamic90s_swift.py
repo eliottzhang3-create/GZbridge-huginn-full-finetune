@@ -2204,6 +2204,7 @@ def patch_memory90_callback() -> None:
             self.grad_norm_count = 0
             self.gradient_audit: dict[str, dict[str, int]] | None = None
             self.optimizer_group_audit: list[dict[str, Any]] | None = None
+            self.memory_contract_audit: dict[str, Any] | None = None
 
         @staticmethod
         def _identity() -> tuple[int, int]:
@@ -2227,6 +2228,42 @@ def patch_memory90_callback() -> None:
                     f"got batch={args.per_device_train_batch_size} "
                     f"accumulation={args.gradient_accumulation_steps} max_steps={state.max_steps}"
                 )
+            audio_model = next(
+                (
+                    module
+                    for module in self.tracked_model.modules()
+                    if all(hasattr(module, name) for name in ("audio_encoder", "audio_aligner"))
+                ),
+                None,
+            )
+            if audio_model is None:
+                raise RuntimeError("90-second memory smoke could not locate the audio model")
+            whisper_gradient_checkpointing = bool(
+                getattr(audio_model.audio_encoder, "gradient_checkpointing", False)
+                or getattr(audio_model.audio_encoder, "is_gradient_checkpointing", False)
+            )
+            checkpoint_wrappers = [
+                type(module).__name__
+                for module in self.tracked_model.modules()
+                if "CheckpointWrapper" in type(module).__name__
+                or hasattr(module, "_checkpoint_wrapped_module")
+            ]
+            if not bool(getattr(args, "vit_gradient_checkpointing", False)) or not whisper_gradient_checkpointing:
+                raise RuntimeError(
+                    "90-second memory smoke requires active Whisper gradient checkpointing: "
+                    f"arg={getattr(args, 'vit_gradient_checkpointing', None)} "
+                    f"module={whisper_gradient_checkpointing}"
+                )
+            if not checkpoint_wrappers:
+                raise RuntimeError(
+                    "90-second memory smoke requested FSDP activation checkpointing but observed no checkpoint wrappers"
+                )
+            self.memory_contract_audit = {
+                "vit_gradient_checkpointing_arg": bool(args.vit_gradient_checkpointing),
+                "whisper_gradient_checkpointing": whisper_gradient_checkpointing,
+                "fsdp_activation_checkpoint_wrapper_count": len(checkpoint_wrappers),
+                "cuda_allocator_config": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+            }
             self.optimizer_group_audit = _audit_optimizer_parameter_groups(
                 self.tracked_model,
                 kwargs.get("optimizer"),
@@ -2261,7 +2298,12 @@ def patch_memory90_callback() -> None:
         def on_train_end(self, args, state, control, **kwargs):
             del args
             rank, world_size = self._identity()
-            if int(state.global_step) != 1 or self.gradient_audit is None or self.optimizer_group_audit is None:
+            if (
+                int(state.global_step) != 1
+                or self.gradient_audit is None
+                or self.optimizer_group_audit is None
+                or self.memory_contract_audit is None
+            ):
                 raise RuntimeError(
                     "90-second memory smoke did not complete one audited optimizer update: "
                     f"global_step={state.global_step} gradient_audit={self.gradient_audit}"
@@ -2286,6 +2328,7 @@ def patch_memory90_callback() -> None:
                 "finite_grad_norm_log_count": self.grad_norm_count,
                 "gradient_audit": self.gradient_audit,
                 "optimizer_group_audit": self.optimizer_group_audit,
+                "memory_contract_audit": self.memory_contract_audit,
                 "memory_allocated_gib": torch.cuda.memory_allocated() / gib,
                 "memory_reserved_gib": torch.cuda.memory_reserved() / gib,
                 "max_memory_allocated_gib": torch.cuda.max_memory_allocated() / gib,

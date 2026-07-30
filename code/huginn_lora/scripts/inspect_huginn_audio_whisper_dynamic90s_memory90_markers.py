@@ -112,6 +112,15 @@ def main() -> None:
         for group in ("huginn_base", "other"):
             if int(gradients.get(group, {}).get("gradient_tensors", -1)) != 0:
                 raise AssertionError(f"Rank {rank} observed forbidden {group} gradients: {gradients}")
+        memory_contract = memory.get("memory_contract_audit")
+        if (
+            not isinstance(memory_contract, dict)
+            or memory_contract.get("vit_gradient_checkpointing_arg") is not True
+            or memory_contract.get("whisper_gradient_checkpointing") is not True
+            or int(memory_contract.get("fsdp_activation_checkpoint_wrapper_count", 0)) <= 0
+            or memory_contract.get("cuda_allocator_config") != "expandable_segments:True"
+        ):
+            raise AssertionError(f"Rank {rank} checkpointed-memory contract mismatch: {memory_contract}")
         validate_optimizer_groups(memory, trainables, rank)
 
         devices.add(int(fsdp["cuda_device"]))
@@ -122,7 +131,8 @@ def main() -> None:
             f"whisper_tensors={trainables['audio_encoder']} prefix_tokens={fsdp['valid_prefix_tokens']} "
             f"optimizer_states={memory['optimizer_state_count']} "
             f"max_allocated_gib={memory['max_memory_allocated_gib']:.3f} "
-            f"max_reserved_gib={memory['max_memory_reserved_gib']:.3f} gradients={gradients}"
+            f"max_reserved_gib={memory['max_memory_reserved_gib']:.3f} "
+            f"memory_contract={memory_contract} gradients={gradients}"
         )
 
     if devices != {0, 1, 2, 3}:

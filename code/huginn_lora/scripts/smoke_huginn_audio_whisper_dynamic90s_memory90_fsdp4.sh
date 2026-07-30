@@ -13,6 +13,7 @@ export PYTHONUNBUFFERED=1
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export NPROC_PER_NODE=4
 export OMP_NUM_THREADS=4
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 RUN_ROOT="${HUGINN_AUDIO_DYNAMIC90S_MEMORY90_RUN_ROOT:-outputs/huginn_audio_whisper_dynamic90s_memory90_fsdp4/run-$(date +%Y%m%d_%H%M%S)}"
 if [ -e "$RUN_ROOT" ]; then
@@ -45,7 +46,8 @@ from swift.utils import get_multimodal_target_regex
 
 available = {field.name for field in fields(SftArguments)}
 required = {
-    'fsdp', 'tuner_type', 'freeze_vit', 'freeze_aligner', 'vit_lr', 'lora_rank',
+    'fsdp', 'tuner_type', 'freeze_vit', 'freeze_aligner', 'vit_lr',
+    'vit_gradient_checkpointing', 'lora_rank',
     'lora_alpha', 'lora_dropout', 'lr_scheduler_type', 'max_steps', 'save_strategy',
 }
 missing = sorted(required - available)
@@ -73,7 +75,7 @@ if [ ! -s "$TRAIN_MANIFEST" ]; then
   exit 1
 fi
 
-FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":false,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
+FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":true,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
 printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
 mkdir -p "$AUDIT_DIR" "$OUTPUT_DIR"
 
@@ -88,7 +90,8 @@ echo "whisper_encoder=fully_trainable learning_rate=1e-4 one_whole_fsdp_unit=tru
 echo "aligner=fully_trainable tensors=14 learning_rate=1e-4"
 echo "huginn_backbone=frozen huginn_lora=66 rank=8 alpha=16 dropout=0.05 learning_rate=1e-4"
 echo "world_size=4 per_device_batch=2 gradient_accumulation=4 global_batch=32 max_steps=1"
-echo "fsdp_reshard_after_forward=true activation_checkpointing=false gradient_checkpointing=false"
+echo "fsdp_reshard_after_forward=true activation_checkpointing=true gradient_checkpointing=false vit_gradient_checkpointing=true"
+echo "pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"
 
 TRAIN_PID=""
 MONITOR_PID=""
@@ -168,6 +171,7 @@ swift sft \
   --per_device_train_batch_size 2 \
   --gradient_accumulation_steps 4 \
   --gradient_checkpointing false \
+  --vit_gradient_checkpointing true \
   --logging_steps 1 \
   --save_strategy no \
   --dataloader_num_workers 0 \

@@ -2325,7 +2325,11 @@ The first required gate for this contract is
 update with every sample exactly 90 seconds long, `B=2` per rank, four ranks, and `GA=4`, giving global batch `32`.
 Each local forward flattens six 30-second Whisper chunks into one Whisper call. The gate requires nonzero finite
 Whisper/aligner/LoRA gradients, no Huginn-base gradients, two 752-position prefixes per rank, complete FSDP2 DTensor
-sharding, and per-rank CUDA peak allocated/reserved memory markers. It saves no checkpoint.
+sharding, and per-rank CUDA peak allocated/reserved memory markers. The initial fully-trainable-Whisper B2 attempt
+reached `31.18 GiB` before the first recurrent-core all-gather and OOMed while requesting another `362 MiB`. The active
+retry therefore preserves B2/GA4 but enables explicit Whisper gradient checkpointing, FSDP activation checkpointing,
+and the expandable-segments CUDA allocator; the marker gate verifies all three are actually active. It saves no
+checkpoint.
 
 Historically, the pre-grouping implementation passed Stage 0-2 remotely, including the production duration contract, real Swift
 collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and a real backward
