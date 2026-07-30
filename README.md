@@ -2391,6 +2391,11 @@ the cumulative counts, effective seconds, next global position, and per-pool epo
 for this short gate so the first phase cannot decay to zero before the resumed updates. All checkpoint-4/6 artifacts
 from the previous with-replacement sampler are obsolete and must not be reused.
 
+For checkpoint jobs, PEFT still receives the leaf `modules_to_save` names, while Swift's model-architecture aligner
+registration uses their full `audio_aligner.<module>` paths. This distinction is required because Swift 4.1.3 builds
+multimodal optimizer groups by matching real `named_parameters()` prefixes; using the leaf names alone leaves all 14
+trainable aligner tensors outside the optimizer.
+
 Run the active model gates in this order after syncing code. The no-replacement CPU sampler audit has already passed and
 does not need to be repeated unless its code or report changes:
 

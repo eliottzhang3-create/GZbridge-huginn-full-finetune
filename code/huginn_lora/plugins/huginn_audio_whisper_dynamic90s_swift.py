@@ -109,6 +109,7 @@ ALIGNER_MODULES_TO_SAVE = (
     "audio_projector",
     "audio_boundary_embeddings",
 )
+ALIGNER_MODEL_ARCH_PATHS = tuple(f"audio_aligner.{name}" for name in ALIGNER_MODULES_TO_SAVE)
 FSDP_UNIT_CLASS_NAMES = (
     "WhisperEncoderFSDPUnit",
     "AudioAlignerFSDPUnit",
@@ -3417,7 +3418,7 @@ def register_huginn_audio_model_arch():
         # unfreeze calls must reach their guarded wrapper methods. Preserve the
         # already-passed whole-aligner registration in every ordinary run.
         "aligner": (
-            list(ALIGNER_MODULES_TO_SAVE)
+            list(ALIGNER_MODEL_ARCH_PATHS)
             if _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
             else ["audio_aligner"]
         ),
