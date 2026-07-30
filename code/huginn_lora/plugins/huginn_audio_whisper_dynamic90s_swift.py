@@ -79,6 +79,7 @@ STAGE5_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_MAX_STEPS"
 MEMORY90_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_MEMORY90_AUDIT_DIR"
 ACCELERATION_STAGE0_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE0_AUDIT_DIR"
 ACCELERATION_STAGE1_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR"
+ACCELERATION_STAGE2_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE2_AUDIT_DIR"
 REALDATA_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_AUDIT_DIR"
 REALDATA_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_MAX_STEPS"
 DATA_POSITION_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR"
@@ -1688,6 +1689,7 @@ def get_active_distributed_audit() -> tuple[Optional[str], Optional[str]]:
         ("stage34", os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip()),
         ("stage5", os.environ.get(STAGE5_AUDIT_DIR_ENV, "").strip()),
         ("memory90", os.environ.get(MEMORY90_AUDIT_DIR_ENV, "").strip()),
+        ("acceleration_stage2", os.environ.get(ACCELERATION_STAGE2_AUDIT_DIR_ENV, "").strip()),
         ("realdata", os.environ.get(REALDATA_AUDIT_DIR_ENV, "").strip()),
         ("checkpoint", os.environ.get(CHECKPOINT_AUDIT_DIR_ENV, "").strip()),
     ]
@@ -2615,6 +2617,29 @@ def _read_fsdp_reshard_after_forward(module: torch.nn.Module) -> dict[str, Any]:
     }
 
 
+def _assert_fsdp_reshard_state(
+    module: torch.nn.Module,
+    *,
+    expected: bool,
+    context: str,
+) -> dict[str, Any]:
+    audit = _read_fsdp_reshard_after_forward(module)
+    explicit_values = {
+        bool(candidate["value"])
+        for candidate in audit["candidates"]
+        if "value" in candidate
+    }
+    if (
+        audit["effective"] is not expected
+        or not audit["has_fsdp_state"]
+        or explicit_values != {expected}
+    ):
+        raise RuntimeError(
+            f"{context} reshard_after_forward mismatch: expected={expected} audit={audit}"
+        )
+    return audit
+
+
 def patch_acceleration_stage0_callback() -> None:
     audit_dir_value = os.environ.get(ACCELERATION_STAGE0_AUDIT_DIR_ENV, "").strip()
     if not audit_dir_value:
@@ -3169,6 +3194,354 @@ def patch_acceleration_stage1_callback() -> None:
     patched_init._huginn_audio_dynamic30s_acceleration_stage1_patched = True
     Trainer.__init__ = patched_init
     print("[HuginnAudioSwift] installed dynamic30s acceleration Stage 1 audit callback")
+
+
+def patch_acceleration_stage2_callback() -> None:
+    """Keep only the recurrent-core FSDP unit unsharded between forwards."""
+    audit_dir_value = os.environ.get(ACCELERATION_STAGE2_AUDIT_DIR_ENV, "").strip()
+    if not audit_dir_value:
+        return
+    conflicting = [
+        name
+        for name in (ACCELERATION_STAGE0_AUDIT_DIR_ENV, ACCELERATION_STAGE1_AUDIT_DIR_ENV)
+        if os.environ.get(name, "").strip()
+    ]
+    if conflicting:
+        raise RuntimeError(f"Acceleration Stage 2 conflicts with active audit modes: {conflicting}")
+    from transformers import Trainer, TrainerCallback
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic30s_acceleration_stage2_patched", False):
+        return
+
+    expected_wrapper_suffixes = (
+        "transformer.prelude.0",
+        "transformer.prelude.1",
+        "transformer.core_block.0",
+        "transformer.core_block.1",
+        "transformer.core_block.2",
+        "transformer.core_block.3",
+        "transformer.core_block.adapter",
+        "transformer.coda.0",
+        "transformer.coda.1",
+        "audio_encoder.encoder",
+        "audio_aligner.temporal_compressor",
+        "audio_aligner.audio_projector",
+        "audio_aligner.audio_boundary_embeddings",
+    )
+
+    class AccelerationStage2Callback(TrainerCallback):
+        _huginn_audio_dynamic30s_acceleration_stage2_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.loss_logs: list[float] = []
+            self.grad_norm_logs: list[float] = []
+            self.gradient_audit: dict[str, dict[str, int]] | None = None
+            self.optimizer_audit: list[dict[str, Any]] | None = None
+            self.fsdp_topology: dict[str, Any] | None = None
+            self.fsdp_units_before: dict[str, Any] = {}
+            self.fsdp_units_after: dict[str, Any] = {}
+            self.checkpoint_wrappers: list[dict[str, Any]] = []
+            self.whisper_outer_wrappers: list[dict[str, Any]] = []
+            self.core_forward_calls = 0
+            self.core_hook_handle = None
+            self.train_started_at: float | None = None
+
+        @staticmethod
+        def _identity() -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Acceleration Stage 2 requires initialized torch.distributed")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"Acceleration Stage 2 requires world_size=4, got {world_size}")
+            return rank, world_size
+
+        def _locate_unit(self, class_name: str) -> tuple[str, torch.nn.Module]:
+            matching = [
+                (name, module)
+                for name, module in self.tracked_model.named_modules()
+                if class_name in _module_mro_names(module)
+            ]
+            if len(matching) != 1:
+                raise RuntimeError(
+                    f"Acceleration Stage 2 expected one {class_name}, found "
+                    f"{[(name, type(module).__name__) for name, module in matching]}"
+                )
+            return matching[0]
+
+        def _locate_audio_model(self) -> torch.nn.Module:
+            matching = [
+                module
+                for module in self.tracked_model.modules()
+                if "HuginnAudioForConditionalGeneration" in _module_mro_names(module)
+            ]
+            if len(matching) != 1:
+                raise RuntimeError(
+                    "Acceleration Stage 2 expected one concrete Huginn audio model, found "
+                    f"{[type(module).__name__ for module in matching]}"
+                )
+            return matching[0]
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            rank, world_size = self._identity()
+            if (
+                int(args.per_device_train_batch_size) != 2
+                or int(args.gradient_accumulation_steps) != 4
+                or int(state.max_steps) != 1
+            ):
+                raise RuntimeError(
+                    "Acceleration Stage 2 requires B2/GA4/max_steps=1: "
+                    f"batch={args.per_device_train_batch_size} "
+                    f"ga={args.gradient_accumulation_steps} max_steps={state.max_steps}"
+                )
+            if bool(getattr(args, "gradient_checkpointing", False)):
+                raise RuntimeError("Acceleration Stage 2 must keep Huginn Trainer checkpointing disabled")
+            if bool(getattr(args, "vit_gradient_checkpointing", False)):
+                raise RuntimeError("Acceleration Stage 2 retains the Stage 1 Whisper checkpoint dedup setting")
+
+            internal_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
+            if internal_modules:
+                raise RuntimeError(
+                    "Acceleration Stage 2 found active Whisper internal gradient checkpointing: "
+                    f"{internal_modules}"
+                )
+            self.checkpoint_wrappers = _audit_activation_checkpoint_wrappers(self.tracked_model)
+            self.whisper_outer_wrappers = [
+                wrapper
+                for wrapper in self.checkpoint_wrappers
+                if wrapper["contains_whisper_encoder"]
+            ]
+            if len(self.whisper_outer_wrappers) != 1:
+                raise RuntimeError(
+                    "Acceleration Stage 2 requires exactly one outer WhisperEncoder checkpoint wrapper: "
+                    f"{self.whisper_outer_wrappers}"
+                )
+            whisper_wrapper = self.whisper_outer_wrappers[0]
+            if (
+                not whisper_wrapper["path"].endswith("audio_encoder.encoder")
+                or "WhisperEncoder" not in whisper_wrapper["inner_mro"]
+            ):
+                raise RuntimeError(
+                    "Acceleration Stage 2 outer Whisper checkpoint ownership mismatch: "
+                    f"{whisper_wrapper}"
+                )
+            missing_wrapper_suffixes = [
+                suffix
+                for suffix in expected_wrapper_suffixes
+                if not any(wrapper["path"].endswith(suffix) for wrapper in self.checkpoint_wrappers)
+            ]
+            if missing_wrapper_suffixes:
+                raise RuntimeError(
+                    "Acceleration Stage 2 unexpectedly lost activation-checkpoint wrappers: "
+                    f"{missing_wrapper_suffixes}; observed={self.checkpoint_wrappers}"
+                )
+
+            self.optimizer_audit = _audit_optimizer_parameter_groups(
+                self.tracked_model,
+                kwargs.get("optimizer"),
+                context="Acceleration Stage 2",
+            )
+            self.fsdp_topology = _audit_formal_fsdp_topology(self.tracked_model)
+
+            units: dict[str, tuple[str, torch.nn.Module]] = {}
+            for class_name in FSDP_UNIT_CLASS_NAMES:
+                unit_path, unit = self._locate_unit(class_name)
+                units[class_name] = (unit_path, unit)
+                self.fsdp_units_before[class_name] = {
+                    "path": unit_path,
+                    "runtime_type": type(unit).__name__,
+                    "mro": _module_mro_names(unit),
+                    "reshard_after_forward": _assert_fsdp_reshard_state(
+                        unit,
+                        expected=True,
+                        context=f"Acceleration Stage 2 preflight {class_name}",
+                    ),
+                }
+
+            core_path, core_unit = units["HuginnRecurrentCoreFSDPUnit"]
+            setter = getattr(core_unit, "set_reshard_after_forward", None)
+            if not callable(setter):
+                raise RuntimeError(
+                    "Acceleration Stage 2 recurrent core exposes no FSDP2 "
+                    "set_reshard_after_forward runtime setter"
+                )
+            setter(False)
+            torch.distributed.barrier()
+
+            for class_name, (unit_path, unit) in units.items():
+                expected = class_name != "HuginnRecurrentCoreFSDPUnit"
+                self.fsdp_units_after[class_name] = {
+                    "path": unit_path,
+                    "runtime_type": type(unit).__name__,
+                    "mro": _module_mro_names(unit),
+                    "reshard_after_forward": _assert_fsdp_reshard_state(
+                        unit,
+                        expected=expected,
+                        context=f"Acceleration Stage 2 post-mutation {class_name}",
+                    ),
+                }
+
+            def core_pre_hook(_module, _args):
+                self.core_forward_calls += 1
+
+            self.core_hook_handle = core_unit.register_forward_pre_hook(core_pre_hook)
+            audio_model = self._locate_audio_model()
+            audio_model._huginn_audio_acceleration_stage2_prefix_tokens = []
+            torch.cuda.reset_peak_memory_stats()
+            self.train_started_at = time.perf_counter()
+            print(
+                "[acceleration-stage2] "
+                f"rank={rank}/{world_size} core_path={core_path} "
+                f"core_reshard_before=true core_reshard_after=false "
+                f"other_units_reshard=true outer_whisper_checkpoint={whisper_wrapper['path']}",
+                flush=True,
+            )
+            return control
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            self.gradient_audit = _audit_local_trainable_gradients(
+                self.tracked_model,
+                context="Acceleration Stage 2 first optimizer update",
+            )
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, state, kwargs
+            for key, destination in (("loss", self.loss_logs), ("grad_norm", self.grad_norm_logs)):
+                value = (logs or {}).get(key)
+                if value is None:
+                    continue
+                numeric = float(value)
+                if not math.isfinite(numeric):
+                    raise RuntimeError(f"Acceleration Stage 2 logged non-finite {key}: {numeric}")
+                destination.append(numeric)
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            rank, world_size = self._identity()
+            if self.core_hook_handle is not None:
+                self.core_hook_handle.remove()
+                self.core_hook_handle = None
+            if int(state.global_step) != 1:
+                raise RuntimeError(f"Acceleration Stage 2 ended at step {state.global_step}, expected 1")
+            if self.train_started_at is None:
+                raise RuntimeError("Acceleration Stage 2 lacks its training start timestamp")
+            if self.gradient_audit is None or not self.loss_logs or not self.grad_norm_logs:
+                raise RuntimeError(
+                    "Acceleration Stage 2 did not complete its gradient/loss audit: "
+                    f"gradient={self.gradient_audit is not None} losses={self.loss_logs} "
+                    f"grad_norms={self.grad_norm_logs}"
+                )
+            if self.core_forward_calls < 4:
+                raise RuntimeError(
+                    "Acceleration Stage 2 observed too few recurrent-core forwards: "
+                    f"{self.core_forward_calls}"
+                )
+
+            audio_model = self._locate_audio_model()
+            prefix_tokens = list(
+                getattr(audio_model, "_huginn_audio_acceleration_stage2_prefix_tokens", [])
+            )
+            if prefix_tokens != [189] * 8:
+                raise RuntimeError(
+                    "Acceleration Stage 2 requires eight exact 30-second prefixes per rank: "
+                    f"observed={prefix_tokens}"
+                )
+            full_labels = getattr(audio_model, "_last_dynamic90s_full_labels", None)
+            shift_labels = getattr(audio_model, "_last_dynamic90s_shift_labels", None)
+            if not torch.is_tensor(full_labels) or not torch.is_tensor(shift_labels):
+                raise RuntimeError("Acceleration Stage 2 lacks shifted-NTP label audit tensors")
+            loss_contract = {
+                "full_labels_shape": list(full_labels.shape),
+                "shift_labels_shape": list(shift_labels.shape),
+                "prefix_tokens": 189,
+                "prefix_labels_all_ignored": bool(full_labels[:, :189].eq(-100).all().item()),
+                "supervised_shift_tokens": int(shift_labels.ne(-100).sum().item()),
+                "shift_length_valid": int(shift_labels.size(1)) == int(full_labels.size(1)) - 1,
+            }
+            if (
+                not loss_contract["prefix_labels_all_ignored"]
+                or loss_contract["supervised_shift_tokens"] <= 0
+                or not loss_contract["shift_length_valid"]
+            ):
+                raise RuntimeError(f"Acceleration Stage 2 shifted-NTP contract mismatch: {loss_contract}")
+
+            for class_name in FSDP_UNIT_CLASS_NAMES:
+                _path, unit = self._locate_unit(class_name)
+                expected = class_name != "HuginnRecurrentCoreFSDPUnit"
+                _assert_fsdp_reshard_state(
+                    unit,
+                    expected=expected,
+                    context=f"Acceleration Stage 2 train-end {class_name}",
+                )
+
+            torch.cuda.synchronize()
+            train_wall_seconds = time.perf_counter() - self.train_started_at
+            gib = 1024**3
+            payload = {
+                "kind": "acceleration_stage2",
+                "gate": "huginn_whisper_dynamic30s_acceleration_stage2_rank_v1",
+                "stage": "acceleration_stage2",
+                "rank": rank,
+                "world_size": world_size,
+                "global_step": int(state.global_step),
+                "cuda_device": torch.cuda.current_device(),
+                "cuda_name": torch.cuda.get_device_name(torch.cuda.current_device()),
+                "per_device_train_batch_size": 2,
+                "gradient_accumulation_steps": 4,
+                "global_batch_size": 32,
+                "synthetic_audio_seconds": 30.0,
+                "expected_audio_tokens": 187,
+                "expected_prefix_tokens": 189,
+                "observed_prefix_tokens": prefix_tokens,
+                "core_forward_calls": self.core_forward_calls,
+                "vit_gradient_checkpointing_arg": False,
+                "whisper_internal_gradient_checkpointing": False,
+                "whisper_outer_activation_checkpointed": True,
+                "whisper_outer_checkpoint_wrappers": self.whisper_outer_wrappers,
+                "whisper_double_checkpoint_candidate": False,
+                "checkpoint_wrappers": self.checkpoint_wrappers,
+                "expected_wrapper_suffixes": list(expected_wrapper_suffixes),
+                "fsdp_units_before": self.fsdp_units_before,
+                "fsdp_units_after": self.fsdp_units_after,
+                "fsdp_topology": self.fsdp_topology,
+                "optimizer_groups": self.optimizer_audit,
+                "gradient_audit": self.gradient_audit,
+                "loss_contract": loss_contract,
+                "finite_losses": self.loss_logs,
+                "finite_grad_norms": self.grad_norm_logs,
+                "train_wall_seconds": train_wall_seconds,
+                "memory_allocated_gib": torch.cuda.memory_allocated() / gib,
+                "memory_reserved_gib": torch.cuda.memory_reserved() / gib,
+                "peak_memory_allocated_gib": torch.cuda.max_memory_allocated() / gib,
+                "peak_memory_reserved_gib": torch.cuda.max_memory_reserved() / gib,
+            }
+            _write_distributed_rank_marker("acceleration-stage2", payload)
+            print(
+                "[acceleration-stage2-marker] "
+                f"rank={rank} core_calls={self.core_forward_calls} "
+                f"prefix_tokens={prefix_tokens} train_wall_seconds={train_wall_seconds:.3f} "
+                f"peak_allocated_gib={payload['peak_memory_allocated_gib']:.3f} "
+                f"peak_reserved_gib={payload['peak_memory_reserved_gib']:.3f}",
+                flush=True,
+            )
+            return control
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic30s_acceleration_stage2_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(AccelerationStage2Callback(self.model))
+
+    patched_init._huginn_audio_dynamic30s_acceleration_stage2_patched = True
+    Trainer.__init__ = patched_init
+    print("[HuginnAudioSwift] installed dynamic30s acceleration Stage 2 audit callback")
 
 
 def patch_memory90_callback() -> None:
@@ -4042,6 +4415,17 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
         if self.training:
             audit_stage34_fsdp_rank(self, prefix_mask)
             audit_stage, _audit_dir = get_active_distributed_audit()
+            if audit_stage == "acceleration_stage2":
+                valid_prefix_tokens = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
+                observed = getattr(
+                    self,
+                    "_huginn_audio_acceleration_stage2_prefix_tokens",
+                    None,
+                )
+                if observed is None:
+                    observed = []
+                    self._huginn_audio_acceleration_stage2_prefix_tokens = observed
+                observed.extend(valid_prefix_tokens)
             if audit_stage in {"realdata", "checkpoint"}:
                 boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
                 valid_prefix_tokens = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
@@ -4439,6 +4823,7 @@ patch_accelerate_fsdp2_full_model_dcp()
 patch_accelerate_fsdp2_save_state_audit()
 patch_acceleration_stage0_callback()
 patch_acceleration_stage1_callback()
+patch_acceleration_stage2_callback()
 patch_memory90_callback()
 patch_stage34_optimizer_step_callback()
 patch_stage5_stability_callback()

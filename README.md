@@ -2336,6 +2336,10 @@ bash code/huginn_lora/run_smoke_huginn_whisper_dynamic30s_acceleration_stage0_fs
 # checkpointing, but disables only Whisper's internal per-layer checkpointing.
 bash code/huginn_lora/run_smoke_huginn_whisper_dynamic30s_acceleration_stage1_fsdp4_5090.sh
 
+# Four-GPU, one-update acceleration Stage 2 worst-case memory gate. It uses
+# exact 30-second synthetic inputs and sets only recurrent-core reshard=false.
+bash code/huginn_lora/run_smoke_huginn_whisper_dynamic30s_acceleration_stage2_fsdp4_5090.sh
+
 # Four-GPU fresh save at step 4, process exit, cold resume to step 6.
 bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh
 
@@ -2367,6 +2371,23 @@ Whisper wrapper, no double-checkpoint candidate, all five units at `reshard_afte
 nonzero gradients for Huginn LoRA + aligner + Whisper, and zero gradients for the frozen native Huginn backbone. It saves
 only per-rank audits and `acceleration_stage1_report.json`, not a model checkpoint. Formal training is not switched to
 this candidate until its FSDP4 result is reviewed and explicitly adopted.
+
+Acceleration Stage 2 is isolated behind
+`HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE2_AUDIT_DIR` and builds on the Stage 1 checkpoint-dedup candidate. The FSDP
+JSON still initializes every unit with `reshard_after_forward=true`; after FSDP2 setup and before the first model
+forward, the Stage 2 callback verifies all five runtime states, calls
+`HuginnRecurrentCoreFSDPUnit.set_reshard_after_forward(False)`, synchronizes all four ranks, and verifies that only the
+recurrent core changed. Train-end auditing confirms that the setting persisted. No normal training launch is affected
+unless the dedicated Stage 2 environment variable is present.
+
+The Stage 2 gate generates one deterministic mono 16-kHz 30-second WAV and 64 synthetic manifest rows, then consumes
+one complete B2/FSDP4/GA4 global batch of 32 samples. Every sample must produce exactly 187 audio content tokens and 189
+valid prefix tokens including trainable audio BOS/EOS; every rank must observe eight 189-token prefixes. It retains
+Whisper SDPA, one outer complete-Whisper checkpoint, zero internal Whisper checkpoint modules, all existing per-block
+activation-checkpoint wrappers, trainable Whisper + aligner + Huginn-only LoRA, and response-only shifted NTP loss. The
+gate records recurrent-core forward counts, finite gradients/losses, wall time, and peak CUDA memory. It fails if peak
+allocated memory reaches 29 GiB or peak reserved memory reaches 30 GiB, and saves no model checkpoint. Passing this gate
+establishes worst-case memory/correctness safety only; real-data speed comparison remains a later paired benchmark.
 
 Formal training still targets more than `3000` realized, decoded, 30-second-capped hours, but max-step planning is now
 deliberately deferred until after the acceleration experiments and their FSDP4 smoke tests. WavCaps source metadata is
