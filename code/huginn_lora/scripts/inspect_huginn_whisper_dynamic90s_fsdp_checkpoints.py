@@ -21,6 +21,7 @@ ALIGNER_PREFIXES = (
     "audio_eos",
 )
 AUDIO_BOUNDARY_PARAMETER_NAMES = ("audio_bos", "audio_eos")
+AUDIO_BOUNDARY_CHECKPOINT_ROLES = ("trainable_active", "frozen_original")
 
 
 def parse_args() -> argparse.Namespace:
@@ -79,6 +80,17 @@ def audio_boundary_key_name(key: str) -> str | None:
     return None
 
 
+def audio_boundary_key_identity(key: str) -> tuple[str, str] | None:
+    boundary_name = audio_boundary_key_name(key)
+    if boundary_name is None:
+        return None
+    if ".modules_to_save.default." in key:
+        return boundary_name, "trainable_active"
+    if ".original_module." in key:
+        return boundary_name, "frozen_original"
+    raise RuntimeError(f"Audio boundary checkpoint key has no PEFT ownership role: {key}")
+
+
 def classify_optimizer_key(key: str) -> str:
     """Classify named optimizer-state entries without assuming one DCP layout."""
     normalized = key
@@ -129,11 +141,15 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
         key = str(raw_key)
         grouped[classify_key(key)].append(key)
     counts = {name: len(keys) for name, keys in grouped.items()}
-    boundary_keys = {name: [] for name in AUDIO_BOUNDARY_PARAMETER_NAMES}
+    boundary_keys = {
+        name: {role: [] for role in AUDIO_BOUNDARY_CHECKPOINT_ROLES}
+        for name in AUDIO_BOUNDARY_PARAMETER_NAMES
+    }
     for key in grouped["aligner"]:
-        boundary_name = audio_boundary_key_name(key)
-        if boundary_name is not None:
-            boundary_keys[boundary_name].append(key)
+        identity = audio_boundary_key_identity(key)
+        if identity is not None:
+            boundary_name, role = identity
+            boundary_keys[boundary_name][role].append(key)
     if (
         counts["lora"] != 66
         or counts["aligner"] < 14
@@ -146,7 +162,10 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
             f"other_preview={grouped['other'][:10]}"
         )
     invalid_boundary_keys = {
-        name: keys for name, keys in boundary_keys.items() if len(keys) != 1
+        f"{name}:{role}": keys
+        for name, role_keys in boundary_keys.items()
+        for role, keys in role_keys.items()
+        if len(keys) != 1
     }
     if invalid_boundary_keys:
         raise RuntimeError(
@@ -258,7 +277,10 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
     max_abs_delta = {name: 0.0 for name in GROUP_NAMES}
     dtypes: dict[str, set[str]] = {name: set() for name in GROUP_NAMES}
     boundary_changes = {
-        name: {"changed": 0, "unchanged": 0, "max_abs_delta": 0.0}
+        name: {
+            role: {"changed": 0, "unchanged": 0, "max_abs_delta": 0.0}
+            for role in AUDIO_BOUNDARY_CHECKPOINT_ROLES
+        }
         for name in AUDIO_BOUNDARY_PARAMETER_NAMES
     }
     for index, key in enumerate(sorted(saved_metadata), start=1):
@@ -271,19 +293,20 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
             )
         group = classify_key(str(key))
         dtypes[group].add(str(left.dtype))
+        boundary_identity = audio_boundary_key_identity(str(key))
         if torch.equal(left, right):
             unchanged[group] += 1
-            boundary_name = audio_boundary_key_name(str(key))
-            if boundary_name is not None:
-                boundary_changes[boundary_name]["unchanged"] += 1
+            if boundary_identity is not None:
+                boundary_name, role = boundary_identity
+                boundary_changes[boundary_name][role]["unchanged"] += 1
         else:
             changed[group] += 1
             tensor_delta = float((left.float() - right.float()).abs().max().item())
             max_abs_delta[group] = max(max_abs_delta[group], tensor_delta)
-            boundary_name = audio_boundary_key_name(str(key))
-            if boundary_name is not None:
-                boundary_changes[boundary_name]["changed"] += 1
-                boundary_changes[boundary_name]["max_abs_delta"] = tensor_delta
+            if boundary_identity is not None:
+                boundary_name, role = boundary_identity
+                boundary_changes[boundary_name][role]["changed"] += 1
+                boundary_changes[boundary_name][role]["max_abs_delta"] = tensor_delta
         del left, right
         if index == 1 or index % 20 == 0 or index == len(saved_metadata):
             print(f"[compare-progress] tensors={index}/{len(saved_metadata)}", flush=True)
@@ -302,8 +325,13 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
         or changed["huginn_base"] != 0
         or changed["other"] != 0
         or any(
-            audit["changed"] != 1 or audit["unchanged"] != 0 or audit["max_abs_delta"] <= 0.0
-            for audit in boundary_changes.values()
+            role_audits["trainable_active"]["changed"] != 1
+            or role_audits["trainable_active"]["unchanged"] != 0
+            or role_audits["trainable_active"]["max_abs_delta"] <= 0.0
+            or role_audits["frozen_original"]["changed"] != 0
+            or role_audits["frozen_original"]["unchanged"] != 1
+            or role_audits["frozen_original"]["max_abs_delta"] != 0.0
+            for role_audits in boundary_changes.values()
         )
     ):
         raise RuntimeError(
@@ -331,7 +359,7 @@ def main() -> None:
     resumed = inspect_checkpoint(args.resume_checkpoint, args.resume_step, args.world_size)
     comparison = compare_model_states(saved, resumed)
     report = {
-        "gate": "huginn_whisper_dynamic90s_full_model_fsdp4_checkpoint_content_v2",
+        "gate": "huginn_whisper_dynamic90s_full_model_fsdp4_checkpoint_content_v3",
         "validation_passed": True,
         "save_checkpoint": {key: value for key, value in saved.items() if key not in {"state_metadata", "grouped_keys"}},
         "resume_checkpoint": {
