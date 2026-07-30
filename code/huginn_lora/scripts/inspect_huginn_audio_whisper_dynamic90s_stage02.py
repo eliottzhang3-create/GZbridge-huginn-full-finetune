@@ -52,7 +52,7 @@ EXPECTED_FSDP_UNIT_CLASS_NAMES = (
     "HuginnCodaFSDPUnit",
 )
 EXPECTED_UNIT_TRAINABLE_TENSORS = {
-    "WhisperEncoderFSDPUnit": 0,
+    "WhisperEncoderFSDPUnit": None,
     "AudioAlignerFSDPUnit": 14,
     "HuginnPreludeFSDPUnit": 16,
     "HuginnRecurrentCoreFSDPUnit": 34,
@@ -330,13 +330,13 @@ def audit_fsdp_unit_topology(audio_model: torch.nn.Module) -> None:
                 f"{class_name} physical block count mismatch: expected={expected_count} actual={actual_count}"
             )
     for class_name, expected_trainables in EXPECTED_UNIT_TRAINABLE_TENSORS.items():
-        actual_trainables = sum(
-            parameter.requires_grad for parameter in modules_by_class[class_name][0].parameters()
-        )
-        if actual_trainables != expected_trainables:
+        unit_parameters = list(modules_by_class[class_name][0].parameters())
+        actual_trainables = sum(parameter.requires_grad for parameter in unit_parameters)
+        expected_actual = len(unit_parameters) if expected_trainables is None else expected_trainables
+        if actual_trainables != expected_actual:
             raise AssertionError(
                 f"{class_name} trainable tensor count mismatch: "
-                f"expected={expected_trainables} actual={actual_trainables}"
+                f"expected={expected_actual} actual={actual_trainables}"
             )
     core_unit = modules_by_class["HuginnRecurrentCoreFSDPUnit"][0]
     if not hasattr(core_unit, "adapter"):
@@ -368,16 +368,15 @@ def audit_trainable_split(model: torch.nn.Module, audio_model: torch.nn.Module) 
         )
     if any(not parameter.requires_grad for _, parameter in aligner_parameters):
         raise AssertionError("Every dynamic aligner tensor must be trainable")
-    if any(parameter.requires_grad for parameter in audio_model.audio_encoder.parameters()):
-        raise AssertionError("Whisper-large must remain frozen")
-    if audio_model.audio_encoder.training:
-        raise AssertionError("Frozen Whisper-large must remain in eval mode")
+    whisper_parameters = list(audio_model.audio_encoder.parameters())
+    if not whisper_parameters or any(not parameter.requires_grad for parameter in whisper_parameters):
+        raise AssertionError("Every Whisper-large encoder parameter must be trainable")
 
     unexpected_trainables = []
     for name, parameter in model.named_parameters():
         if not parameter.requires_grad:
             continue
-        if "lora_" in name or any(
+        if "lora_" in name or "audio_encoder" in name or any(
             key in name
             for key in ("temporal_compressor", "audio_projector", "audio_boundary_embeddings")
         ):
@@ -387,7 +386,7 @@ def audit_trainable_split(model: torch.nn.Module, audio_model: torch.nn.Module) 
         raise AssertionError(f"Unexpected trainable base parameters: {unexpected_trainables[:20]}")
     print(
         f"[trainables] aligner_tensors={len(aligner_parameters)} "
-        "whisper_trainable=0 huginn_base_trainable=0"
+        f"whisper_trainable_tensors={len(whisper_parameters)} huginn_base_trainable=0"
     )
 
 
@@ -505,8 +504,8 @@ def audit_real_prefix_batches(trainer: Any, plugin: Any, audio_model: torch.nn.M
 def audit_backward(trainer: Any, audio_model: torch.nn.Module) -> None:
     model = trainer.model
     model.train()
-    if audio_model.audio_encoder.training:
-        raise AssertionError("Whisper encoder re-entered train mode after model.train()")
+    if not audio_model.audio_encoder.training:
+        raise AssertionError("Trainable Whisper encoder did not enter train mode")
     raw_batch = next(iter(trainer.get_train_dataloader()))
     batch = trainer._prepare_inputs(raw_batch)
     model.zero_grad(set_to_none=True)
@@ -535,9 +534,9 @@ def audit_backward(trainer: Any, audio_model: torch.nn.Module) -> None:
             grad_groups["base"] += parameter.numel()
         else:
             grad_groups["other"] += parameter.numel()
-    if grad_groups["lora"] <= 0 or grad_groups["aligner"] <= 0:
-        raise AssertionError(f"Missing LoRA/aligner gradients: {grad_groups}")
-    if grad_groups["whisper"] or grad_groups["base"] or grad_groups["other"]:
+    if grad_groups["lora"] <= 0 or grad_groups["aligner"] <= 0 or grad_groups["whisper"] <= 0:
+        raise AssertionError(f"Missing LoRA/aligner/Whisper gradients: {grad_groups}")
+    if grad_groups["base"] or grad_groups["other"]:
         raise AssertionError(f"Frozen/unexpected parameters received gradients: {grad_groups}")
 
     prefix_mask = getattr(audio_model, "_last_audio_prefix_mask", None)
@@ -575,7 +574,7 @@ def build_swift_argv(repo_root: Path, plugin: Any, manifest_path: Path, output_d
         "--max_length", "192",
         "--output_dir", str(output_dir),
         "--tuner_type", "lora_llm",
-        "--freeze_vit", "true",
+        "--freeze_vit", "false",
         "--freeze_aligner", "false",
         "--learning_rate", "1e-4",
         "--aligner_lr", "1e-4",

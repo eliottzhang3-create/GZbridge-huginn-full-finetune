@@ -58,9 +58,11 @@ done
 
 python - "$REALDATA_REPORT" "$SAMPLER_REPORT" "$DATASET_MAX_SAMPLES" <<'PY'
 import json
+import inspect
 import sys
 from dataclasses import fields
 from pathlib import Path
+from accelerate.utils import fsdp_utils
 from swift.arguments.sft_args import SftArguments
 
 report = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
@@ -83,6 +85,13 @@ required = {
 missing = sorted(required - available)
 if missing:
     raise SystemExit(f'Installed Swift lacks required checkpoint smoke arguments: {missing}')
+for function_name in ('_get_model_state_dict', '_set_model_state_dict'):
+    function = getattr(fsdp_utils, function_name, None)
+    if function is None or 'adapter_only' not in inspect.signature(function).parameters:
+        raise SystemExit(
+            f'Installed Accelerate lacks paired full-model FSDP API {function_name}(..., adapter_only=...): '
+            f'{function!r}'
+        )
 print('[precheck] real_data_chain=passed no_replacement_sampler=passed checkpoint_arguments=present dataset_quota=sufficient')
 PY
 
@@ -99,6 +108,7 @@ export HUGINN_AUDIO_DYNAMIC90S_FSDP2_NONPERSISTENT_ROPE=1
 export HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT=1
 export HUGINN_AUDIO_DYNAMIC90S_PEFT_ALIGNER_MODULES_TO_SAVE=1
 export HUGINN_AUDIO_DYNAMIC90S_FSDP_SAVE_DEBUG=1
+export HUGINN_AUDIO_DYNAMIC90S_FULL_MODEL_DCP=1
 export HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR="$DATA_AUDIT_DIR"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR="$TRAINING_STATS_DIR"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS=1
@@ -111,11 +121,12 @@ echo "run_root=$RUN_ROOT"
 echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH accumulation=$GRADIENT_ACCUMULATION_STEPS"
 echo "phase1=fresh_process_positions_0_15_train_to_step_4_save_checkpoint_4"
 echo "phase2=new_process_group_positions_16_23_resume_checkpoint_4_train_to_step_6"
-echo "checkpoint_model_contract=lora_66+aligner_14 fsdp_state_dict=SHARDED_STATE_DICT"
+echo "checkpoint_model_contract=full_model_dcp_including_whisper+lora_66+aligner fsdp_state_dict=SHARDED_STATE_DICT"
 echo "checkpoint_state=model+optimizer+scheduler+rng+trainer_global_step+no_replacement_sampler_position+cumulative_data_statistics"
 echo "lr_scheduler=constant learning_rate=1e-4"
 echo "modules_to_save=${MODULES_TO_SAVE[*]}"
-echo "whisper_encoder=frozen aligner_lr=1e-4 lora_rank=8 lora_alpha=16 lora_dropout=0.05"
+echo "whisper_encoder=fully_trainable learning_rate=1e-4 aligner_lr=1e-4"
+echo "huginn_backbone=frozen lora_rank=8 lora_alpha=16 lora_dropout=0.05 full_model_dcp=true"
 
 ACTIVE_PID=""
 ACTIVE_PHASE=""
@@ -225,7 +236,7 @@ run_save_phase() {
     --max_length 192 \
     --output_dir "$SAVE_OUTPUT_DIR" \
     --tuner_type lora_llm \
-    --freeze_vit true \
+    --freeze_vit false \
     --freeze_aligner false \
     --modules_to_save "${MODULES_TO_SAVE[@]}" \
     --learning_rate 1e-4 \
@@ -285,7 +296,7 @@ run_resume_phase() {
     --max_length 192 \
     --output_dir "$RESUME_OUTPUT_DIR" \
     --tuner_type lora_llm \
-    --freeze_vit true \
+    --freeze_vit false \
     --freeze_aligner false \
     --modules_to_save "${MODULES_TO_SAVE[@]}" \
     --learning_rate 1e-4 \

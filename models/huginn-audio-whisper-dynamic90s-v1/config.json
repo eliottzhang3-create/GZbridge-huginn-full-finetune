@@ -28,7 +28,7 @@
   "bos_token_id": 65504,
   "effective_expected_depth": 132,
   "eos_token_id": 65505,
-  "freeze_audio_encoder": true,
+  "freeze_audio_encoder": false,
   "freeze_text_backbone": true,
   "head_dim": 96,
   "init_orthogonal": false,

@@ -22,7 +22,7 @@ class HuginnAudioConfig(RavenConfig):
         audio_compressor_kernel_size: int = 6,
         audio_compressor_stride: int = 6,
         audio_projector_hidden_size: int = 2048,
-        freeze_audio_encoder: bool = True,
+        freeze_audio_encoder: bool = False,
         freeze_text_backbone: bool = True,
         use_audio_boundary_embeddings: bool = True,
         **kwargs,

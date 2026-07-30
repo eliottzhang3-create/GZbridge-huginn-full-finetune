@@ -623,7 +623,7 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
 - FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming restore later completed a caption-generation run successfully.
 
-#### Current isolated Whisper-large dynamic-90s LoRA route (FSDP4 Stage 5 passed; data inventory prepared)
+#### Current isolated Whisper-large dynamic-90s LoRA route (Whisper-unfrozen validation pending)
 
 The new dynamic route is isolated from the historical fixed-32 Whisper route. Historical files remain at
 `models/huginn-audio-whisper-v1/` and `code/huginn_lora/plugins/huginn_audio_swift.py`; do not point historical
@@ -632,7 +632,7 @@ checkpoints or evaluation scripts at the dynamic package.
 - dynamic model package: `models/huginn-audio-whisper-dynamic90s-v1/`
 - dynamic Swift plugin: `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`
 - model type/template/model arch: `huginn_audio_whisper_dynamic90s`
-- Whisper-large remains frozen; the aligner is trainable; Huginn uses `lora_llm` with rank `8`, alpha `16`, and effective
+- Whisper-large and the aligner are fully trainable at `1e-4`; Huginn uses `lora_llm` with rank `8`, alpha `16`, and effective
   dropout `0.05`. The installed ms-swift `LoRALLMTuner` does not forward the generic dropout argument into PEFT, so the
   isolated dynamic plugin patches `peft.LoraConfig` before LoRA-layer creation and the Stage 0-2 gate audits both the
   saved PEFT config value and every instantiated LoRA dropout module.
@@ -680,8 +680,8 @@ per-device batch size 1, gradient accumulation 1, and `max_steps=1`; it delibera
 The first distributed step covers four different prefixes across the four ranks: 1 second / 10 prefix tokens, 30
 seconds / 252, 60 seconds / 502, and 120.01 seconds truncated to 90 seconds / 752. Every rank must write both an FSDP
 marker and an optimizer-step marker. Post-run validation requires world size 4, CUDA devices 0-3, FSDP2 DTensors, the
-exact `66 LoRA + 14 aligner` trainable tensor split, frozen Whisper/Huginn base, and `global_step=1` on all ranks.
-It additionally requires all 80 trainable tensors to be DTensors and verifies that all parameters in each of the five
+the exact `66 LoRA + 14 aligner + complete Whisper encoder` trainable split, frozen Huginn base, and `global_step=1` on all ranks.
+It additionally requires every trainable tensor to be a DTensor and verifies that all parameters in each of the five
 coarse units are DTensors. The earlier per-SandwichBlock Stage 3-4 attempt failed correctly at `64/80` DTensor
 trainables: the 64 block LoRA tensors were sharded, while the recurrent-adapter LoRA pair and 14 aligner tensors were
 outside FSDP. That topology has been replaced rather than weakening the audit.
@@ -2306,16 +2306,30 @@ been restored to their original paths. The new route is isolated under
 `models/huginn-audio-whisper-dynamic90s-v1/` and
 `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`.
 
-The pre-grouping implementation passed Stage 0-2 remotely, including the production duration contract, real Swift
+The active trainability contract changed on 2026-07-30 and supersedes every frozen-Whisper validation result below:
+
+- the complete Whisper-large encoder is trainable at learning rate `1e-4` and remains one whole FSDP unit;
+- the complete 14-tensor aligner is trainable at learning rate `1e-4`;
+- the 66 Huginn-only LoRA tensors are trainable with rank `8`, alpha `16`, dropout `0.05`, and learning rate `1e-4`;
+- the native Huginn backbone and LM head remain frozen; Whisper and the aligner still receive no LoRA modules;
+- all old checkpoint-4/6 runs used a different optimizer/model contract and are invalid as resume evidence.
+
+The first required gate for this contract is
+`code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_memory90_fsdp4_5090.sh`. It performs one complete optimizer
+update with every sample exactly 90 seconds long, `B=2` per rank, four ranks, and `GA=4`, giving global batch `32`.
+Each local forward flattens six 30-second Whisper chunks into one Whisper call. The gate requires nonzero finite
+Whisper/aligner/LoRA gradients, no Huginn-base gradients, two 752-position prefixes per rank, complete FSDP2 DTensor
+sharding, and per-rank CUDA peak allocated/reserved memory markers. It saves no checkpoint.
+
+Historically, the pre-grouping implementation passed Stage 0-2 remotely, including the production duration contract, real Swift
 collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and a real backward
 pass. The first Stage 3-4 attempt then exposed incomplete wrapping (`64/80` trainable DTensors). The implementation now
 uses five coarse callable FSDP units (Whisper whole, aligner whole, prelude 2 blocks, recurrent adapter + 4 blocks, coda
 2 blocks), all with `reshard_after_forward=true`; LoRA remains Huginn-only. The revised merged Stage 3-4 FSDP4 gate has
 now passed on all four ranks with `640` DTensor parameters and one optimizer update. The 20-step synthetic Stage 5
-stability smoke also passed on all ranks with finite losses/gradient norms through `global_step=20`. Stage 6 checkpoint
-save/reload remains intentionally deferred. The immediate gate is the read-only four-pool data inventory submitted by
-`code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_data_pools_5090.sh`; do not create or launch formal mixed-data
-training until its report has been reviewed and the canonical manifests and token-aware schedule have been prepared.
+stability smoke also passed on all ranks with finite losses/gradient norms through `global_step=20`. Those results
+predate Whisper unfreezing and remain architecture/history evidence only; the active gate order is the trainable-Whisper
+90-second memory smoke followed by the replacement checkpoint/resume smoke documented below.
 
 The current duration contract has no discard threshold: every input longer than 90 seconds, including inputs beyond
 120 seconds, is retained by truncating it to the first 90 seconds. Stage 0-2 sends a 120.01-second WAV through the real
@@ -2336,9 +2350,11 @@ Swift `IterableDataset`, checks deterministic non-zero-position restart, and dec
 pool without loading Whisper/Huginn or materializing converted audio. GigaSpeech Opus segments are decoded on demand
 from the read-only public source with ffmpeg segment bounds. Dynamic token counts remain runtime statistics.
 
-That real data-chain gate has now passed. The next gate is
+That real data-chain gate has now passed and remains valid because it audits data/index/decode behavior without loading
+the model. The earlier eight-step real-model gate used frozen Whisper and is therefore historical rather than evidence
+for the active trainability contract. Its entry point is
 `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_realdata_fsdp4_5090.sh`: eight real optimizer steps on four
-GPUs with checkpoint saving disabled. It re-audits the five coarse FSDP units, frozen Whisper, Huginn-only rank-8 LoRA,
+GPUs with checkpoint saving disabled. The script has been updated to re-audit trainable Whisper, Huginn-only rank-8 LoRA,
 trainable aligner, finite losses/gradient norms, and per-rank realized dynamic audio-token totals. Its deterministic
 global sample window is positions `0..31`, which covers all four pools (`11` WavCaps, `6` AudioCaps, `2` Clotho, and
 `13` GigaSpeech; `19` AAC and `13` ASR). Checkpoint save/restart remains the following separate gate.
@@ -2347,11 +2363,15 @@ The earlier real-mixture FSDP4 architecture gate passed, but its old with-replac
 active sampler contract. The replacement checkpoint gate is
 `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh`. Phase 1 uses one fresh
 four-rank process group to consume global mixture positions `0..15`, train through step `4`, and save a complete
-adapter-only FSDP DCP. Phase 2 starts a distinct four-rank process group, restores checkpoint `4`, starts the stateless
+full-model FSDP DCP. PEFT's default adapter-only DCP cannot contain trainable Whisper weights, while wrapping the whole
+Whisper encoder as `modules_to_save` would deep-copy it. The isolated plugin therefore opts this gate into Accelerate's
+paired full-model FSDP2 save/load path. Phase 2 starts a distinct four-rank process group, restores checkpoint `4`, starts the stateless
 mixture explicitly at position `16` with Trainer data skipping disabled, consumes positions `16..23`, and reaches step
-`6`. The gate requires exactly `66` Huginn LoRA plus `14` aligner tensors, restored optimizer step `4`, scheduler epoch
+`6`. The gate requires full Whisper model shards, exactly `66` Huginn LoRA tensors, the PEFT-owned trainable aligner,
+restored optimizer state for every trainable Whisper/aligner/LoRA tensor, optimizer step `4`, scheduler epoch
 `4`, exact per-rank Python/NumPy/CPU/CUDA RNG restoration, Trainer global step continuity, disjoint process-launch IDs,
-and actual LoRA plus aligner tensor changes between checkpoints `4` and `6`. It now additionally requires zero repeated
+nonzero gradients for all three trainable groups, actual Whisper/LoRA/aligner tensor changes, and exact equality of the
+frozen Huginn backbone between checkpoints `4` and `6`. It additionally requires zero repeated
 pool records across the save/resume boundary, exact forward-consumed positions on all four ranks, and cumulative
 per-pool sample and effective-duration statistics. The statistics metadata is carried through the collator and is
 committed only after an actual successful training forward, so Swift's duplicate template encoding and Accelerate's
@@ -2360,15 +2380,15 @@ the cumulative counts, effective seconds, next global position, and per-pool epo
 for this short gate so the first phase cannot decay to zero before the resumed updates. All checkpoint-4/6 artifacts
 from the previous with-replacement sampler are obsolete and must not be reused.
 
-Run the replacement gates in this order after syncing code:
+Run the active model gates in this order after syncing code. The no-replacement CPU sampler audit has already passed and
+does not need to be repeated unless its code or report changes:
 
 ```bash
-bash code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_indexed_mixture_5090.sh
+bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_memory90_fsdp4_5090.sh
 bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh
 ```
 
-The first job is metadata/index only and overwrites the old sampler report with the no-replacement v2 report. The
-second job refuses to start unless that report has passed. Its run root stores cumulative snapshots in
+The checkpoint job still refuses to start unless the no-replacement v2 report has passed. Its run root stores cumulative snapshots in
 `training_statistics/training_statistics.jsonl` and `training_statistics/latest.json`; checkpoint `4` and checkpoint
 `6` each store their own `audio_training_statistics.json`. Per-rank forward-consumption JSONL is enabled only for the
 short smoke so the audit can prove four-rank aggregation, exact save/resume continuity, zero cross-checkpoint repeats,

@@ -12,13 +12,12 @@ EXPECTED_MAX_STEPS = 20
 EXPECTED_TRAINABLE_TENSORS = {
     "lora": 66,
     "aligner": 14,
-    "audio_encoder": 0,
     "huginn_base": 0,
     "other": 0,
 }
 EXPECTED_FIRST_STEP_PREFIX_TOKENS = {10, 252, 502, 752}
 EXPECTED_UNIT_TRAINABLE_TENSORS = {
-    "WhisperEncoderFSDPUnit": 0,
+    "WhisperEncoderFSDPUnit": None,
     "AudioAlignerFSDPUnit": 14,
     "HuginnPreludeFSDPUnit": 16,
     "HuginnRecurrentCoreFSDPUnit": 34,
@@ -51,12 +50,20 @@ def main() -> None:
             or fsdp.get("world_size") != 4
         ):
             raise AssertionError(f"Invalid Stage 5 FSDP marker for rank {rank}: {fsdp}")
-        if fsdp.get("trainable_tensors") != EXPECTED_TRAINABLE_TENSORS:
-            raise AssertionError(f"Rank {rank} trainable split mismatch: {fsdp.get('trainable_tensors')}")
+        trainables = fsdp.get("trainable_tensors")
+        if (
+            not isinstance(trainables, dict)
+            or int(trainables.get("lora", -1)) != 66
+            or int(trainables.get("aligner", -1)) != 14
+            or int(trainables.get("audio_encoder", 0)) <= 0
+            or int(trainables.get("huginn_base", -1)) != 0
+            or int(trainables.get("other", -1)) != 0
+        ):
+            raise AssertionError(f"Rank {rank} trainable split mismatch: {trainables}")
         if int(fsdp.get("dtensor_parameter_count", 0)) <= 0:
             raise AssertionError(f"Rank {rank} exposes no FSDP2 DTensor parameters")
-        if int(fsdp.get("dtensor_trainable_count", -1)) != 80:
-            raise AssertionError(f"Rank {rank} DTensor trainable count is not 80: {fsdp}")
+        if int(fsdp.get("dtensor_trainable_count", -1)) != sum(int(value) for value in trainables.values()):
+            raise AssertionError(f"Rank {rank} DTensor trainable count mismatch: {fsdp}")
         fsdp_units = fsdp.get("fsdp_units")
         if not isinstance(fsdp_units, dict) or set(fsdp_units) != set(EXPECTED_UNIT_TRAINABLE_TENSORS):
             raise AssertionError(f"Rank {rank} FSDP unit topology mismatch: {fsdp_units}")
@@ -65,7 +72,8 @@ def main() -> None:
             parameter_count = int(unit.get("parameter_count", 0))
             if parameter_count <= 0 or int(unit.get("dtensor_parameter_count", -1)) != parameter_count:
                 raise AssertionError(f"Rank {rank} unit {unit_name} is not completely sharded: {unit}")
-            if int(unit.get("trainable_parameter_count", -1)) != expected_trainables:
+            expected_actual = parameter_count if expected_trainables is None else expected_trainables
+            if int(unit.get("trainable_parameter_count", -1)) != expected_actual:
                 raise AssertionError(f"Rank {rank} unit {unit_name} trainable split mismatch: {unit}")
 
         prefix_tokens = fsdp.get("valid_prefix_tokens")

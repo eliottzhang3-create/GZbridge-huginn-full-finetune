@@ -31,12 +31,11 @@ TRAINING_STATS_VERSION = "huginn_dynamic90s_training_statistics_v1"
 EXPECTED_TRAINABLE_TENSORS = {
     "lora": 66,
     "aligner": 14,
-    "audio_encoder": 0,
     "huginn_base": 0,
     "other": 0,
 }
 EXPECTED_UNIT_TRAINABLE_TENSORS = {
-    "WhisperEncoderFSDPUnit": 0,
+    "WhisperEncoderFSDPUnit": None,
     "AudioAlignerFSDPUnit": 14,
     "HuginnPreludeFSDPUnit": 16,
     "HuginnRecurrentCoreFSDPUnit": 34,
@@ -69,6 +68,33 @@ def read_json(path: Path) -> dict[str, Any]:
     return payload
 
 
+def validate_optimizer_groups(
+    marker: dict[str, Any],
+    trainables: dict[str, Any],
+    *,
+    phase: str,
+    rank: int,
+) -> None:
+    audits = marker.get("optimizer_group_audit")
+    if not isinstance(audits, list) or not audits:
+        raise AssertionError(f"Missing {phase} optimizer-group audit for rank {rank}: {marker}")
+    observed = {name: 0 for name in ("lora", "aligner", "audio_encoder", "huginn_base", "other")}
+    for audit in audits:
+        if abs(float(audit.get("learning_rate", -1.0)) - 1e-4) > 1e-12:
+            raise AssertionError(f"Invalid {phase} optimizer LR for rank {rank}: {audits}")
+        counts = audit.get("parameter_counts")
+        if not isinstance(counts, dict):
+            raise AssertionError(f"Missing {phase} optimizer parameter counts for rank {rank}: {audits}")
+        for name in observed:
+            observed[name] += int(counts.get(name, 0))
+    expected = {name: int(trainables.get(name, 0)) for name in observed}
+    if observed != expected:
+        raise AssertionError(
+            f"Invalid {phase} optimizer ownership for rank {rank}: "
+            f"observed={observed} expected={expected}"
+        )
+
+
 def validate_phase_markers(
     audit_dir: Path,
     phase: str,
@@ -86,10 +112,20 @@ def validate_phase_markers(
             or fsdp.get("stage") != "checkpoint"
             or fsdp.get("rank") != rank
             or fsdp.get("world_size") != world_size
-            or fsdp.get("trainable_tensors") != EXPECTED_TRAINABLE_TENSORS
-            or int(fsdp.get("dtensor_trainable_count", -1)) != 80
         ):
             raise AssertionError(f"Invalid {phase} FSDP marker for rank {rank}: {fsdp}")
+        trainables = fsdp.get("trainable_tensors")
+        if (
+            not isinstance(trainables, dict)
+            or int(trainables.get("lora", -1)) != EXPECTED_TRAINABLE_TENSORS["lora"]
+            or int(trainables.get("aligner", -1)) != EXPECTED_TRAINABLE_TENSORS["aligner"]
+            or int(trainables.get("audio_encoder", 0)) <= 0
+            or int(trainables.get("huginn_base", -1)) != 0
+            or int(trainables.get("other", -1)) != 0
+            or int(fsdp.get("dtensor_trainable_count", -1))
+            != sum(int(value) for value in trainables.values())
+        ):
+            raise AssertionError(f"Invalid {phase} Whisper-unfrozen trainable split for rank {rank}: {fsdp}")
         units = fsdp.get("fsdp_units")
         if not isinstance(units, dict) or set(units) != set(EXPECTED_UNIT_TRAINABLE_TENSORS):
             raise AssertionError(f"Invalid {phase} FSDP units for rank {rank}: {units}")
@@ -98,8 +134,13 @@ def validate_phase_markers(
             if (
                 int(unit.get("parameter_count", 0)) <= 0
                 or int(unit.get("dtensor_parameter_count", -1)) != int(unit["parameter_count"])
-                or int(unit.get("trainable_parameter_count", -1)) != expected_trainables
             ):
+                raise AssertionError(f"Invalid {phase} unit {name} rank {rank}: {unit}")
+            actual_trainables = int(unit.get("trainable_parameter_count", -1))
+            if expected_trainables is None:
+                if actual_trainables != int(unit["parameter_count"]):
+                    raise AssertionError(f"Whisper unit is not fully trainable in {phase} rank {rank}: {unit}")
+            elif actual_trainables != expected_trainables:
                 raise AssertionError(f"Invalid {phase} unit {name} rank {rank}: {unit}")
 
         start = read_json(audit_dir / f"checkpoint-start-rank-{rank}.json")
@@ -113,9 +154,10 @@ def validate_phase_markers(
             raise AssertionError(f"Invalid {phase} start marker for rank {rank}: {start}")
         pids.add(int(start["pid"]))
         launch_ids.add(str(start.get("launch_id", "")))
+        validate_optimizer_groups(start, trainables, phase=phase, rank=rank)
         if phase == "resume":
             if (
-                int(start.get("optimizer_state_count", 0)) <= 0
+                int(start.get("optimizer_state_count", -1)) != sum(int(value) for value in trainables.values())
                 or start.get("optimizer_step_min") != start_step
                 or start.get("optimizer_step_max") != start_step
                 or start.get("scheduler_last_epoch") != start_step
@@ -139,6 +181,16 @@ def validate_phase_markers(
             or int(end.get("realized_audio_tokens", 0)) <= 0
         ):
             raise AssertionError(f"Invalid {phase} end marker for rank {rank}: {end}")
+        gradients = end.get("gradient_audit")
+        if not isinstance(gradients, dict):
+            raise AssertionError(f"Missing {phase} gradient audit for rank {rank}: {end}")
+        for group in ("lora", "aligner", "audio_encoder"):
+            if int(gradients.get(group, {}).get("nonzero_gradient_tensors", 0)) <= 0:
+                raise AssertionError(f"No nonzero {group} gradients in {phase} rank {rank}: {gradients}")
+        for group in ("huginn_base", "other"):
+            if int(gradients.get(group, {}).get("gradient_tensors", -1)) != 0:
+                raise AssertionError(f"Forbidden {group} gradients in {phase} rank {rank}: {gradients}")
+        validate_optimizer_groups(end, trainables, phase=phase, rank=rank)
         if phase == "resume":
             rng = read_json(audit_dir / f"rng-restore-rank-{rank}.json")
             if (
@@ -151,6 +203,8 @@ def validate_phase_markers(
         print(
             f"[checkpoint-marker] phase={phase} rank={rank} pid={start['pid']} "
             f"step_window=[{start_step},{end_step}] dtensor_parameters={fsdp['dtensor_parameter_count']} "
+            f"optimizer_states={start.get('optimizer_state_count')} "
+            f"learning_rates={start.get('learning_rates')} "
             f"finite_losses={end['finite_loss_log_count']} finite_grad_norms={end['finite_grad_norm_log_count']} "
             f"audio_samples={end['audio_sample_count']} audio_tokens={end['realized_audio_tokens']}"
         )
@@ -500,6 +554,7 @@ def main() -> None:
             args.save_stats_state,
             args.save_step,
             save_forward_records,
+            args.seed,
         )
         resume_state = validate_statistics_state(
             args.resume_stats_state,

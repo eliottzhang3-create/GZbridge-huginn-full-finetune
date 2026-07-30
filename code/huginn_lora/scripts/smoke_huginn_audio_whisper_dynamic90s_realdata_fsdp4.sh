@@ -93,7 +93,7 @@ echo "task_weights=AAC:0.60,ASR:0.40 aac_weights=WavCaps:0.60,AudioCaps:0.30,Clo
 echo "gigaspeech=read_only_opus_segment_decode_in_memory"
 echo "audio_tokens=dynamic_complete_120ms_blocks runtime_accumulation=true"
 echo "audio_over_90s=retain_first_90s no_duration_discard=true"
-echo "whisper_encoder=frozen_fp32"
+echo "whisper_encoder=fully_trainable learning_rate=1e-4"
 echo "aligner=trainable tensors=14 learning_rate=1e-4"
 echo "huginn=lora_llm tensors=66 rank=8 alpha=16 dropout=0.05 learning_rate=1e-4"
 echo "lora_scope=huginn_transformer_only"
@@ -169,7 +169,7 @@ swift sft \
   --max_length 192 \
   --output_dir "$OUTPUT_DIR" \
   --tuner_type lora_llm \
-  --freeze_vit true \
+  --freeze_vit false \
   --freeze_aligner false \
   --learning_rate 1e-4 \
   --aligner_lr 1e-4 \

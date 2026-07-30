@@ -76,12 +76,14 @@ TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT"
 STAGE34_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE34_AUDIT_DIR"
 STAGE5_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_AUDIT_DIR"
 STAGE5_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_MAX_STEPS"
+MEMORY90_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_MEMORY90_AUDIT_DIR"
 REALDATA_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_AUDIT_DIR"
 REALDATA_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_MAX_STEPS"
 DATA_POSITION_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR"
 DATA_POSITION_AUDIT_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_PHASE"
 PEFT_ALIGNER_MODULES_TO_SAVE_ENV = "HUGINN_AUDIO_DYNAMIC90S_PEFT_ALIGNER_MODULES_TO_SAVE"
 FSDP_SAVE_DEBUG_ENV = "HUGINN_AUDIO_DYNAMIC90S_FSDP_SAVE_DEBUG"
+FULL_MODEL_DCP_ENV = "HUGINN_AUDIO_DYNAMIC90S_FULL_MODEL_DCP"
 CHECKPOINT_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_AUDIT_DIR"
 CHECKPOINT_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_PHASE"
 CHECKPOINT_START_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_START_STEP"
@@ -116,7 +118,9 @@ FSDP_UNIT_CLASS_NAMES = (
     "HuginnCodaFSDPUnit",
 )
 FSDP_UNIT_EXPECTED_TRAINABLE_TENSORS = {
-    "WhisperEncoderFSDPUnit": 0,
+    # The complete Whisper unit is trainable; its exact tensor count is
+    # validated against the unit's own parameter count after FSDP wrapping.
+    "WhisperEncoderFSDPUnit": None,
     "AudioAlignerFSDPUnit": 14,
     "HuginnPreludeFSDPUnit": 16,
     "HuginnRecurrentCoreFSDPUnit": 34,
@@ -515,15 +519,25 @@ def force_audio_aligner_trainable(model: torch.nn.Module) -> None:
         raise RuntimeError("Unable to locate the Huginn audio model after PEFT adapter loading")
 
     audio_model.audio_aligner.requires_grad_(True)
-    if any(parameter.requires_grad for parameter in audio_model.audio_encoder.parameters()):
-        raise RuntimeError("audio_encoder became trainable while restoring the WavCaps adapter")
+    audio_model.audio_encoder.requires_grad_(True)
 
     aligner_trainable = sum(
         parameter.numel()
         for name, parameter in audio_model.named_parameters()
         if parameter.requires_grad and is_aligner_parameter_name(name)
     )
-    print(f"[HuginnAudioSwift] forced_aligner_trainable_parameters={aligner_trainable}")
+    audio_encoder_trainable = sum(
+        parameter.numel() for parameter in audio_model.audio_encoder.parameters() if parameter.requires_grad
+    )
+    if aligner_trainable <= 0 or audio_encoder_trainable <= 0:
+        raise RuntimeError(
+            "Failed to restore the Whisper-unfrozen trainability contract: "
+            f"audio_encoder={audio_encoder_trainable} aligner={aligner_trainable}"
+        )
+    print(
+        "[HuginnAudioSwift] forced_audio_trainables "
+        f"audio_encoder_parameters={audio_encoder_trainable} aligner_parameters={aligner_trainable}"
+    )
 
 
 def _active_modules_to_save_names(wrapper: torch.nn.Module) -> list[str]:
@@ -683,12 +697,31 @@ def _fsdp_dcp_lora_resume_model(
     state_metadata = getattr(metadata, "state_dict_metadata", {})
     checkpoint_groups = _fsdp_save_state_groups(state_metadata)
     checkpoint_counts = {name: len(keys) for name, keys in checkpoint_groups.items()}
-    expected_counts = {"lora": 66, "aligner": 14, "other": 0}
-    if checkpoint_counts != expected_counts:
-        raise RuntimeError(
-            "Dynamic Whisper resume DCP does not match the adapter contract: "
-            f"expected={expected_counts} actual={checkpoint_counts}"
-        )
+    if _requested(FULL_MODEL_DCP_ENV):
+        if (
+            checkpoint_counts["lora"] != 66
+            or checkpoint_counts["aligner"] < 14
+            or checkpoint_counts["audio_encoder"] <= 0
+            or checkpoint_counts["huginn_base"] <= 0
+            or checkpoint_counts["other"] != 0
+        ):
+            raise RuntimeError(
+                "Dynamic Whisper resume DCP does not match the full-model contract: "
+                f"actual={checkpoint_counts}"
+            )
+    else:
+        expected_counts = {
+            "lora": 66,
+            "aligner": 14,
+            "audio_encoder": 0,
+            "huginn_base": 0,
+            "other": 0,
+        }
+        if checkpoint_counts != expected_counts:
+            raise RuntimeError(
+                "Dynamic Whisper resume DCP does not match the adapter contract: "
+                f"expected={expected_counts} actual={checkpoint_counts}"
+            )
     lora_entries = [
         (str(key), entry)
         for key, entry in state_metadata.items()
@@ -860,7 +893,13 @@ def patch_swift_lora_llm_fsdp_dcp_resume() -> None:
 
 
 def _fsdp_save_state_groups(state_dict: dict[str, Any]) -> dict[str, list[str]]:
-    groups: dict[str, list[str]] = {"lora": [], "aligner": [], "other": []}
+    groups: dict[str, list[str]] = {
+        "lora": [],
+        "aligner": [],
+        "audio_encoder": [],
+        "huginn_base": [],
+        "other": [],
+    }
     for raw_key in state_dict:
         key = str(raw_key)
         aliases = checkpoint_key_aliases(key)
@@ -868,9 +907,53 @@ def _fsdp_save_state_groups(state_dict: dict[str, Any]) -> dict[str, list[str]]:
             groups["lora"].append(key)
         elif any(alias.startswith(ALIGNER_PREFIXES) for alias in aliases):
             groups["aligner"].append(key)
+        elif any(alias.startswith("audio_encoder.") for alias in aliases):
+            groups["audio_encoder"].append(key)
+        elif any(alias.startswith(("transformer.", "lm_head.")) for alias in aliases):
+            groups["huginn_base"].append(key)
         else:
             groups["other"].append(key)
     return groups
+
+
+def patch_accelerate_fsdp2_full_model_dcp() -> None:
+    """Use Accelerate's paired full-state FSDP2 save/load path for trainable Whisper.
+
+    PEFT's default ``adapter_only=True`` path cannot contain the trainable
+    Whisper encoder. The checkpoint smoke opts into the normal full FSDP model
+    state so model topology, optimizer, scheduler, RNG, and every Whisper shard
+    are restored by Accelerate's existing paired DCP implementation.
+    """
+    if not _requested(FULL_MODEL_DCP_ENV):
+        return
+    try:
+        from accelerate.utils import fsdp_utils
+    except ImportError as exc:
+        raise RuntimeError("Unable to import Accelerate FSDP utilities for full-model DCP") from exc
+
+    original_get = fsdp_utils._get_model_state_dict
+    if not getattr(original_get, "_huginn_whisper_dynamic90s_full_dcp_patched", False):
+        @wraps(original_get)
+        def get_full_model_state(model, adapter_only=False, sd_options=None):
+            del adapter_only
+            return original_get(model, adapter_only=False, sd_options=sd_options)
+
+        get_full_model_state._huginn_whisper_dynamic90s_full_dcp_patched = True
+        fsdp_utils._get_model_state_dict = get_full_model_state
+
+    original_set = getattr(fsdp_utils, "_set_model_state_dict", None)
+    if original_set is None:
+        raise RuntimeError("Installed Accelerate lacks _set_model_state_dict required for paired full-model DCP")
+    if not getattr(original_set, "_huginn_whisper_dynamic90s_full_dcp_patched", False):
+        @wraps(original_set)
+        def set_full_model_state(model, state_dict, adapter_only=False, sd_options=None):
+            del adapter_only
+            return original_set(model, state_dict, adapter_only=False, sd_options=sd_options)
+
+        set_full_model_state._huginn_whisper_dynamic90s_full_dcp_patched = True
+        fsdp_utils._set_model_state_dict = set_full_model_state
+
+    print("[HuginnAudioDynamic90s] installed paired Accelerate full-model FSDP2 DCP patch")
 
 
 def patch_accelerate_fsdp2_save_state_audit() -> None:
@@ -892,7 +975,9 @@ def patch_accelerate_fsdp2_save_state_audit() -> None:
                 "[HuginnAudioDynamic90s] FSDP2 pre-DCP save-state audit "
                 f"adapter_only={adapter_only} tensor_count={len(state_dict)} "
                 f"lora={len(groups['lora'])} aligner={len(groups['aligner'])} "
-                f"other={len(groups['other'])} aligner_preview={groups['aligner'][:8]}"
+                f"audio_encoder={len(groups['audio_encoder'])} "
+                f"huginn_base={len(groups['huginn_base'])} other={len(groups['other'])} "
+                f"aligner_preview={groups['aligner'][:8]}"
             )
         return state_dict
 
@@ -1500,6 +1585,7 @@ def get_active_distributed_audit() -> tuple[Optional[str], Optional[str]]:
     configured = [
         ("stage34", os.environ.get(STAGE34_AUDIT_DIR_ENV, "").strip()),
         ("stage5", os.environ.get(STAGE5_AUDIT_DIR_ENV, "").strip()),
+        ("memory90", os.environ.get(MEMORY90_AUDIT_DIR_ENV, "").strip()),
         ("realdata", os.environ.get(REALDATA_AUDIT_DIR_ENV, "").strip()),
         ("checkpoint", os.environ.get(CHECKPOINT_AUDIT_DIR_ENV, "").strip()),
     ]
@@ -1893,16 +1979,15 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
             group = "other"
         trainable_tensors[group] += 1
 
-    expected_trainables = {
-        "lora": 66,
-        "aligner": 14,
-        "audio_encoder": 0,
-        "huginn_base": 0,
-        "other": 0,
-    }
-    if trainable_tensors != expected_trainables:
+    if (
+        trainable_tensors["lora"] != 66
+        or trainable_tensors["aligner"] != 14
+        or trainable_tensors["audio_encoder"] <= 0
+        or trainable_tensors["huginn_base"] != 0
+        or trainable_tensors["other"] != 0
+    ):
         raise RuntimeError(
-            f"{audit_stage} post-FSDP trainable split mismatch: expected={expected_trainables} "
+            f"{audit_stage} post-FSDP Whisper-unfrozen trainable split mismatch: "
             f"actual={trainable_tensors}"
         )
     total_trainable_tensors = sum(trainable_tensors.values())
@@ -1933,10 +2018,15 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
                 f"parameters={len(unit_parameters)} dtensors={unit_dtensors}"
             )
         expected_unit_trainables = FSDP_UNIT_EXPECTED_TRAINABLE_TENSORS[expected_class_name]
-        if unit_trainables != expected_unit_trainables:
+        if expected_unit_trainables is None:
+            unit_trainability_valid = unit_trainables == len(unit_parameters)
+        else:
+            unit_trainability_valid = unit_trainables == expected_unit_trainables
+        if not unit_trainability_valid:
             raise RuntimeError(
                 f"Unexpected trainable tensor count inside {expected_class_name}: "
-                f"expected={expected_unit_trainables} actual={unit_trainables}"
+                f"expected={expected_unit_trainables if expected_unit_trainables is not None else 'all'} "
+                f"actual={unit_trainables} total={len(unit_parameters)}"
             )
         unit_audits[expected_class_name] = {
             "parameter_count": len(unit_parameters),
@@ -1966,6 +2056,244 @@ def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -
         flush=True,
     )
     model._huginn_audio_dynamic90s_distributed_fsdp_audited = True
+
+
+def _training_parameter_group(name: str) -> str:
+    normalized_name = normalize_parameter_name(name)
+    if "lora_" in name:
+        return "lora"
+    if is_aligner_parameter_name(normalized_name):
+        return "aligner"
+    if normalized_name.startswith("audio_encoder."):
+        return "audio_encoder"
+    if normalized_name.startswith(("transformer.", "lm_head.")):
+        return "huginn_base"
+    return "other"
+
+
+def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) -> dict[str, dict[str, int]]:
+    scalar_flags: dict[str, dict[str, list[torch.Tensor]]] = {
+        name: {"finite": [], "nonzero": []}
+        for name in ("lora", "aligner", "audio_encoder", "huginn_base", "other")
+    }
+    gradient_tensor_counts = {name: 0 for name in scalar_flags}
+    for name, parameter in model.named_parameters():
+        gradient = parameter.grad
+        if gradient is None:
+            continue
+        group = _training_parameter_group(name)
+        local_gradient = gradient.to_local() if hasattr(gradient, "to_local") else gradient
+        if local_gradient.numel() == 0:
+            continue
+        gradient_tensor_counts[group] += 1
+        scalar_flags[group]["finite"].append(torch.isfinite(local_gradient).all())
+        scalar_flags[group]["nonzero"].append(torch.count_nonzero(local_gradient).gt(0))
+
+    result: dict[str, dict[str, int]] = {}
+    for group, flags in scalar_flags.items():
+        if flags["finite"]:
+            finite_tensors = int(torch.stack(flags["finite"]).sum().item())
+            nonzero_tensors = int(torch.stack(flags["nonzero"]).sum().item())
+        else:
+            finite_tensors = 0
+            nonzero_tensors = 0
+        result[group] = {
+            "gradient_tensors": gradient_tensor_counts[group],
+            "finite_gradient_tensors": finite_tensors,
+            "nonzero_gradient_tensors": nonzero_tensors,
+        }
+        if finite_tensors != gradient_tensor_counts[group]:
+            raise RuntimeError(f"{context} observed non-finite gradients in {group}: {result[group]}")
+
+    if (
+        result["lora"]["nonzero_gradient_tensors"] <= 0
+        or result["aligner"]["nonzero_gradient_tensors"] <= 0
+        or result["audio_encoder"]["nonzero_gradient_tensors"] <= 0
+        or result["huginn_base"]["gradient_tensors"] != 0
+        or result["other"]["gradient_tensors"] != 0
+    ):
+        raise RuntimeError(f"{context} gradient ownership mismatch: {result}")
+    return result
+
+
+def _audit_optimizer_parameter_groups(
+    model: torch.nn.Module,
+    optimizer: Any,
+    *,
+    context: str,
+    expected_learning_rate: float = 1e-4,
+) -> list[dict[str, Any]]:
+    if optimizer is None:
+        raise RuntimeError(f"{context} received no optimizer")
+    parameter_groups_by_id = {
+        id(parameter): _training_parameter_group(name)
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    }
+    observed_counts = {name: 0 for name in ("lora", "aligner", "audio_encoder", "huginn_base", "other")}
+    group_audits: list[dict[str, Any]] = []
+    for index, optimizer_group in enumerate(optimizer.param_groups):
+        counts = {name: 0 for name in observed_counts}
+        unknown_parameters = 0
+        for parameter in optimizer_group.get("params", []):
+            group = parameter_groups_by_id.get(id(parameter))
+            if group is None:
+                unknown_parameters += 1
+                continue
+            counts[group] += 1
+            observed_counts[group] += 1
+        learning_rate = float(optimizer_group["lr"])
+        if abs(learning_rate - expected_learning_rate) > 1e-12:
+            raise RuntimeError(
+                f"{context} optimizer group {index} has LR {learning_rate}, "
+                f"expected {expected_learning_rate}: counts={counts}"
+            )
+        if unknown_parameters:
+            raise RuntimeError(
+                f"{context} optimizer group {index} contains {unknown_parameters} unknown parameters"
+            )
+        group_audits.append({"index": index, "learning_rate": learning_rate, "parameter_counts": counts})
+
+    expected_counts = {name: 0 for name in observed_counts}
+    for group in parameter_groups_by_id.values():
+        expected_counts[group] += 1
+    if observed_counts != expected_counts:
+        raise RuntimeError(
+            f"{context} optimizer parameter coverage mismatch: "
+            f"observed={observed_counts} expected={expected_counts} groups={group_audits}"
+        )
+    if (
+        observed_counts["lora"] != 66
+        or observed_counts["aligner"] != 14
+        or observed_counts["audio_encoder"] <= 0
+        or observed_counts["huginn_base"] != 0
+        or observed_counts["other"] != 0
+    ):
+        raise RuntimeError(f"{context} optimizer ownership mismatch: {observed_counts}")
+    return group_audits
+
+
+def patch_memory90_callback() -> None:
+    if not os.environ.get(MEMORY90_AUDIT_DIR_ENV, "").strip():
+        return
+    from transformers import Trainer, TrainerCallback
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic90s_memory90_patched", False):
+        return
+
+    class Memory90Callback(TrainerCallback):
+        _huginn_audio_dynamic90s_memory90_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.loss_count = 0
+            self.grad_norm_count = 0
+            self.gradient_audit: dict[str, dict[str, int]] | None = None
+            self.optimizer_group_audit: list[dict[str, Any]] | None = None
+
+        @staticmethod
+        def _identity() -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("90-second memory smoke requires initialized torch.distributed")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"90-second memory smoke requires world_size=4, got {world_size}")
+            return rank, world_size
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            self._identity()
+            if (
+                int(args.per_device_train_batch_size) != 2
+                or int(args.gradient_accumulation_steps) != 4
+                or int(state.max_steps) != 1
+            ):
+                raise RuntimeError(
+                    "90-second memory smoke requires per_device_batch=2, gradient_accumulation=4, max_steps=1; "
+                    f"got batch={args.per_device_train_batch_size} "
+                    f"accumulation={args.gradient_accumulation_steps} max_steps={state.max_steps}"
+                )
+            self.optimizer_group_audit = _audit_optimizer_parameter_groups(
+                self.tracked_model,
+                kwargs.get("optimizer"),
+                context="90-second memory smoke",
+            )
+            torch.cuda.reset_peak_memory_stats()
+            return control
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            self.gradient_audit = _audit_local_trainable_gradients(
+                self.tracked_model,
+                context="90-second memory smoke",
+            )
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, state, kwargs
+            for key in ("loss", "grad_norm"):
+                value = (logs or {}).get(key)
+                if value is None:
+                    continue
+                numeric = float(value)
+                if not math.isfinite(numeric):
+                    raise RuntimeError(f"90-second memory smoke observed non-finite {key}: {numeric}")
+                if key == "loss":
+                    self.loss_count += 1
+                else:
+                    self.grad_norm_count += 1
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args
+            rank, world_size = self._identity()
+            if int(state.global_step) != 1 or self.gradient_audit is None or self.optimizer_group_audit is None:
+                raise RuntimeError(
+                    "90-second memory smoke did not complete one audited optimizer update: "
+                    f"global_step={state.global_step} gradient_audit={self.gradient_audit}"
+                )
+            optimizer = kwargs.get("optimizer")
+            inner_optimizer = getattr(optimizer, "optimizer", optimizer)
+            optimizer_state_count = len(getattr(inner_optimizer, "state", {})) if inner_optimizer is not None else 0
+            torch.cuda.synchronize()
+            gib = 1024 ** 3
+            payload = {
+                "kind": "memory90",
+                "stage": "memory90",
+                "rank": rank,
+                "world_size": world_size,
+                "global_step": int(state.global_step),
+                "per_device_train_batch_size": 2,
+                "gradient_accumulation_steps": 4,
+                "global_batch_size": 32,
+                "optimizer_type": type(optimizer).__name__ if optimizer is not None else None,
+                "optimizer_state_count": optimizer_state_count,
+                "finite_loss_log_count": self.loss_count,
+                "finite_grad_norm_log_count": self.grad_norm_count,
+                "gradient_audit": self.gradient_audit,
+                "optimizer_group_audit": self.optimizer_group_audit,
+                "memory_allocated_gib": torch.cuda.memory_allocated() / gib,
+                "memory_reserved_gib": torch.cuda.memory_reserved() / gib,
+                "max_memory_allocated_gib": torch.cuda.max_memory_allocated() / gib,
+                "max_memory_reserved_gib": torch.cuda.max_memory_reserved() / gib,
+            }
+            _write_distributed_rank_marker("memory90", payload)
+            print(f"[HuginnAudioDynamic90s] MEMORY90_AUDIT {payload}", flush=True)
+            return control
+
+    @wraps(original_init)
+    def init_with_memory90_callback(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic90s_memory90_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(Memory90Callback(self.model))
+
+    init_with_memory90_callback._huginn_audio_dynamic90s_memory90_patched = True
+    Trainer.__init__ = init_with_memory90_callback
+    print("[HuginnAudioDynamic90s] installed 90-second memory callback")
 
 
 def patch_stage34_optimizer_step_callback() -> None:
@@ -2370,6 +2698,8 @@ def patch_checkpoint_resume_callback() -> None:
             self.finite_grad_norm_log_count = 0
             self.optimizer_type = None
             self.observed_start_step = None
+            self.gradient_audit: dict[str, dict[str, int]] | None = None
+            self.optimizer_group_audit: list[dict[str, Any]] | None = None
 
         @staticmethod
         def _identity() -> tuple[int, int]:
@@ -2429,14 +2759,28 @@ def patch_checkpoint_resume_callback() -> None:
             optimizer = kwargs.get("optimizer")
             scheduler = kwargs.get("lr_scheduler")
             self.optimizer_type = type(optimizer).__name__ if optimizer is not None else None
+            self.optimizer_group_audit = _audit_optimizer_parameter_groups(
+                self.tracked_model,
+                optimizer,
+                context=f"Checkpoint {phase} phase",
+            )
             optimizer_steps = self._optimizer_steps(optimizer) if optimizer is not None else []
             scheduler_last_epoch = int(getattr(scheduler, "last_epoch", -999)) if scheduler is not None else None
             learning_rates = [float(group["lr"]) for group in optimizer.param_groups] if optimizer is not None else []
+            expected_optimizer_state_count = sum(
+                parameter.requires_grad for parameter in self.tracked_model.parameters()
+            )
             if phase == "resume":
-                if not optimizer_steps or min(optimizer_steps) != expected_start_step or max(optimizer_steps) != expected_start_step:
+                if (
+                    len(optimizer_steps) != expected_optimizer_state_count
+                    or min(optimizer_steps, default=-1) != expected_start_step
+                    or max(optimizer_steps, default=-1) != expected_start_step
+                ):
                     raise RuntimeError(
                         "Resume optimizer state was not restored to the checkpoint step: "
-                        f"expected={expected_start_step} observed={optimizer_steps[:20]}"
+                        f"expected_step={expected_start_step} "
+                        f"expected_states={expected_optimizer_state_count} "
+                        f"observed_count={len(optimizer_steps)} observed_steps={optimizer_steps[:20]}"
                     )
                 if scheduler_last_epoch != expected_start_step:
                     raise RuntimeError(
@@ -2458,8 +2802,10 @@ def patch_checkpoint_resume_callback() -> None:
                 "optimizer_step_min": min(optimizer_steps) if optimizer_steps else None,
                 "optimizer_step_max": max(optimizer_steps) if optimizer_steps else None,
                 "optimizer_state_count": len(optimizer_steps),
+                "expected_optimizer_state_count": expected_optimizer_state_count,
                 "scheduler_last_epoch": scheduler_last_epoch,
                 "learning_rates": learning_rates,
+                "optimizer_group_audit": self.optimizer_group_audit,
             }
             _write_distributed_rank_marker("checkpoint-start", payload)
             print(
@@ -2468,6 +2814,14 @@ def patch_checkpoint_resume_callback() -> None:
                 f"optimizer_steps=[{payload['optimizer_step_min']},{payload['optimizer_step_max']}] "
                 f"scheduler_last_epoch={scheduler_last_epoch} learning_rates={learning_rates}",
                 flush=True,
+            )
+            return control
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            self.gradient_audit = _audit_local_trainable_gradients(
+                self.tracked_model,
+                context=f"Checkpoint {phase} phase",
             )
             return control
 
@@ -2499,6 +2853,8 @@ def patch_checkpoint_resume_callback() -> None:
                     f"Checkpoint {phase} finite-log count mismatch: updates={expected_updates} "
                     f"losses={self.finite_loss_log_count} grad_norms={self.finite_grad_norm_log_count}"
                 )
+            if self.gradient_audit is None:
+                raise RuntimeError(f"Checkpoint {phase} phase observed no pre-optimizer gradient audit")
             audio = self._audio_statistics()
             if audio["audio_batch_count"] != expected_updates or audio["audio_sample_count"] != expected_updates:
                 raise RuntimeError(
@@ -2516,6 +2872,8 @@ def patch_checkpoint_resume_callback() -> None:
                 "finite_loss_log_count": self.finite_loss_log_count,
                 "finite_grad_norm_log_count": self.finite_grad_norm_log_count,
                 "optimizer_type": self.optimizer_type,
+                "gradient_audit": self.gradient_audit,
+                "optimizer_group_audit": self.optimizer_group_audit,
                 **audio,
             }
             _write_distributed_rank_marker("checkpoint-end", payload)
@@ -2684,9 +3042,10 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
                     "Audio prefix token count exceeds dynamic bounds: "
                     f"valid_prefix_tokens={valid_prefix_tokens} max_audio_tokens={max_audio_tokens}"
                 )
-            if audio_encoder_trainable != 0:
+            if audio_encoder_trainable <= 0:
                 raise RuntimeError(
-                    f"Audio encoder must remain frozen, found {audio_encoder_trainable} trainable local parameters"
+                    "Audio encoder must be trainable in the active Whisper-unfrozen route, "
+                    f"found {audio_encoder_trainable} trainable local parameters"
                 )
             print(
                 "[HuginnAudioSwift] train_chain_audit_audio "
@@ -2720,10 +3079,16 @@ def print_train_chain_parameter_audit(model: torch.nn.Module) -> None:
             groups["huginn_backbone"] += parameter.numel()
         else:
             groups["other"] += parameter.numel()
-    if groups["audio_encoder"] != 0:
-        raise RuntimeError(f"Audio encoder must be frozen before FSDP wrapping: {groups}")
-    if groups["aligner"] <= 0 or groups["huginn_backbone"] <= 0:
-        raise RuntimeError(f"Full-tuning parameter split is incomplete before FSDP wrapping: {groups}")
+    if (
+        groups["audio_encoder"] <= 0
+        or groups["aligner"] <= 0
+        or groups["huginn_backbone"] <= 0
+        or groups["other"] != 0
+    ):
+        raise RuntimeError(
+            "Pre-PEFT Whisper/aligner/Huginn construction is incomplete before FSDP wrapping: "
+            f"{groups}"
+        )
     print(f"[HuginnAudioSwift] train_chain_audit_parameters={groups}")
 
 
@@ -2746,7 +3111,7 @@ def build_huginn_audio_model(model_dir: str):
     config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
     config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL
     config.audio_compressor_stride = DYNAMIC_COMPRESSOR_STRIDE
-    config.freeze_audio_encoder = True
+    config.freeze_audio_encoder = False
     config.freeze_text_backbone = False
 
     model = AutoModelForCausalLM.from_config(
@@ -2822,8 +3187,9 @@ class HuginnAudioTemplate(Template):
             max_length=int(getattr(self.audio_feature_extractor, "n_samples", 480000)),
             return_tensors="pt",
         )
-        # Whisper is currently frozen in FP32. Preserve the feature extractor's
-        # FP32 log-mel values instead of quantizing them to the LLM BF16 dtype.
+        # Preserve the feature extractor's FP32 log-mel values. The trainable
+        # Whisper unit performs its own device/dtype match immediately before
+        # the encoder call, including under BF16 autocast/FSDP mixed precision.
         # The model still performs a defensive dtype/device match immediately
         # before every encoder call.
         media_inputs["input_features"] = media_inputs["input_features"].float()
@@ -2942,7 +3308,7 @@ class HuginnAudioLoader(ModelLoader):
         config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
         config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL
         config.audio_compressor_stride = DYNAMIC_COMPRESSOR_STRIDE
-        config.freeze_audio_encoder = True
+        config.freeze_audio_encoder = False
         config.freeze_text_backbone = False
         print(f"[HuginnAudioSwift] config.audio_encoder_name={config.audio_encoder_name}")
         print(f"[HuginnAudioSwift] config.audio_encoder_hidden_size={config.audio_encoder_hidden_size}")
@@ -3016,7 +3382,9 @@ patch_peft_dynamic90s_lora_dropout()
 patch_peft_constructor_modules_to_save()
 patch_peft_adapter_restore()
 patch_swift_lora_llm_fsdp_dcp_resume()
+patch_accelerate_fsdp2_full_model_dcp()
 patch_accelerate_fsdp2_save_state_audit()
+patch_memory90_callback()
 patch_stage34_optimizer_step_callback()
 patch_stage5_stability_callback()
 patch_realdata_stability_callback()

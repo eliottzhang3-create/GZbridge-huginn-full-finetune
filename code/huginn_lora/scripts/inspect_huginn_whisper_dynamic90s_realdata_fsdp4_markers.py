@@ -25,12 +25,11 @@ from data_pipeline.indexed_atomic_mixture import (  # noqa: E402
 EXPECTED_TRAINABLE_TENSORS = {
     "lora": 66,
     "aligner": 14,
-    "audio_encoder": 0,
     "huginn_base": 0,
     "other": 0,
 }
 EXPECTED_UNIT_TRAINABLE_TENSORS = {
-    "WhisperEncoderFSDPUnit": 0,
+    "WhisperEncoderFSDPUnit": None,
     "AudioAlignerFSDPUnit": 14,
     "HuginnPreludeFSDPUnit": 16,
     "HuginnRecurrentCoreFSDPUnit": 34,
@@ -66,12 +65,20 @@ def validate_fsdp_marker(payload: dict, rank: int, world_size: int) -> int:
         or payload.get("world_size") != world_size
     ):
         raise AssertionError(f"Invalid real-data FSDP marker for rank {rank}: {payload}")
-    if payload.get("trainable_tensors") != EXPECTED_TRAINABLE_TENSORS:
-        raise AssertionError(f"Rank {rank} trainable split mismatch: {payload.get('trainable_tensors')}")
+    trainables = payload.get("trainable_tensors")
+    if (
+        not isinstance(trainables, dict)
+        or int(trainables.get("lora", -1)) != 66
+        or int(trainables.get("aligner", -1)) != 14
+        or int(trainables.get("audio_encoder", 0)) <= 0
+        or int(trainables.get("huginn_base", -1)) != 0
+        or int(trainables.get("other", -1)) != 0
+    ):
+        raise AssertionError(f"Rank {rank} trainable split mismatch: {trainables}")
     if int(payload.get("dtensor_parameter_count", 0)) <= 0:
         raise AssertionError(f"Rank {rank} exposes no FSDP2 DTensor parameters")
-    if int(payload.get("dtensor_trainable_count", -1)) != 80:
-        raise AssertionError(f"Rank {rank} DTensor trainable count is not 80: {payload}")
+    if int(payload.get("dtensor_trainable_count", -1)) != sum(int(value) for value in trainables.values()):
+        raise AssertionError(f"Rank {rank} DTensor trainable count mismatch: {payload}")
     units = payload.get("fsdp_units")
     if not isinstance(units, dict) or set(units) != set(EXPECTED_UNIT_TRAINABLE_TENSORS):
         raise AssertionError(f"Rank {rank} FSDP unit topology mismatch: {units}")
@@ -80,7 +87,8 @@ def validate_fsdp_marker(payload: dict, rank: int, world_size: int) -> int:
         parameter_count = int(unit.get("parameter_count", 0))
         if parameter_count <= 0 or int(unit.get("dtensor_parameter_count", -1)) != parameter_count:
             raise AssertionError(f"Rank {rank} unit {unit_name} is not fully sharded: {unit}")
-        if int(unit.get("trainable_parameter_count", -1)) != expected_trainables:
+        expected_actual = parameter_count if expected_trainables is None else expected_trainables
+        if int(unit.get("trainable_parameter_count", -1)) != expected_actual:
             raise AssertionError(f"Rank {rank} unit {unit_name} trainable split mismatch: {unit}")
     prefix_tokens = payload.get("valid_prefix_tokens")
     if not isinstance(prefix_tokens, list) or len(prefix_tokens) != 1:

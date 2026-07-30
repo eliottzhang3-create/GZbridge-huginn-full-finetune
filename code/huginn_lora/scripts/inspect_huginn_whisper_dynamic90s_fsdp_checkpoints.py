@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit and compare dynamic-90s Whisper LoRA+aligner FSDP checkpoints."""
+"""Audit and compare full-model dynamic-90s Whisper FSDP checkpoints."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 import torch
 
 
-EXPECTED_COUNTS = {"lora": 66, "aligner": 14, "other": 0}
+GROUP_NAMES = ("lora", "aligner", "audio_encoder", "huginn_base", "other")
 ALIGNER_PREFIXES = (
     "audio_aligner",
     "temporal_compressor",
@@ -61,6 +61,36 @@ def classify_key(key: str) -> str:
         return "lora"
     if any(alias.startswith(ALIGNER_PREFIXES) for alias in aliases):
         return "aligner"
+    if any(alias.startswith("audio_encoder.") for alias in aliases):
+        return "audio_encoder"
+    if any(alias.startswith(("transformer.", "lm_head.")) for alias in aliases):
+        return "huginn_base"
+    return "other"
+
+
+def classify_optimizer_key(key: str) -> str:
+    """Classify named optimizer-state entries without assuming one DCP layout."""
+    normalized = key
+    normalized = normalized.replace(".modules_to_save.default.", ".")
+    normalized = normalized.replace(".original_module.", ".")
+    normalized = normalized.replace(".lora_A.default.", ".lora_A.")
+    normalized = normalized.replace(".lora_B.default.", ".lora_B.")
+    if ".lora_A." in normalized or ".lora_B." in normalized:
+        return "lora"
+    if any(
+        normalized.startswith(prefix)
+        or f".{prefix}." in normalized
+        for prefix in ALIGNER_PREFIXES
+    ):
+        return "aligner"
+    if normalized.startswith("audio_encoder.") or ".audio_encoder." in normalized:
+        return "audio_encoder"
+    if (
+        normalized.startswith(("transformer.", "lm_head."))
+        or ".transformer." in normalized
+        or ".lm_head." in normalized
+    ):
+        return "huginn_base"
     return "other"
 
 
@@ -82,14 +112,21 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
         raise FileNotFoundError(f"FSDP checkpoint/model directory is missing: {checkpoint}")
     metadata = FileSystemReader(str(model_dir)).read_metadata()
     state_metadata = getattr(metadata, "state_dict_metadata", {})
-    grouped: dict[str, list[str]] = {"lora": [], "aligner": [], "other": []}
+    state_metadata_by_key = {str(key): value for key, value in state_metadata.items()}
+    grouped: dict[str, list[str]] = {name: [] for name in GROUP_NAMES}
     for raw_key in state_metadata:
         key = str(raw_key)
         grouped[classify_key(key)].append(key)
     counts = {name: len(keys) for name, keys in grouped.items()}
-    if counts != EXPECTED_COUNTS:
+    if (
+        counts["lora"] != 66
+        or counts["aligner"] < 14
+        or counts["audio_encoder"] <= 0
+        or counts["huginn_base"] <= 0
+        or counts["other"] != 0
+    ):
         raise RuntimeError(
-            f"Checkpoint model contract mismatch at {checkpoint}: expected={EXPECTED_COUNTS} actual={counts} "
+            f"Full-model checkpoint contract mismatch at {checkpoint}: actual={counts} "
             f"other_preview={grouped['other'][:10]}"
         )
 
@@ -115,12 +152,27 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
             f"Expected {world_size} per-rank RNG files at {checkpoint}, found {len(rng_files)}: {rng_files}"
         )
     optimizer_dcp_dirs = []
+    optimizer_metadata_counts: dict[str, dict[str, int]] = {}
     for candidate in checkpoint.iterdir():
         if candidate == model_dir or not candidate.is_dir() or not (candidate / ".metadata").is_file():
             continue
         candidate_metadata = FileSystemReader(str(candidate)).read_metadata()
-        if getattr(candidate_metadata, "state_dict_metadata", {}):
+        candidate_state_metadata = getattr(candidate_metadata, "state_dict_metadata", {})
+        if candidate_state_metadata:
             optimizer_dcp_dirs.append(candidate)
+            optimizer_groups = {name: [] for name in GROUP_NAMES}
+            for raw_key in candidate_state_metadata:
+                key = str(raw_key)
+                optimizer_groups[classify_optimizer_key(key)].append(key)
+            optimizer_metadata_counts[candidate.name] = {
+                name: len(keys) for name, keys in optimizer_groups.items()
+            }
+            print(
+                f"[optimizer-metadata] checkpoint={checkpoint.name} dir={candidate.name} "
+                f"counts={optimizer_metadata_counts[candidate.name]} "
+                f"aligner_preview={optimizer_groups['aligner'][:4]} "
+                f"audio_encoder_preview={optimizer_groups['audio_encoder'][:4]}"
+            )
     if not optimizer_dcp_dirs:
         raise RuntimeError(f"No optimizer DCP state directory was found at {checkpoint}")
 
@@ -129,6 +181,16 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
         f"scheduler_last_epoch={scheduler_last_epoch} rng_files={len(rng_files)} "
         f"optimizer_dcp_dirs={[path.name for path in optimizer_dcp_dirs]}"
     )
+    for group in ("lora", "aligner", "audio_encoder", "huginn_base"):
+        preview = []
+        for key in grouped[group][:8]:
+            entry = state_metadata_by_key[key]
+            preview.append({
+                "key": key,
+                "shape": tuple(int(value) for value in getattr(entry, "size", ())),
+                "dtype": str(getattr(getattr(entry, "properties", None), "dtype", None)),
+            })
+        print(f"[model-metadata] checkpoint={checkpoint.name} group={group} preview={preview}")
     return {
         "path": str(checkpoint),
         "step": expected_step,
@@ -139,6 +201,7 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
         "scheduler_last_epoch": scheduler_last_epoch,
         "rng_files": [str(path) for path in rng_files],
         "optimizer_dcp_dirs": [str(path) for path in optimizer_dcp_dirs],
+        "optimizer_metadata_counts": optimizer_metadata_counts,
     }
 
 
@@ -165,8 +228,10 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
             f"save_only={sorted(set(saved_metadata) - set(resumed_metadata))[:10]} "
             f"resume_only={sorted(set(resumed_metadata) - set(saved_metadata))[:10]}"
         )
-    changed = {"lora": 0, "aligner": 0, "other": 0}
-    unchanged = {"lora": 0, "aligner": 0, "other": 0}
+    changed = {name: 0 for name in GROUP_NAMES}
+    unchanged = {name: 0 for name in GROUP_NAMES}
+    max_abs_delta = {name: 0.0 for name in GROUP_NAMES}
+    dtypes: dict[str, set[str]] = {name: set() for name in GROUP_NAMES}
     for index, key in enumerate(sorted(saved_metadata), start=1):
         left = load_one_tensor(saved["model_dir"], str(key), saved_metadata[key])
         right = load_one_tensor(resumed["model_dir"], str(key), resumed_metadata[key])
@@ -176,20 +241,36 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
                 f"left={left.shape}/{left.dtype} right={right.shape}/{right.dtype}"
             )
         group = classify_key(str(key))
+        dtypes[group].add(str(left.dtype))
         if torch.equal(left, right):
             unchanged[group] += 1
         else:
             changed[group] += 1
+            tensor_delta = float((left.float() - right.float()).abs().max().item())
+            max_abs_delta[group] = max(max_abs_delta[group], tensor_delta)
         del left, right
         if index == 1 or index % 20 == 0 or index == len(saved_metadata):
             print(f"[compare-progress] tensors={index}/{len(saved_metadata)}", flush=True)
-    if changed["lora"] <= 0 or changed["aligner"] <= 0 or changed["other"] != 0:
+    comparison_summary = {
+        "changed": changed,
+        "unchanged": unchanged,
+        "max_abs_delta": max_abs_delta,
+        "dtypes": {name: sorted(values) for name, values in dtypes.items()},
+    }
+    print(f"[model-change-summary] {comparison_summary}")
+    if (
+        changed["lora"] <= 0
+        or changed["aligner"] <= 0
+        or changed["audio_encoder"] <= 0
+        or changed["huginn_base"] != 0
+        or changed["other"] != 0
+    ):
         raise RuntimeError(
-            "Cold-resume updates did not change both required trainable groups: "
-            f"changed={changed} unchanged={unchanged}"
+            "Cold-resume updates do not match Whisper+aligner+LoRA trainability: "
+            f"{comparison_summary}"
         )
-    print(f"[model-change] changed={changed} unchanged={unchanged}")
-    return {"changed": changed, "unchanged": unchanged}
+    print(f"[model-change] changed={changed} unchanged={unchanged} max_abs_delta={max_abs_delta}")
+    return comparison_summary
 
 
 def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
@@ -209,7 +290,7 @@ def main() -> None:
     resumed = inspect_checkpoint(args.resume_checkpoint, args.resume_step, args.world_size)
     comparison = compare_model_states(saved, resumed)
     report = {
-        "gate": "huginn_whisper_dynamic90s_fsdp4_checkpoint_content_v1",
+        "gate": "huginn_whisper_dynamic90s_full_model_fsdp4_checkpoint_content_v2",
         "validation_passed": True,
         "save_checkpoint": {key: value for key, value in saved.items() if key not in {"state_metadata", "grouped_keys"}},
         "resume_checkpoint": {
