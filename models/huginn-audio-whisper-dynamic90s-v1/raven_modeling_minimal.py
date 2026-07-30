@@ -80,6 +80,9 @@ class AudioBoundaryEmbeddings(nn.Module):
         nn.init.normal_(self.audio_bos, mean=0.0, std=init_std)
         nn.init.normal_(self.audio_eos, mean=0.0, std=init_std)
 
+    def forward(self) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.audio_bos * 1.0, self.audio_eos * 1.0
+
 
 class WhisperEncoderFSDPUnit(nn.Module):
     """One callable FSDP unit containing the complete Whisper encoder."""
@@ -145,10 +148,10 @@ class AudioAlignerFSDPUnit(nn.Module):
         if self.audio_boundary_embeddings is None:
             return projected, None, None
 
-        # Materialize both parameters inside this wrapped forward. Accessing a
-        # sharded parameter directly after the unit has resharded is invalid.
-        audio_bos = self.audio_boundary_embeddings.audio_bos * 1.0
-        audio_eos = self.audio_boundary_embeddings.audio_eos * 1.0
+        # Calling the module is required for PEFT's ModulesToSaveWrapper to
+        # route execution through its active trainable copy. It also keeps both
+        # parameters materialized inside this FSDP unit's wrapped forward.
+        audio_bos, audio_eos = self.audio_boundary_embeddings()
         return projected, audio_bos, audio_eos
 
 
