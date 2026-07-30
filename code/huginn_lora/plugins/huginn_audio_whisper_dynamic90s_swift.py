@@ -170,14 +170,18 @@ def is_aligner_parameter_name(name: str) -> bool:
     return normalize_parameter_name(name).startswith(ALIGNER_PREFIXES)
 
 
-def audio_boundary_parameter_name(name: str) -> str | None:
-    normalized = normalize_parameter_name(name)
-    for boundary_name in AUDIO_BOUNDARY_PARAMETER_NAMES:
-        if normalized == boundary_name or normalized.endswith(
-            f"audio_boundary_embeddings.{boundary_name}"
-        ):
-            return boundary_name
-    return None
+def trainable_audio_boundary_parameter_ids(model: torch.nn.Module) -> dict[str, set[int]]:
+    """Locate active boundary parameters without depending on PEFT/FSDP names."""
+    parameter_ids = {name: set() for name in AUDIO_BOUNDARY_PARAMETER_NAMES}
+    for module in model.modules():
+        direct_parameters = vars(module).get("_parameters", {})
+        if not isinstance(direct_parameters, dict):
+            continue
+        for boundary_name in AUDIO_BOUNDARY_PARAMETER_NAMES:
+            parameter = direct_parameters.get(boundary_name)
+            if parameter is not None and parameter.requires_grad:
+                parameter_ids[boundary_name].add(id(parameter))
+    return parameter_ids
 
 MODEL_TYPE = "huginn_audio_whisper_dynamic90s"
 TEMPLATE_TYPE = "huginn_audio_whisper_dynamic90s"
@@ -2208,8 +2212,14 @@ def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) ->
         }
         for name in AUDIO_BOUNDARY_PARAMETER_NAMES
     }
+    boundary_parameter_ids = trainable_audio_boundary_parameter_ids(model)
+    boundary_name_by_parameter_id = {
+        parameter_id: boundary_name
+        for boundary_name, parameter_ids in boundary_parameter_ids.items()
+        for parameter_id in parameter_ids
+    }
     for name, parameter in model.named_parameters():
-        boundary_name = audio_boundary_parameter_name(name)
+        boundary_name = boundary_name_by_parameter_id.get(id(parameter))
         gradient = parameter.grad
         if gradient is None:
             continue
@@ -2318,13 +2328,7 @@ def _audit_optimizer_parameter_groups(
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
     }
-    expected_boundary_parameter_ids = {name: set() for name in AUDIO_BOUNDARY_PARAMETER_NAMES}
-    for parameter_name, parameter in model.named_parameters():
-        if not parameter.requires_grad:
-            continue
-        boundary_name = audio_boundary_parameter_name(parameter_name)
-        if boundary_name is not None:
-            expected_boundary_parameter_ids[boundary_name].add(id(parameter))
+    expected_boundary_parameter_ids = trainable_audio_boundary_parameter_ids(model)
     observed_boundary_parameter_ids = {name: set() for name in AUDIO_BOUNDARY_PARAMETER_NAMES}
     observed_counts = {name: 0 for name in ("lora", "aligner", "audio_encoder", "huginn_base", "other")}
     group_audits: list[dict[str, Any]] = []
