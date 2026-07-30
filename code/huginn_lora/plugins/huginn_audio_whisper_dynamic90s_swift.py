@@ -2186,6 +2186,27 @@ def _audit_optimizer_parameter_groups(
     return group_audits
 
 
+def _whisper_gradient_checkpoint_modules(model: torch.nn.Module) -> list[str]:
+    audio_model = next(
+        (
+            module
+            for module in model.modules()
+            if all(hasattr(module, name) for name in ("audio_encoder", "audio_aligner"))
+        ),
+        None,
+    )
+    if audio_model is None:
+        raise RuntimeError("Unable to locate the audio model for Whisper checkpointing audit")
+    return [
+        type(module).__name__
+        for module in audio_model.audio_encoder.modules()
+        if bool(
+            getattr(module, "gradient_checkpointing", False)
+            or getattr(module, "is_gradient_checkpointing", False)
+        )
+    ]
+
+
 def patch_memory90_callback() -> None:
     if not os.environ.get(MEMORY90_AUDIT_DIR_ENV, "").strip():
         return
@@ -2228,24 +2249,7 @@ def patch_memory90_callback() -> None:
                     f"got batch={args.per_device_train_batch_size} "
                     f"accumulation={args.gradient_accumulation_steps} max_steps={state.max_steps}"
                 )
-            audio_model = next(
-                (
-                    module
-                    for module in self.tracked_model.modules()
-                    if all(hasattr(module, name) for name in ("audio_encoder", "audio_aligner"))
-                ),
-                None,
-            )
-            if audio_model is None:
-                raise RuntimeError("90-second memory smoke could not locate the audio model")
-            whisper_gradient_checkpoint_modules = [
-                type(module).__name__
-                for module in audio_model.audio_encoder.modules()
-                if bool(
-                    getattr(module, "gradient_checkpointing", False)
-                    or getattr(module, "is_gradient_checkpointing", False)
-                )
-            ]
+            whisper_gradient_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
             whisper_gradient_checkpointing = bool(whisper_gradient_checkpoint_modules)
             checkpoint_wrappers = [
                 type(module).__name__
@@ -2762,6 +2766,7 @@ def patch_checkpoint_resume_callback() -> None:
             self.observed_start_step = None
             self.gradient_audit: dict[str, dict[str, int]] | None = None
             self.optimizer_group_audit: list[dict[str, Any]] | None = None
+            self.whisper_gradient_checkpoint_modules: list[str] | None = None
 
         @staticmethod
         def _identity() -> tuple[int, int]:
@@ -2810,7 +2815,6 @@ def patch_checkpoint_resume_callback() -> None:
             }
 
         def on_train_begin(self, args, state, control, **kwargs):
-            del args
             rank, world_size = self._identity()
             self.observed_start_step = int(state.global_step)
             if self.observed_start_step != expected_start_step:
@@ -2826,6 +2830,16 @@ def patch_checkpoint_resume_callback() -> None:
                 optimizer,
                 context=f"Checkpoint {phase} phase",
             )
+            self.whisper_gradient_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
+            if (
+                not bool(getattr(args, "vit_gradient_checkpointing", False))
+                or not self.whisper_gradient_checkpoint_modules
+            ):
+                raise RuntimeError(
+                    f"Checkpoint {phase} phase requires active Whisper gradient checkpointing: "
+                    f"arg={getattr(args, 'vit_gradient_checkpointing', None)} "
+                    f"modules={self.whisper_gradient_checkpoint_modules}"
+                )
             optimizer_steps = self._optimizer_steps(optimizer) if optimizer is not None else []
             scheduler_last_epoch = int(getattr(scheduler, "last_epoch", -999)) if scheduler is not None else None
             learning_rates = [float(group["lr"]) for group in optimizer.param_groups] if optimizer is not None else []
@@ -2868,6 +2882,7 @@ def patch_checkpoint_resume_callback() -> None:
                 "scheduler_last_epoch": scheduler_last_epoch,
                 "learning_rates": learning_rates,
                 "optimizer_group_audit": self.optimizer_group_audit,
+                "whisper_gradient_checkpoint_modules": self.whisper_gradient_checkpoint_modules,
             }
             _write_distributed_rank_marker("checkpoint-start", payload)
             print(
@@ -2936,6 +2951,7 @@ def patch_checkpoint_resume_callback() -> None:
                 "optimizer_type": self.optimizer_type,
                 "gradient_audit": self.gradient_audit,
                 "optimizer_group_audit": self.optimizer_group_audit,
+                "whisper_gradient_checkpoint_modules": self.whisper_gradient_checkpoint_modules,
                 **audio,
             }
             _write_distributed_rank_marker("checkpoint-end", payload)

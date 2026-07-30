@@ -14,6 +14,7 @@ export PYTHONHASHSEED=0
 export CUDA_VISIBLE_DEVICES=0,1,2,3
 export NPROC_PER_NODE=4
 export OMP_NUM_THREADS=4
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 WORLD_SIZE=4
 PER_DEVICE_BATCH=1
@@ -81,6 +82,7 @@ if int(sys.argv[3]) < 24:
 available = {field.name for field in fields(SftArguments)}
 required = {
     'fsdp', 'modules_to_save', 'resume_from_checkpoint', 'ignore_data_skip', 'vit_lr',
+    'vit_gradient_checkpointing', 'gradient_checkpointing_kwargs',
     'save_strategy', 'save_steps', 'save_only_model', 'lr_scheduler_type',
     'streaming', 'max_steps',
 }
@@ -143,6 +145,8 @@ echo "checkpoint_state=model+optimizer+scheduler+rng+trainer_global_step+no_repl
 echo "lr_scheduler=constant learning_rate=1e-4"
 echo "modules_to_save=${MODULES_TO_SAVE[*]}"
 echo "whisper_encoder=fully_trainable learning_rate=1e-4 aligner_lr=1e-4"
+echo "gradient_checkpointing=false vit_gradient_checkpointing=true use_reentrant=false"
+echo "pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"
 echo "huginn_backbone=frozen lora_rank=8 lora_alpha=16 lora_dropout=0.05 full_model_dcp=true"
 
 ACTIVE_PID=""
@@ -268,6 +272,8 @@ run_save_phase() {
     --per_device_train_batch_size "$PER_DEVICE_BATCH" \
     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --gradient_checkpointing false \
+    --vit_gradient_checkpointing true \
+    --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --logging_steps 1 \
     --save_strategy steps \
     --save_steps "$SAVE_STEP" \
@@ -331,6 +337,8 @@ run_resume_phase() {
     --per_device_train_batch_size "$PER_DEVICE_BATCH" \
     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --gradient_checkpointing false \
+    --vit_gradient_checkpointing true \
+    --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --logging_steps 1 \
     --save_strategy steps \
     --save_steps "$RESUME_STEP" \

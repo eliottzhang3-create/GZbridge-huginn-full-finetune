@@ -154,6 +154,10 @@ def validate_phase_markers(
             raise AssertionError(f"Invalid {phase} start marker for rank {rank}: {start}")
         pids.add(int(start["pid"]))
         launch_ids.add(str(start.get("launch_id", "")))
+        if not isinstance(start.get("whisper_gradient_checkpoint_modules"), list) or not start[
+            "whisper_gradient_checkpoint_modules"
+        ]:
+            raise AssertionError(f"Whisper checkpointing is inactive in {phase} rank {rank}: {start}")
         validate_optimizer_groups(start, trainables, phase=phase, rank=rank)
         if phase == "resume":
             if (
@@ -190,6 +194,10 @@ def validate_phase_markers(
         for group in ("huginn_base", "other"):
             if int(gradients.get(group, {}).get("gradient_tensors", -1)) != 0:
                 raise AssertionError(f"Forbidden {group} gradients in {phase} rank {rank}: {gradients}")
+        if end.get("whisper_gradient_checkpoint_modules") != start.get("whisper_gradient_checkpoint_modules"):
+            raise AssertionError(
+                f"Whisper checkpointing state changed in {phase} rank {rank}: start={start} end={end}"
+            )
         validate_optimizer_groups(end, trainables, phase=phase, rank=rank)
         if phase == "resume":
             rng = read_json(audit_dir / f"rng-restore-rank-{rank}.json")
