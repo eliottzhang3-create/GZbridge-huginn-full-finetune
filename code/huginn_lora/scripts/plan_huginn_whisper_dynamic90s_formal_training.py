@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
-"""Freeze the formal dynamic-30s training length from the registered data pools."""
+"""Freeze the user-specified 20k-step dynamic-30s formal training plan."""
 
 from __future__ import annotations
 
 import argparse
 import json
-import math
 import os
 import sys
 from pathlib import Path
@@ -26,23 +25,27 @@ from data_pipeline.indexed_atomic_mixture import (  # noqa: E402
 )
 
 
-PLAN_VERSION = "huginn_whisper_dynamic30s_formal_plan_v2"
+PLAN_VERSION = "huginn_whisper_dynamic30s_fixed20k_formal_plan_v3"
 DEFAULT_SEED = 20260730
-DEFAULT_TARGET_HOURS = 3000.0
-DEFAULT_RESERVE_RATIO = 1.05
-DEFAULT_STEP_ROUNDING = 100
+DEFAULT_MAX_STEPS = 20000
+DEFAULT_CHECKPOINT_INTERVAL = 5000
 DEFAULT_WORLD_SIZE = 4
 DEFAULT_PER_DEVICE_BATCH = 2
 DEFAULT_GRADIENT_ACCUMULATION = 4
+TARGET_REALIZED_HOURS = 3000.0
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=DEFAULT_SEED)
-    parser.add_argument("--target-hours", type=float, default=DEFAULT_TARGET_HOURS)
-    parser.add_argument("--reserve-ratio", type=float, default=DEFAULT_RESERVE_RATIO)
-    parser.add_argument("--step-rounding", type=int, default=DEFAULT_STEP_ROUNDING)
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS)
+    parser.add_argument(
+        "--checkpoint-interval",
+        type=int,
+        default=DEFAULT_CHECKPOINT_INTERVAL,
+    )
     parser.add_argument("--world-size", type=int, default=DEFAULT_WORLD_SIZE)
     parser.add_argument("--per-device-batch", type=int, default=DEFAULT_PER_DEVICE_BATCH)
     parser.add_argument("--gradient-accumulation", type=int, default=DEFAULT_GRADIENT_ACCUMULATION)
@@ -63,28 +66,21 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 def validate_args(args: argparse.Namespace) -> None:
     if args.seed < 0:
         raise ValueError(f"seed must be non-negative, got {args.seed}")
-    if args.target_hours <= 0:
-        raise ValueError(f"target-hours must be positive, got {args.target_hours}")
-    if args.reserve_ratio < 1.0:
-        raise ValueError(f"reserve-ratio must be >= 1, got {args.reserve_ratio}")
-    if args.step_rounding <= 0 or args.step_rounding % 2:
-        raise ValueError("step-rounding must be a positive even integer")
-    if min(args.world_size, args.per_device_batch, args.gradient_accumulation) <= 0:
-        raise ValueError("world-size, per-device-batch, and gradient-accumulation must be positive")
-
-
-def estimated_hours_for_steps(
-    planner: DeterministicHierarchicalMixture,
-    steps: int,
-    global_batch: int,
-    average_hours: dict[str, float],
-) -> tuple[float, dict[str, int]]:
-    sample_count = steps * global_batch
-    counts = {name: 0 for name in POOL_ORDER}
-    for position in range(sample_count):
-        counts[planner.pool_for_position(position)] += 1
-    hours = sum(counts[name] * average_hours[name] for name in POOL_ORDER)
-    return hours, counts
+    if args.max_steps != DEFAULT_MAX_STEPS:
+        raise ValueError(
+            f"The active formal contract fixes max_steps={DEFAULT_MAX_STEPS}, got {args.max_steps}"
+        )
+    if args.checkpoint_interval != DEFAULT_CHECKPOINT_INTERVAL:
+        raise ValueError(
+            "The active formal contract fixes checkpoint_interval="
+            f"{DEFAULT_CHECKPOINT_INTERVAL}, got {args.checkpoint_interval}"
+        )
+    if args.max_steps % args.checkpoint_interval != 0:
+        raise ValueError("max_steps must be divisible by checkpoint_interval")
+    if (args.world_size, args.per_device_batch, args.gradient_accumulation) != (4, 2, 4):
+        raise ValueError(
+            "The active formal contract requires world_size/per_device_batch/gradient_accumulation=4/2/4"
+        )
 
 
 def main() -> None:
@@ -92,103 +88,81 @@ def main() -> None:
     validate_args(args)
     registry_path = args.registry.expanduser().resolve()
     registry = load_pool_registry(registry_path)
-    pool_sizes = {name: int(registry["pools"][name]["record_count"]) for name in POOL_ORDER}
-    missing_planning_hours = [
-        name
-        for name in POOL_ORDER
-        if registry["pools"][name].get("planning_effective_duration_hours") is None
-    ]
-    if missing_planning_hours:
-        raise ValueError(
-            "Formal duration planning is deferred until capped-duration estimates are available for: "
-            f"{missing_planning_hours}. Run the post-acceleration duration-estimation gate first."
-        )
-    effective_pool_hours = {
-        name: float(registry["pools"][name]["planning_effective_duration_hours"])
+    pool_sizes = {
+        name: int(registry["pools"][name]["record_count"])
         for name in POOL_ORDER
     }
-    if any(value <= 0 for value in effective_pool_hours.values()):
-        raise ValueError(f"Registry planning effective hours must be positive: {effective_pool_hours}")
-    average_hours = {name: effective_pool_hours[name] / pool_sizes[name] for name in POOL_ORDER}
-    expected_hours_per_sample = sum(
-        GLOBAL_POOL_WEIGHTS[name] * average_hours[name]
-        for name in POOL_ORDER
-    )
     global_batch = args.world_size * args.per_device_batch * args.gradient_accumulation
-    planning_hours = args.target_hours * args.reserve_ratio
-    unrounded_steps = planning_hours / (expected_hours_per_sample * global_batch)
-    max_steps = math.ceil(unrounded_steps / args.step_rounding) * args.step_rounding
-
-    planner = DeterministicHierarchicalMixture(pool_sizes=pool_sizes, seed=args.seed)
-    estimated_hours, scheduled_counts = estimated_hours_for_steps(
-        planner,
-        max_steps,
-        global_batch,
-        average_hours,
+    total_samples = args.max_steps * global_batch
+    checkpoint_steps = list(
+        range(args.checkpoint_interval, args.max_steps + 1, args.checkpoint_interval)
     )
-    while estimated_hours <= planning_hours:
-        max_steps += args.step_rounding
-        estimated_hours, scheduled_counts = estimated_hours_for_steps(
-            planner,
-            max_steps,
-            global_batch,
-            average_hours,
-        )
+    if checkpoint_steps != [5000, 10000, 15000, 20000]:
+        raise RuntimeError(f"Formal checkpoint schedule changed unexpectedly: {checkpoint_steps}")
 
-    if max_steps % 2:
-        raise RuntimeError(f"Rounded max_steps must be even, got {max_steps}")
-    halfway_step = max_steps // 2
-    total_samples = max_steps * global_batch
+    sampler = DeterministicHierarchicalMixture(pool_sizes=pool_sizes, seed=args.seed)
+    scheduled_counts = {name: 0 for name in POOL_ORDER}
+    scheduled_counts_by_checkpoint: dict[str, dict[str, int]] = {}
+    checkpoint_positions = {
+        step * global_batch: step
+        for step in checkpoint_steps
+    }
+    for position in range(total_samples):
+        scheduled_counts[sampler.pool_for_position(position)] += 1
+        completed_samples = position + 1
+        checkpoint_step = checkpoint_positions.get(completed_samples)
+        if checkpoint_step is not None:
+            scheduled_counts_by_checkpoint[str(checkpoint_step)] = dict(scheduled_counts)
     scheduled_ratios = {
         name: scheduled_counts[name] / total_samples
         for name in POOL_ORDER
     }
     payload = {
         "plan_version": PLAN_VERSION,
+        "step_policy": "user_fixed_20000_steps_no_duration_estimation",
         "sampler_version": SAMPLER_VERSION,
+        "sampler_epoch_policy": "per_pool_no_replacement_reshuffle_after_full_coverage",
         "sampler_seed": args.seed,
         "registry_path": str(registry_path),
         "registry_contract_version": registry.get("contract_version"),
-        "target_realized_hours_minimum": args.target_hours,
-        "planning_reserve_ratio": args.reserve_ratio,
-        "planning_hours": planning_hours,
-        "duration_estimate_is_completion_authority": False,
-        "completion_authority": "checkpoint audio_training_statistics.json total_effective_duration_hours",
-        "effective_pool_hours_assumption": effective_pool_hours,
         "duration_policy": "retain_all_then_cap_at30s",
+        "target_realized_hours_minimum": TARGET_REALIZED_HOURS,
+        "duration_estimate_used_for_max_steps": False,
+        "completion_authority": (
+            "final checkpoint audio_training_statistics.json "
+            "total_effective_duration_hours"
+        ),
         "pool_sizes": pool_sizes,
-        "pool_average_source_hours_per_record": average_hours,
         "configured_pool_weights": GLOBAL_POOL_WEIGHTS,
         "scheduled_pool_counts": scheduled_counts,
+        "scheduled_pool_counts_by_checkpoint": scheduled_counts_by_checkpoint,
         "scheduled_pool_ratios": scheduled_ratios,
-        "estimated_source_hours": estimated_hours,
         "world_size": args.world_size,
         "per_device_train_batch_size": args.per_device_batch,
         "gradient_accumulation_steps": args.gradient_accumulation,
         "global_batch_size": global_batch,
-        "step_rounding": args.step_rounding,
-        "unrounded_steps_with_reserve": unrounded_steps,
-        "max_steps": max_steps,
-        "halfway_step": halfway_step,
+        "max_steps": args.max_steps,
+        "halfway_step": args.max_steps // 2,
+        "checkpoint_interval": args.checkpoint_interval,
+        "checkpoint_steps": checkpoint_steps,
+        "checkpoint_count": len(checkpoint_steps),
         "total_scheduled_samples": total_samples,
-        "checkpoint_steps": [halfway_step, max_steps],
     }
     output_path = args.output.expanduser().resolve()
     if output_path.exists():
         existing = json.loads(output_path.read_text(encoding="utf-8"))
         if existing != payload:
-            raise RuntimeError(f"Existing formal plan differs from the current frozen plan: {output_path}")
+            raise RuntimeError(f"Existing formal plan differs from the fixed plan: {output_path}")
     else:
         write_json_atomic(output_path, payload)
     print(
         "[formal-plan] "
-        f"max_steps={max_steps} halfway_step={halfway_step} global_batch={global_batch} "
-        f"estimated_hours={estimated_hours:.6f} target_hours={args.target_hours:.3f} "
-        f"planning_hours={planning_hours:.3f}"
+        f"max_steps={args.max_steps} checkpoint_steps={checkpoint_steps} "
+        f"global_batch={global_batch} total_samples={total_samples} "
+        "duration_estimation=false"
     )
     print(f"[formal-plan] scheduled_pool_counts={scheduled_counts}")
     print(f"[formal-plan] scheduled_pool_ratios={scheduled_ratios}")
-    print(f"[formal-plan] effective_pool_hours={effective_pool_hours}")
     print(f"[formal-plan] output={output_path}")
 
 

@@ -22,8 +22,8 @@ GRADIENT_ACCUMULATION_STEPS=4
 GLOBAL_BATCH=$((WORLD_SIZE * PER_DEVICE_BATCH * GRADIENT_ACCUMULATION_STEPS))
 SEED="${HUGINN_DYNAMIC90S_MIXTURE_SEED:-20260730}"
 TARGET_HOURS=3000
-PLANNING_RESERVE_RATIO=1.05
-STEP_ROUNDING=100
+FIXED_MAX_STEPS=20000
+CHECKPOINT_INTERVAL=5000
 LEARNING_RATE=1e-4
 ALIGNER_LR=1e-4
 WHISPER_LR=1e-4
@@ -43,7 +43,7 @@ REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_
 REALDATA_REPORT="${HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/real_data_chain_report.json}"
 SAMPLER_REPORT="${HUGINN_DYNAMIC90S_SAMPLER_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/sampler/mixture_sampler_report.json}"
 PLANNER="$REPO_ROOT/code/huginn_lora/scripts/plan_huginn_whisper_dynamic90s_formal_training.py"
-CHECKPOINT_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_fsdp_checkpoints.py"
+FORMAL_CHECKPOINT_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_formal_checkpoints.py"
 MODULES_TO_SAVE=(temporal_compressor audio_projector audio_boundary_embeddings)
 
 if [ -e "$RUN_ROOT" ]; then
@@ -61,7 +61,7 @@ FINAL_AUDIT_REPORT="$RUN_ROOT/formal_checkpoint_content_report.json"
 
 for required_path in \
   "$MODEL_PATH" "$PLUGIN_PATH" "$REGISTRY" "$REALDATA_REPORT" "$SAMPLER_REPORT" \
-  "$PLANNER" "$CHECKPOINT_INSPECTOR"; do
+  "$PLANNER" "$FORMAL_CHECKPOINT_INSPECTOR"; do
   if [ ! -e "$required_path" ]; then
     echo "Required formal-training path is missing: $required_path" >&2
     exit 1
@@ -152,33 +152,43 @@ python -u "$PLANNER" \
   --registry "$REGISTRY" \
   --output "$PLAN_PATH" \
   --seed "$SEED" \
-  --target-hours "$TARGET_HOURS" \
-  --reserve-ratio "$PLANNING_RESERVE_RATIO" \
-  --step-rounding "$STEP_ROUNDING" \
+  --max-steps "$FIXED_MAX_STEPS" \
+  --checkpoint-interval "$CHECKPOINT_INTERVAL" \
   --world-size "$WORLD_SIZE" \
   --per-device-batch "$PER_DEVICE_BATCH" \
   --gradient-accumulation "$GRADIENT_ACCUMULATION_STEPS"
 
-read -r MAX_STEPS HALFWAY_STEP TOTAL_SAMPLES < <(python - "$PLAN_PATH" <<'PY'
+read -r MAX_STEPS HALFWAY_STEP TOTAL_SAMPLES CHECKPOINT_INTERVAL_FROM_PLAN CHECKPOINT_STEPS_CSV < <(python - "$PLAN_PATH" <<'PY'
 import json
 import sys
 from pathlib import Path
 
 plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(plan["max_steps"], plan["halfway_step"], plan["total_scheduled_samples"])
+print(
+    plan["max_steps"],
+    plan["halfway_step"],
+    plan["total_scheduled_samples"],
+    plan["checkpoint_interval"],
+    ",".join(str(step) for step in plan["checkpoint_steps"]),
+)
 PY
 )
-if [ -z "${MAX_STEPS:-}" ] || [ -z "${HALFWAY_STEP:-}" ] || [ -z "${TOTAL_SAMPLES:-}" ]; then
+if [ -z "${MAX_STEPS:-}" ] || [ -z "${HALFWAY_STEP:-}" ] || [ -z "${TOTAL_SAMPLES:-}" ] || [ -z "${CHECKPOINT_STEPS_CSV:-}" ]; then
   echo "Unable to read the frozen formal training plan: $PLAN_PATH" >&2
   exit 1
 fi
-if (( MAX_STEPS % 100 != 0 || HALFWAY_STEP * 2 != MAX_STEPS || TOTAL_SAMPLES != MAX_STEPS * GLOBAL_BATCH )); then
+if (( MAX_STEPS != 20000 || HALFWAY_STEP != 10000 || CHECKPOINT_INTERVAL_FROM_PLAN != 5000 || TOTAL_SAMPLES != MAX_STEPS * GLOBAL_BATCH )); then
   echo "Formal plan arithmetic is inconsistent: max=$MAX_STEPS half=$HALFWAY_STEP samples=$TOTAL_SAMPLES" >&2
+  exit 1
+fi
+if [ "$CHECKPOINT_STEPS_CSV" != "5000,10000,15000,20000" ]; then
+  echo "Formal checkpoint schedule is inconsistent: $CHECKPOINT_STEPS_CSV" >&2
   exit 1
 fi
 
 RESUME_ARGS=()
 START_POSITION=0
+RESUME_START_STEP=0
 RESUME_STATS_STATE=""
 if [ -n "$RESUME_CHECKPOINT" ]; then
   if [ ! -d "$RESUME_CHECKPOINT/pytorch_model_fsdp_0" ]; then
@@ -190,34 +200,113 @@ if [ -n "$RESUME_CHECKPOINT" ]; then
     echo "Formal resume checkpoint lacks cumulative audio statistics: $RESUME_STATS_STATE" >&2
     exit 1
   fi
-  START_POSITION="$(python - "$RESUME_STATS_STATE" "$HALFWAY_STEP" "$GLOBAL_BATCH" "$SEED" <<'PY'
+  read -r START_POSITION RESUME_START_STEP < <(python - "$RESUME_CHECKPOINT" "$PLAN_PATH" "$GLOBAL_BATCH" "$SEED" <<'PY'
 import json
 import sys
 from pathlib import Path
 
-state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-halfway = int(sys.argv[2])
+checkpoint = Path(sys.argv[1]).resolve()
+current_plan = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 global_batch = int(sys.argv[3])
 seed = int(sys.argv[4])
+embedded_plan_path = checkpoint / "formal_training_plan.json"
+runtime_path = checkpoint / "huginn_training_runtime_contract.json"
+statistics_path = checkpoint / "audio_training_statistics.json"
+trainer_state_path = checkpoint / "trainer_state.json"
+scheduler_path = checkpoint / "scheduler.pt"
+for path in (embedded_plan_path, runtime_path, statistics_path, trainer_state_path, scheduler_path):
+    if not path.is_file() or path.stat().st_size <= 0:
+        raise SystemExit(f"Formal resume checkpoint is missing required state: {path}")
+embedded_plan = json.loads(embedded_plan_path.read_text(encoding="utf-8"))
+if embedded_plan != current_plan:
+    raise SystemExit(
+        f"Formal resume checkpoint plan differs from the current frozen plan: {embedded_plan_path}"
+    )
+runtime = json.loads(runtime_path.read_text(encoding="utf-8"))
+formal = runtime.get("formal_training", {})
+resume_step = int(runtime.get("global_step", -1))
+checkpoint_steps = [int(value) for value in current_plan["checkpoint_steps"]]
+expected_formal = {
+    "checkpoint_role": "scheduled",
+    "checkpoint_step": resume_step,
+    "checkpoint_index": checkpoint_steps.index(resume_step) + 1
+    if resume_step in checkpoint_steps
+    else -1,
+    "plan_version": current_plan["plan_version"],
+    "step_policy": current_plan["step_policy"],
+    "sampler_version": current_plan["sampler_version"],
+    "sampler_epoch_policy": current_plan["sampler_epoch_policy"],
+    "sampler_seed": int(current_plan["sampler_seed"]),
+    "duration_policy": current_plan["duration_policy"],
+    "duration_estimate_used_for_max_steps": False,
+    "target_realized_hours_minimum": float(current_plan["target_realized_hours_minimum"]),
+    "max_steps": int(current_plan["max_steps"]),
+    "halfway_step": int(current_plan["halfway_step"]),
+    "checkpoint_interval": int(current_plan["checkpoint_interval"]),
+    "checkpoint_steps": checkpoint_steps,
+    "checkpoint_count": int(current_plan["checkpoint_count"]),
+    "global_batch_size": int(current_plan["global_batch_size"]),
+    "total_scheduled_samples": int(current_plan["total_scheduled_samples"]),
+}
+if (
+    runtime.get("gate") != "huginn_whisper_dynamic30s_training_runtime_contract_v1"
+    or runtime.get("phase") != "formal_checkpoint"
+    or resume_step not in checkpoint_steps[:-1]
+    or formal != expected_formal
+):
+    raise SystemExit(
+        "Formal resume runtime contract mismatch: "
+        f"actual={formal} expected={expected_formal} runtime={runtime}"
+    )
+trainer_state = json.loads(trainer_state_path.read_text(encoding="utf-8"))
+if int(trainer_state.get("global_step", -1)) != resume_step:
+    raise SystemExit(f"Formal resume trainer state is not checkpoint-{resume_step}: {trainer_state}")
+rng_files = sorted(checkpoint.glob("rng_state*.pth"))
+if len(rng_files) != 4:
+    raise SystemExit(f"Formal resume requires four per-rank RNG files, found: {rng_files}")
+optimizer_dirs = [
+    path
+    for path in checkpoint.iterdir()
+    if path.is_dir()
+    and path.name != "pytorch_model_fsdp_0"
+    and (path / ".metadata").is_file()
+]
+if not optimizer_dirs:
+    raise SystemExit(f"Formal resume checkpoint has no optimizer DCP directory: {checkpoint}")
+observed_sibling_steps = []
+for sibling in checkpoint.parent.glob("checkpoint-*"):
+    if not sibling.is_dir():
+        continue
+    try:
+        observed_sibling_steps.append(int(sibling.name.split("-", 1)[1]))
+    except (IndexError, ValueError) as exc:
+        raise SystemExit(f"Unexpected checkpoint directory beside resume state: {sibling}") from exc
+expected_sibling_steps = [step for step in checkpoint_steps if step <= resume_step]
+if sorted(observed_sibling_steps) != expected_sibling_steps:
+    raise SystemExit(
+        "Formal resume requires one unbranched checkpoint chain through the selected step: "
+        f"expected_siblings={expected_sibling_steps} actual={sorted(observed_sibling_steps)}"
+    )
+state = json.loads(statistics_path.read_text(encoding="utf-8"))
 if state.get("statistics_version") != "huginn_dynamic30s_training_statistics_v2":
     raise SystemExit(f"Resume checkpoint uses an incompatible audio contract: {state.get('statistics_version')!r}")
-if int(state.get("global_step", -1)) != halfway:
-    raise SystemExit(f"Resume checkpoint must be the halfway checkpoint-{halfway}: {state.get('global_step')}")
+if int(state.get("global_step", -1)) != resume_step:
+    raise SystemExit(f"Resume statistics step mismatch: expected={resume_step} actual={state.get('global_step')}")
 if int(state.get("sampler_seed", -1)) != seed:
     raise SystemExit(f"Resume sampler seed mismatch: state={state.get('sampler_seed')} current={seed}")
 position = int(state.get("next_global_position", -1))
-expected = halfway * global_batch
+expected = resume_step * global_batch
 if position != expected or int(state.get("total_samples", -1)) != expected:
     raise SystemExit(f"Resume sample position mismatch: expected={expected} actual={position}")
-print(position)
+print(position, resume_step)
 PY
-)"
+)
   RESUME_ARGS+=(--resume_from_checkpoint "$RESUME_CHECKPOINT" --ignore_data_skip true)
 fi
 
 AVAILABLE_GB="$(df -BG "$REPO_ROOT" | awk 'NR==2 {gsub(/G/, "", $4); print $4}')"
 if [ -z "$AVAILABLE_GB" ] || [ "$AVAILABLE_GB" -lt "$MIN_FREE_GB" ]; then
-  echo "Insufficient storage for two full FSDP checkpoints: available=${AVAILABLE_GB:-unknown}G required=${MIN_FREE_GB}G" >&2
+  echo "Insufficient storage for four planned full FSDP checkpoints: available=${AVAILABLE_GB:-unknown}G required=${MIN_FREE_GB}G" >&2
   exit 1
 fi
 
@@ -235,8 +324,9 @@ export HUGINN_AUDIO_DYNAMIC90S_PEFT_ALIGNER_MODULES_TO_SAVE=1
 export HUGINN_AUDIO_DYNAMIC90S_FULL_MODEL_DCP=1
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR="$TRAINING_STATS_DIR"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS="$STATISTICS_LOG_STEPS"
-export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CHECKPOINT_STEPS="$HALFWAY_STEP,$MAX_STEPS"
+export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CHECKPOINT_STEPS="$CHECKPOINT_STEPS_CSV"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE=formal
+export HUGINN_AUDIO_DYNAMIC30S_FORMAL_PLAN_PATH="$PLAN_PATH"
 export HUGINN_AUDIO_DYNAMIC30S_RECURRENT_CORE_RESHARD_AFTER_FORWARD_FALSE=1
 unset HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE0_AUDIT_DIR
 unset HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR
@@ -258,9 +348,9 @@ echo "run_root=$RUN_ROOT"
 echo "registry=$REGISTRY sampler=deterministic_hierarchical_no_replacement_v2 seed=$SEED start_position=$START_POSITION"
 echo "tasks=AAC_60_percent+ASR_40_percent prompts=task_specific"
 echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH accumulation=$GRADIENT_ACCUMULATION_STEPS global_batch=$GLOBAL_BATCH"
-echo "target_realized_hours_gt=$TARGET_HOURS planning_reserve_ratio=$PLANNING_RESERVE_RATIO"
+echo "target_realized_hours_gt=$TARGET_HOURS max_steps_policy=user_fixed_no_duration_estimation"
 echo "max_steps=$MAX_STEPS halfway_step=$HALFWAY_STEP total_scheduled_samples=$TOTAL_SAMPLES"
-echo "checkpoints=checkpoint-$HALFWAY_STEP,checkpoint-$MAX_STEPS save_total_limit=2 full_model_dcp=true"
+echo "checkpoints=$CHECKPOINT_STEPS_CSV checkpoint_interval=$CHECKPOINT_INTERVAL_FROM_PLAN save_total_limit=4 full_model_dcp=true"
 echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=160ms padding=local_batch_longest labels=-100"
 echo "whisper=fully_trainable aligner=fully_trainable huginn_backbone=frozen huginn_lora_only=true"
 echo "learning_rates=whisper:$WHISPER_LR,aligner:$ALIGNER_LR,lora:$LEARNING_RATE"
@@ -338,7 +428,7 @@ CMD+=(--lr_scheduler_type cosine --warmup_ratio "$WARMUP_RATIO" --weight_decay "
 CMD+=(--fsdp "$FSDP_CONFIG_PATH" --max_steps "$MAX_STEPS")
 CMD+=(--per_device_train_batch_size "$PER_DEVICE_BATCH" --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS")
 CMD+=(--gradient_checkpointing false --vit_gradient_checkpointing false --gradient_checkpointing_kwargs '{"use_reentrant": false}')
-CMD+=(--logging_steps "$LOGGING_STEPS" --save_strategy steps --save_steps "$HALFWAY_STEP" --save_total_limit 2)
+CMD+=(--logging_steps "$LOGGING_STEPS" --save_strategy steps --save_steps "$CHECKPOINT_INTERVAL_FROM_PLAN" --save_total_limit 4)
 CMD+=(--dataloader_num_workers 0 --dataloader_pin_memory false --dataset_num_proc 1)
 CMD+=(--save_only_model false --report_to "$REPORT_TO" --bf16 true --seed "$SEED" --data_seed "$SEED")
 CMD+=("${RESUME_ARGS[@]}")
@@ -356,69 +446,52 @@ if [ "$TRAIN_STATUS" -ne 0 ]; then
 fi
 stop_resource_monitor
 
-find_one_checkpoint() {
-  local root=$1
-  local step=$2
-  mapfile -t matches < <(find "$root" -type d -name "checkpoint-$step" -print | sort)
+IFS=',' read -r -a CHECKPOINT_STEPS <<< "$CHECKPOINT_STEPS_CSV"
+CHECKPOINT_PATHS=()
+OLD_CHECKPOINT_ROOT=""
+if [ -n "$RESUME_CHECKPOINT" ]; then
+  OLD_CHECKPOINT_ROOT="$(cd "$(dirname "$RESUME_CHECKPOINT")" && pwd)"
+fi
+for step in "${CHECKPOINT_STEPS[@]}"; do
+  mapfile -t matches < <(
+    {
+      find "$OUTPUT_DIR" -type d -name "checkpoint-$step" -print
+      if [ -n "$OLD_CHECKPOINT_ROOT" ]; then
+        find "$OLD_CHECKPOINT_ROOT" -maxdepth 1 -type d -name "checkpoint-$step" -print
+      fi
+    } | sort -u
+  )
   if [ "${#matches[@]}" -ne 1 ]; then
-    echo "Expected exactly one checkpoint-$step below $root; found ${#matches[@]}" >&2
+    echo "Expected exactly one retained checkpoint-$step across current/prior run roots; found ${#matches[@]}" >&2
     printf '  %s\n' "${matches[@]:-<none>}" >&2
     exit 1
   fi
-  printf '%s\n' "${matches[0]}"
-}
+  CHECKPOINT_PATHS+=("${matches[0]}")
+done
 
-FINAL_CHECKPOINT="$(find_one_checkpoint "$OUTPUT_DIR" "$MAX_STEPS")"
-if [ -n "$RESUME_CHECKPOINT" ]; then
-  HALF_CHECKPOINT="$RESUME_CHECKPOINT"
-  SURVIVING_NEW_CHECKPOINTS="$(find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print | wc -l)"
-  if [ "$SURVIVING_NEW_CHECKPOINTS" -ne 1 ]; then
-    echo "A resumed formal output must contain only the final checkpoint; found $SURVIVING_NEW_CHECKPOINTS" >&2
-    exit 1
+SURVIVING_NEW_CHECKPOINTS="$(find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print | wc -l)"
+EXPECTED_NEW_CHECKPOINTS=0
+for step in "${CHECKPOINT_STEPS[@]}"; do
+  if [ "$step" -gt "$RESUME_START_STEP" ]; then
+    EXPECTED_NEW_CHECKPOINTS=$((EXPECTED_NEW_CHECKPOINTS + 1))
   fi
-else
-  HALF_CHECKPOINT="$(find_one_checkpoint "$OUTPUT_DIR" "$HALFWAY_STEP")"
-  SURVIVING_CHECKPOINTS="$(find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print | wc -l)"
-  if [ "$SURVIVING_CHECKPOINTS" -ne 2 ]; then
-    echo "Fresh formal training must retain exactly two checkpoints; found $SURVIVING_CHECKPOINTS" >&2
-    exit 1
-  fi
+done
+if [ "$SURVIVING_NEW_CHECKPOINTS" -ne "$EXPECTED_NEW_CHECKPOINTS" ]; then
+  echo "Formal output checkpoint count mismatch: expected=$EXPECTED_NEW_CHECKPOINTS actual=$SURVIVING_NEW_CHECKPOINTS" >&2
+  exit 1
 fi
 
-python - "$FINAL_CHECKPOINT/audio_training_statistics.json" "$TARGET_HOURS" "$MAX_STEPS" "$TOTAL_SAMPLES" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-path = Path(sys.argv[1])
-target_hours = float(sys.argv[2])
-max_steps = int(sys.argv[3])
-total_samples = int(sys.argv[4])
-state = json.loads(path.read_text(encoding="utf-8"))
-if int(state.get("global_step", -1)) != max_steps:
-    raise SystemExit(f"Final statistics step mismatch: expected={max_steps} actual={state.get('global_step')}")
-if int(state.get("total_samples", -1)) != total_samples:
-    raise SystemExit(f"Final sample count mismatch: expected={total_samples} actual={state.get('total_samples')}")
-hours = float(state.get("total_effective_duration_hours", -1.0))
-if hours <= target_hours:
-    raise SystemExit(f"Formal run did not exceed {target_hours} realized hours: actual={hours}")
-pool_counts = {name: entry["sample_count"] for name, entry in state["pools"].items()}
-pool_hours = {name: entry["effective_duration_hours"] for name, entry in state["pools"].items()}
-print(f"[formal-final] global_step={max_steps} samples={total_samples} realized_hours={hours:.6f}")
-print(f"[formal-final] pool_sample_counts={pool_counts}")
-print(f"[formal-final] pool_effective_hours={pool_hours}")
-PY
-
-python -u "$CHECKPOINT_INSPECTOR" \
-  --save-checkpoint "$HALF_CHECKPOINT" \
-  --resume-checkpoint "$FINAL_CHECKPOINT" \
-  --save-step "$HALFWAY_STEP" \
-  --resume-step "$MAX_STEPS" \
-  --world-size "$WORLD_SIZE" \
+FORMAL_AUDIT_ARGS=(
+  --plan "$PLAN_PATH"
+  --world-size "$WORLD_SIZE"
   --output-report "$FINAL_AUDIT_REPORT"
+)
+for checkpoint_path in "${CHECKPOINT_PATHS[@]}"; do
+  FORMAL_AUDIT_ARGS+=(--checkpoint "$checkpoint_path")
+done
+python -u "$FORMAL_CHECKPOINT_INSPECTOR" "${FORMAL_AUDIT_ARGS[@]}"
 
 echo "========== HUGINN WHISPER DYNAMIC30S MULTITASK FORMAL FSDP4 PASSED =========="
-echo "half_checkpoint=$HALF_CHECKPOINT"
-echo "final_checkpoint=$FINAL_CHECKPOINT"
+echo "checkpoints=${CHECKPOINT_PATHS[*]}"
 echo "formal_plan=$PLAN_PATH"
 echo "checkpoint_audit=$FINAL_AUDIT_REPORT"

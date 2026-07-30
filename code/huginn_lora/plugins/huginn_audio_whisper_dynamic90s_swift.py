@@ -101,6 +101,8 @@ TRAINING_STATS_FORWARD_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_F
 TRAINING_STATS_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE"
 TRAINING_STATS_STATE_FILENAME = "audio_training_statistics.json"
 TRAINING_RUNTIME_CONTRACT_FILENAME = "huginn_training_runtime_contract.json"
+FORMAL_TRAINING_PLAN_PATH_ENV = "HUGINN_AUDIO_DYNAMIC30S_FORMAL_PLAN_PATH"
+FORMAL_TRAINING_PLAN_FILENAME = "formal_training_plan.json"
 TRAINING_STATS_VERSION = "huginn_dynamic30s_training_statistics_v2"
 SAMPLER_VERSION = "deterministic_hierarchical_no_replacement_v2"
 TRAINING_POOL_ORDER = (
@@ -1766,9 +1768,27 @@ def patch_training_statistics_callback() -> None:
         def __init__(self, tracked_model: torch.nn.Module):
             self.tracked_model = tracked_model
             self.formal_mode = os.environ.get(TRAINING_STATS_PHASE_ENV, "").strip() == "formal"
+            formal_plan_value = os.environ.get(FORMAL_TRAINING_PLAN_PATH_ENV, "").strip()
+            self.formal_plan_path = (
+                Path(formal_plan_value).expanduser().resolve()
+                if formal_plan_value
+                else None
+            )
+            if self.formal_mode:
+                if self.formal_plan_path is None or not self.formal_plan_path.is_file():
+                    raise RuntimeError(
+                        f"Formal training requires a frozen plan through {FORMAL_TRAINING_PLAN_PATH_ENV}: "
+                        f"{self.formal_plan_path}"
+                    )
+                self.formal_plan = json.loads(self.formal_plan_path.read_text(encoding="utf-8"))
+                if not isinstance(self.formal_plan, dict):
+                    raise TypeError(f"Formal training plan is not an object: {self.formal_plan_path}")
+            else:
+                self.formal_plan = None
             self.formal_gradient_audited = False
             self.formal_finite_loss_logs = 0
             self.formal_finite_grad_norm_logs = 0
+            self.formal_lora_runtime_audit: dict[str, Any] | None = None
             self.statistics_dir = Path(statistics_dir_value).expanduser().resolve()
             self.statistics_dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -1989,6 +2009,62 @@ def patch_training_statistics_callback() -> None:
                     f"state_step={self.base_global_step} trainer_step={state.global_step}"
                 )
             if self.formal_mode:
+                rank, world_size = self._identity()
+                del rank
+                global_batch = (
+                    world_size
+                    * int(args.per_device_train_batch_size)
+                    * int(args.gradient_accumulation_steps)
+                )
+                plan = self.formal_plan
+                max_steps = int(plan.get("max_steps", -1))
+                halfway_step = int(plan.get("halfway_step", -1))
+                checkpoint_steps = [int(value) for value in plan.get("checkpoint_steps", [])]
+                expected_plan = {
+                    "plan_version": "huginn_whisper_dynamic30s_fixed20k_formal_plan_v3",
+                    "step_policy": "user_fixed_20000_steps_no_duration_estimation",
+                    "sampler_version": SAMPLER_VERSION,
+                    "sampler_epoch_policy": (
+                        "per_pool_no_replacement_reshuffle_after_full_coverage"
+                    ),
+                    "sampler_seed": self.sampler_seed,
+                    "duration_policy": "retain_all_then_cap_at30s",
+                    "duration_estimate_used_for_max_steps": False,
+                    "world_size": world_size,
+                    "per_device_train_batch_size": int(args.per_device_train_batch_size),
+                    "gradient_accumulation_steps": int(args.gradient_accumulation_steps),
+                    "global_batch_size": global_batch,
+                    "max_steps": int(state.max_steps),
+                    "halfway_step": int(state.max_steps) // 2,
+                    "total_scheduled_samples": int(state.max_steps) * global_batch,
+                    "checkpoint_interval": 5000,
+                    "checkpoint_steps": [5000, 10000, 15000, 20000],
+                    "checkpoint_count": 4,
+                }
+                mismatches = {
+                    key: {"actual": plan.get(key), "expected": expected}
+                    for key, expected in expected_plan.items()
+                    if plan.get(key) != expected
+                }
+                if (
+                    mismatches
+                    or max_steps != 20000
+                    or halfway_step * 2 != max_steps
+                    or float(plan.get("target_realized_hours_minimum", -1.0)) != 3000.0
+                    or checkpoint_steps != [5000, 10000, 15000, 20000]
+                    or set(self.checkpoint_steps) != set(checkpoint_steps)
+                    or int(state.global_step) not in {0, *checkpoint_steps[:-1]}
+                ):
+                    raise RuntimeError(
+                        "Formal dynamic-30s frozen plan mismatch: "
+                        f"mismatches={mismatches} state_step={state.global_step} "
+                        f"checkpoint_steps={sorted(self.checkpoint_steps)} plan={plan}"
+                    )
+                if plan.get("pool_sizes") != self.pool_sizes:
+                    raise RuntimeError(
+                        f"Formal dynamic-30s pool sizes differ from the frozen plan: "
+                        f"plan={plan.get('pool_sizes')} runtime={self.pool_sizes}"
+                    )
                 optimizer_audit = _audit_optimizer_parameter_groups(
                     self.tracked_model,
                     kwargs.get("optimizer"),
@@ -1999,6 +2075,7 @@ def patch_training_statistics_callback() -> None:
                     self.tracked_model,
                     context="Formal dynamic-30s training",
                 )
+                self.formal_lora_runtime_audit = lora_audit
                 fsdp_audit = _audit_formal_fsdp_topology(self.tracked_model)
                 whisper_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
                 if bool(getattr(args, "vit_gradient_checkpointing", False)) or whisper_checkpoint_modules:
@@ -2101,6 +2178,108 @@ def patch_training_statistics_callback() -> None:
             if rank == 0:
                 checkpoint_dir = self._checkpoint_dir(args.output_dir, int(state.global_step))
                 _write_json_atomic(checkpoint_dir / TRAINING_STATS_STATE_FILENAME, payload)
+            if self.formal_mode:
+                step = int(state.global_step)
+                halfway_step = int(self.formal_plan["halfway_step"])
+                max_steps = int(self.formal_plan["max_steps"])
+                checkpoint_steps = [
+                    int(value) for value in self.formal_plan["checkpoint_steps"]
+                ]
+                if step not in checkpoint_steps:
+                    raise RuntimeError(
+                        f"Formal training attempted an undeclared checkpoint save at step {step}: "
+                        f"expected={checkpoint_steps}"
+                    )
+                checkpoint_index = checkpoint_steps.index(step) + 1
+                if step == max_steps:
+                    checkpoint_role = "final"
+                else:
+                    checkpoint_role = "scheduled"
+                internal_whisper = _whisper_gradient_checkpoint_modules(self.tracked_model)
+                checkpoint_wrappers = _audit_activation_checkpoint_wrappers(self.tracked_model)
+                outer_whisper = [
+                    wrapper
+                    for wrapper in checkpoint_wrappers
+                    if wrapper["contains_whisper_encoder"]
+                ]
+                if (
+                    internal_whisper
+                    or len(outer_whisper) != 1
+                    or not outer_whisper[0]["path"].endswith("audio_encoder.encoder")
+                    or "WhisperEncoder" not in outer_whisper[0]["inner_mro"]
+                ):
+                    raise RuntimeError(
+                        f"Formal checkpoint {checkpoint_role} Whisper checkpointing mismatch: "
+                        f"internal={internal_whisper} outer={outer_whisper}"
+                    )
+                for class_name in FSDP_UNIT_CLASS_NAMES:
+                    matching = [
+                        module
+                        for module in self.tracked_model.modules()
+                        if class_name in _module_mro_names(module)
+                    ]
+                    if len(matching) != 1:
+                        raise RuntimeError(
+                            f"Formal checkpoint {checkpoint_role} expected one {class_name}, "
+                            f"found {len(matching)}"
+                        )
+                    _assert_fsdp_reshard_state(
+                        matching[0],
+                        expected=class_name != "HuginnRecurrentCoreFSDPUnit",
+                        context=f"Formal checkpoint {checkpoint_role} {class_name}",
+                    )
+                lora_audit = _audit_lora_runtime_configuration(
+                    self.tracked_model,
+                    context=f"Formal checkpoint {checkpoint_role}",
+                )
+                formal_contract = {
+                    "checkpoint_role": checkpoint_role,
+                    "checkpoint_step": step,
+                    "checkpoint_index": checkpoint_index,
+                    "plan_version": self.formal_plan["plan_version"],
+                    "step_policy": self.formal_plan["step_policy"],
+                    "sampler_version": self.formal_plan["sampler_version"],
+                    "sampler_epoch_policy": self.formal_plan["sampler_epoch_policy"],
+                    "sampler_seed": int(self.formal_plan["sampler_seed"]),
+                    "duration_policy": self.formal_plan["duration_policy"],
+                    "duration_estimate_used_for_max_steps": False,
+                    "target_realized_hours_minimum": float(
+                        self.formal_plan["target_realized_hours_minimum"]
+                    ),
+                    "max_steps": max_steps,
+                    "halfway_step": halfway_step,
+                    "checkpoint_interval": int(
+                        self.formal_plan["checkpoint_interval"]
+                    ),
+                    "checkpoint_steps": checkpoint_steps,
+                    "checkpoint_count": int(self.formal_plan["checkpoint_count"]),
+                    "global_batch_size": int(self.formal_plan["global_batch_size"]),
+                    "total_scheduled_samples": int(
+                        self.formal_plan["total_scheduled_samples"]
+                    ),
+                }
+                contract = _build_dynamic30s_training_runtime_contract(
+                    phase=("formal_final" if checkpoint_role == "final" else "formal_checkpoint"),
+                    global_step=step,
+                    world_size=_world_size,
+                    lora_runtime_audit=lora_audit,
+                    formal_training=formal_contract,
+                )
+                if rank == 0:
+                    checkpoint_dir = self._checkpoint_dir(args.output_dir, step)
+                    _write_json_atomic(
+                        checkpoint_dir / TRAINING_RUNTIME_CONTRACT_FILENAME,
+                        contract,
+                    )
+                    _write_json_atomic(
+                        checkpoint_dir / FORMAL_TRAINING_PLAN_FILENAME,
+                        self.formal_plan,
+                    )
+                    print(
+                        "[formal-checkpoint-contract] "
+                        f"role={checkpoint_role} step={step} checkpoint={checkpoint_dir}",
+                        flush=True,
+                    )
             return control
 
         def on_train_end(self, args, state, control, **kwargs):
@@ -2582,6 +2761,68 @@ def _audit_lora_runtime_configuration(model: torch.nn.Module, *, context: str) -
         "adapters": adapters,
         "restricted_to_huginn_transformer": True,
     }
+
+
+def _build_dynamic30s_training_runtime_contract(
+    *,
+    phase: str,
+    global_step: int,
+    world_size: int,
+    lora_runtime_audit: dict[str, Any],
+    formal_training: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    contract = {
+        "gate": "huginn_whisper_dynamic30s_training_runtime_contract_v1",
+        "phase": phase,
+        "global_step": int(global_step),
+        "world_size": int(world_size),
+        "checkpointing": {
+            "fsdp_activation_checkpointing": True,
+            "whisper_internal_gradient_checkpointing": False,
+            "whisper_outer_activation_checkpointed": True,
+            "double_checkpoint_candidate": False,
+        },
+        "fsdp_reshard_after_forward": {
+            class_name: class_name != "HuginnRecurrentCoreFSDPUnit"
+            for class_name in FSDP_UNIT_CLASS_NAMES
+        },
+        "trainability": {
+            "whisper_encoder": True,
+            "audio_aligner": True,
+            "huginn_lora": True,
+            "huginn_native_backbone": False,
+        },
+        "learning_rates": {
+            "whisper_encoder": 1e-4,
+            "audio_aligner": 1e-4,
+            "huginn_lora": 1e-4,
+        },
+        "lora": {
+            "rank": int(lora_runtime_audit["rank"]),
+            "alpha": int(lora_runtime_audit["alpha"]),
+            "dropout": float(lora_runtime_audit["dropout"]),
+            "tensor_count": int(lora_runtime_audit["tensor_count"]),
+            "target_module_count": int(lora_runtime_audit["target_module_count"]),
+            "direct_lora_layer_count": int(lora_runtime_audit["direct_lora_layer_count"]),
+            "restricted_to_huginn_transformer": bool(
+                lora_runtime_audit["restricted_to_huginn_transformer"]
+            ),
+        },
+        "audio": {
+            "maximum_seconds": 30.0,
+            "token_duration_ms": 160,
+            "maximum_content_tokens": 187,
+            "trainable_boundary_tokens": ["audio_bos", "audio_eos"],
+        },
+        "loss": {
+            "type": "shifted_next_token_prediction",
+            "supervision": "assistant_response_only",
+            "audio_prefix_labels": -100,
+        },
+    }
+    if formal_training is not None:
+        contract["formal_training"] = formal_training
+    return contract
 
 
 def _audit_formal_fsdp_topology(model: torch.nn.Module) -> dict[str, Any]:
@@ -4603,57 +4844,12 @@ def patch_checkpoint_resume_callback() -> None:
                 )
             if rank == 0:
                 checkpoint_dir = Path(args.output_dir) / f"checkpoint-{int(state.global_step)}"
-                contract = {
-                    "gate": "huginn_whisper_dynamic30s_training_runtime_contract_v1",
-                    "phase": phase,
-                    "global_step": int(state.global_step),
-                    "world_size": world_size,
-                    "checkpointing": {
-                        "fsdp_activation_checkpointing": True,
-                        "whisper_internal_gradient_checkpointing": False,
-                        "whisper_outer_activation_checkpointed": True,
-                        "double_checkpoint_candidate": False,
-                    },
-                    "fsdp_reshard_after_forward": {
-                        class_name: class_name != "HuginnRecurrentCoreFSDPUnit"
-                        for class_name in FSDP_UNIT_CLASS_NAMES
-                    },
-                    "trainability": {
-                        "whisper_encoder": True,
-                        "audio_aligner": True,
-                        "huginn_lora": True,
-                        "huginn_native_backbone": False,
-                    },
-                    "learning_rates": {
-                        "whisper_encoder": 1e-4,
-                        "audio_aligner": 1e-4,
-                        "huginn_lora": 1e-4,
-                    },
-                    "lora": {
-                        "rank": int(self.lora_runtime_audit["rank"]),
-                        "alpha": int(self.lora_runtime_audit["alpha"]),
-                        "dropout": float(self.lora_runtime_audit["dropout"]),
-                        "tensor_count": int(self.lora_runtime_audit["tensor_count"]),
-                        "target_module_count": int(self.lora_runtime_audit["target_module_count"]),
-                        "direct_lora_layer_count": int(
-                            self.lora_runtime_audit["direct_lora_layer_count"]
-                        ),
-                        "restricted_to_huginn_transformer": bool(
-                            self.lora_runtime_audit["restricted_to_huginn_transformer"]
-                        ),
-                    },
-                    "audio": {
-                        "maximum_seconds": 30.0,
-                        "token_duration_ms": 160,
-                        "maximum_content_tokens": 187,
-                        "trainable_boundary_tokens": ["audio_bos", "audio_eos"],
-                    },
-                    "loss": {
-                        "type": "shifted_next_token_prediction",
-                        "supervision": "assistant_response_only",
-                        "audio_prefix_labels": -100,
-                    },
-                }
+                contract = _build_dynamic30s_training_runtime_contract(
+                    phase=phase,
+                    global_step=int(state.global_step),
+                    world_size=world_size,
+                    lora_runtime_audit=self.lora_runtime_audit,
+                )
                 _write_json_atomic(
                     checkpoint_dir / TRAINING_RUNTIME_CONTRACT_FILENAME,
                     contract,

@@ -2414,13 +2414,24 @@ wrapper and the real PEFT Linear. The audit now derives 33 targets from matched 
 separately requires 33 modules that directly register `lora_A`; delegated wrappers are not counted. No model topology,
 LoRA attachment, checkpoint state, or training behavior was changed by this correction.
 
-Formal training still targets more than `3000` realized, decoded, 30-second-capped hours, but max-step planning is now
-deliberately deferred until after the acceleration experiments and their FSDP4 smoke tests. WavCaps source metadata is
-not duration-complete, so the metadata-pool prerequisite must not fabricate a precise post-cap hour total. A separate
-duration-estimation gate will be run before formal training, after which the planner will add the agreed `5%` reserve,
-follow the exact deterministic pool-selection sequence, and round `max_steps` upward to an even multiple of `100`.
-The formal job will retain exactly two full-model checkpoints at halfway and completion. If final realized statistics do
-not exceed 3000 hours, the final checkpoint remains saved and the terminal audit exits with an error.
+Formal training is fixed by user instruction at exactly `20000` optimizer steps; no metadata-duration estimate is used
+to choose `max_steps`. With FSDP4, per-device batch `2`, and gradient accumulation `4`, the global batch is `32` and the
+run consumes exactly `640000` scheduled samples. It saves full model/optimizer/scheduler/RNG checkpoints every `5000`
+steps and retains exactly four: `checkpoint-5000`, `checkpoint-10000`, `checkpoint-15000`, and `checkpoint-20000`.
+The frozen plan records the deterministic per-pool sample counts at every checkpoint. Runtime and terminal audits verify
+the no-replacement-v2 sampler policy, exact resume position, cumulative sample/duration accounting, and all four
+checkpoint contracts. The terminal audit still reports whether actually decoded, 30-second-capped audio strictly
+exceeded `3000` hours. If it did not, all four checkpoints remain saved and audited, then the job exits with an error;
+it does not start an automatic continuation.
+
+Formal cold resume is allowed only from `checkpoint-5000`, `checkpoint-10000`, or `checkpoint-15000`. The prior
+checkpoint directory must contain one unbranched sequence through the selected step, and the new run root must be fresh:
+
+```bash
+HUGINN_AUDIO_DYNAMIC90S_FORMAL_RESUME_CHECKPOINT=/absolute/path/to/checkpoint-10000 \
+HUGINN_AUDIO_DYNAMIC90S_FORMAL_RUN_ROOT=/absolute/path/to/new-resume-run \
+bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
+```
 
 The full Torch Profiler route is paused after a Kineto/native `SIGSEGV` on the old recurrent dynamic-90s workload and is
 not part of the current launch sequence.
