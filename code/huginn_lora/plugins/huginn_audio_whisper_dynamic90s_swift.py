@@ -149,6 +149,7 @@ ALIGNER_PREFIXES = (
     "audio_bos",
     "audio_eos",
 )
+AUDIO_BOUNDARY_PARAMETER_NAMES = ("audio_bos", "audio_eos")
 
 
 def normalize_parameter_name(name: str) -> str:
@@ -167,6 +168,16 @@ def normalize_parameter_name(name: str) -> str:
 
 def is_aligner_parameter_name(name: str) -> bool:
     return normalize_parameter_name(name).startswith(ALIGNER_PREFIXES)
+
+
+def audio_boundary_parameter_name(name: str) -> str | None:
+    normalized = normalize_parameter_name(name)
+    for boundary_name in AUDIO_BOUNDARY_PARAMETER_NAMES:
+        if normalized == boundary_name or normalized.endswith(
+            f"audio_boundary_embeddings.{boundary_name}"
+        ):
+            return boundary_name
+    return None
 
 MODEL_TYPE = "huginn_audio_whisper_dynamic90s"
 TEMPLATE_TYPE = "huginn_audio_whisper_dynamic90s"
@@ -2188,6 +2199,10 @@ def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) ->
         for name in ("lora", "aligner", "audio_encoder", "huginn_base", "other")
     }
     gradient_tensor_counts = {name: 0 for name in scalar_flags}
+    boundary_gradients = {
+        name: {"gradient_tensors": 0, "finite_gradient_tensors": 0, "nonzero_gradient_tensors": 0}
+        for name in AUDIO_BOUNDARY_PARAMETER_NAMES
+    }
     for name, parameter in model.named_parameters():
         gradient = parameter.grad
         if gradient is None:
@@ -2197,8 +2212,15 @@ def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) ->
         if local_gradient.numel() == 0:
             continue
         gradient_tensor_counts[group] += 1
-        scalar_flags[group]["finite"].append(torch.isfinite(local_gradient).all())
-        scalar_flags[group]["nonzero"].append(torch.count_nonzero(local_gradient).gt(0))
+        finite = torch.isfinite(local_gradient).all()
+        nonzero = torch.count_nonzero(local_gradient).gt(0)
+        scalar_flags[group]["finite"].append(finite)
+        scalar_flags[group]["nonzero"].append(nonzero)
+        boundary_name = audio_boundary_parameter_name(name)
+        if boundary_name is not None:
+            boundary_gradients[boundary_name]["gradient_tensors"] += 1
+            boundary_gradients[boundary_name]["finite_gradient_tensors"] += int(finite.item())
+            boundary_gradients[boundary_name]["nonzero_gradient_tensors"] += int(nonzero.item())
 
     result: dict[str, dict[str, int]] = {}
     for group, flags in scalar_flags.items():
@@ -2224,6 +2246,24 @@ def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) ->
         or result["other"]["gradient_tensors"] != 0
     ):
         raise RuntimeError(f"{context} gradient ownership mismatch: {result}")
+    invalid_boundaries = {
+        name: audit
+        for name, audit in boundary_gradients.items()
+        if audit != {
+            "gradient_tensors": 1,
+            "finite_gradient_tensors": 1,
+            "nonzero_gradient_tensors": 1,
+        }
+    }
+    if invalid_boundaries:
+        raise RuntimeError(
+            f"{context} audio boundary gradient mismatch: "
+            f"invalid={invalid_boundaries} all={boundary_gradients}"
+        )
+    result["audio_boundaries"] = {
+        name: audit["nonzero_gradient_tensors"]
+        for name, audit in boundary_gradients.items()
+    }
     return result
 
 
@@ -2242,6 +2282,14 @@ def _audit_optimizer_parameter_groups(
         for name, parameter in model.named_parameters()
         if parameter.requires_grad
     }
+    expected_boundary_parameter_ids = {name: set() for name in AUDIO_BOUNDARY_PARAMETER_NAMES}
+    for parameter_name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        boundary_name = audio_boundary_parameter_name(parameter_name)
+        if boundary_name is not None:
+            expected_boundary_parameter_ids[boundary_name].add(id(parameter))
+    observed_boundary_parameter_ids = {name: set() for name in AUDIO_BOUNDARY_PARAMETER_NAMES}
     observed_counts = {name: 0 for name in ("lora", "aligner", "audio_encoder", "huginn_base", "other")}
     group_audits: list[dict[str, Any]] = []
     for index, optimizer_group in enumerate(optimizer.param_groups):
@@ -2254,6 +2302,10 @@ def _audit_optimizer_parameter_groups(
                 continue
             counts[group] += 1
             observed_counts[group] += 1
+            parameter_id = id(parameter)
+            for boundary_name, expected_ids in expected_boundary_parameter_ids.items():
+                if parameter_id in expected_ids:
+                    observed_boundary_parameter_ids[boundary_name].add(parameter_id)
         learning_rate = float(optimizer_group["lr"])
         configured_learning_rate = float(optimizer_group.get("initial_lr", learning_rate))
         learning_rate_valid = abs(configured_learning_rate - expected_learning_rate) <= 1e-12
@@ -2293,6 +2345,24 @@ def _audit_optimizer_parameter_groups(
         or observed_counts["other"] != 0
     ):
         raise RuntimeError(f"{context} optimizer ownership mismatch: {observed_counts}")
+    boundary_optimizer_counts = {
+        name: len(parameter_ids)
+        for name, parameter_ids in observed_boundary_parameter_ids.items()
+    }
+    expected_boundary_counts = {
+        name: len(parameter_ids)
+        for name, parameter_ids in expected_boundary_parameter_ids.items()
+    }
+    if (
+        expected_boundary_counts != {"audio_bos": 1, "audio_eos": 1}
+        or boundary_optimizer_counts != expected_boundary_counts
+    ):
+        raise RuntimeError(
+            f"{context} audio boundary optimizer coverage mismatch: "
+            f"observed={boundary_optimizer_counts} expected={expected_boundary_counts}"
+        )
+    for audit in group_audits:
+        audit["audio_boundary_parameter_counts"] = boundary_optimizer_counts
     return group_audits
 
 

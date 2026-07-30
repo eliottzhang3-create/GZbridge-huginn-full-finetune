@@ -20,6 +20,7 @@ ALIGNER_PREFIXES = (
     "audio_bos",
     "audio_eos",
 )
+AUDIO_BOUNDARY_PARAMETER_NAMES = ("audio_bos", "audio_eos")
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,6 +67,16 @@ def classify_key(key: str) -> str:
     if any(alias.startswith(("transformer.", "lm_head.")) for alias in aliases):
         return "huginn_base"
     return "other"
+
+
+def audio_boundary_key_name(key: str) -> str | None:
+    for alias in key_aliases(key):
+        for boundary_name in AUDIO_BOUNDARY_PARAMETER_NAMES:
+            if alias == boundary_name or alias.endswith(
+                f"audio_boundary_embeddings.{boundary_name}"
+            ):
+                return boundary_name
+    return None
 
 
 def classify_optimizer_key(key: str) -> str:
@@ -118,6 +129,11 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
         key = str(raw_key)
         grouped[classify_key(key)].append(key)
     counts = {name: len(keys) for name, keys in grouped.items()}
+    boundary_keys = {name: [] for name in AUDIO_BOUNDARY_PARAMETER_NAMES}
+    for key in grouped["aligner"]:
+        boundary_name = audio_boundary_key_name(key)
+        if boundary_name is not None:
+            boundary_keys[boundary_name].append(key)
     if (
         counts["lora"] != 66
         or counts["aligner"] < 14
@@ -128,6 +144,14 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
         raise RuntimeError(
             f"Full-model checkpoint contract mismatch at {checkpoint}: actual={counts} "
             f"other_preview={grouped['other'][:10]}"
+        )
+    invalid_boundary_keys = {
+        name: keys for name, keys in boundary_keys.items() if len(keys) != 1
+    }
+    if invalid_boundary_keys:
+        raise RuntimeError(
+            f"Audio boundary checkpoint contract mismatch at {checkpoint}: "
+            f"invalid={invalid_boundary_keys} all={boundary_keys}"
         )
 
     trainer_state = load_json(checkpoint / "trainer_state.json")
@@ -198,6 +222,7 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
         "state_metadata": state_metadata,
         "grouped_keys": grouped,
         "counts": counts,
+        "audio_boundary_keys": boundary_keys,
         "scheduler_last_epoch": scheduler_last_epoch,
         "rng_files": [str(path) for path in rng_files],
         "optimizer_dcp_dirs": [str(path) for path in optimizer_dcp_dirs],
@@ -232,6 +257,10 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
     unchanged = {name: 0 for name in GROUP_NAMES}
     max_abs_delta = {name: 0.0 for name in GROUP_NAMES}
     dtypes: dict[str, set[str]] = {name: set() for name in GROUP_NAMES}
+    boundary_changes = {
+        name: {"changed": 0, "unchanged": 0, "max_abs_delta": 0.0}
+        for name in AUDIO_BOUNDARY_PARAMETER_NAMES
+    }
     for index, key in enumerate(sorted(saved_metadata), start=1):
         left = load_one_tensor(saved["model_dir"], str(key), saved_metadata[key])
         right = load_one_tensor(resumed["model_dir"], str(key), resumed_metadata[key])
@@ -244,10 +273,17 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
         dtypes[group].add(str(left.dtype))
         if torch.equal(left, right):
             unchanged[group] += 1
+            boundary_name = audio_boundary_key_name(str(key))
+            if boundary_name is not None:
+                boundary_changes[boundary_name]["unchanged"] += 1
         else:
             changed[group] += 1
             tensor_delta = float((left.float() - right.float()).abs().max().item())
             max_abs_delta[group] = max(max_abs_delta[group], tensor_delta)
+            boundary_name = audio_boundary_key_name(str(key))
+            if boundary_name is not None:
+                boundary_changes[boundary_name]["changed"] += 1
+                boundary_changes[boundary_name]["max_abs_delta"] = tensor_delta
         del left, right
         if index == 1 or index % 20 == 0 or index == len(saved_metadata):
             print(f"[compare-progress] tensors={index}/{len(saved_metadata)}", flush=True)
@@ -256,6 +292,7 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
         "unchanged": unchanged,
         "max_abs_delta": max_abs_delta,
         "dtypes": {name: sorted(values) for name, values in dtypes.items()},
+        "audio_boundary_changes": boundary_changes,
     }
     print(f"[model-change-summary] {comparison_summary}")
     if (
@@ -264,6 +301,10 @@ def compare_model_states(saved: dict[str, Any], resumed: dict[str, Any]) -> dict
         or changed["audio_encoder"] <= 0
         or changed["huginn_base"] != 0
         or changed["other"] != 0
+        or any(
+            audit["changed"] != 1 or audit["unchanged"] != 0 or audit["max_abs_delta"] <= 0.0
+            for audit in boundary_changes.values()
+        )
     ):
         raise RuntimeError(
             "Cold-resume updates do not match Whisper+aligner+LoRA trainability: "
