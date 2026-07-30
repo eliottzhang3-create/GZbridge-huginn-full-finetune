@@ -180,14 +180,28 @@ def validate_data_window(
     end_position: int,
     planner: DeterministicHierarchicalMixture,
     pools: dict[str, Any],
+    max_prefetched_positions: int,
 ) -> Counter[str]:
     expected_positions = list(range(start_position, end_position))
     actual_positions = [int(record["global_position"]) for record in records]
     position_counts = Counter(actual_positions)
-    if sorted(position_counts) != expected_positions:
+    unique_positions = sorted(position_counts)
+    contiguous_positions = list(range(start_position, start_position + len(unique_positions)))
+    if unique_positions != contiguous_positions:
         raise AssertionError(
-            f"Phase {phase} unique data positions mismatch: "
-            f"expected={expected_positions} actual={sorted(position_counts)}"
+            f"Phase {phase} template-encoded positions are not contiguous from {start_position}: "
+            f"actual={unique_positions}"
+        )
+    if unique_positions[: len(expected_positions)] != expected_positions:
+        raise AssertionError(
+            f"Phase {phase} consumed data prefix mismatch: "
+            f"expected={expected_positions} actual_prefix={unique_positions[:len(expected_positions)]}"
+        )
+    prefetched_positions = unique_positions[len(expected_positions):]
+    if len(prefetched_positions) > max_prefetched_positions:
+        raise AssertionError(
+            f"Phase {phase} encoded too many unconsumed prefetch positions: "
+            f"maximum={max_prefetched_positions} actual={prefetched_positions}"
         )
     multiplicities = set(position_counts.values())
     if len(multiplicities) != 1 or not multiplicities.issubset({1, 2}):
@@ -215,7 +229,8 @@ def validate_data_window(
                 f"first={previous_provenance} duplicate={current_provenance}"
             )
     pool_counts: Counter[str] = Counter()
-    for position in expected_positions:
+    prefetched_pool_counts: Counter[str] = Counter()
+    for position in unique_positions:
         record = unique_records[position]
         position = int(record["global_position"])
         selection = planner.selection(position)
@@ -230,11 +245,16 @@ def validate_data_window(
             raise AssertionError(
                 f"Phase {phase} data provenance mismatch at position {position}: actual={actual} expected={expected}"
             )
-        pool_counts[selection.pool_name] += 1
+        if position < end_position:
+            pool_counts[selection.pool_name] += 1
+        else:
+            prefetched_pool_counts[selection.pool_name] += 1
     print(
         f"[data-window] phase={phase} positions={start_position}..{end_position - 1} "
         f"unique_records={len(unique_records)} raw_encode_records={len(records)} "
-        f"encode_multiplicity={next(iter(multiplicities))} pool_counts={dict(pool_counts)}"
+        f"encode_multiplicity={next(iter(multiplicities))} pool_counts={dict(pool_counts)} "
+        f"unconsumed_prefetch_positions={prefetched_positions} "
+        f"unconsumed_prefetch_pool_counts={dict(prefetched_pool_counts)}"
     )
     return pool_counts
 
@@ -273,6 +293,7 @@ def main() -> None:
             args.save_step * args.world_size,
             planner,
             pools,
+            max_prefetched_positions=2 * args.world_size,
         )
         resume_counts = validate_data_window(
             resume_records,
@@ -281,6 +302,7 @@ def main() -> None:
             args.resume_step * args.world_size,
             planner,
             pools,
+            max_prefetched_positions=2 * args.world_size,
         )
     print(
         f"[process-groups] save_launch={sorted(save_launch_ids)} resume_launch={sorted(resume_launch_ids)} "

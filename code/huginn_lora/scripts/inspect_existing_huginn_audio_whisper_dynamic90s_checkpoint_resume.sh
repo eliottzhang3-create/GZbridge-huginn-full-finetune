@@ -68,6 +68,7 @@ echo "run_root=$RUN_ROOT"
 echo "save_checkpoint=$SAVE_CHECKPOINT"
 echo "resume_checkpoint=$RESUME_CHECKPOINT"
 
+set +e
 python -u "$MARKER_INSPECTOR" \
   --save-audit-dir "$SAVE_AUDIT_DIR" \
   --resume-audit-dir "$RESUME_AUDIT_DIR" \
@@ -77,6 +78,7 @@ python -u "$MARKER_INSPECTOR" \
   --save-step "$SAVE_STEP" \
   --resume-step "$RESUME_STEP" \
   --world-size "$WORLD_SIZE"
+MARKER_STATUS=$?
 
 python -u "$CHECKPOINT_INSPECTOR" \
   --save-checkpoint "$SAVE_CHECKPOINT" \
@@ -85,7 +87,14 @@ python -u "$CHECKPOINT_INSPECTOR" \
   --resume-step "$RESUME_STEP" \
   --world-size "$WORLD_SIZE" \
   --output-report "$CONTENT_REPORT"
+CHECKPOINT_STATUS=$?
+set -e
+
+echo "[audit-status] markers=$MARKER_STATUS checkpoint_content=$CHECKPOINT_STATUS"
+if [ "$MARKER_STATUS" -ne 0 ] || [ "$CHECKPOINT_STATUS" -ne 0 ]; then
+  echo "========== HUGINN WHISPER DYNAMIC90S EXISTING CHECKPOINT AUDIT FAILED ==========" >&2
+  exit 1
+fi
 
 echo "========== HUGINN WHISPER DYNAMIC90S EXISTING CHECKPOINT AUDIT PASSED =========="
 echo "content_report=$CONTENT_REPORT"
-

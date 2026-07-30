@@ -2353,8 +2353,11 @@ gate so the first phase cannot decay to zero before the resumed updates.
 The first checkpoint smoke completed both four-rank training phases and produced checkpoint `4` and checkpoint `6`.
 Its initial post-run marker audit exposed that Swift 4.1.3 calls template encoding twice for each streaming row. The
 data audit now requires a uniform encode multiplicity of one or two, requires duplicate pool/task/uid provenance to be
-identical, and only then collapses records by global mixture position. This does not relax the independent per-rank
-model-consumption counters. The completed run can be audited without repeating training by submitting
+identical, and only then collapses records by global mixture position. Because Accelerate's ordered
+`DataLoaderDispatcher` can prepare later batches before Trainer stops, the audit treats only a bounded, contiguous
+suffix after the exact consumed window as unconsumed prefetch; it still requires the consumed positions to be the
+strict prefix starting at the configured restart position. This does not relax the independent per-rank
+forward/model-consumption counters. The completed run can be audited without repeating training by submitting
 `code/huginn_lora/run_inspect_existing_huginn_audio_whisper_dynamic90s_checkpoint_resume_5090.sh` with
 `HUGINN_AUDIO_DYNAMIC90S_EXISTING_CHECKPOINT_RUN_ROOT` set to its existing run directory. That posthoc job performs no
 audio decode or model forward; it validates the saved markers and reads the FSDP DCP checkpoints to compare LoRA and
