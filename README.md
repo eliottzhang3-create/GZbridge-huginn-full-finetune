@@ -2410,9 +2410,49 @@ The checkpoint job still refuses to start unless the no-replacement v2 report ha
 short smoke so the audit can prove four-rank aggregation, exact save/resume continuity, zero cross-checkpoint repeats,
 and exclusion of the template/prefetch-only rows.
 
-Formal-training constraints already fixed by the user, but not yet implemented or launched:
+Formal-training constraints fixed by the user:
 
 - train for more than `4000` realized source-audio hours;
 - retain exactly two formal checkpoints, one at half of the final global-step count and one at completion;
 - before formal training, pass a four-GPU FSDP checkpoint smoke that saves, exits all training processes, starts a new
   process group, resumes model/optimizer/scheduler/RNG/data position, and then performs additional finite updates.
+
+The four-GPU checkpoint save/cold-resume smoke has now passed. Formal training is implemented but has not been launched:
+
+- step planner: `code/huginn_lora/scripts/plan_huginn_whisper_dynamic90s_formal_training.py`;
+- runtime: `code/huginn_lora/scripts/train_huginn_audio_whisper_dynamic90s_multitask_fsdp4.sh`;
+- submit wrapper: `code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh`.
+
+The planner reads the remote `pool_registry.json`, uses the fixed source-pool hours (`6500/136/24/2498.217`) and the
+deterministic sampler's exact pool selections, adds a `5%` planning reserve above `4000` hours, and rounds the optimizer
+step count upward to an even multiple of `100`. With the currently known pool sizes this is approximately `17800`
+steps, so the expected checkpoints are approximately `checkpoint-8900` and `checkpoint-17800`; the generated
+`formal_training_plan.json` is authoritative for the exact remote values. Duration estimates never replace runtime
+accounting: the final gate requires `audio_training_statistics.json` to report more than `4000` actually decoded,
+90-second-capped hours.
+
+Formal topology is the passed worst-case-memory configuration: four GPUs, per-device batch `2`, gradient accumulation
+`4`, global batch `32`, fully trainable Whisper and aligner at `1e-4`, Huginn-only rank-8/alpha-16/dropout-0.05 LoRA at
+`1e-4`, frozen native Huginn backbone, cosine schedule with `5%` warmup, and the five coarse FSDP units with
+`reshard_after_forward=true`. Whisper and FSDP activation checkpointing remain enabled. The job retains exactly the
+halfway and final full-model DCP checkpoints and writes cumulative sample/hour ratios every `100` steps.
+
+The formal first-forward audit requires response-only contiguous labels, full audio-prefix `-100` masking, shifted NTP
+(`logits[:, :-1]` against `labels[:, 1:]`), the exact optimizer ownership split, all trainables sharded as DTensors,
+active Whisper gradient checkpointing, and nonzero finite first-update gradients in Whisper, aligner, and LoRA only.
+The final checkpoint audit requires Whisper/aligner/LoRA changes, an unchanged Huginn backbone, complete optimizer,
+scheduler, RNG, and cumulative statistics state.
+
+Fresh formal submission must use the wrapper:
+
+```bash
+bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
+```
+
+To cold-resume from the generated halfway checkpoint, submit a new job and a new run root:
+
+```bash
+HUGINN_AUDIO_DYNAMIC90S_FORMAL_RESUME_CHECKPOINT=/absolute/path/to/checkpoint-HALF \
+HUGINN_AUDIO_DYNAMIC90S_FORMAL_RUN_ROOT=/absolute/path/to/new-resume-run \
+bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
+```

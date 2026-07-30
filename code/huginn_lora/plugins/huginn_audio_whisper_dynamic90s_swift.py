@@ -370,13 +370,48 @@ def patch_huginn_audio_shift_loss(model):
             supervised_token_count = int((shift_labels != -100).sum().item())
             if supervised_token_count <= 0:
                 raise RuntimeError("NTP shift loss has no supervised target tokens")
+            if not torch.is_tensor(input_ids) or input_ids.shape != labels.shape:
+                raise RuntimeError(
+                    "Response-only label audit requires text input_ids and labels with identical shapes: "
+                    f"input_ids={getattr(input_ids, 'shape', None)} labels={tuple(labels.shape)}"
+                )
+            response_spans = []
+            for row_index in range(labels.size(0)):
+                row_labels = labels[row_index]
+                supervised = row_labels.ne(-100).nonzero(as_tuple=False).flatten()
+                if supervised.numel() == 0:
+                    raise RuntimeError(f"Text sample {row_index} has no supervised response tokens")
+                first = int(supervised[0].item())
+                last = int(supervised[-1].item())
+                if first <= 0:
+                    raise RuntimeError(
+                        f"Text sample {row_index} supervises the prompt/BOS region: first_target={first}"
+                    )
+                expected = torch.arange(first, last + 1, device=supervised.device)
+                if not torch.equal(supervised, expected):
+                    raise RuntimeError(
+                        f"Text sample {row_index} response labels are not one contiguous span: "
+                        f"first={first} last={last} count={supervised.numel()}"
+                    )
+                if not bool(row_labels[:first].eq(-100).all().item()):
+                    raise RuntimeError(f"Text sample {row_index} has a supervised system/user prompt token")
+                if not bool(row_labels[last + 1:].eq(-100).all().item()):
+                    raise RuntimeError(f"Text sample {row_index} has a supervised right-padding token")
+                if not torch.equal(
+                    row_labels[first:last + 1],
+                    input_ids[row_index, first:last + 1].to(row_labels.device),
+                ):
+                    raise RuntimeError(
+                        f"Text sample {row_index} response labels do not match the same-position input tokens"
+                    )
+                response_spans.append((first, last, int(supervised.numel())))
             print(
                 "[HuginnAudioSwift] train_chain_audit_ntp "
                 f"text_input_ids={tuple(input_ids.shape) if torch.is_tensor(input_ids) else None} "
                 f"audio_features={tuple(audio_input_features.shape) if torch.is_tensor(audio_input_features) else None} "
                 f"logits={tuple(logits.shape)} prefix_tokens={prefix_token_count} "
                 f"shift_logits={tuple(shift_logits.shape)} shift_labels={tuple(shift_labels.shape)} "
-                f"supervised_tokens={supervised_token_count}"
+                f"supervised_tokens={supervised_token_count} response_spans={response_spans}"
             )
             self._huginn_audio_shift_loss_audit_logged = True
 
@@ -389,8 +424,8 @@ def patch_huginn_audio_shift_loss(model):
         else:
             loss = logits.new_tensor(0.0)
 
-        if os.environ.get(STAGE5_AUDIT_DIR_ENV, "").strip() and not bool(torch.isfinite(loss).item()):
-            raise RuntimeError(f"Stage 5 observed a non-finite raw training loss: {loss.detach()}")
+        if self.training and audit_requested and not bool(torch.isfinite(loss).item()):
+            raise RuntimeError(f"Dynamic-90s train-chain audit observed a non-finite raw loss: {loss.detach()}")
 
         outputs.loss = loss
         if hasattr(outputs, "log_ppl"):
@@ -1673,6 +1708,10 @@ def patch_training_statistics_callback() -> None:
 
         def __init__(self, tracked_model: torch.nn.Module):
             self.tracked_model = tracked_model
+            self.formal_mode = os.environ.get(TRAINING_STATS_PHASE_ENV, "").strip() == "formal"
+            self.formal_gradient_audited = False
+            self.formal_finite_loss_logs = 0
+            self.formal_finite_grad_norm_logs = 0
             self.statistics_dir = Path(statistics_dir_value).expanduser().resolve()
             self.statistics_dir.mkdir(parents=True, exist_ok=True)
             try:
@@ -1881,7 +1920,6 @@ def patch_training_statistics_callback() -> None:
             return matches[0]
 
         def on_train_begin(self, args, state, control, **kwargs):
-            del args, kwargs
             expected_start = int(os.environ.get("HUGINN_DYNAMIC90S_MIXTURE_START_POSITION", "0"))
             if sum(self.base_counts) != expected_start:
                 raise RuntimeError(
@@ -1893,6 +1931,54 @@ def patch_training_statistics_callback() -> None:
                     "Training statistics checkpoint step mismatch: "
                     f"state_step={self.base_global_step} trainer_step={state.global_step}"
                 )
+            if self.formal_mode:
+                optimizer_audit = _audit_optimizer_parameter_groups(
+                    self.tracked_model,
+                    kwargs.get("optimizer"),
+                    context="Formal dynamic-90s training",
+                    allow_scheduled_learning_rate=True,
+                )
+                fsdp_audit = _audit_formal_fsdp_topology(self.tracked_model)
+                whisper_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
+                if not bool(getattr(args, "vit_gradient_checkpointing", False)) or not whisper_checkpoint_modules:
+                    raise RuntimeError(
+                        "Formal dynamic-90s training requires active Whisper gradient checkpointing: "
+                        f"arg={getattr(args, 'vit_gradient_checkpointing', None)} "
+                        f"modules={whisper_checkpoint_modules}"
+                    )
+                print(
+                    "[formal-runtime-audit] "
+                    f"optimizer_groups={optimizer_audit} fsdp={fsdp_audit} "
+                    f"whisper_gradient_checkpoint_modules={whisper_checkpoint_modules}",
+                    flush=True,
+                )
+            return control
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            if self.formal_mode and not self.formal_gradient_audited:
+                gradients = _audit_local_trainable_gradients(
+                    self.tracked_model,
+                    context="Formal dynamic-90s first optimizer update",
+                )
+                print(f"[formal-runtime-audit] first_update_gradients={gradients}", flush=True)
+                self.formal_gradient_audited = True
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, state, kwargs
+            if not self.formal_mode or not logs:
+                return control
+            for key in ("loss", "grad_norm"):
+                if key not in logs:
+                    continue
+                value = float(logs[key])
+                if not math.isfinite(value):
+                    raise RuntimeError(f"Formal dynamic-90s training logged non-finite {key}: {value}")
+                if key == "loss":
+                    self.formal_finite_loss_logs += 1
+                else:
+                    self.formal_finite_grad_norm_logs += 1
             return control
 
         def on_step_end(self, args, state, control, **kwargs):
@@ -1922,6 +2008,17 @@ def patch_training_statistics_callback() -> None:
 
         def on_train_end(self, args, state, control, **kwargs):
             del args, kwargs
+            if self.formal_mode and (
+                not self.formal_gradient_audited
+                or self.formal_finite_loss_logs <= 0
+                or self.formal_finite_grad_norm_logs <= 0
+            ):
+                raise RuntimeError(
+                    "Formal dynamic-90s runtime audits were incomplete: "
+                    f"gradients={self.formal_gradient_audited} "
+                    f"finite_loss_logs={self.formal_finite_loss_logs} "
+                    f"finite_grad_norm_logs={self.formal_finite_grad_norm_logs}"
+                )
             self._emit(int(state.global_step), "train_end")
             return control
 
@@ -2136,6 +2233,7 @@ def _audit_optimizer_parameter_groups(
     *,
     context: str,
     expected_learning_rate: float = 1e-4,
+    allow_scheduled_learning_rate: bool = False,
 ) -> list[dict[str, Any]]:
     if optimizer is None:
         raise RuntimeError(f"{context} received no optimizer")
@@ -2157,16 +2255,27 @@ def _audit_optimizer_parameter_groups(
             counts[group] += 1
             observed_counts[group] += 1
         learning_rate = float(optimizer_group["lr"])
-        if abs(learning_rate - expected_learning_rate) > 1e-12:
+        configured_learning_rate = float(optimizer_group.get("initial_lr", learning_rate))
+        learning_rate_valid = abs(configured_learning_rate - expected_learning_rate) <= 1e-12
+        if allow_scheduled_learning_rate:
+            learning_rate_valid = learning_rate_valid and 0.0 <= learning_rate <= expected_learning_rate + 1e-12
+        else:
+            learning_rate_valid = learning_rate_valid and abs(learning_rate - expected_learning_rate) <= 1e-12
+        if not learning_rate_valid:
             raise RuntimeError(
-                f"{context} optimizer group {index} has LR {learning_rate}, "
-                f"expected {expected_learning_rate}: counts={counts}"
+                f"{context} optimizer group {index} has current/configured LR "
+                f"{learning_rate}/{configured_learning_rate}, expected base {expected_learning_rate}: counts={counts}"
             )
         if unknown_parameters:
             raise RuntimeError(
                 f"{context} optimizer group {index} contains {unknown_parameters} unknown parameters"
             )
-        group_audits.append({"index": index, "learning_rate": learning_rate, "parameter_counts": counts})
+        group_audits.append({
+            "index": index,
+            "learning_rate": learning_rate,
+            "configured_learning_rate": configured_learning_rate,
+            "parameter_counts": counts,
+        })
 
     expected_counts = {name: 0 for name in observed_counts}
     for group in parameter_groups_by_id.values():
@@ -2185,6 +2294,62 @@ def _audit_optimizer_parameter_groups(
     ):
         raise RuntimeError(f"{context} optimizer ownership mismatch: {observed_counts}")
     return group_audits
+
+
+def _audit_formal_fsdp_topology(model: torch.nn.Module) -> dict[str, Any]:
+    """Require the already-smoked five-unit FSDP2 topology in formal training."""
+
+    def is_dtensor(parameter: torch.Tensor) -> bool:
+        return all(hasattr(parameter, attribute) for attribute in ("device_mesh", "placements", "to_local"))
+
+    trainable_counts = {name: 0 for name in ("lora", "aligner", "audio_encoder", "huginn_base", "other")}
+    trainable_dtensors = 0
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        group = _training_parameter_group(name)
+        trainable_counts[group] += 1
+        trainable_dtensors += int(is_dtensor(parameter))
+    expected_trainable_total = sum(trainable_counts.values())
+    if (
+        trainable_counts["lora"] != 66
+        or trainable_counts["aligner"] != 14
+        or trainable_counts["audio_encoder"] <= 0
+        or trainable_counts["huginn_base"] != 0
+        or trainable_counts["other"] != 0
+        or trainable_dtensors != expected_trainable_total
+    ):
+        raise RuntimeError(
+            "Formal dynamic-90s FSDP trainable split is invalid: "
+            f"counts={trainable_counts} dtensors={trainable_dtensors}/{expected_trainable_total}"
+        )
+
+    units: dict[str, dict[str, int]] = {}
+    for class_name in FSDP_UNIT_CLASS_NAMES:
+        matching = [
+            module
+            for module in model.modules()
+            if any(base.__name__ == class_name for base in type(module).__mro__)
+        ]
+        if len(matching) != 1:
+            raise RuntimeError(f"Formal training expected one {class_name}, found {len(matching)}")
+        parameters = list(matching[0].parameters())
+        dtensor_count = sum(is_dtensor(parameter) for parameter in parameters)
+        if not parameters or dtensor_count != len(parameters):
+            raise RuntimeError(
+                f"Formal FSDP unit is not completely sharded: class={class_name} "
+                f"parameters={len(parameters)} dtensors={dtensor_count}"
+            )
+        units[class_name] = {
+            "parameter_tensors": len(parameters),
+            "dtensor_parameters": dtensor_count,
+            "trainable_tensors": sum(parameter.requires_grad for parameter in parameters),
+        }
+    return {
+        "trainable_tensors": trainable_counts,
+        "trainable_dtensors": trainable_dtensors,
+        "units": units,
+    }
 
 
 def _whisper_gradient_checkpoint_modules(model: torch.nn.Module) -> list[str]:
