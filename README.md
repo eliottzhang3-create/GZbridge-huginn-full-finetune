@@ -2361,16 +2361,17 @@ checkpointing wraps the complete `WhisperEncoder` inside `WhisperEncoderFSDPUnit
 shared detector now reports that wrapper as Whisper's outer activation checkpoint, relative to Whisper's internal
 per-layer gradient checkpointing.
 
-Acceleration Stage 1 is isolated behind
-`HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR`; normal training is unchanged unless its dedicated smoke script
-is launched. It uses the same real deterministic data window, FSDP4, per-device batch `2`, gradient accumulation `4`,
+The Acceleration Stage 1 diagnostic callback is isolated behind
+`HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR`. Its dedicated smoke uses the same real deterministic data
+window, FSDP4, per-device batch `2`, gradient accumulation `4`,
 SDPA attention, and five coarse FSDP units as Stage 0. The only training-setting change is
 `vit_gradient_checkpointing=false`, while FSDP `activation_checkpointing=true` preserves exactly one checkpoint wrapper
 around the complete Whisper encoder. The gate requires zero Whisper internal checkpoint modules, exactly one outer
 Whisper wrapper, no double-checkpoint candidate, all five units at `reshard_after_forward=true`, finite loss/grad norm,
 nonzero gradients for Huginn LoRA + aligner + Whisper, and zero gradients for the frozen native Huginn backbone. It saves
-only per-rank audits and `acceleration_stage1_report.json`, not a model checkpoint. Formal training is not switched to
-this candidate until its FSDP4 result is reviewed and explicitly adopted.
+only per-rank audits and `acceleration_stage1_report.json`, not a model checkpoint. This candidate passed and has now
+been adopted by the checkpoint/resume smoke and formal-training launcher: Whisper internal per-layer checkpointing is
+disabled, while the single outer FSDP activation-checkpoint wrapper around the complete Whisper encoder remains active.
 
 Acceleration Stage 2 is isolated behind
 `HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE2_AUDIT_DIR` and builds on the Stage 1 checkpoint-dedup candidate. The FSDP
@@ -2378,7 +2379,11 @@ JSON still initializes every unit with `reshard_after_forward=true`; after FSDP2
 forward, the Stage 2 callback verifies all five runtime states, calls
 `HuginnRecurrentCoreFSDPUnit.set_reshard_after_forward(False)`, synchronizes all four ranks, and verifies that only the
 recurrent core changed. Train-end auditing confirms that the setting persisted. No normal training launch is affected
-unless the dedicated Stage 2 environment variable is present.
+unless the dedicated Stage 2 environment variable is present. The Stage 2 candidate passed on all four ranks at about
+`172.07s` for the one-update B2/GA4 gate, with peak allocated memory `15.244 GiB` and peak reserved memory
+`17.992 GiB`. It has now been adopted through the separate production switch
+`HUGINN_AUDIO_DYNAMIC30S_RECURRENT_CORE_RESHARD_AFTER_FORWARD_FALSE=1` in both checkpoint/resume smoke and formal
+training; Stage 0/1/2 audit modes remain unset in those production paths.
 
 The Stage 2 gate generates one deterministic mono 16-kHz 30-second WAV and 64 synthetic manifest rows, then consumes
 one complete B2/FSDP4/GA4 global batch of 32 samples. Every sample must produce exactly 187 audio content tokens and 189
@@ -2387,7 +2392,20 @@ Whisper SDPA, one outer complete-Whisper checkpoint, zero internal Whisper check
 activation-checkpoint wrappers, trainable Whisper + aligner + Huginn-only LoRA, and response-only shifted NTP loss. The
 gate records recurrent-core forward counts, finite gradients/losses, wall time, and peak CUDA memory. It fails if peak
 allocated memory reaches 29 GiB or peak reserved memory reaches 30 GiB, and saves no model checkpoint. Passing this gate
-establishes worst-case memory/correctness safety only; real-data speed comparison remains a later paired benchmark.
+establishes worst-case memory/correctness safety. The user explicitly waived a separate Stage 3 paired comparison, so
+the next mandatory gate is the real-data four-GPU save/cold-resume smoke.
+
+The checkpoint/resume smoke now exercises the adopted acceleration contract in two distinct four-rank process groups:
+fresh steps `0..4`, full checkpoint save, complete process exit, then cold resume for steps `4..6`. It requires FSDP
+activation checkpointing, zero Whisper internal checkpoint modules, exactly one outer complete-Whisper checkpoint
+wrapper, and `reshard_after_forward=false` only for `HuginnRecurrentCoreFSDPUnit`. It also re-audits the effective LoRA
+rank/alpha/dropout and Huginn-only ownership, Whisper/aligner/LoRA optimizer coverage at `1e-4`, nonzero finite gradients
+including trainable audio BOS/EOS, frozen native Huginn parameters, dynamic prefix bounds, prefix-label `-100` masking,
+assistant-response-only contiguous supervision, shifted next-token prediction, all five coarse FSDP units, full-model
+DCP contents, optimizer/scheduler/per-rank RNG restoration, deterministic no-replacement data continuity, exclusion of
+prefetched rows from statistics, cumulative sample/hour accounting, and AAC/ASR task-specific prompt mapping. Each
+checkpoint receives `huginn_training_runtime_contract.json`; the offline checkpoint inspector rejects any contract or
+trainable-state mismatch. Formal training must not be submitted until this updated smoke passes.
 
 Formal training still targets more than `3000` realized, decoded, 30-second-capped hours, but max-step planning is now
 deliberately deferred until after the acceleration experiments and their FSDP4 smoke tests. WavCaps source metadata is

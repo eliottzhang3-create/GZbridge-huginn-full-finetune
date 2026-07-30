@@ -41,6 +41,13 @@ EXPECTED_UNIT_TRAINABLE_TENSORS = {
     "HuginnRecurrentCoreFSDPUnit": 34,
     "HuginnCodaFSDPUnit": 16,
 }
+EXPECTED_RESHARD_AFTER_FORWARD = {
+    "WhisperEncoderFSDPUnit": True,
+    "AudioAlignerFSDPUnit": True,
+    "HuginnPreludeFSDPUnit": True,
+    "HuginnRecurrentCoreFSDPUnit": False,
+    "HuginnCodaFSDPUnit": True,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -93,6 +100,116 @@ def validate_optimizer_groups(
             f"Invalid {phase} optimizer ownership for rank {rank}: "
             f"observed={observed} expected={expected}"
         )
+
+
+def validate_lora_runtime(marker: dict[str, Any], *, phase: str, rank: int) -> None:
+    audit = marker.get("lora_runtime_audit")
+    expected = {
+        "tensor_count": 66,
+        "target_module_count": 33,
+        "rank": 8,
+        "alpha": 16,
+        "dropout": 0.05,
+        "restricted_to_huginn_transformer": True,
+    }
+    if not isinstance(audit, dict) or any(audit.get(key) != value for key, value in expected.items()):
+        raise AssertionError(f"Invalid {phase} LoRA runtime audit for rank {rank}: {audit}")
+    adapters = audit.get("adapters")
+    if not isinstance(adapters, dict) or not adapters:
+        raise AssertionError(f"Missing {phase} PEFT adapter audit for rank {rank}: {audit}")
+    for adapter_name, config in adapters.items():
+        if config != {"rank": 8, "alpha": 16.0, "dropout": 0.05}:
+            raise AssertionError(
+                f"Invalid {phase} PEFT adapter {adapter_name!r} for rank {rank}: {config}"
+            )
+
+
+def validate_reshard_audit(
+    audits: Any,
+    *,
+    phase: str,
+    rank: int,
+    context: str,
+) -> None:
+    if not isinstance(audits, dict) or set(audits) != set(EXPECTED_RESHARD_AFTER_FORWARD):
+        raise AssertionError(
+            f"Invalid {phase} {context} reshard unit set for rank {rank}: {audits}"
+        )
+    for class_name, expected in EXPECTED_RESHARD_AFTER_FORWARD.items():
+        audit = audits[class_name]
+        if not isinstance(audit, dict):
+            raise AssertionError(
+                f"Invalid {phase} {context} reshard payload for rank {rank} "
+                f"unit={class_name}: {audit}"
+            )
+        if "reshard_after_forward" in audit:
+            audit = audit["reshard_after_forward"]
+        if not isinstance(audit, dict):
+            raise AssertionError(
+                f"Invalid {phase} {context} nested reshard payload for rank {rank} "
+                f"unit={class_name}: {audit}"
+            )
+        explicit = {
+            bool(candidate["value"])
+            for candidate in audit.get("candidates", [])
+            if "value" in candidate
+        }
+        if (
+            audit.get("effective") is not expected
+            or explicit != {expected}
+            or audit.get("has_fsdp_state") is not True
+        ):
+            raise AssertionError(
+                f"Invalid {phase} {context} reshard state for rank {rank} "
+                f"unit={class_name}: expected={expected} audit={audit}"
+            )
+
+
+def validate_checkpointing_contract(marker: dict[str, Any], *, phase: str, rank: int) -> None:
+    if (
+        marker.get("vit_gradient_checkpointing_arg") is not False
+        or marker.get("whisper_internal_gradient_checkpointing") is not False
+        or marker.get("whisper_gradient_checkpoint_modules") != []
+        or marker.get("whisper_outer_activation_checkpointed") is not True
+        or marker.get("whisper_double_checkpoint_candidate") is not False
+    ):
+        raise AssertionError(f"Invalid {phase} checkpointing contract for rank {rank}: {marker}")
+    outer = marker.get("whisper_outer_checkpoint_wrappers", [])
+    if (
+        len(outer) != 1
+        or not outer[0].get("path", "").endswith("audio_encoder.encoder")
+        or "WhisperEncoder" not in outer[0].get("inner_mro", [])
+    ):
+        raise AssertionError(f"Invalid {phase} outer Whisper wrapper for rank {rank}: {outer}")
+    validate_reshard_audit(
+        marker.get("fsdp_reshard_after_forward"),
+        phase=phase,
+        rank=rank,
+        context="effective",
+    )
+    runtime = marker.get("recurrent_core_runtime_audit")
+    if (
+        not isinstance(runtime, dict)
+        or runtime.get("policy") != "recurrent_core_false_all_other_units_true"
+        or int(runtime.get("world_size", -1)) != 4
+    ):
+        raise AssertionError(f"Invalid {phase} recurrent-core runtime audit for rank {rank}: {runtime}")
+    before = runtime.get("before")
+    expected_before = {name: True for name in EXPECTED_RESHARD_AFTER_FORWARD}
+    if not isinstance(before, dict) or set(before) != set(expected_before):
+        raise AssertionError(f"Invalid {phase} pre-mutation reshard audit for rank {rank}: {before}")
+    for class_name in expected_before:
+        audit = before[class_name].get("reshard_after_forward", {})
+        if audit.get("effective") is not True:
+            raise AssertionError(
+                f"{phase} rank {rank} {class_name} was not initially reshard=true: {audit}"
+            )
+    validate_reshard_audit(
+        runtime.get("after"),
+        phase=phase,
+        rank=rank,
+        context="post-mutation",
+    )
 
 
 def validate_phase_markers(
@@ -154,10 +271,33 @@ def validate_phase_markers(
             raise AssertionError(f"Invalid {phase} start marker for rank {rank}: {start}")
         pids.add(int(start["pid"]))
         launch_ids.add(str(start.get("launch_id", "")))
-        if not isinstance(start.get("whisper_gradient_checkpoint_modules"), list) or not start[
-            "whisper_gradient_checkpoint_modules"
-        ]:
-            raise AssertionError(f"Whisper checkpointing is inactive in {phase} rank {rank}: {start}")
+        validate_checkpointing_contract(start, phase=phase, rank=rank)
+        validate_lora_runtime(start, phase=phase, rank=rank)
+        checkpoint_wrappers = start.get("checkpoint_wrappers", [])
+        required_wrapper_suffixes = (
+            "transformer.prelude.0",
+            "transformer.prelude.1",
+            "transformer.core_block.0",
+            "transformer.core_block.1",
+            "transformer.core_block.2",
+            "transformer.core_block.3",
+            "transformer.core_block.adapter",
+            "transformer.coda.0",
+            "transformer.coda.1",
+            "audio_encoder.encoder",
+            "audio_aligner.temporal_compressor",
+            "audio_aligner.audio_projector",
+            "audio_aligner.audio_boundary_embeddings",
+        )
+        missing_wrappers = [
+            suffix
+            for suffix in required_wrapper_suffixes
+            if not any(wrapper.get("path", "").endswith(suffix) for wrapper in checkpoint_wrappers)
+        ]
+        if missing_wrappers:
+            raise AssertionError(
+                f"Missing {phase} activation-checkpoint wrappers for rank {rank}: {missing_wrappers}"
+            )
         validate_optimizer_groups(start, trainables, phase=phase, rank=rank)
         if phase == "resume":
             if (
@@ -194,10 +334,26 @@ def validate_phase_markers(
         for group in ("huginn_base", "other"):
             if int(gradients.get(group, {}).get("gradient_tensors", -1)) != 0:
                 raise AssertionError(f"Forbidden {group} gradients in {phase} rank {rank}: {gradients}")
-        if end.get("whisper_gradient_checkpoint_modules") != start.get("whisper_gradient_checkpoint_modules"):
+        validate_checkpointing_contract(end, phase=phase, rank=rank)
+        validate_lora_runtime(end, phase=phase, rank=rank)
+        loss_contract = end.get("loss_contract", {})
+        if (
+            not (2 < int(loss_contract.get("prefix_length", 0)) <= 189)
+            or loss_contract.get("prefix_labels_all_ignored") is not True
+            or loss_contract.get("shift_length_valid") is not True
+            or int(loss_contract.get("supervised_shift_tokens", 0)) <= 0
+            or loss_contract.get("response_only_contiguous_suffix") is not True
+            or not loss_contract.get("response_spans")
+        ):
             raise AssertionError(
-                f"Whisper checkpointing state changed in {phase} rank {rank}: start={start} end={end}"
+                f"Invalid {phase} shifted-NTP loss contract for rank {rank}: {loss_contract}"
             )
+        if (
+            float(end.get("train_wall_seconds", 0.0)) <= 0.0
+            or float(end.get("peak_memory_allocated_gib", 99.0)) >= 29.0
+            or float(end.get("peak_memory_reserved_gib", 99.0)) >= 30.0
+        ):
+            raise AssertionError(f"Invalid {phase} runtime/memory audit for rank {rank}: {end}")
         validate_optimizer_groups(end, trainables, phase=phase, rank=rank)
         if phase == "resume":
             rng = read_json(audit_dir / f"rng-restore-rank-{rank}.json")
@@ -214,7 +370,9 @@ def validate_phase_markers(
             f"optimizer_states={start.get('optimizer_state_count')} "
             f"learning_rates={start.get('learning_rates')} "
             f"finite_losses={end['finite_loss_log_count']} finite_grad_norms={end['finite_grad_norm_log_count']} "
-            f"audio_samples={end['audio_sample_count']} audio_tokens={end['realized_audio_tokens']}"
+            f"audio_samples={end['audio_sample_count']} audio_tokens={end['realized_audio_tokens']} "
+            f"train_wall_seconds={end['train_wall_seconds']:.3f} "
+            f"peak_reserved_gib={end['peak_memory_reserved_gib']:.3f}"
         )
     if len(pids) != world_size:
         raise AssertionError(f"Phase {phase} expected one process per rank, observed pids={sorted(pids)}")

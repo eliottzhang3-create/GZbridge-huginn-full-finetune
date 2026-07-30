@@ -22,6 +22,14 @@ ALIGNER_PREFIXES = (
 )
 AUDIO_BOUNDARY_PARAMETER_NAMES = ("audio_bos", "audio_eos")
 AUDIO_BOUNDARY_CHECKPOINT_ROLES = ("trainable_active", "frozen_original")
+TRAINING_RUNTIME_CONTRACT_FILENAME = "huginn_training_runtime_contract.json"
+EXPECTED_RESHARD_AFTER_FORWARD = {
+    "WhisperEncoderFSDPUnit": True,
+    "AudioAlignerFSDPUnit": True,
+    "HuginnPreludeFSDPUnit": True,
+    "HuginnRecurrentCoreFSDPUnit": False,
+    "HuginnCodaFSDPUnit": True,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -126,7 +134,12 @@ def load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[str, Any]:
+def inspect_checkpoint(
+    path: Path,
+    expected_step: int,
+    world_size: int,
+    expected_phase: str,
+) -> dict[str, Any]:
     from torch.distributed.checkpoint import FileSystemReader
 
     checkpoint = path.resolve()
@@ -219,6 +232,60 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
     if not optimizer_dcp_dirs:
         raise RuntimeError(f"No optimizer DCP state directory was found at {checkpoint}")
 
+    runtime_contract = load_json(checkpoint / TRAINING_RUNTIME_CONTRACT_FILENAME)
+    expected_checkpointing = {
+        "fsdp_activation_checkpointing": True,
+        "whisper_internal_gradient_checkpointing": False,
+        "whisper_outer_activation_checkpointed": True,
+        "double_checkpoint_candidate": False,
+    }
+    if (
+        runtime_contract.get("gate") != "huginn_whisper_dynamic30s_training_runtime_contract_v1"
+        or runtime_contract.get("phase") != expected_phase
+        or int(runtime_contract.get("global_step", -1)) != expected_step
+        or int(runtime_contract.get("world_size", -1)) != world_size
+        or runtime_contract.get("checkpointing") != expected_checkpointing
+        or runtime_contract.get("fsdp_reshard_after_forward") != EXPECTED_RESHARD_AFTER_FORWARD
+        or runtime_contract.get("trainability")
+        != {
+            "whisper_encoder": True,
+            "audio_aligner": True,
+            "huginn_lora": True,
+            "huginn_native_backbone": False,
+        }
+        or runtime_contract.get("learning_rates")
+        != {
+            "whisper_encoder": 1e-4,
+            "audio_aligner": 1e-4,
+            "huginn_lora": 1e-4,
+        }
+        or runtime_contract.get("lora")
+        != {
+            "rank": 8,
+            "alpha": 16,
+            "dropout": 0.05,
+            "tensor_count": 66,
+            "target_module_count": 33,
+            "restricted_to_huginn_transformer": True,
+        }
+        or runtime_contract.get("audio")
+        != {
+            "maximum_seconds": 30.0,
+            "token_duration_ms": 160,
+            "maximum_content_tokens": 187,
+            "trainable_boundary_tokens": ["audio_bos", "audio_eos"],
+        }
+        or runtime_contract.get("loss")
+        != {
+            "type": "shifted_next_token_prediction",
+            "supervision": "assistant_response_only",
+            "audio_prefix_labels": -100,
+        }
+    ):
+        raise RuntimeError(
+            f"Training runtime contract mismatch at {checkpoint}: {runtime_contract}"
+        )
+
     print(
         f"[checkpoint] path={checkpoint} step={expected_step} model_counts={counts} "
         f"scheduler_last_epoch={scheduler_last_epoch} rng_files={len(rng_files)} "
@@ -246,6 +313,7 @@ def inspect_checkpoint(path: Path, expected_step: int, world_size: int) -> dict[
         "rng_files": [str(path) for path in rng_files],
         "optimizer_dcp_dirs": [str(path) for path in optimizer_dcp_dirs],
         "optimizer_metadata_counts": optimizer_metadata_counts,
+        "training_runtime_contract": runtime_contract,
     }
 
 
@@ -355,11 +423,11 @@ def main() -> None:
     args = parse_args()
     if args.save_step <= 0 or args.resume_step <= args.save_step or args.world_size != 4:
         raise ValueError("Expected 0 < save_step < resume_step and world_size=4")
-    saved = inspect_checkpoint(args.save_checkpoint, args.save_step, args.world_size)
-    resumed = inspect_checkpoint(args.resume_checkpoint, args.resume_step, args.world_size)
+    saved = inspect_checkpoint(args.save_checkpoint, args.save_step, args.world_size, "save")
+    resumed = inspect_checkpoint(args.resume_checkpoint, args.resume_step, args.world_size, "resume")
     comparison = compare_model_states(saved, resumed)
     report = {
-        "gate": "huginn_whisper_dynamic90s_full_model_fsdp4_checkpoint_content_v3",
+        "gate": "huginn_whisper_dynamic30s_full_model_fsdp4_checkpoint_content_v4",
         "validation_passed": True,
         "save_checkpoint": {key: value for key, value in saved.items() if key not in {"state_metadata", "grouped_keys"}},
         "resume_checkpoint": {

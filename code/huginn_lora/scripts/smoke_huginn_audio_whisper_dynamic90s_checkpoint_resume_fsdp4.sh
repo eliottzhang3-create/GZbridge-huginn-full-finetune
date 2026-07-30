@@ -37,7 +37,7 @@ RESUME_AUDIT_DIR="$RUN_ROOT/resume_rank_audits"
 DATA_AUDIT_DIR="$RUN_ROOT/data_position_audits"
 FORWARD_AUDIT_DIR="$RUN_ROOT/forward_consumption_audits"
 TRAINING_STATS_DIR="$RUN_ROOT/training_statistics"
-FSDP_CONFIG_PATH="$RUN_ROOT/fsdp2_lora_no_activation.json"
+FSDP_CONFIG_PATH="$RUN_ROOT/fsdp2_checkpoint_accelerated.json"
 CONTENT_REPORT="$RUN_ROOT/checkpoint_content_report.json"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-dynamic90s-v1"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py"
@@ -65,7 +65,12 @@ import inspect
 import sys
 from dataclasses import fields
 from pathlib import Path
+
+repo_root = Path.cwd()
+sys.path.insert(0, str(repo_root / 'code' / 'huginn_lora'))
+
 from accelerate.utils import fsdp_utils
+from data_pipeline.dynamic90s_mixture_rows import EXPECTED_TASKS, TASK_PROMPTS
 from swift.arguments.sft_args import SftArguments
 from swift.tuner_plugin.lora_llm import LoRALLMTuner
 from swift.utils import get_multimodal_target_regex
@@ -96,6 +101,13 @@ if int(report.get('seed', -1)) != int(sys.argv[4]) or int(sampler_report.get('se
     )
 if int(sys.argv[3]) < 24:
     raise SystemExit(f'Checkpoint dataset quota must be at least 24, got {sys.argv[3]}')
+if set(TASK_PROMPTS) != {'AAC', 'ASR'} or TASK_PROMPTS['AAC'] == TASK_PROMPTS['ASR']:
+    raise SystemExit(f'AAC and ASR require distinct task prompts: {TASK_PROMPTS}')
+if EXPECTED_TASKS.get('gigaspeech_l_asr') != 'ASR' or any(
+    EXPECTED_TASKS.get(name) != 'AAC'
+    for name in ('wavcaps_no_bbc_aac', 'audiocaps_v2_aac', 'clotho_v2_aac')
+):
+    raise SystemExit(f'Dataset-to-task mapping is invalid: {EXPECTED_TASKS}')
 available = {field.name for field in fields(SftArguments)}
 required = {
     'fsdp', 'modules_to_save', 'resume_from_checkpoint', 'ignore_data_skip', 'vit_lr',
@@ -127,11 +139,11 @@ for function_name in ('_get_model_state_dict', '_set_model_state_dict'):
         )
 print(
     '[precheck] real_data_chain=passed no_replacement_sampler=passed checkpoint_arguments=present '
-    'dataset_quota=sufficient lora_llm_mixed_tuning_contract=present'
+    'dataset_quota=sufficient task_prompts=distinct lora_llm_mixed_tuning_contract=present'
 )
 PY
 
-FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":false,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
+FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":true,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
 printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
 mkdir -p \
   "$SAVE_OUTPUT_DIR" "$RESUME_OUTPUT_DIR" "$SAVE_AUDIT_DIR" "$RESUME_AUDIT_DIR" \
@@ -150,6 +162,10 @@ export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR="$TRAINING_STATS_DIR"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS=1
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CHECKPOINT_STEPS="$SAVE_STEP,$RESUME_STEP"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_FORWARD_AUDIT_DIR="$FORWARD_AUDIT_DIR"
+export HUGINN_AUDIO_DYNAMIC30S_RECURRENT_CORE_RESHARD_AFTER_FORWARD_FALSE=1
+unset HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE0_AUDIT_DIR
+unset HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR
+unset HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE2_AUDIT_DIR
 unset HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT
 
 echo "========== HUGINN WHISPER DYNAMIC30S CHECKPOINT RESUME FSDP4 START =========="
@@ -164,7 +180,8 @@ echo "lr_scheduler=constant learning_rate=1e-4"
 echo "modules_to_save=${MODULES_TO_SAVE[*]}"
 echo "whisper_encoder=fully_trainable learning_rate=1e-4 aligner_lr=1e-4"
 echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=160ms"
-echo "gradient_checkpointing=false vit_gradient_checkpointing=true use_reentrant=false"
+echo "activation_checkpointing=true gradient_checkpointing=false vit_gradient_checkpointing=false use_reentrant=false"
+echo "fsdp_reshard=whisper_true aligner_true prelude_true recurrent_core_false coda_true"
 echo "pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"
 echo "huginn_backbone=frozen lora_rank=8 lora_alpha=16 lora_dropout=0.05 full_model_dcp=true"
 
@@ -291,7 +308,7 @@ run_save_phase() {
     --per_device_train_batch_size "$PER_DEVICE_BATCH" \
     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --gradient_checkpointing false \
-    --vit_gradient_checkpointing true \
+    --vit_gradient_checkpointing false \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --logging_steps 1 \
     --save_strategy steps \
@@ -311,6 +328,11 @@ echo "[checkpoint] saved=$SAVE_CHECKPOINT"
 SAVE_STATS_STATE="$SAVE_CHECKPOINT/audio_training_statistics.json"
 if [ ! -s "$SAVE_STATS_STATE" ]; then
   echo "Saved checkpoint is missing cumulative training statistics: $SAVE_STATS_STATE" >&2
+  exit 1
+fi
+SAVE_RUNTIME_CONTRACT="$SAVE_CHECKPOINT/huginn_training_runtime_contract.json"
+if [ ! -s "$SAVE_RUNTIME_CONTRACT" ]; then
+  echo "Saved checkpoint is missing the accelerated runtime contract: $SAVE_RUNTIME_CONTRACT" >&2
   exit 1
 fi
 
@@ -356,7 +378,7 @@ run_resume_phase() {
     --per_device_train_batch_size "$PER_DEVICE_BATCH" \
     --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
     --gradient_checkpointing false \
-    --vit_gradient_checkpointing true \
+    --vit_gradient_checkpointing false \
     --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
     --logging_steps 1 \
     --save_strategy steps \
@@ -376,6 +398,11 @@ echo "[checkpoint] resumed=$RESUME_CHECKPOINT"
 RESUME_STATS_STATE="$RESUME_CHECKPOINT/audio_training_statistics.json"
 if [ ! -s "$RESUME_STATS_STATE" ]; then
   echo "Resumed checkpoint is missing cumulative training statistics: $RESUME_STATS_STATE" >&2
+  exit 1
+fi
+RESUME_RUNTIME_CONTRACT="$RESUME_CHECKPOINT/huginn_training_runtime_contract.json"
+if [ ! -s "$RESUME_RUNTIME_CONTRACT" ]; then
+  echo "Resumed checkpoint is missing the accelerated runtime contract: $RESUME_RUNTIME_CONTRACT" >&2
   exit 1
 fi
 

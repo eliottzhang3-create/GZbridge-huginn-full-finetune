@@ -80,6 +80,7 @@ MEMORY90_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_MEMORY90_AUDIT_DIR"
 ACCELERATION_STAGE0_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE0_AUDIT_DIR"
 ACCELERATION_STAGE1_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR"
 ACCELERATION_STAGE2_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE2_AUDIT_DIR"
+RECURRENT_CORE_NO_RESHARD_ENV = "HUGINN_AUDIO_DYNAMIC30S_RECURRENT_CORE_RESHARD_AFTER_FORWARD_FALSE"
 REALDATA_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_AUDIT_DIR"
 REALDATA_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_MAX_STEPS"
 DATA_POSITION_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR"
@@ -99,6 +100,7 @@ TRAINING_STATS_CHECKPOINT_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CH
 TRAINING_STATS_FORWARD_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_FORWARD_AUDIT_DIR"
 TRAINING_STATS_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE"
 TRAINING_STATS_STATE_FILENAME = "audio_training_statistics.json"
+TRAINING_RUNTIME_CONTRACT_FILENAME = "huginn_training_runtime_contract.json"
 TRAINING_STATS_VERSION = "huginn_dynamic30s_training_statistics_v2"
 SAMPLER_VERSION = "deterministic_hierarchical_no_replacement_v2"
 TRAINING_POOL_ORDER = (
@@ -1993,18 +1995,58 @@ def patch_training_statistics_callback() -> None:
                     context="Formal dynamic-90s training",
                     allow_scheduled_learning_rate=True,
                 )
+                lora_audit = _audit_lora_runtime_configuration(
+                    self.tracked_model,
+                    context="Formal dynamic-30s training",
+                )
                 fsdp_audit = _audit_formal_fsdp_topology(self.tracked_model)
                 whisper_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
-                if not bool(getattr(args, "vit_gradient_checkpointing", False)) or not whisper_checkpoint_modules:
+                if bool(getattr(args, "vit_gradient_checkpointing", False)) or whisper_checkpoint_modules:
                     raise RuntimeError(
-                        "Formal dynamic-90s training requires active Whisper gradient checkpointing: "
+                        "Formal dynamic-30s training requires Whisper internal checkpointing disabled: "
                         f"arg={getattr(args, 'vit_gradient_checkpointing', None)} "
                         f"modules={whisper_checkpoint_modules}"
                     )
+                checkpoint_wrappers = _audit_activation_checkpoint_wrappers(self.tracked_model)
+                outer_whisper = [
+                    wrapper for wrapper in checkpoint_wrappers if wrapper["contains_whisper_encoder"]
+                ]
+                if (
+                    len(outer_whisper) != 1
+                    or not outer_whisper[0]["path"].endswith("audio_encoder.encoder")
+                ):
+                    raise RuntimeError(
+                        f"Formal dynamic-30s outer Whisper checkpoint mismatch: {outer_whisper}"
+                    )
+                recurrent_runtime_audit = getattr(
+                    self.tracked_model,
+                    "_huginn_audio_recurrent_core_no_reshard_audit",
+                    None,
+                )
+                if not isinstance(recurrent_runtime_audit, dict):
+                    raise RuntimeError("Formal dynamic-30s training lacks recurrent-core no-reshard audit")
+                reshard_audit: dict[str, Any] = {}
+                for class_name in FSDP_UNIT_CLASS_NAMES:
+                    matching = [
+                        module
+                        for module in self.tracked_model.modules()
+                        if class_name in _module_mro_names(module)
+                    ]
+                    if len(matching) != 1:
+                        raise RuntimeError(
+                            f"Formal dynamic-30s expected one {class_name}, found {len(matching)}"
+                        )
+                    expected_reshard = class_name != "HuginnRecurrentCoreFSDPUnit"
+                    reshard_audit[class_name] = _assert_fsdp_reshard_state(
+                        matching[0],
+                        expected=expected_reshard,
+                        context=f"Formal dynamic-30s {class_name}",
+                    )
                 print(
                     "[formal-runtime-audit] "
-                    f"optimizer_groups={optimizer_audit} fsdp={fsdp_audit} "
-                    f"whisper_gradient_checkpoint_modules={whisper_checkpoint_modules}",
+                    f"optimizer_groups={optimizer_audit} lora={lora_audit} fsdp={fsdp_audit} "
+                    f"whisper_gradient_checkpoint_modules={whisper_checkpoint_modules} "
+                    f"outer_whisper_checkpoint={outer_whisper} reshard={reshard_audit}",
                     flush=True,
                 )
             return control
@@ -2444,6 +2486,79 @@ def _audit_optimizer_parameter_groups(
     for audit in group_audits:
         audit["audio_boundary_parameter_counts"] = boundary_optimizer_counts
     return group_audits
+
+
+def _audit_lora_runtime_configuration(model: torch.nn.Module, *, context: str) -> dict[str, Any]:
+    """Verify the effective PEFT contract after LoRA/FSDP wrapping."""
+    peft_configs = getattr(model, "peft_config", None)
+    if not peft_configs:
+        raise RuntimeError(f"{context} exposes no PEFT adapter configuration")
+    adapters: dict[str, dict[str, Any]] = {}
+    for adapter_name, config in peft_configs.items():
+        observed = {
+            "rank": int(config.r),
+            "alpha": float(config.lora_alpha),
+            "dropout": float(config.lora_dropout),
+        }
+        if observed != {"rank": 8, "alpha": 16.0, "dropout": 0.05}:
+            raise RuntimeError(
+                f"{context} PEFT config mismatch for adapter {adapter_name!r}: {observed}"
+            )
+        adapters[str(adapter_name)] = observed
+
+    lora_parameters = [
+        (name, parameter)
+        for name, parameter in model.named_parameters()
+        if "lora_" in name
+    ]
+    forbidden_lora = [
+        name
+        for name, _parameter in lora_parameters
+        if "audio_encoder" in name or "audio_aligner" in name or "lm_head" in name
+    ]
+    non_huginn_lora = [
+        name
+        for name, _parameter in lora_parameters
+        if "transformer" not in name
+    ]
+    if len(lora_parameters) != 66 or forbidden_lora or non_huginn_lora:
+        raise RuntimeError(
+            f"{context} LoRA ownership mismatch: tensors={len(lora_parameters)} "
+            f"forbidden={forbidden_lora} non_huginn={non_huginn_lora}"
+        )
+    for name, parameter in lora_parameters:
+        if "lora_A" in name and parameter.ndim == 2 and int(parameter.shape[0]) != 8:
+            raise RuntimeError(f"{context} LoRA A rank mismatch: {name} shape={tuple(parameter.shape)}")
+        if "lora_B" in name and parameter.ndim == 2 and int(parameter.shape[1]) != 8:
+            raise RuntimeError(f"{context} LoRA B rank mismatch: {name} shape={tuple(parameter.shape)}")
+
+    target_modules = 0
+    for module in model.modules():
+        lora_a = getattr(module, "lora_A", None)
+        if not lora_a:
+            continue
+        target_modules += 1
+        alpha_values = getattr(module, "lora_alpha", {})
+        if not alpha_values or any(float(value) != 16.0 for value in alpha_values.values()):
+            raise RuntimeError(f"{context} effective LoRA alpha mismatch: {alpha_values}")
+        dropout_values = getattr(module, "lora_dropout", {})
+        if not dropout_values:
+            raise RuntimeError(f"{context} LoRA module exposes no effective dropout modules")
+        for dropout in dropout_values.values():
+            probability = float(getattr(dropout, "p", -1.0))
+            if abs(probability - 0.05) > 1e-12:
+                raise RuntimeError(f"{context} effective LoRA dropout mismatch: {probability}")
+    if target_modules != 33:
+        raise RuntimeError(f"{context} LoRA target-module count mismatch: {target_modules}")
+    return {
+        "tensor_count": len(lora_parameters),
+        "target_module_count": target_modules,
+        "rank": 8,
+        "alpha": 16,
+        "dropout": 0.05,
+        "adapters": adapters,
+        "restricted_to_huginn_transformer": True,
+    }
 
 
 def _audit_formal_fsdp_topology(model: torch.nn.Module) -> dict[str, Any]:
@@ -4064,6 +4179,122 @@ def patch_realdata_stability_callback() -> None:
     )
 
 
+def patch_recurrent_core_no_reshard_callback() -> None:
+    """Apply the validated recurrent-core FSDP2 residency policy per process."""
+    requested = os.environ.get(RECURRENT_CORE_NO_RESHARD_ENV, "").strip().lower()
+    if requested not in {"1", "true", "yes"}:
+        return
+    from transformers import Trainer, TrainerCallback
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_recurrent_core_no_reshard_patched", False):
+        return
+
+    class RecurrentCoreNoReshardCallback(TrainerCallback):
+        _huginn_audio_recurrent_core_no_reshard_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.runtime_audit: dict[str, Any] | None = None
+
+        def _units(self) -> dict[str, tuple[str, torch.nn.Module]]:
+            units: dict[str, tuple[str, torch.nn.Module]] = {}
+            for class_name in FSDP_UNIT_CLASS_NAMES:
+                matching = [
+                    (name, module)
+                    for name, module in self.tracked_model.named_modules()
+                    if class_name in _module_mro_names(module)
+                ]
+                if len(matching) != 1:
+                    raise RuntimeError(
+                        f"Recurrent-core no-reshard expected one {class_name}, found "
+                        f"{[(name, type(module).__name__) for name, module in matching]}"
+                    )
+                units[class_name] = matching[0]
+            return units
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Recurrent-core no-reshard requires initialized torch.distributed")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(
+                    f"Recurrent-core no-reshard requires world_size=4, got {world_size}"
+                )
+            units = self._units()
+            before: dict[str, Any] = {}
+            for class_name, (path, unit) in units.items():
+                before[class_name] = {
+                    "path": path,
+                    "reshard_after_forward": _assert_fsdp_reshard_state(
+                        unit,
+                        expected=True,
+                        context=f"Recurrent-core no-reshard preflight {class_name}",
+                    ),
+                }
+            _core_path, core_unit = units["HuginnRecurrentCoreFSDPUnit"]
+            setter = getattr(core_unit, "set_reshard_after_forward", None)
+            if not callable(setter):
+                raise RuntimeError(
+                    "Recurrent-core no-reshard requires FSDP2 set_reshard_after_forward"
+                )
+            setter(False)
+            torch.distributed.barrier()
+
+            after: dict[str, Any] = {}
+            for class_name, (path, unit) in units.items():
+                expected = class_name != "HuginnRecurrentCoreFSDPUnit"
+                after[class_name] = {
+                    "path": path,
+                    "reshard_after_forward": _assert_fsdp_reshard_state(
+                        unit,
+                        expected=expected,
+                        context=f"Recurrent-core no-reshard post-mutation {class_name}",
+                    ),
+                }
+            self.runtime_audit = {
+                "policy": "recurrent_core_false_all_other_units_true",
+                "world_size": world_size,
+                "before": before,
+                "after": after,
+            }
+            self.tracked_model._huginn_audio_recurrent_core_no_reshard_audit = self.runtime_audit
+            print(
+                "[HuginnAudioDynamic30s] RECURRENT_CORE_NO_RESHARD_APPLIED "
+                f"rank={rank} world_size={world_size} core=false other_units=true",
+                flush=True,
+            )
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            if self.runtime_audit is None:
+                raise RuntimeError("Recurrent-core no-reshard was not applied before training")
+            for class_name, (_path, unit) in self._units().items():
+                expected = class_name != "HuginnRecurrentCoreFSDPUnit"
+                _assert_fsdp_reshard_state(
+                    unit,
+                    expected=expected,
+                    context=f"Recurrent-core no-reshard train-end {class_name}",
+                )
+            return control
+
+    @wraps(original_init)
+    def init_with_recurrent_core_no_reshard(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_recurrent_core_no_reshard_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(RecurrentCoreNoReshardCallback(self.model))
+
+    init_with_recurrent_core_no_reshard._huginn_audio_recurrent_core_no_reshard_patched = True
+    Trainer.__init__ = init_with_recurrent_core_no_reshard
+    print("[HuginnAudioDynamic30s] installed recurrent-core no-reshard callback")
+
+
 def patch_checkpoint_resume_callback() -> None:
     """Audit state restoration and new updates in each cold-start phase."""
     audit_dir = os.environ.get(CHECKPOINT_AUDIT_DIR_ENV, "").strip()
@@ -4103,7 +4334,13 @@ def patch_checkpoint_resume_callback() -> None:
             self.observed_start_step = None
             self.gradient_audit: dict[str, dict[str, int]] | None = None
             self.optimizer_group_audit: list[dict[str, Any]] | None = None
+            self.lora_runtime_audit: dict[str, Any] | None = None
             self.whisper_gradient_checkpoint_modules: list[str] | None = None
+            self.checkpoint_wrappers: list[dict[str, Any]] = []
+            self.whisper_outer_wrappers: list[dict[str, Any]] = []
+            self.fsdp_reshard_after_forward: dict[str, Any] = {}
+            self.recurrent_core_runtime_audit: dict[str, Any] | None = None
+            self.train_started_at: float | None = None
 
         @staticmethod
         def _identity() -> tuple[int, int]:
@@ -4130,7 +4367,7 @@ def patch_checkpoint_resume_callback() -> None:
                     values.append(int(step))
             return values
 
-        def _audio_statistics(self) -> dict[str, int]:
+        def _audio_runtime_owner(self) -> torch.nn.Module:
             owners = [
                 module
                 for module in self.tracked_model.modules()
@@ -4141,7 +4378,10 @@ def patch_checkpoint_resume_callback() -> None:
                     "Checkpoint smoke expected one direct runtime-statistics owner, "
                     f"found {len(owners)}"
                 )
-            module = owners[0]
+            return owners[0]
+
+        def _audio_statistics(self) -> dict[str, int]:
+            module = self._audio_runtime_owner()
             return {
                 "audio_batch_count": int(module._huginn_audio_realdata_batch_count),
                 "audio_sample_count": int(module._huginn_audio_realdata_sample_count),
@@ -4167,15 +4407,80 @@ def patch_checkpoint_resume_callback() -> None:
                 optimizer,
                 context=f"Checkpoint {phase} phase",
             )
+            self.lora_runtime_audit = _audit_lora_runtime_configuration(
+                self.tracked_model,
+                context=f"Checkpoint {phase} phase",
+            )
             self.whisper_gradient_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
-            if (
-                not bool(getattr(args, "vit_gradient_checkpointing", False))
-                or not self.whisper_gradient_checkpoint_modules
-            ):
+            if bool(getattr(args, "vit_gradient_checkpointing", False)) or self.whisper_gradient_checkpoint_modules:
                 raise RuntimeError(
-                    f"Checkpoint {phase} phase requires active Whisper gradient checkpointing: "
+                    f"Checkpoint {phase} phase requires Whisper internal checkpointing disabled: "
                     f"arg={getattr(args, 'vit_gradient_checkpointing', None)} "
                     f"modules={self.whisper_gradient_checkpoint_modules}"
+                )
+            self.checkpoint_wrappers = _audit_activation_checkpoint_wrappers(self.tracked_model)
+            self.whisper_outer_wrappers = [
+                wrapper
+                for wrapper in self.checkpoint_wrappers
+                if wrapper["contains_whisper_encoder"]
+            ]
+            if (
+                len(self.whisper_outer_wrappers) != 1
+                or not self.whisper_outer_wrappers[0]["path"].endswith("audio_encoder.encoder")
+                or "WhisperEncoder" not in self.whisper_outer_wrappers[0]["inner_mro"]
+            ):
+                raise RuntimeError(
+                    f"Checkpoint {phase} phase outer Whisper checkpoint mismatch: "
+                    f"{self.whisper_outer_wrappers}"
+                )
+            required_wrapper_suffixes = (
+                "transformer.prelude.0",
+                "transformer.prelude.1",
+                "transformer.core_block.0",
+                "transformer.core_block.1",
+                "transformer.core_block.2",
+                "transformer.core_block.3",
+                "transformer.core_block.adapter",
+                "transformer.coda.0",
+                "transformer.coda.1",
+                "audio_encoder.encoder",
+                "audio_aligner.temporal_compressor",
+                "audio_aligner.audio_projector",
+                "audio_aligner.audio_boundary_embeddings",
+            )
+            missing_wrappers = [
+                suffix
+                for suffix in required_wrapper_suffixes
+                if not any(wrapper["path"].endswith(suffix) for wrapper in self.checkpoint_wrappers)
+            ]
+            if missing_wrappers:
+                raise RuntimeError(
+                    f"Checkpoint {phase} phase lost activation-checkpoint wrappers: {missing_wrappers}"
+                )
+            self.recurrent_core_runtime_audit = getattr(
+                self.tracked_model,
+                "_huginn_audio_recurrent_core_no_reshard_audit",
+                None,
+            )
+            if not isinstance(self.recurrent_core_runtime_audit, dict):
+                raise RuntimeError(
+                    f"Checkpoint {phase} phase lacks recurrent-core no-reshard runtime audit"
+                )
+            for class_name in FSDP_UNIT_CLASS_NAMES:
+                matching = [
+                    module
+                    for module in self.tracked_model.modules()
+                    if class_name in _module_mro_names(module)
+                ]
+                if len(matching) != 1:
+                    raise RuntimeError(
+                        f"Checkpoint {phase} phase expected one {class_name}, found {len(matching)}"
+                    )
+                expected_reshard = class_name != "HuginnRecurrentCoreFSDPUnit"
+                self.fsdp_reshard_after_forward[class_name] = _assert_fsdp_reshard_state(
+                    matching[0],
+                    expected=expected_reshard,
+                    context=f"Checkpoint {phase} phase {class_name}",
                 )
             optimizer_steps = self._optimizer_steps(optimizer) if optimizer is not None else []
             scheduler_last_epoch = int(getattr(scheduler, "last_epoch", -999)) if scheduler is not None else None
@@ -4219,9 +4524,20 @@ def patch_checkpoint_resume_callback() -> None:
                 "scheduler_last_epoch": scheduler_last_epoch,
                 "learning_rates": learning_rates,
                 "optimizer_group_audit": self.optimizer_group_audit,
+                "lora_runtime_audit": self.lora_runtime_audit,
                 "whisper_gradient_checkpoint_modules": self.whisper_gradient_checkpoint_modules,
+                "vit_gradient_checkpointing_arg": False,
+                "whisper_internal_gradient_checkpointing": False,
+                "whisper_outer_activation_checkpointed": True,
+                "whisper_outer_checkpoint_wrappers": self.whisper_outer_wrappers,
+                "whisper_double_checkpoint_candidate": False,
+                "checkpoint_wrappers": self.checkpoint_wrappers,
+                "fsdp_reshard_after_forward": self.fsdp_reshard_after_forward,
+                "recurrent_core_runtime_audit": self.recurrent_core_runtime_audit,
             }
             _write_distributed_rank_marker("checkpoint-start", payload)
+            torch.cuda.reset_peak_memory_stats()
+            self.train_started_at = time.perf_counter()
             print(
                 "[HuginnAudioDynamic90s] CHECKPOINT_START_AUDIT "
                 f"phase={phase} rank={rank} global_step={self.observed_start_step} "
@@ -4254,6 +4570,76 @@ def patch_checkpoint_resume_callback() -> None:
                     self.finite_grad_norm_log_count += 1
             return control
 
+        def on_save(self, args, state, control, **kwargs):
+            del kwargs
+            rank, world_size = self._identity()
+            if int(state.global_step) != expected_end_step:
+                raise RuntimeError(
+                    f"Checkpoint {phase} runtime contract save step mismatch: "
+                    f"expected={expected_end_step} actual={state.global_step}"
+                )
+            if rank == 0:
+                checkpoint_dir = Path(args.output_dir) / f"checkpoint-{int(state.global_step)}"
+                contract = {
+                    "gate": "huginn_whisper_dynamic30s_training_runtime_contract_v1",
+                    "phase": phase,
+                    "global_step": int(state.global_step),
+                    "world_size": world_size,
+                    "checkpointing": {
+                        "fsdp_activation_checkpointing": True,
+                        "whisper_internal_gradient_checkpointing": False,
+                        "whisper_outer_activation_checkpointed": True,
+                        "double_checkpoint_candidate": False,
+                    },
+                    "fsdp_reshard_after_forward": {
+                        class_name: class_name != "HuginnRecurrentCoreFSDPUnit"
+                        for class_name in FSDP_UNIT_CLASS_NAMES
+                    },
+                    "trainability": {
+                        "whisper_encoder": True,
+                        "audio_aligner": True,
+                        "huginn_lora": True,
+                        "huginn_native_backbone": False,
+                    },
+                    "learning_rates": {
+                        "whisper_encoder": 1e-4,
+                        "audio_aligner": 1e-4,
+                        "huginn_lora": 1e-4,
+                    },
+                    "lora": {
+                        "rank": int(self.lora_runtime_audit["rank"]),
+                        "alpha": int(self.lora_runtime_audit["alpha"]),
+                        "dropout": float(self.lora_runtime_audit["dropout"]),
+                        "tensor_count": int(self.lora_runtime_audit["tensor_count"]),
+                        "target_module_count": int(self.lora_runtime_audit["target_module_count"]),
+                        "restricted_to_huginn_transformer": bool(
+                            self.lora_runtime_audit["restricted_to_huginn_transformer"]
+                        ),
+                    },
+                    "audio": {
+                        "maximum_seconds": 30.0,
+                        "token_duration_ms": 160,
+                        "maximum_content_tokens": 187,
+                        "trainable_boundary_tokens": ["audio_bos", "audio_eos"],
+                    },
+                    "loss": {
+                        "type": "shifted_next_token_prediction",
+                        "supervision": "assistant_response_only",
+                        "audio_prefix_labels": -100,
+                    },
+                }
+                _write_json_atomic(
+                    checkpoint_dir / TRAINING_RUNTIME_CONTRACT_FILENAME,
+                    contract,
+                )
+                print(
+                    "[HuginnAudioDynamic30s] CHECKPOINT_RUNTIME_CONTRACT_SAVED "
+                    f"phase={phase} step={state.global_step} path="
+                    f"{checkpoint_dir / TRAINING_RUNTIME_CONTRACT_FILENAME}",
+                    flush=True,
+                )
+            return control
+
         def on_train_end(self, args, state, control, **kwargs):
             del args, kwargs
             rank, world_size = self._identity()
@@ -4274,6 +4660,80 @@ def patch_checkpoint_resume_callback() -> None:
                 raise RuntimeError(
                     f"Checkpoint {phase} runtime audio count mismatch: expected={expected_updates} actual={audio}"
                 )
+            audio_model = self._audio_runtime_owner()
+            prefix_mask = getattr(audio_model, "_last_audio_prefix_mask", None)
+            full_labels = getattr(audio_model, "_last_dynamic90s_full_labels", None)
+            shift_labels = getattr(audio_model, "_last_dynamic90s_shift_labels", None)
+            if (
+                not torch.is_tensor(prefix_mask)
+                or not torch.is_tensor(full_labels)
+                or not torch.is_tensor(shift_labels)
+            ):
+                raise RuntimeError(f"Checkpoint {phase} lacks runtime prefix/NTP audit tensors")
+            prefix_length = int(prefix_mask.size(1))
+            text_labels = full_labels[:, prefix_length:]
+            response_spans: list[tuple[int, int, int]] = []
+            for row in text_labels:
+                supervised = row.ne(-100).nonzero(as_tuple=False).flatten()
+                if supervised.numel() <= 0:
+                    raise RuntimeError(f"Checkpoint {phase} has no supervised response tokens")
+                first = int(supervised[0].item())
+                last = int(supervised[-1].item())
+                expected_positions = torch.arange(
+                    first,
+                    last + 1,
+                    device=supervised.device,
+                    dtype=supervised.dtype,
+                )
+                if not torch.equal(supervised, expected_positions) or first <= 0:
+                    raise RuntimeError(
+                        f"Checkpoint {phase} response-only labels are not one contiguous suffix: "
+                        f"positions={supervised.tolist()}"
+                    )
+                response_spans.append((first, last, int(supervised.numel())))
+            loss_contract = {
+                "prefix_length": prefix_length,
+                "valid_prefix_tokens": [int(value) for value in prefix_mask.sum(dim=1).tolist()],
+                "prefix_labels_all_ignored": bool(
+                    full_labels[:, :prefix_length].eq(-100).all().item()
+                ),
+                "shift_length_valid": int(shift_labels.size(1)) == int(full_labels.size(1)) - 1,
+                "supervised_shift_tokens": int(shift_labels.ne(-100).sum().item()),
+                "response_spans": response_spans,
+                "response_only_contiguous_suffix": True,
+            }
+            if (
+                prefix_length <= 2
+                or prefix_length > 189
+                or not loss_contract["prefix_labels_all_ignored"]
+                or not loss_contract["shift_length_valid"]
+                or loss_contract["supervised_shift_tokens"] <= 0
+            ):
+                raise RuntimeError(
+                    f"Checkpoint {phase} shifted-NTP contract mismatch: {loss_contract}"
+                )
+            train_end_reshard: dict[str, Any] = {}
+            for class_name in FSDP_UNIT_CLASS_NAMES:
+                matching = [
+                    module
+                    for module in self.tracked_model.modules()
+                    if class_name in _module_mro_names(module)
+                ]
+                if len(matching) != 1:
+                    raise RuntimeError(
+                        f"Checkpoint {phase} train-end expected one {class_name}, found {len(matching)}"
+                    )
+                expected_reshard = class_name != "HuginnRecurrentCoreFSDPUnit"
+                train_end_reshard[class_name] = _assert_fsdp_reshard_state(
+                    matching[0],
+                    expected=expected_reshard,
+                    context=f"Checkpoint {phase} train-end {class_name}",
+                )
+            if self.train_started_at is None:
+                raise RuntimeError(f"Checkpoint {phase} lacks its training start timestamp")
+            torch.cuda.synchronize()
+            train_wall_seconds = time.perf_counter() - self.train_started_at
+            gib = 1024**3
             payload = {
                 "kind": "checkpoint_end",
                 "stage": "checkpoint",
@@ -4288,7 +4748,19 @@ def patch_checkpoint_resume_callback() -> None:
                 "optimizer_type": self.optimizer_type,
                 "gradient_audit": self.gradient_audit,
                 "optimizer_group_audit": self.optimizer_group_audit,
+                "lora_runtime_audit": self.lora_runtime_audit,
                 "whisper_gradient_checkpoint_modules": self.whisper_gradient_checkpoint_modules,
+                "vit_gradient_checkpointing_arg": False,
+                "whisper_internal_gradient_checkpointing": False,
+                "whisper_outer_activation_checkpointed": True,
+                "whisper_outer_checkpoint_wrappers": self.whisper_outer_wrappers,
+                "whisper_double_checkpoint_candidate": False,
+                "fsdp_reshard_after_forward": train_end_reshard,
+                "recurrent_core_runtime_audit": self.recurrent_core_runtime_audit,
+                "loss_contract": loss_contract,
+                "train_wall_seconds": train_wall_seconds,
+                "peak_memory_allocated_gib": torch.cuda.max_memory_allocated() / gib,
+                "peak_memory_reserved_gib": torch.cuda.max_memory_reserved() / gib,
                 **audio,
             }
             _write_distributed_rank_marker("checkpoint-end", payload)
@@ -4296,7 +4768,9 @@ def patch_checkpoint_resume_callback() -> None:
                 "[HuginnAudioDynamic90s] CHECKPOINT_END_AUDIT "
                 f"phase={phase} rank={rank} step_window=[{self.observed_start_step},{state.global_step}] "
                 f"finite_losses={self.finite_loss_log_count} finite_grad_norms={self.finite_grad_norm_log_count} "
-                f"audio_samples={audio['audio_sample_count']} audio_tokens={audio['realized_audio_tokens']}",
+                f"audio_samples={audio['audio_sample_count']} audio_tokens={audio['realized_audio_tokens']} "
+                f"train_wall_seconds={train_wall_seconds:.3f} "
+                f"peak_reserved_gib={payload['peak_memory_reserved_gib']:.3f}",
                 flush=True,
             )
             return control
@@ -4828,6 +5302,7 @@ patch_memory90_callback()
 patch_stage34_optimizer_step_callback()
 patch_stage5_stability_callback()
 patch_realdata_stability_callback()
+patch_recurrent_core_no_reshard_callback()
 patch_training_statistics_callback()
 patch_checkpoint_resume_callback()
 patch_checkpoint_rng_restore_audit()

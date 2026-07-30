@@ -237,6 +237,10 @@ export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR="$TRAINING_STATS_DIR"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS="$STATISTICS_LOG_STEPS"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CHECKPOINT_STEPS="$HALFWAY_STEP,$MAX_STEPS"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE=formal
+export HUGINN_AUDIO_DYNAMIC30S_RECURRENT_CORE_RESHARD_AFTER_FORWARD_FALSE=1
+unset HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE0_AUDIT_DIR
+unset HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR
+unset HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE2_AUDIT_DIR
 unset HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT
 unset HUGINN_AUDIO_DYNAMIC90S_FSDP_SAVE_DEBUG
 unset HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_AUDIT_DIR
@@ -261,8 +265,8 @@ echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=160ms pad
 echo "whisper=fully_trainable aligner=fully_trainable huginn_backbone=frozen huginn_lora_only=true"
 echo "learning_rates=whisper:$WHISPER_LR,aligner:$ALIGNER_LR,lora:$LEARNING_RATE"
 echo "lora=rank8,alpha16,dropout0.05 scheduler=cosine warmup_ratio=$WARMUP_RATIO weight_decay=$WEIGHT_DECAY max_grad_norm=$MAX_GRAD_NORM"
-echo "fsdp_units=whisper,aligner,prelude2,recurrent_adapter_plus_core4,coda2 reshard_after_forward=true"
-echo "activation_checkpointing=true vit_gradient_checkpointing=true use_reentrant=false"
+echo "fsdp_units=whisper,aligner,prelude2,recurrent_adapter_plus_core4,coda2 recurrent_core_reshard_after_forward=false all_other_units=true"
+echo "activation_checkpointing=true vit_gradient_checkpointing=false whisper_outer_checkpoint=true use_reentrant=false"
 echo "resume_checkpoint=${RESUME_CHECKPOINT:-<fresh>}"
 echo "free_storage_gb=$AVAILABLE_GB required_free_gb=$MIN_FREE_GB report_to=$REPORT_TO"
 
@@ -333,7 +337,7 @@ CMD+=(--lora_rank 8 --lora_alpha 16 --lora_dropout 0.05)
 CMD+=(--lr_scheduler_type cosine --warmup_ratio "$WARMUP_RATIO" --weight_decay "$WEIGHT_DECAY" --max_grad_norm "$MAX_GRAD_NORM")
 CMD+=(--fsdp "$FSDP_CONFIG_PATH" --max_steps "$MAX_STEPS")
 CMD+=(--per_device_train_batch_size "$PER_DEVICE_BATCH" --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS")
-CMD+=(--gradient_checkpointing false --vit_gradient_checkpointing true --gradient_checkpointing_kwargs '{"use_reentrant": false}')
+CMD+=(--gradient_checkpointing false --vit_gradient_checkpointing false --gradient_checkpointing_kwargs '{"use_reentrant": false}')
 CMD+=(--logging_steps "$LOGGING_STEPS" --save_strategy steps --save_steps "$HALFWAY_STEP" --save_total_limit 2)
 CMD+=(--dataloader_num_workers 0 --dataloader_pin_memory false --dataset_num_proc 1)
 CMD+=(--save_only_model false --report_to "$REPORT_TO" --bf16 true --seed "$SEED" --data_seed "$SEED")
