@@ -93,6 +93,16 @@ def main() -> None:
     registry_path = args.registry.expanduser().resolve()
     registry = load_pool_registry(registry_path)
     pool_sizes = {name: int(registry["pools"][name]["record_count"]) for name in POOL_ORDER}
+    missing_planning_hours = [
+        name
+        for name in POOL_ORDER
+        if registry["pools"][name].get("planning_effective_duration_hours") is None
+    ]
+    if missing_planning_hours:
+        raise ValueError(
+            "Formal duration planning is deferred until capped-duration estimates are available for: "
+            f"{missing_planning_hours}. Run the post-acceleration duration-estimation gate first."
+        )
     effective_pool_hours = {
         name: float(registry["pools"][name]["planning_effective_duration_hours"])
         for name in POOL_ORDER
@@ -145,7 +155,7 @@ def main() -> None:
         "duration_estimate_is_completion_authority": False,
         "completion_authority": "checkpoint audio_training_statistics.json total_effective_duration_hours",
         "effective_pool_hours_assumption": effective_pool_hours,
-        "duration_policy": "discard_gt90s_then_cap_at30s",
+        "duration_policy": "retain_all_then_cap_at30s",
         "pool_sizes": pool_sizes,
         "pool_average_source_hours_per_record": average_hours,
         "configured_pool_weights": GLOBAL_POOL_WEIGHTS,

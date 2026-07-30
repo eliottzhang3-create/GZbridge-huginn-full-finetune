@@ -41,6 +41,11 @@ def load_pool_registry(path: str | Path) -> dict[str, Any]:
             "Pool registry contract is incompatible with the current single-30s route: "
             f"actual={payload.get('contract_version')!r} expected={EXPECTED_CONTRACT_VERSION!r}"
         )
+    if payload.get("duration_policy") != "retain_all_then_cap_at30s":
+        raise ValueError(
+            "Pool registry uses an obsolete duration policy: "
+            f"{payload.get('duration_policy')!r}"
+        )
     pools = payload.get("pools")
     if not isinstance(pools, dict) or set(pools) != set(POOL_ORDER):
         raise ValueError(f"Unexpected registry pool set: {sorted(pools) if isinstance(pools, dict) else pools!r}")
@@ -60,7 +65,6 @@ def load_pool_registry(path: str | Path) -> dict[str, Any]:
             "index_path",
             "record_count",
             "task",
-            "planning_effective_duration_hours",
         )
         missing = [key for key in required if key not in entry]
         if missing:
@@ -71,10 +75,11 @@ def load_pool_registry(path: str | Path) -> dict[str, Any]:
             )
         if int(entry["record_count"]) <= 0:
             raise ValueError(f"Registry pool {name} has invalid record_count={entry['record_count']!r}")
-        if float(entry["planning_effective_duration_hours"]) <= 0:
+        planning_hours = entry.get("planning_effective_duration_hours")
+        if planning_hours is not None and float(planning_hours) <= 0:
             raise ValueError(
                 f"Registry pool {name} has invalid planning effective hours="
-                f"{entry['planning_effective_duration_hours']!r}"
+                f"{planning_hours!r}"
             )
     return payload
 
@@ -199,12 +204,6 @@ def iter_dynamic90s_mixture_rows(
                 break
             global_position = selection.global_position
             record = pools[selection.pool_name].record(selection.record_index)
-            raw_duration = record.get("raw_duration_sec")
-            if raw_duration is not None and float(raw_duration) > 90.0:
-                raise RuntimeError(
-                    "The duration-filtered registry contains an ineligible record: "
-                    f"pool={selection.pool_name} index={selection.record_index} duration={raw_duration}"
-                )
             targets = record.get("targets")
             if not isinstance(targets, list) or not targets:
                 raise ValueError(

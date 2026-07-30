@@ -1,8 +1,10 @@
-"""Stream duration-filtered Huginn audio metadata pools to atomic JSONL.
+"""Stream Huginn audio metadata pools to atomic JSONL.
 
-Requires the passed metadata inventory and atomic pilot. Audio files are never
-decoded, copied, converted, or exhaustively stat-checked. Token accounting is
-deferred to training-time statistics.
+Every eligible dataset record is retained. Source durations are copied only
+when already present in metadata; missing WavCaps durations do not trigger
+audio reads. Runtime decoding retains at most the first 30 seconds. Audio files
+are never decoded, copied, converted, or exhaustively stat-checked here. Token
+accounting is deferred to training-time statistics.
 """
 
 from __future__ import annotations
@@ -58,7 +60,6 @@ POOL_WEIGHTS = {
     "clotho_v2_aac": 0.06,
     "gigaspeech_l_asr": 0.40,
 }
-MAX_ELIGIBLE_DURATION_SECONDS = 90.0
 MAX_RETAINED_DURATION_SECONDS = 30.0
 FALLBACK_EFFECTIVE_POOL_HOURS = {
     "audiocaps_v2_aac": 136.0,
@@ -246,12 +247,11 @@ def audiocaps_records(manifest: Path, counters: Counter[str]) -> Iterator[dict[s
         }
         duration = metadata_duration_seconds(source_record)
         if duration is not None:
-            if duration > MAX_ELIGIBLE_DURATION_SECONDS:
-                counters["excluded_over_90s"] += 1
-                continue
             record["raw_duration_sec"] = duration
             counters["duration_metadata_records"] += 1
-        counters["eligible_records"] += 1
+        else:
+            counters["duration_missing_records"] += 1
+        counters["emitted_records"] += 1
         yield record
 
 
@@ -278,16 +278,8 @@ def wavcaps_records(pilot: dict[str, Any], counters: Counter[str]) -> Iterator[d
                 # AudioSet clips are fixed 10-second excerpts; some WavCaps
                 # metadata releases omit an explicit duration field.
                 duration = 10.0
-            if duration is None:
-                raise ValueError(
-                    "WavCaps duration metadata is required for the >90s exclusion contract: "
-                    f"source={source} sample_id={sample_id} metadata={metadata_path}"
-                )
-            if duration > MAX_ELIGIBLE_DURATION_SECONDS:
-                counters["excluded_over_90s"] += 1
-                continue
-            counters["eligible_records"] += 1
-            yield {
+                counters["duration_assumed_audioset_10s_records"] += 1
+            record = {
                 "schema_version": SCHEMA_VERSION,
                 "uid": f"wavcaps:{source}:{sample_id}",
                 "dataset": "WavCaps",
@@ -295,10 +287,16 @@ def wavcaps_records(pilot: dict[str, Any], counters: Counter[str]) -> Iterator[d
                 "task": "AAC",
                 "split": "train",
                 "audio": {"path": str(path), "format": suffix.lstrip(".")},
-                "raw_duration_sec": duration,
                 "targets": targets,
                 "metadata": {"sample_id": sample_id, "metadata_path": str(metadata_path)},
             }
+            if duration is not None:
+                record["raw_duration_sec"] = duration
+                counters["duration_available_records"] += 1
+            else:
+                counters["duration_missing_records"] += 1
+            counters["emitted_records"] += 1
+            yield record
 
 
 def clotho_records(root: Path, manifest_name: str) -> Iterator[dict[str, Any]]:
@@ -361,10 +359,7 @@ def gigaspeech_records(root: Path, metadata_name: str, counters: Counter[str]) -
             if begin < 0 or end <= begin:
                 raise ValueError(f"Invalid GigaSpeech-L bounds: sid={sid} begin={begin} end={end}")
             duration = end - begin
-            if duration > MAX_ELIGIBLE_DURATION_SECONDS:
-                counters["excluded_over_90s"] += 1
-                continue
-            counters["eligible_l_segments"] += 1
+            counters["emitted_l_segments"] += 1
             yield {
                 "schema_version": SCHEMA_VERSION,
                 "uid": f"gigaspeech_l:{sid}",
@@ -460,27 +455,24 @@ def main() -> None:
         {
             "excluded_sources": ["BBC_Sound_Effects"],
             "bbc_record_count": 0,
-            "duration_filter": {
-                "discard_above_seconds": MAX_ELIGIBLE_DURATION_SECONDS,
+            "duration_accounting": {
+                "retain_all_records": True,
                 "retained_cap_seconds": MAX_RETAINED_DURATION_SECONDS,
                 **dict(wavcaps_counters),
             },
         }
     )
-    if (
-        wavcaps_counters["source_records"]
-        != wavcaps_counters["eligible_records"] + wavcaps_counters["excluded_over_90s"]
-        or not pool_stats["wavcaps_no_bbc_aac"]["duration_metadata_complete"]
-    ):
+    if wavcaps_counters["source_records"] != wavcaps_counters["emitted_records"]:
         raise ValueError(
-            "WavCaps duration filtering did not account for every metadata record: "
+            "WavCaps metadata streaming did not emit every non-BBC record: "
             f"counters={dict(wavcaps_counters)} stats={pool_stats['wavcaps_no_bbc_aac']}"
         )
     print(f"[full-pool] pool=wavcaps_no_bbc_aac records={pool_stats['wavcaps_no_bbc_aac']['record_count']} ready=true", flush=True)
     print(
         "[duration] pool=wavcaps_no_bbc_aac "
-        f"excluded_over_90s={wavcaps_counters['excluded_over_90s']} "
-        f"effective_hours_30s_cap={pool_stats['wavcaps_no_bbc_aac']['effective_duration_hours_after_30s_cap']:.6f}",
+        f"metadata_available={pool_stats['wavcaps_no_bbc_aac']['duration_metadata_record_count']} "
+        f"metadata_missing={wavcaps_counters['duration_missing_records']} "
+        "planning_hours=deferred",
         flush=True,
     )
 
@@ -494,8 +486,8 @@ def main() -> None:
     pool_stats["audiocaps_v2_aac"] = writers["audiocaps_v2_aac"].finish_temporary(
         {
             "source_manifest": str(Path(args.audiocaps_manifest)),
-            "duration_filter": {
-                "discard_above_seconds": MAX_ELIGIBLE_DURATION_SECONDS,
+            "duration_accounting": {
+                "retain_all_records": True,
                 "retained_cap_seconds": MAX_RETAINED_DURATION_SECONDS,
                 **dict(audiocaps_counters),
             },
@@ -529,14 +521,14 @@ def main() -> None:
     giga_expected = int(inventory["pools"]["gigaspeech_l_asr"]["l_segment_count"])
     if (
         giga_counters["l_segments"] != giga_expected
-        or writers["gigaspeech_l_asr"].record_count != giga_counters["eligible_l_segments"]
-        or giga_counters["eligible_l_segments"] + giga_counters["excluded_over_90s"] != giga_expected
+        or writers["gigaspeech_l_asr"].record_count != giga_counters["emitted_l_segments"]
+        or giga_counters["emitted_l_segments"] != giga_expected
     ):
         raise ValueError(
             "GigaSpeech-L count changed: "
             f"expected={giga_expected} emitted={writers['gigaspeech_l_asr'].record_count} "
-            f"eligible={giga_counters['eligible_l_segments']} "
-            f"excluded_over_90s={giga_counters['excluded_over_90s']} seen={giga_counters['l_segments']}"
+            f"emitted_l_segments={giga_counters['emitted_l_segments']} "
+            f"seen={giga_counters['l_segments']}"
         )
     pool_stats["gigaspeech_l_asr"] = writers["gigaspeech_l_asr"].finish_temporary(
         {"metadata_counters": dict(giga_counters), "duplicate_sid_audit": "passed by prerequisite inventory"}
@@ -544,18 +536,32 @@ def main() -> None:
     print(f"[full-pool] pool=gigaspeech_l_asr records={pool_stats['gigaspeech_l_asr']['record_count']} ready=true", flush=True)
     print(
         "[duration] pool=gigaspeech_l_asr "
-        f"excluded_over_90s={giga_counters['excluded_over_90s']} "
+        "retained_all_segments=true "
         f"effective_hours_30s_cap={pool_stats['gigaspeech_l_asr']['effective_duration_hours_after_30s_cap']:.6f}",
         flush=True,
     )
 
-    for pool_name in ("wavcaps_no_bbc_aac", "gigaspeech_l_asr"):
-        if not pool_stats[pool_name]["duration_metadata_complete"]:
-            raise ValueError(f"Planning requires complete duration metadata for {pool_name}")
+    if not pool_stats["gigaspeech_l_asr"]["duration_metadata_complete"]:
+        raise ValueError("GigaSpeech-L segment metadata must retain complete duration accounting")
+
+    def planning_hours(pool_name: str) -> float | None:
+        if pool_name in FALLBACK_EFFECTIVE_POOL_HOURS:
+            return FALLBACK_EFFECTIVE_POOL_HOURS[pool_name]
+        if pool_stats[pool_name]["duration_metadata_complete"]:
+            return float(pool_stats[pool_name]["effective_duration_hours_after_30s_cap"])
+        return None
+
+    def planning_source(pool_name: str) -> str:
+        if pool_name in FALLBACK_EFFECTIVE_POOL_HOURS:
+            return "fixed_verified_pool_hours_all_samples_le_30s"
+        if pool_stats[pool_name]["duration_metadata_complete"]:
+            return "complete_source_metadata_after_30s_cap"
+        return "deferred_missing_source_duration_metadata"
 
     registry = {
         "contract_version": contract.get("contract_version"),
         "schema_version": SCHEMA_VERSION,
+        "duration_policy": "retain_all_then_cap_at30s",
         "index_format": "little-endian uint64 JSONL byte offsets without header",
         "sampling_weights": POOL_WEIGHTS,
         "per_record_token_accounting": False,
@@ -565,16 +571,8 @@ def main() -> None:
                 "index_path": pool_stats[pool_name]["index_path"],
                 "stats_path": str(writers[pool_name].stats_path),
                 "record_count": pool_stats[pool_name]["record_count"],
-                "planning_effective_duration_hours": (
-                    FALLBACK_EFFECTIVE_POOL_HOURS[pool_name]
-                    if pool_name in FALLBACK_EFFECTIVE_POOL_HOURS
-                    else pool_stats[pool_name]["effective_duration_hours_after_30s_cap"]
-                ),
-                "planning_duration_source": (
-                    "fixed_verified_pool_hours_all_samples_le_30s"
-                    if pool_name in FALLBACK_EFFECTIVE_POOL_HOURS
-                    else "complete_source_metadata_after_gt90_filter_and_30s_cap"
-                ),
+                "planning_effective_duration_hours": planning_hours(pool_name),
+                "planning_duration_source": planning_source(pool_name),
                 "global_weight": POOL_WEIGHTS[pool_name],
                 "task": "ASR" if pool_name == "gigaspeech_l_asr" else "AAC",
             }
@@ -589,9 +587,10 @@ def main() -> None:
         "full_audio_path_scan": False,
         "token_accounting": False,
         "duration_policy": {
-            "discard_above_seconds": MAX_ELIGIBLE_DURATION_SECONDS,
+            "retain_all_records": True,
+            "discard_above_seconds": None,
             "retain_at_most_seconds": MAX_RETAINED_DURATION_SECONDS,
-            "audio_decode_for_filtering": False,
+            "audio_decode_for_eligibility": False,
         },
         "preflight_free_gib": free_gib,
         "required_free_gib": args.min_free_gib,

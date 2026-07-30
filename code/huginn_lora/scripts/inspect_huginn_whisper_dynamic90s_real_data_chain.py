@@ -334,7 +334,7 @@ def main() -> None:
         "gate": "huginn_whisper_dynamic30s_real_data_chain_v2",
         "validation_passed": True,
         "contract_version": registry.get("contract_version"),
-        "duration_policy": "discard_gt90s_then_cap_at30s",
+        "duration_policy": "retain_all_then_cap_at30s",
         "registry": str(registry_path),
         "seed": args.seed,
         "swift_rows_checked": len(baseline_rows),

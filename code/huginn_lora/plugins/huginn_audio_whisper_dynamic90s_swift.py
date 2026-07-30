@@ -50,7 +50,6 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio a
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_AUDIO_CHUNK_SECONDS = 30.0
 DEFAULT_MAX_AUDIO_SECONDS = 30.0
-DISCARD_AUDIO_ABOVE_SECONDS = 90.0
 WHISPER_MAX_FEATURE_FRAMES = 3000
 WHISPER_FEATURE_HOP_LENGTH = 160
 WHISPER_ENCODER_DOWNSAMPLE = 2
@@ -3564,13 +3563,6 @@ class HuginnAudioTemplate(Template):
 
         audit_consumed_audio_position(inputs.audios[0])
         audio_item = inputs.audios[0]
-        if isinstance(audio_item, dict) and audio_item.get("raw_duration_sec") is not None:
-            raw_duration_seconds = float(audio_item["raw_duration_sec"])
-            if raw_duration_seconds > DISCARD_AUDIO_ABOVE_SECONDS:
-                raise RuntimeError(
-                    "A duration-filtered training pool emitted an ineligible audio sample: "
-                    f"duration={raw_duration_seconds:.6f}s limit={DISCARD_AUDIO_ABOVE_SECONDS:.6f}s"
-                )
         waveform = self._load_audio_item(audio_item)
         audio_chunks, audio_feature_lengths = split_audio_for_whisper(
             waveform,

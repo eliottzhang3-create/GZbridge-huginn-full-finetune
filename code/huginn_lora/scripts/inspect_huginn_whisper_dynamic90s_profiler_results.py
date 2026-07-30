@@ -203,7 +203,7 @@ def main() -> None:
             }
             if any(value != expected for value in lengths.values()):
                 raise RuntimeError(f"Rank {rank} profiler input metadata is incomplete: {lengths}")
-            if any(value <= 0.0 or value > 90.001 for value in row_durations):
+            if any(value <= 0.0 or value > 30.001 for value in row_durations):
                 raise RuntimeError(f"Rank {rank} observed invalid effective audio duration: {row_durations}")
             if any(value < 2 or value > 752 for value in row_prefixes):
                 raise RuntimeError(f"Rank {rank} observed invalid dynamic prefix length: {row_prefixes}")

@@ -77,6 +77,8 @@ if (
     or report.get('contract_version') != 'huginn_whisper_dynamic30s_data_v2'
 ):
     raise SystemExit(f'Real data-chain prerequisite has not passed: {sys.argv[1]}')
+if report.get('duration_policy') != 'retain_all_then_cap_at30s':
+    raise SystemExit(f'Real data-chain uses the obsolete duration policy: {report.get("duration_policy")!r}')
 sampler_report = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
 if (
     not sampler_report.get('validation_passed')
@@ -85,6 +87,8 @@ if (
     or sampler_report.get('contract_version') != 'huginn_whisper_dynamic30s_data_v2'
 ):
     raise SystemExit(f'No-replacement sampler prerequisite has not passed: {sys.argv[2]}')
+if sampler_report.get('duration_policy') != 'retain_all_then_cap_at30s':
+    raise SystemExit(f'Sampler report uses the obsolete duration policy: {sampler_report.get("duration_policy")!r}')
 if int(report.get('seed', -1)) != int(sys.argv[4]) or int(sampler_report.get('seed', -1)) != int(sys.argv[4]):
     raise SystemExit(
         f'Prerequisite seed mismatch: real={report.get("seed")} sampler={sampler_report.get("seed")} '
@@ -159,7 +163,7 @@ echo "checkpoint_state=model+optimizer+scheduler+rng+trainer_global_step+no_repl
 echo "lr_scheduler=constant learning_rate=1e-4"
 echo "modules_to_save=${MODULES_TO_SAVE[*]}"
 echo "whisper_encoder=fully_trainable learning_rate=1e-4 aligner_lr=1e-4"
-echo "audio=single_dynamic_chunk retain_first30s discard_gt90s token_rate=160ms"
+echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=160ms"
 echo "gradient_checkpointing=false vit_gradient_checkpointing=true use_reentrant=false"
 echo "pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"
 echo "huginn_backbone=frozen lora_rank=8 lora_alpha=16 lora_dropout=0.05 full_model_dcp=true"

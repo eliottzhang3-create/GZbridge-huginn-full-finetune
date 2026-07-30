@@ -94,6 +94,8 @@ if (
     or real_data.get("contract_version") != "huginn_whisper_dynamic30s_data_v2"
 ):
     raise SystemExit(f"Real data-chain prerequisite has not passed: {sys.argv[1]}")
+if real_data.get("duration_policy") != "retain_all_then_cap_at30s":
+    raise SystemExit(f"Real data-chain uses the obsolete duration policy: {real_data.get('duration_policy')!r}")
 if (
     not sampler.get("validation_passed")
     or sampler.get("sampler_version") != "deterministic_hierarchical_no_replacement_v2"
@@ -101,6 +103,8 @@ if (
     or sampler.get("contract_version") != "huginn_whisper_dynamic30s_data_v2"
 ):
     raise SystemExit(f"No-replacement sampler prerequisite has not passed: {sys.argv[2]}")
+if sampler.get("duration_policy") != "retain_all_then_cap_at30s":
+    raise SystemExit(f"Sampler report uses the obsolete duration policy: {sampler.get('duration_policy')!r}")
 if int(real_data.get("seed", -1)) != int(sys.argv[3]) or int(sampler.get("seed", -1)) != int(sys.argv[3]):
     raise SystemExit(
         f"Prerequisite seed mismatch: real={real_data.get('seed')} sampler={sampler.get('seed')} "
@@ -253,7 +257,7 @@ echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH accumulation=$GR
 echo "target_realized_hours_gt=$TARGET_HOURS planning_reserve_ratio=$PLANNING_RESERVE_RATIO"
 echo "max_steps=$MAX_STEPS halfway_step=$HALFWAY_STEP total_scheduled_samples=$TOTAL_SAMPLES"
 echo "checkpoints=checkpoint-$HALFWAY_STEP,checkpoint-$MAX_STEPS save_total_limit=2 full_model_dcp=true"
-echo "audio=single_dynamic_chunk discard_gt90s retain_first30s token_rate=160ms padding=local_batch_longest labels=-100"
+echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=160ms padding=local_batch_longest labels=-100"
 echo "whisper=fully_trainable aligner=fully_trainable huginn_backbone=frozen huginn_lora_only=true"
 echo "learning_rates=whisper:$WHISPER_LR,aligner:$ALIGNER_LR,lora:$LEARNING_RATE"
 echo "lora=rank8,alpha16,dropout0.05 scheduler=cosine warmup_ratio=$WARMUP_RATIO weight_decay=$WEIGHT_DECAY max_grad_norm=$MAX_GRAD_NORM"

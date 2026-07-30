@@ -2304,8 +2304,8 @@ The active Huginn route now uses exactly one dynamic Whisper chunk per sample. E
 environment variables, model type, and model directory are retained only for Swift/checkpoint tooling compatibility;
 their active runtime semantics are now:
 
-- source duration `>90s`: exclude the atomic record before it enters the no-replacement sampling pool;
-- source duration `(30s, 90s]`: decode and retain only the first `30s`;
+- every eligible dataset record is retained regardless of source duration;
+- source duration `>30s`: decode and retain only the first `30s`;
 - source duration `<=30s`: retain the real duration;
 - no 2/3-chunk splitting or concatenation; every local sample has exactly one Whisper chunk;
 - one Conv1d compressor with kernel `8`, stride `8`, padding `0`, giving one token per complete `160ms`;
@@ -2314,13 +2314,13 @@ their active runtime semantics are now:
 - Whisper, the complete aligner, and Huginn-only rank-8 LoRA remain trainable at `1e-4`; the native Huginn backbone
   and LM head remain frozen.
 
-The old v1 metadata pools cannot safely implement `>90s` rejection without introducing gaps into global sampler
-positions. The active data route therefore builds metadata-only v2 pools under
+The active data route builds metadata-only v2 pools under
 `data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/`. It reads source metadata, writes new JSONL/index
-files, and does not copy, download, or exhaustively decode audio. WavCaps and GigaSpeech use complete metadata duration
-accounting; AudioCaps and Clotho retain their verified pool-hour assumptions because those datasets are already at or
-below 30 seconds. The same deterministic hierarchical no-replacement sampler is used unchanged over the filtered pool
-sizes, preserving complete per-pool epochs and exact arbitrary-position resume.
+files, and does not copy, download, scan, or decode WavCaps audio during pool construction. Missing WavCaps duration
+metadata is allowed because duration no longer controls sample eligibility. GigaSpeech retains exact segment durations;
+AudioCaps and Clotho retain their existing metadata/verified assumptions. The deterministic hierarchical no-replacement
+sampler runs over every non-BBC WavCaps record and every GigaSpeech-L segment, preserving complete per-pool epochs and
+exact arbitrary-position resume.
 
 Run the current gates in this order after syncing code:
 
@@ -2335,12 +2335,13 @@ bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resum
 bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
 ```
 
-Formal training now targets more than `3000` realized, decoded, 30-second-capped hours. The planner reads each v2
-registry pool's post-filter/post-cap planning hours, adds a `5%` reserve, follows the exact deterministic pool selection
-sequence, and rounds `max_steps` upward to an even multiple of `100`. The generated remote
-`formal_training_plan.json` is authoritative because the exact WavCaps post-cap hours are not available in the local
-code-only workspace. The job retains exactly two full-model checkpoints at halfway and completion. If final realized
-statistics do not exceed 3000 hours, the final checkpoint remains saved and the terminal audit exits with an error.
+Formal training still targets more than `3000` realized, decoded, 30-second-capped hours, but max-step planning is now
+deliberately deferred until after the acceleration experiments and their FSDP4 smoke tests. WavCaps source metadata is
+not duration-complete, so the metadata-pool prerequisite must not fabricate a precise post-cap hour total. A separate
+duration-estimation gate will be run before formal training, after which the planner will add the agreed `5%` reserve,
+follow the exact deterministic pool-selection sequence, and round `max_steps` upward to an even multiple of `100`.
+The formal job will retain exactly two full-model checkpoints at halfway and completion. If final realized statistics do
+not exceed 3000 hours, the final checkpoint remains saved and the terminal audit exits with an error.
 
 The full Torch Profiler route is paused after a Kineto/native `SIGSEGV` on the old recurrent dynamic-90s workload and is
 not part of the current launch sequence.

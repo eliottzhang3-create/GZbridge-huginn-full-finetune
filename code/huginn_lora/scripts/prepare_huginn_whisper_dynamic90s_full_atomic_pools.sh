@@ -30,7 +30,7 @@ echo "inventory=$INVENTORY"
 echo "pilot_report=$PILOT_REPORT"
 echo "output_root=$OUTPUT_ROOT"
 echo "min_free_gib=$MIN_FREE_GIB"
-echo "duration_policy=discard_gt90s_retain_first30s metadata_only=true"
+echo "duration_policy=retain_all_retain_first30s metadata_only=true"
 echo "audio_decode=false audio_copy=false full_audio_scan=false token_accounting=false"
 
 python -u code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_contract.py

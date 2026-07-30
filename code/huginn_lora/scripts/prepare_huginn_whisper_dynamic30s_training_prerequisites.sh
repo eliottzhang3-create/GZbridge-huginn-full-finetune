@@ -18,7 +18,6 @@ FULL_REPORT="$DATA_ROOT/full_pool_report.json"
 SAMPLER_DIR="$DATA_ROOT/sampler"
 SAMPLER_REPORT="$SAMPLER_DIR/mixture_sampler_report.json"
 REALDATA_REPORT="$DATA_ROOT/real_data_chain_report.json"
-PLAN_PREVIEW="$DATA_ROOT/formal_training_plan_3000h_preview.json"
 
 export HUGINN_DYNAMIC90S_FULL_POOL_ROOT="$DATA_ROOT"
 export HUGINN_DYNAMIC90S_POOL_REGISTRY="$REGISTRY"
@@ -29,7 +28,7 @@ export HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT="$REALDATA_REPORT"
 
 echo "========== HUGINN WHISPER DYNAMIC30S TRAINING PREREQUISITES START =========="
 echo "data_root=$DATA_ROOT"
-echo "duration_policy=discard_gt90s_retain_first30s token_rate=160ms chunks_per_sample=1"
+echo "duration_policy=retain_all_retain_first30s token_rate=160ms chunks_per_sample=1"
 echo "scope=metadata_rebuild+sampler_cpu_audit+four_real_audio_decodes"
 
 if [ ! -s "$REGISTRY" ] || [ ! -s "$FULL_REPORT" ]; then
@@ -44,24 +43,19 @@ registry = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 report = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
 if registry.get("contract_version") != "huginn_whisper_dynamic30s_data_v2":
     raise SystemExit(f"Existing registry has incompatible contract: {registry.get('contract_version')!r}")
+if registry.get("duration_policy") != "retain_all_then_cap_at30s":
+    raise SystemExit(f"Existing registry uses the obsolete duration policy: {registry.get('duration_policy')!r}")
 if not report.get("validation_passed") or report.get("gate") != "huginn_whisper_dynamic30s_full_atomic_pools_v2":
     raise SystemExit(f"Existing full-pool report is not a passed dynamic30s gate: {sys.argv[2]}")
+policy = report.get("duration_policy", {})
+if policy.get("retain_all_records") is not True or policy.get("discard_above_seconds") is not None:
+    raise SystemExit(f"Existing full-pool report uses the obsolete duration policy: {policy}")
 print(f"[prerequisite] reuse_passed_full_pool={sys.argv[1]}")
 PY
 fi
 
 bash code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_indexed_mixture.sh
 bash code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_real_data_chain.sh
-python -u code/huginn_lora/scripts/plan_huginn_whisper_dynamic90s_formal_training.py \
-  --registry "$REGISTRY" \
-  --output "$PLAN_PREVIEW" \
-  --seed "${HUGINN_DYNAMIC90S_MIXTURE_SEED:-20260730}" \
-  --target-hours 3000 \
-  --reserve-ratio 1.05 \
-  --step-rounding 100 \
-  --world-size 4 \
-  --per-device-batch 2 \
-  --gradient-accumulation 4
 
 python - "$SAMPLER_REPORT" "$REALDATA_REPORT" <<'PY'
 import json
@@ -76,15 +70,19 @@ if (
     or sampler.get("contract_version") != "huginn_whisper_dynamic30s_data_v2"
 ):
     raise SystemExit(f"Sampler audit did not pass: {sys.argv[1]}")
+if sampler.get("duration_policy") != "retain_all_then_cap_at30s":
+    raise SystemExit(f"Sampler audit uses the obsolete duration policy: {sampler.get('duration_policy')!r}")
 if (
     not realdata.get("validation_passed")
     or realdata.get("gate") != "huginn_whisper_dynamic30s_real_data_chain_v2"
     or realdata.get("contract_version") != "huginn_whisper_dynamic30s_data_v2"
 ):
     raise SystemExit(f"Real-data chain did not pass dynamic30s contract: {sys.argv[2]}")
+if realdata.get("duration_policy") != "retain_all_then_cap_at30s":
+    raise SystemExit(f"Real-data chain uses the obsolete duration policy: {realdata.get('duration_policy')!r}")
 print(f"[prerequisite] sampler_report={sys.argv[1]}")
 print(f"[prerequisite] realdata_report={sys.argv[2]}")
 PY
 
-echo "formal_plan_preview=$PLAN_PREVIEW"
+echo "formal_plan_preview=deferred_until_post_acceleration_smoke_duration_estimation"
 echo "========== HUGINN WHISPER DYNAMIC30S TRAINING PREREQUISITES PASSED =========="

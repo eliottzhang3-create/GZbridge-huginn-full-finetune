@@ -124,8 +124,8 @@ def validate_record(pool_name: str, record: dict[str, Any]) -> None:
     if "effective_audio_tokens" in record:
         raise ValueError(f"Pool {pool_name} unexpectedly precomputed effective_audio_tokens")
     raw_duration = record.get("raw_duration_sec")
-    if raw_duration is not None and (float(raw_duration) <= 0 or float(raw_duration) > 90.0):
-        raise ValueError(f"Pool {pool_name} contains an ineligible duration: {raw_duration}")
+    if raw_duration is not None and float(raw_duration) <= 0:
+        raise ValueError(f"Pool {pool_name} contains a non-positive duration: {raw_duration}")
 
 
 def probe_indices(record_count: int, probe_count: int, seed: int) -> list[int]:
@@ -227,13 +227,18 @@ def main() -> None:
     full_report = load_json(Path(args.full_report))
     if not full_report.get("validation_passed"):
         raise ValueError("Full atomic-pool report has not passed")
+    if registry.get("duration_policy") != "retain_all_then_cap_at30s":
+        raise ValueError(f"Registry uses an obsolete duration policy: {registry.get('duration_policy')!r}")
+    report_policy = full_report.get("duration_policy", {})
+    if report_policy.get("retain_all_records") is not True or report_policy.get("discard_above_seconds") is not None:
+        raise ValueError(f"Full atomic-pool report uses an obsolete duration policy: {report_policy}")
     compare_weights(registry.get("sampling_weights", {}), GLOBAL_POOL_WEIGHTS, "registry weights")
     registry_pools = registry.get("pools", {})
     if set(registry_pools) != set(POOL_ORDER):
         raise ValueError(f"Registry pool set mismatch: {sorted(registry_pools)}")
     for pool_name, entry in registry_pools.items():
-        planning_hours = float(entry.get("planning_effective_duration_hours", -1.0))
-        if planning_hours <= 0:
+        planning_hours = entry.get("planning_effective_duration_hours")
+        if planning_hours is not None and float(planning_hours) <= 0:
             raise ValueError(f"Pool {pool_name} has invalid planning effective hours: {planning_hours}")
 
     output_dir = Path(args.output_dir)
@@ -405,7 +410,7 @@ def main() -> None:
             "gate": "huginn_whisper_dynamic30s_indexed_mixture_no_replacement_v2",
             "validation_passed": True,
             "contract_version": registry.get("contract_version"),
-            "duration_policy": "discard_gt90s_then_cap_at30s",
+            "duration_policy": "retain_all_then_cap_at30s",
             "sampler_version": SAMPLER_VERSION,
             "seed": args.seed,
             "world_size": args.world_size,
