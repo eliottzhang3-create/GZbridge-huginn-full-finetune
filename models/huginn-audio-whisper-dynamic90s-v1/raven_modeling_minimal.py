@@ -88,6 +88,30 @@ class WhisperEncoderFSDPUnit(nn.Module):
         super().__init__()
         self.encoder = encoder
 
+    @property
+    def gradient_checkpointing(self) -> bool:
+        return bool(getattr(self.encoder, "gradient_checkpointing", False))
+
+    @property
+    def is_gradient_checkpointing(self) -> bool:
+        return bool(getattr(self.encoder, "is_gradient_checkpointing", self.gradient_checkpointing))
+
+    def gradient_checkpointing_enable(self, *args, **kwargs):
+        return self.encoder.gradient_checkpointing_enable(*args, **kwargs)
+
+    def gradient_checkpointing_disable(self):
+        return self.encoder.gradient_checkpointing_disable()
+
+    def enable_input_require_grads(self):
+        # Whisper is full-tuned and receives floating log-mel tensors rather
+        # than frozen embedding outputs. Non-reentrant checkpointing does not
+        # require those inputs to have requires_grad=True. This method exists
+        # so Swift reaches gradient_checkpointing_enable on the wrapped tower.
+        return None
+
+    def disable_input_require_grads(self):
+        return None
+
     def forward(self, *args, **kwargs):
         return self.encoder(*args, **kwargs)
 

@@ -47,7 +47,7 @@ from swift.utils import get_multimodal_target_regex
 available = {field.name for field in fields(SftArguments)}
 required = {
     'fsdp', 'tuner_type', 'freeze_vit', 'freeze_aligner', 'vit_lr',
-    'vit_gradient_checkpointing', 'lora_rank',
+    'vit_gradient_checkpointing', 'gradient_checkpointing_kwargs', 'lora_rank',
     'lora_alpha', 'lora_dropout', 'lr_scheduler_type', 'max_steps', 'save_strategy',
 }
 missing = sorted(required - available)
@@ -172,6 +172,7 @@ swift sft \
   --gradient_accumulation_steps 4 \
   --gradient_checkpointing false \
   --vit_gradient_checkpointing true \
+  --gradient_checkpointing_kwargs '{"use_reentrant": false}' \
   --logging_steps 1 \
   --save_strategy no \
   --dataloader_num_workers 0 \

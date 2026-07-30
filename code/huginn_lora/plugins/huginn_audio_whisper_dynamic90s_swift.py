@@ -2238,10 +2238,15 @@ def patch_memory90_callback() -> None:
             )
             if audio_model is None:
                 raise RuntimeError("90-second memory smoke could not locate the audio model")
-            whisper_gradient_checkpointing = bool(
-                getattr(audio_model.audio_encoder, "gradient_checkpointing", False)
-                or getattr(audio_model.audio_encoder, "is_gradient_checkpointing", False)
-            )
+            whisper_gradient_checkpoint_modules = [
+                type(module).__name__
+                for module in audio_model.audio_encoder.modules()
+                if bool(
+                    getattr(module, "gradient_checkpointing", False)
+                    or getattr(module, "is_gradient_checkpointing", False)
+                )
+            ]
+            whisper_gradient_checkpointing = bool(whisper_gradient_checkpoint_modules)
             checkpoint_wrappers = [
                 type(module).__name__
                 for module in self.tracked_model.modules()
@@ -2261,6 +2266,7 @@ def patch_memory90_callback() -> None:
             self.memory_contract_audit = {
                 "vit_gradient_checkpointing_arg": bool(args.vit_gradient_checkpointing),
                 "whisper_gradient_checkpointing": whisper_gradient_checkpointing,
+                "whisper_gradient_checkpoint_modules": whisper_gradient_checkpoint_modules,
                 "fsdp_activation_checkpoint_wrapper_count": len(checkpoint_wrappers),
                 "cuda_allocator_config": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
             }

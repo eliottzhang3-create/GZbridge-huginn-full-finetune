@@ -2328,8 +2328,9 @@ Whisper/aligner/LoRA gradients, no Huginn-base gradients, two 752-position prefi
 sharding, and per-rank CUDA peak allocated/reserved memory markers. The initial fully-trainable-Whisper B2 attempt
 reached `31.18 GiB` before the first recurrent-core all-gather and OOMed while requesting another `362 MiB`. The active
 retry therefore preserves B2/GA4 but enables explicit Whisper gradient checkpointing, FSDP activation checkpointing,
-and the expandable-segments CUDA allocator; the marker gate verifies all three are actually active. It saves no
-checkpoint.
+and the expandable-segments CUDA allocator. The custom whole-Whisper FSDP unit proxies Swift's gradient-checkpointing
+interface to the inner Hugging Face encoder and uses non-reentrant checkpointing for floating log-mel inputs; the marker
+gate verifies all three memory controls are actually active. It saves no checkpoint.
 
 Historically, the pre-grouping implementation passed Stage 0-2 remotely, including the production duration contract, real Swift
 collator/prefix checks, effective rank-8/alpha-16/dropout-0.05 LoRA audit, frozen Whisper/base audit, and a real backward
