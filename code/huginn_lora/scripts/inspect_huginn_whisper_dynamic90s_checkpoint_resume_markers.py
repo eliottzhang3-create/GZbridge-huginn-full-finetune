@@ -18,7 +18,14 @@ if str(HUGINN_LORA_ROOT) not in sys.path:
     sys.path.insert(0, str(HUGINN_LORA_ROOT))
 
 from data_pipeline.dynamic90s_mixture_rows import load_pool_registry, open_indexed_pools  # noqa: E402
-from data_pipeline.indexed_atomic_mixture import POOL_ORDER, DeterministicHierarchicalMixture  # noqa: E402
+from data_pipeline.indexed_atomic_mixture import (  # noqa: E402
+    POOL_ORDER,
+    SAMPLER_VERSION,
+    DeterministicHierarchicalMixture,
+)
+
+
+TRAINING_STATS_VERSION = "huginn_dynamic90s_training_statistics_v1"
 
 
 EXPECTED_TRAINABLE_TENSORS = {
@@ -42,6 +49,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-audit-dir", type=Path, required=True)
     parser.add_argument("--resume-audit-dir", type=Path, required=True)
     parser.add_argument("--data-audit-dir", type=Path, required=True)
+    parser.add_argument("--forward-audit-dir", type=Path, required=True)
+    parser.add_argument("--save-stats-state", type=Path, required=True)
+    parser.add_argument("--resume-stats-state", type=Path, required=True)
     parser.add_argument("--registry", type=Path, required=True)
     parser.add_argument("--seed", type=int, default=20260730)
     parser.add_argument("--save-step", type=int, default=4)
@@ -214,7 +224,15 @@ def validate_data_window(
     # above independently prove the exact number of model-consumed samples.
     # Every duplicate must carry identical provenance before it is collapsed.
     unique_records: dict[int, dict[str, Any]] = {}
-    provenance_fields = ("pool_name", "task", "uid")
+    provenance_fields = (
+        "pool_name",
+        "task",
+        "uid",
+        "record_index",
+        "pool_occurrence_index",
+        "pool_epoch",
+        "pool_epoch_offset",
+    )
     for record in records:
         position = int(record["global_position"])
         previous = unique_records.get(position)
@@ -239,6 +257,10 @@ def validate_data_window(
             "pool_name": selection.pool_name,
             "task": atomic["task"],
             "uid": atomic["uid"],
+            "record_index": selection.record_index,
+            "pool_occurrence_index": selection.pool_occurrence_index,
+            "pool_epoch": selection.pool_epoch,
+            "pool_epoch_offset": selection.pool_epoch_offset,
         }
         actual = {key: record.get(key) for key in expected}
         if actual != expected:
@@ -257,6 +279,135 @@ def validate_data_window(
         f"unconsumed_prefetch_pool_counts={dict(prefetched_pool_counts)}"
     )
     return pool_counts
+
+
+def read_forward_records(
+    audit_dir: Path,
+    phase: str,
+    world_size: int,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    observed_ranks: set[int] = set()
+    for rank in range(world_size):
+        path = audit_dir / f"forward-{phase}-rank-{rank}.jsonl"
+        if not path.is_file() or path.stat().st_size <= 0:
+            raise FileNotFoundError(f"Missing forward-consumption audit: {path}")
+        rank_records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if any(record.get("rank") != rank or record.get("phase") != phase for record in rank_records):
+            raise AssertionError(f"Invalid forward-consumption records in {path}: {rank_records}")
+        observed_ranks.add(rank)
+        records.extend(rank_records)
+    if observed_ranks != set(range(world_size)):
+        raise AssertionError(f"Forward-consumption audit missed ranks: {observed_ranks}")
+    return records
+
+
+def validate_forward_window(
+    records: list[dict[str, Any]],
+    phase: str,
+    start_position: int,
+    end_position: int,
+    world_size: int,
+    planner: DeterministicHierarchicalMixture,
+) -> tuple[Counter[str], dict[str, float]]:
+    expected_positions = list(range(start_position, end_position))
+    actual_positions = sorted(int(record["global_position"]) for record in records)
+    if actual_positions != expected_positions or len(set(actual_positions)) != len(actual_positions):
+        raise AssertionError(
+            f"Phase {phase} actual forward positions mismatch: "
+            f"expected={expected_positions} actual={actual_positions}"
+        )
+    rank_counts = Counter(int(record["rank"]) for record in records)
+    expected_per_rank = (end_position - start_position) // world_size
+    if rank_counts != Counter({rank: expected_per_rank for rank in range(world_size)}):
+        raise AssertionError(
+            f"Phase {phase} forward records were not aggregated from all ranks: {dict(rank_counts)}"
+        )
+    pool_counts: Counter[str] = Counter()
+    pool_durations: dict[str, float] = {name: 0.0 for name in POOL_ORDER}
+    for record in records:
+        position = int(record["global_position"])
+        selection = planner.selection(position)
+        expected = {
+            "pool_name": selection.pool_name,
+            "record_index": selection.record_index,
+            "pool_occurrence_index": selection.pool_occurrence_index,
+            "pool_epoch": selection.pool_epoch,
+        }
+        actual = {key: record.get(key) for key in expected}
+        if actual != expected:
+            raise AssertionError(
+                f"Phase {phase} actual forward sampler provenance mismatch at {position}: "
+                f"actual={actual} expected={expected}"
+            )
+        duration = float(record["effective_duration_seconds"])
+        if not (0.0 < duration <= 90.001):
+            raise AssertionError(f"Phase {phase} invalid effective duration at {position}: {duration}")
+        pool_counts[selection.pool_name] += 1
+        pool_durations[selection.pool_name] += duration
+    print(
+        f"[forward-window] phase={phase} positions={start_position}..{end_position - 1} "
+        f"records={len(records)} rank_counts={dict(rank_counts)} pool_counts={dict(pool_counts)} "
+        f"effective_hours={sum(pool_durations.values()) / 3600.0:.9f}"
+    )
+    return pool_counts, pool_durations
+
+
+def validate_statistics_state(
+    path: Path,
+    expected_step: int,
+    expected_records: list[dict[str, Any]],
+    expected_seed: int,
+) -> dict[str, Any]:
+    state = read_json(path)
+    if (
+        state.get("statistics_version") != TRAINING_STATS_VERSION
+        or state.get("sampler_version") != SAMPLER_VERSION
+        or int(state.get("sampler_seed", -1)) != expected_seed
+        or int(state.get("global_step", -1)) != expected_step
+        or int(state.get("world_size", -1)) != 4
+    ):
+        raise AssertionError(f"Invalid cumulative training statistics header at {path}: {state}")
+    expected_counts = Counter(str(record["pool_name"]) for record in expected_records)
+    expected_durations = {
+        name: sum(
+            float(record["effective_duration_seconds"])
+            for record in expected_records
+            if record["pool_name"] == name
+        )
+        for name in POOL_ORDER
+    }
+    if int(state.get("total_samples", -1)) != len(expected_records):
+        raise AssertionError(f"Statistics total sample mismatch at {path}: {state}")
+    if int(state.get("next_global_position", -1)) != len(expected_records):
+        raise AssertionError(f"Statistics next position mismatch at {path}: {state}")
+    pools = state.get("pools")
+    if not isinstance(pools, dict) or set(pools) != set(POOL_ORDER):
+        raise AssertionError(f"Statistics pools mismatch at {path}: {pools}")
+    for name in POOL_ORDER:
+        if int(pools[name].get("sample_count", -1)) != expected_counts[name]:
+            raise AssertionError(f"Statistics pool sample mismatch at {path}: pool={name} state={pools[name]}")
+        actual_duration = float(pools[name].get("effective_duration_seconds", -1.0))
+        if abs(actual_duration - expected_durations[name]) > 1e-5:
+            raise AssertionError(
+                f"Statistics pool duration mismatch at {path}: pool={name} "
+                f"actual={actual_duration} expected={expected_durations[name]}"
+            )
+        expected_sample_ratio = expected_counts[name] / len(expected_records)
+        if abs(float(pools[name].get("sample_ratio", -1.0)) - expected_sample_ratio) > 1e-12:
+            raise AssertionError(f"Statistics pool sample ratio mismatch at {path}: pool={name}")
+    total_duration = sum(expected_durations.values())
+    if abs(float(state.get("total_effective_duration_seconds", -1.0)) - total_duration) > 1e-5:
+        raise AssertionError(f"Statistics total duration mismatch at {path}: {state}")
+    for name in POOL_ORDER:
+        expected_duration_ratio = expected_durations[name] / total_duration
+        if abs(float(pools[name].get("duration_ratio", -1.0)) - expected_duration_ratio) > 1e-9:
+            raise AssertionError(f"Statistics pool duration ratio mismatch at {path}: pool={name}")
+    print(
+        f"[statistics-state] path={path} step={expected_step} samples={len(expected_records)} "
+        f"effective_hours={total_duration / 3600.0:.9f}"
+    )
+    return state
 
 
 def main() -> None:
@@ -304,11 +455,86 @@ def main() -> None:
             pools,
             max_prefetched_positions=2 * args.world_size,
         )
+        save_forward_records = read_forward_records(args.forward_audit_dir, "save", args.world_size)
+        resume_forward_records = read_forward_records(args.forward_audit_dir, "resume", args.world_size)
+        save_forward_counts, save_forward_durations = validate_forward_window(
+            save_forward_records,
+            args.seed,
+            "save",
+            0,
+            args.save_step * args.world_size,
+            args.world_size,
+            planner,
+        )
+        resume_forward_counts, resume_forward_durations = validate_forward_window(
+            resume_forward_records,
+            "resume",
+            args.save_step * args.world_size,
+            args.resume_step * args.world_size,
+            args.world_size,
+            planner,
+        )
+        if save_forward_counts != save_counts or resume_forward_counts != resume_counts:
+            raise AssertionError(
+                "Template consumed-prefix counts differ from actual forward counts: "
+                f"save_template={save_counts} save_forward={save_forward_counts} "
+                f"resume_template={resume_counts} resume_forward={resume_forward_counts}"
+            )
+        combined_forward_records = save_forward_records + resume_forward_records
+        epoch_record_keys = [
+            (str(record["pool_name"]), int(record["pool_epoch"]), int(record["record_index"]))
+            for record in combined_forward_records
+        ]
+        if len(epoch_record_keys) != len(set(epoch_record_keys)):
+            duplicates = [key for key, count in Counter(epoch_record_keys).items() if count > 1]
+            raise AssertionError(f"No-replacement sampler repeated records across checkpoint: {duplicates}")
+        if any(int(record["pool_epoch"]) != 0 for record in combined_forward_records):
+            raise AssertionError("The short checkpoint smoke unexpectedly crossed a pool epoch boundary")
+        raw_record_keys = [
+            (str(record["pool_name"]), int(record["record_index"]))
+            for record in combined_forward_records
+        ]
+        if len(raw_record_keys) != len(set(raw_record_keys)):
+            duplicates = [key for key, count in Counter(raw_record_keys).items() if count > 1]
+            raise AssertionError(f"Checkpoint smoke repeated raw pool records: {duplicates}")
+        save_state = validate_statistics_state(
+            args.save_stats_state,
+            args.save_step,
+            save_forward_records,
+        )
+        resume_state = validate_statistics_state(
+            args.resume_stats_state,
+            args.resume_step,
+            combined_forward_records,
+            args.seed,
+        )
+        run_delta = resume_state.get("run_delta", {})
+        delta_counts = run_delta.get("sample_counts", {})
+        delta_durations = run_delta.get("effective_duration_seconds", {})
+        for name in POOL_ORDER:
+            if int(delta_counts.get(name, -1)) != resume_forward_counts[name]:
+                raise AssertionError(
+                    f"Resume statistics sample delta mismatch for {name}: "
+                    f"actual={delta_counts.get(name)} expected={resume_forward_counts[name]}"
+                )
+            if abs(float(delta_durations.get(name, -1.0)) - resume_forward_durations[name]) > 1e-5:
+                raise AssertionError(
+                    f"Resume statistics duration delta mismatch for {name}: "
+                    f"actual={delta_durations.get(name)} expected={resume_forward_durations[name]}"
+                )
+        if int(save_state["next_global_position"]) != args.save_step * args.world_size:
+            raise AssertionError(f"Save statistics did not persist the exact resume position: {save_state}")
     print(
         f"[process-groups] save_launch={sorted(save_launch_ids)} resume_launch={sorted(resume_launch_ids)} "
         f"save_pids={sorted(save_pids)} resume_pids={sorted(resume_pids)} distinct_launches=true"
     )
     print(f"[mixture] save_pool_counts={dict(save_counts)} resume_pool_counts={dict(resume_counts)}")
+    print(
+        "[no-replacement] cross_checkpoint_duplicates=0 "
+        f"save_effective_hours={sum(save_forward_durations.values()) / 3600.0:.9f} "
+        f"resume_delta_effective_hours={sum(resume_forward_durations.values()) / 3600.0:.9f} "
+        "prefetch_counted_in_statistics=false four_rank_aggregation=true"
+    )
     print("========== HUGINN WHISPER DYNAMIC90S CHECKPOINT RESUME MARKERS PASSED ==========")
 
 

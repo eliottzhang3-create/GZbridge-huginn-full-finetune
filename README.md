@@ -792,11 +792,12 @@ Submit it only through:
 bash code/huginn_lora/run_prepare_huginn_whisper_dynamic90s_full_atomic_pools_5090.sh
 ```
 
-The next gate is indexed random access plus deterministic hierarchical mixture validation and is implemented but not
-yet remote-verified. It validates random reads from every JSONL/uint64-index pair, simulates `1,000,000` global sample
-draws, audits both hierarchy levels (`AAC/ASR=60/40`, then AAC `60/30/10`), checks per-rank FSDP4 distributions, proves
-stateless resume from arbitrary global positions, and writes a `4,096`-entry metadata-only pilot schedule. It reads no
-audio and performs no token calculation.
+The indexed random-access gate now validates the in-place no-replacement v2 sampler. It validates random reads from
+every JSONL/uint64-index pair, simulates `1,000,000` global pool selections, audits both hierarchy levels
+(`AAC/ASR=60/40`, then AAC `60/30/10`), and exhaustively checks two complete independently shuffled epochs of every
+pool. Every atomic record must appear exactly once per pool epoch, epoch 1 must reorder epoch 0, the same seed must be
+reproducible, and uninterrupted versus arbitrary-position resumed streams must be identical. It also writes a
+`4,096`-entry metadata-only pilot schedule. It reads no audio and performs no token calculation.
 
 - reusable indexed mixture module: `code/huginn_lora/data_pipeline/indexed_atomic_mixture.py`;
 - inspector: `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_indexed_mixture.py`;
@@ -2325,7 +2326,9 @@ Swift path and separately checks the production planner with 180-second and one-
 The four full atomic pools are complete: WavCaps excluding BBC Sound Effects, AudioCaps-v2, Clotho-v2 train grouped by
 audio, and GigaSpeech-L segment-level ASR. The deterministic indexed hierarchical mixture gate has passed with the
 required `AAC=60%` / `ASR=40%` task split and `WavCaps=60%` / `AudioCaps=30%` / `Clotho=10%` inside AAC. Sampling is by
-training occurrence, not by precomputed token count. Clotho selects exactly one deterministic caption per occurrence.
+training occurrence, not by precomputed token count. The sampler has since been replaced in place by deterministic
+per-pool no-replacement epochs: a pool cannot repeat an atomic record until that pool has been completely covered and
+reshuffled for its next epoch. Clotho selects exactly one deterministic caption per occurrence.
 
 The real data-chain gate is
 `code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_real_data_chain_5090.sh`. It registers the indexed mixture as a
@@ -2340,28 +2343,36 @@ trainable aligner, finite losses/gradient norms, and per-rank realized dynamic a
 global sample window is positions `0..31`, which covers all four pools (`11` WavCaps, `6` AudioCaps, `2` Clotho, and
 `13` GigaSpeech; `19` AAC and `13` ASR). Checkpoint save/restart remains the following separate gate.
 
-The real-mixture FSDP4 gate has passed. The checkpoint gate is
+The earlier real-mixture FSDP4 architecture gate passed, but its old with-replacement sample sequence is no longer the
+active sampler contract. The replacement checkpoint gate is
 `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh`. Phase 1 uses one fresh
 four-rank process group to consume global mixture positions `0..15`, train through step `4`, and save a complete
 adapter-only FSDP DCP. Phase 2 starts a distinct four-rank process group, restores checkpoint `4`, starts the stateless
 mixture explicitly at position `16` with Trainer data skipping disabled, consumes positions `16..23`, and reaches step
 `6`. The gate requires exactly `66` Huginn LoRA plus `14` aligner tensors, restored optimizer step `4`, scheduler epoch
 `4`, exact per-rank Python/NumPy/CPU/CUDA RNG restoration, Trainer global step continuity, disjoint process-launch IDs,
-and actual LoRA plus aligner tensor changes between checkpoints `4` and `6`. Constant LR is used only for this short
-gate so the first phase cannot decay to zero before the resumed updates.
+and actual LoRA plus aligner tensor changes between checkpoints `4` and `6`. It now additionally requires zero repeated
+pool records across the save/resume boundary, exact forward-consumed positions on all four ranks, and cumulative
+per-pool sample and effective-duration statistics. The statistics metadata is carried through the collator and is
+committed only after an actual successful training forward, so Swift's duplicate template encoding and Accelerate's
+unconsumed prefetch tail are excluded. Each checkpoint contains `audio_training_statistics.json`; cold resume restores
+the cumulative counts, effective seconds, next global position, and per-pool epoch offsets. Constant LR is used only
+for this short gate so the first phase cannot decay to zero before the resumed updates. All checkpoint-4/6 artifacts
+from the previous with-replacement sampler are obsolete and must not be reused.
 
-The first checkpoint smoke completed both four-rank training phases and produced checkpoint `4` and checkpoint `6`.
-Its initial post-run marker audit exposed that Swift 4.1.3 calls template encoding twice for each streaming row. The
-data audit now requires a uniform encode multiplicity of one or two, requires duplicate pool/task/uid provenance to be
-identical, and only then collapses records by global mixture position. Because Accelerate's ordered
-`DataLoaderDispatcher` can prepare later batches before Trainer stops, the audit treats only a bounded, contiguous
-suffix after the exact consumed window as unconsumed prefetch; it still requires the consumed positions to be the
-strict prefix starting at the configured restart position. This does not relax the independent per-rank
-forward/model-consumption counters. The completed run can be audited without repeating training by submitting
-`code/huginn_lora/run_inspect_existing_huginn_audio_whisper_dynamic90s_checkpoint_resume_5090.sh` with
-`HUGINN_AUDIO_DYNAMIC90S_EXISTING_CHECKPOINT_RUN_ROOT` set to its existing run directory. That posthoc job performs no
-audio decode or model forward; it validates the saved markers and reads the FSDP DCP checkpoints to compare LoRA and
-aligner tensors between steps `4` and `6`.
+Run the replacement gates in this order after syncing code:
+
+```bash
+bash code/huginn_lora/run_inspect_huginn_whisper_dynamic90s_indexed_mixture_5090.sh
+bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh
+```
+
+The first job is metadata/index only and overwrites the old sampler report with the no-replacement v2 report. The
+second job refuses to start unless that report has passed. Its run root stores cumulative snapshots in
+`training_statistics/training_statistics.jsonl` and `training_statistics/latest.json`; checkpoint `4` and checkpoint
+`6` each store their own `audio_training_statistics.json`. Per-rank forward-consumption JSONL is enabled only for the
+short smoke so the audit can prove four-rank aggregation, exact save/resume continuity, zero cross-checkpoint repeats,
+and exclusion of the template/prefetch-only rows.
 
 Formal-training constraints already fixed by the user, but not yet implemented or launched:
 

@@ -7,6 +7,7 @@ import json
 import os
 import sys
 from collections import Counter
+from itertools import islice
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ if str(HUGINN_LORA_ROOT) not in sys.path:
 from data_pipeline.indexed_atomic_mixture import (  # noqa: E402
     GLOBAL_POOL_WEIGHTS,
     POOL_ORDER,
+    SAMPLER_VERSION,
     DeterministicHierarchicalMixture,
     IndexedJsonlPool,
     splitmix64,
@@ -138,6 +140,60 @@ def maximum_error(observed: dict[str, float]) -> float:
     return max(abs(observed[name] - GLOBAL_POOL_WEIGHTS[name]) for name in POOL_ORDER)
 
 
+def audit_no_replacement_epochs(
+    planner: DeterministicHierarchicalMixture,
+) -> dict[str, dict[str, Any]]:
+    reports: dict[str, dict[str, Any]] = {}
+    for pool_name in POOL_ORDER:
+        pool_size = planner.pool_sizes[pool_name]
+        first_epoch_order: list[int] = []
+        changed_positions = 0
+        for epoch in range(2):
+            seen = bytearray(pool_size)
+            for epoch_offset in range(pool_size):
+                occurrence = epoch * pool_size + epoch_offset
+                record_index, observed_epoch, observed_offset = planner.record_index_for_occurrence(
+                    pool_name,
+                    occurrence,
+                )
+                if observed_epoch != epoch or observed_offset != epoch_offset:
+                    raise AssertionError(
+                        f"Pool epoch coordinates changed: pool={pool_name} occurrence={occurrence} "
+                        f"actual=({observed_epoch},{observed_offset}) expected=({epoch},{epoch_offset})"
+                    )
+                if seen[record_index]:
+                    raise AssertionError(
+                        f"No-replacement epoch repeated a record: pool={pool_name} "
+                        f"epoch={epoch} record_index={record_index}"
+                    )
+                seen[record_index] = 1
+                if epoch == 0:
+                    first_epoch_order.append(record_index)
+                elif record_index != first_epoch_order[epoch_offset]:
+                    changed_positions += 1
+            if sum(seen) != pool_size:
+                raise AssertionError(
+                    f"No-replacement epoch did not cover its complete pool: "
+                    f"pool={pool_name} epoch={epoch} covered={sum(seen)} size={pool_size}"
+                )
+        if pool_size > 1 and changed_positions == 0:
+            raise AssertionError(f"Pool epoch 1 did not reshuffle relative to epoch 0: {pool_name}")
+        reports[pool_name] = {
+            "record_count": pool_size,
+            "audited_epochs": 2,
+            "zero_duplicates_per_epoch": True,
+            "complete_coverage_per_epoch": True,
+            "epoch_1_changed_positions": changed_positions,
+            "passed": True,
+        }
+        print(
+            f"[no-replacement] pool={pool_name} records={pool_size} epochs=2 "
+            f"changed_positions={changed_positions} passed=true",
+            flush=True,
+        )
+    return reports
+
+
 def main() -> None:
     args = parse_args()
     if (
@@ -152,7 +208,7 @@ def main() -> None:
 
     contract = load_json(Path(args.contract))
     sampling = contract.get("sampling_contract", {})
-    if sampling.get("unit") != "hierarchical_sample_draw_probability":
+    if sampling.get("unit") != "hierarchical_sample_draw_probability_with_per_pool_no_replacement_epochs_v2":
         raise ValueError(f"Unexpected sampler unit: {sampling.get('unit')!r}")
     compare_weights(sampling.get("global_pool_weights", {}), GLOBAL_POOL_WEIGHTS, "contract weights")
     if sampling.get("task_weights") != {"AAC": 0.6, "ASR": 0.4}:
@@ -228,6 +284,7 @@ def main() -> None:
             {pool_name: pool.record_count for pool_name, pool in pools.items()},
             seed=args.seed,
         )
+        no_replacement_report = audit_no_replacement_epochs(planner)
         global_counts: Counter[str] = Counter()
         rank_counts = [Counter() for _ in range(args.world_size)]
         task_counts: Counter[str] = Counter()
@@ -277,25 +334,46 @@ def main() -> None:
                 }
             )
 
-        deterministic_positions = [0, 1, 2, 3, 17, 1024, 123456, args.simulation_draws + 17]
+        deterministic_positions = [0, 1, 2, 3, 17, 1024, 123456]
         first_pass = [planner.selection(position) for position in deterministic_positions]
-        second_pass = [planner.selection(position) for position in deterministic_positions]
+        repeat_planner = DeterministicHierarchicalMixture(planner.pool_sizes, seed=args.seed)
+        second_pass = [repeat_planner.selection(position) for position in deterministic_positions]
         if first_pass != second_pass:
-            raise AssertionError("Stateless mixture selection is not repeatable")
-        resume_start = min(123456, max(0, args.simulation_draws - args.world_size * 8))
+            raise AssertionError("No-replacement mixture selection is not reproducible for the same seed")
+        resume_probe_count = args.world_size * 8
+        resume_starts = sorted(
+            {
+                0,
+                1,
+                17,
+                min(4096, max(0, args.simulation_draws - resume_probe_count)),
+                min(123456, max(0, args.simulation_draws - resume_probe_count)),
+            }
+        )
+        resumed_tail: list[Any] = []
+        for resume_start in resume_starts:
+            uninterrupted_tail = list(
+                islice(planner.iter_selections(0), resume_start, resume_start + resume_probe_count)
+            )
+            resumed_tail = list(islice(planner.iter_selections(resume_start), resume_probe_count))
+            if resumed_tail != uninterrupted_tail:
+                raise AssertionError(
+                    f"Arbitrary-position resume diverged at start={resume_start}: "
+                    f"uninterrupted={uninterrupted_tail[:3]} resumed={resumed_tail[:3]}"
+                )
+        resume_start = resume_starts[-1]
         for rank in range(args.world_size):
-            iterator = planner.positions_for_rank(rank, args.world_size, resume_start)
-            positions = [next(iterator) for _ in range(8)]
-            if any(position % args.world_size != rank for position in positions):
-                raise AssertionError(f"Rank position sharding failed: rank={rank} positions={positions}")
-            if [planner.selection(position) for position in positions] != [
-                planner.selection(position) for position in positions
-            ]:
-                raise AssertionError(f"Resume selection mismatch for rank={rank}")
+            positions = [
+                selection.global_position
+                for selection in resumed_tail
+                if selection.global_position % args.world_size == rank
+            ]
+            if len(positions) != 8:
+                raise AssertionError(f"Rank resume position coverage failed: rank={rank} positions={positions}")
 
         schedule_records: list[dict[str, Any]] = []
-        for position in range(args.schedule_records):
-            selection = planner.selection(position)
+        for selection in islice(planner.iter_selections(0), args.schedule_records):
+            position = selection.global_position
             record = pools[selection.pool_name].record(selection.record_index)
             validate_record(selection.pool_name, record)
             target_index = planner.target_index(position, len(record["targets"]))
@@ -305,6 +383,9 @@ def main() -> None:
                     "rank": position % args.world_size,
                     "pool": selection.pool_name,
                     "record_index": selection.record_index,
+                    "pool_occurrence_index": selection.pool_occurrence_index,
+                    "pool_epoch": selection.pool_epoch,
+                    "pool_epoch_offset": selection.pool_epoch_offset,
                     "uid": record["uid"],
                     "task": record["task"],
                     "source": record["source"],
@@ -314,12 +395,14 @@ def main() -> None:
             )
 
         report = {
-            "gate": "huginn_whisper_dynamic90s_indexed_mixture_v1",
+            "gate": "huginn_whisper_dynamic90s_indexed_mixture_no_replacement_v2",
             "validation_passed": True,
+            "sampler_version": SAMPLER_VERSION,
             "seed": args.seed,
             "world_size": args.world_size,
             "simulation_draws": args.simulation_draws,
-            "sampler_unit": "hierarchical_sample_draw_probability",
+            "sampler_unit": "hierarchical_sample_draw_probability_with_per_pool_no_replacement_epochs_v2",
+            "no_replacement_epoch_audit": no_replacement_report,
             "expected_global_pool_weights": GLOBAL_POOL_WEIGHTS,
             "observed_global_pool_counts": dict(global_counts),
             "observed_global_pool_ratios": observed_global,
@@ -331,6 +414,7 @@ def main() -> None:
             "rank_reports": rank_reports,
             "random_access": random_access_report,
             "deterministic_resume_positions": deterministic_positions,
+            "audited_resume_starts": resume_starts,
             "pilot_schedule_path": str(schedule_path),
             "pilot_schedule_records": args.schedule_records,
             "audio_read": False,

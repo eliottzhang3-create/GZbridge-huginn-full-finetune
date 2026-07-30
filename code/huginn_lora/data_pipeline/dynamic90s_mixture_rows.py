@@ -99,6 +99,9 @@ def render_training_row(
     pool_name: str,
     global_position: int,
     record_index: int,
+    pool_occurrence_index: int,
+    pool_epoch: int,
+    pool_epoch_offset: int,
     target_index: int,
 ) -> dict[str, Any]:
     validate_atomic_record(pool_name, record)
@@ -119,6 +122,10 @@ def render_training_row(
         "pool_name": pool_name,
         "task": task,
         "uid": str(record["uid"]),
+        "record_index": int(record_index),
+        "pool_occurrence_index": int(pool_occurrence_index),
+        "pool_epoch": int(pool_epoch),
+        "pool_epoch_offset": int(pool_epoch_offset),
     }
     return {
         "messages": [
@@ -131,6 +138,9 @@ def render_training_row(
             "global_position": int(global_position),
             "pool_name": pool_name,
             "record_index": int(record_index),
+            "pool_occurrence_index": int(pool_occurrence_index),
+            "pool_epoch": int(pool_epoch),
+            "pool_epoch_offset": int(pool_epoch_offset),
             "target_index": int(target_index),
             "uid": str(record["uid"]),
             "dataset": str(record.get("dataset", "")),
@@ -148,6 +158,7 @@ def iter_dynamic90s_mixture_rows(
     seed: int,
     start_position: int = 0,
     max_samples: int | None = None,
+    pool_occurrence_counts: dict[str, int] | None = None,
 ) -> Iterator[dict[str, Any]]:
     """Yield deterministic rows beginning at an explicit global sample position."""
     if start_position < 0:
@@ -163,9 +174,10 @@ def iter_dynamic90s_mixture_rows(
     with ExitStack() as stack:
         pools = open_indexed_pools(registry, stack)
         emitted = 0
-        global_position = int(start_position)
-        while max_samples is None or emitted < max_samples:
-            selection = planner.selection(global_position)
+        for selection in planner.iter_selections(start_position, pool_occurrence_counts):
+            if max_samples is not None and emitted >= max_samples:
+                break
+            global_position = selection.global_position
             record = pools[selection.pool_name].record(selection.record_index)
             targets = record.get("targets")
             if not isinstance(targets, list) or not targets:
@@ -178,7 +190,9 @@ def iter_dynamic90s_mixture_rows(
                 pool_name=selection.pool_name,
                 global_position=global_position,
                 record_index=selection.record_index,
+                pool_occurrence_index=selection.pool_occurrence_index,
+                pool_epoch=selection.pool_epoch,
+                pool_epoch_offset=selection.pool_epoch_offset,
                 target_index=target_index,
             )
             emitted += 1
-            global_position += 1

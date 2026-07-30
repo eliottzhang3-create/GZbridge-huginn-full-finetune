@@ -87,6 +87,22 @@ CHECKPOINT_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_PHASE"
 CHECKPOINT_START_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_START_STEP"
 CHECKPOINT_END_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_END_STEP"
 CHECKPOINT_LAUNCH_ID_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_LAUNCH_ID"
+TRAINING_STATS_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR"
+TRAINING_STATS_RESUME_STATE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE"
+TRAINING_STATS_LOG_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS"
+TRAINING_STATS_CHECKPOINT_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CHECKPOINT_STEPS"
+TRAINING_STATS_FORWARD_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_FORWARD_AUDIT_DIR"
+TRAINING_STATS_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE"
+TRAINING_STATS_STATE_FILENAME = "audio_training_statistics.json"
+TRAINING_STATS_VERSION = "huginn_dynamic90s_training_statistics_v1"
+SAMPLER_VERSION = "deterministic_hierarchical_no_replacement_v2"
+TRAINING_POOL_ORDER = (
+    "wavcaps_no_bbc_aac",
+    "audiocaps_v2_aac",
+    "clotho_v2_aac",
+    "gigaspeech_l_asr",
+)
+TRAINING_POOL_TO_ID = {name: index for index, name in enumerate(TRAINING_POOL_ORDER)}
 ALIGNER_MODULES_TO_SAVE = (
     "temporal_compressor",
     "audio_projector",
@@ -159,6 +175,98 @@ def _requested(environment_name: str) -> bool:
     return os.environ.get(environment_name, "").strip().lower() in {"1", "true", "yes"}
 
 
+def _training_tensor(kwargs: dict[str, Any], name: str) -> torch.Tensor | None:
+    value = kwargs.pop(name, None)
+    if value is not None and not torch.is_tensor(value):
+        raise TypeError(f"{name} must be a tensor when provided, got {type(value)}")
+    return value
+
+
+def _record_actual_training_samples(
+    model: torch.nn.Module,
+    global_positions: torch.Tensor | None,
+    pool_ids: torch.Tensor | None,
+    record_indices: torch.Tensor | None,
+    pool_occurrence_indices: torch.Tensor | None,
+    pool_epochs: torch.Tensor | None,
+    effective_durations: torch.Tensor | None,
+) -> None:
+    fields = {
+        "global_positions": global_positions,
+        "pool_ids": pool_ids,
+        "record_indices": record_indices,
+        "pool_occurrence_indices": pool_occurrence_indices,
+        "pool_epochs": pool_epochs,
+        "effective_durations": effective_durations,
+    }
+    if all(value is None for value in fields.values()):
+        return
+    missing = [name for name, value in fields.items() if value is None]
+    if missing:
+        raise RuntimeError(f"Training statistics metadata is incomplete: missing={missing}")
+    flattened = {name: value.detach().reshape(-1).cpu() for name, value in fields.items() if value is not None}
+    batch_sizes = {tensor.numel() for tensor in flattened.values()}
+    if len(batch_sizes) != 1 or next(iter(batch_sizes)) <= 0:
+        raise RuntimeError(
+            f"Training statistics metadata batch sizes differ: "
+            f"{ {name: tensor.numel() for name, tensor in flattened.items()} }"
+        )
+    positions = [int(value) for value in flattened["global_positions"].tolist()]
+    rendered_pool_ids = [int(value) for value in flattened["pool_ids"].tolist()]
+    rendered_record_indices = [int(value) for value in flattened["record_indices"].tolist()]
+    rendered_occurrences = [int(value) for value in flattened["pool_occurrence_indices"].tolist()]
+    rendered_epochs = [int(value) for value in flattened["pool_epochs"].tolist()]
+    rendered_durations = [float(value) for value in flattened["effective_durations"].tolist()]
+    if any(position < 0 for position in positions):
+        raise RuntimeError(f"Negative global training position: {positions}")
+    if any(pool_id < 0 or pool_id >= len(TRAINING_POOL_ORDER) for pool_id in rendered_pool_ids):
+        raise RuntimeError(f"Invalid training pool IDs: {rendered_pool_ids}")
+    if any(value < 0 for value in rendered_record_indices + rendered_occurrences + rendered_epochs):
+        raise RuntimeError("Training sampler provenance contains a negative index")
+    if any(not math.isfinite(value) or value <= 0 or value > DEFAULT_MAX_AUDIO_SECONDS + 1e-3 for value in rendered_durations):
+        raise RuntimeError(f"Invalid effective training durations: {rendered_durations}")
+
+    if "_huginn_audio_training_sample_counts" not in vars(model):
+        model._huginn_audio_training_sample_counts = [0 for _ in TRAINING_POOL_ORDER]
+        model._huginn_audio_training_duration_seconds = [0.0 for _ in TRAINING_POOL_ORDER]
+    for pool_id, duration in zip(rendered_pool_ids, rendered_durations):
+        model._huginn_audio_training_sample_counts[pool_id] += 1
+        model._huginn_audio_training_duration_seconds[pool_id] += duration
+
+    audit_dir_value = os.environ.get(TRAINING_STATS_FORWARD_AUDIT_DIR_ENV, "").strip()
+    if audit_dir_value:
+        phase = os.environ.get(TRAINING_STATS_PHASE_ENV, "").strip()
+        if not phase:
+            raise RuntimeError(f"{TRAINING_STATS_PHASE_ENV} is required for forward statistics auditing")
+        rank = int(os.environ.get("RANK", "0"))
+        audit_dir = Path(audit_dir_value)
+        audit_dir.mkdir(parents=True, exist_ok=True)
+        path = audit_dir / f"forward-{phase}-rank-{rank}.jsonl"
+        with path.open("a", encoding="utf-8") as handle:
+            for position, pool_id, record_index, occurrence, epoch, duration in zip(
+                positions,
+                rendered_pool_ids,
+                rendered_record_indices,
+                rendered_occurrences,
+                rendered_epochs,
+                rendered_durations,
+            ):
+                payload = {
+                    "phase": phase,
+                    "rank": rank,
+                    "global_position": position,
+                    "pool_name": TRAINING_POOL_ORDER[pool_id],
+                    "pool_id": pool_id,
+                    "record_index": record_index,
+                    "pool_occurrence_index": occurrence,
+                    "pool_epoch": epoch,
+                    "effective_duration_seconds": duration,
+                }
+                handle.write(json.dumps(payload, sort_keys=True) + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+
+
 def patch_huginn_audio_shift_loss(model):
     if getattr(model, "_huginn_audio_shift_loss_patched", False):
         print("[HuginnAudioSwift] shift-loss patch already applied")
@@ -167,6 +275,18 @@ def patch_huginn_audio_shift_loss(model):
     original_forward = model.forward
 
     def forward_with_shift_loss(self, *args, **kwargs):
+        training_global_positions = _training_tensor(kwargs, "audio_training_global_positions")
+        training_pool_ids = _training_tensor(kwargs, "audio_training_pool_ids")
+        training_record_indices = _training_tensor(kwargs, "audio_training_record_indices")
+        training_pool_occurrence_indices = _training_tensor(
+            kwargs,
+            "audio_training_pool_occurrence_indices",
+        )
+        training_pool_epochs = _training_tensor(kwargs, "audio_training_pool_epochs")
+        training_effective_durations = _training_tensor(
+            kwargs,
+            "audio_training_effective_duration_seconds",
+        )
         if self.training and not getattr(self, "_huginn_audio_runtime_checkpoint_state_logged", False):
             rank = os.environ.get("RANK", "0")
             print(
@@ -271,6 +391,16 @@ def patch_huginn_audio_shift_loss(model):
         outputs.loss = loss
         if hasattr(outputs, "log_ppl"):
             outputs.log_ppl = loss.detach().clone()
+        if self.training and audio_input_features is not None and past_key_values is None:
+            _record_actual_training_samples(
+                self,
+                training_global_positions,
+                training_pool_ids,
+                training_record_indices,
+                training_pool_occurrence_indices,
+                training_pool_epochs,
+                training_effective_durations,
+            )
         return outputs
 
     model.forward = MethodType(forward_with_shift_loss, model)
@@ -1288,7 +1418,16 @@ def audit_consumed_audio_position(audio_item: Any) -> None:
         raise RuntimeError(f"{DATA_POSITION_AUDIT_PHASE_ENV} is required when data-position audit is enabled")
     if not isinstance(audio_item, dict):
         raise TypeError(f"Data-position audit requires a dictionary audio item, got {type(audio_item)}")
-    required_fields = ("global_position", "pool_name", "task", "uid")
+    required_fields = (
+        "global_position",
+        "pool_name",
+        "task",
+        "uid",
+        "record_index",
+        "pool_occurrence_index",
+        "pool_epoch",
+        "pool_epoch_offset",
+    )
     missing = [field for field in required_fields if audio_item.get(field) is None]
     if missing:
         raise RuntimeError(f"Data-position audit audio item is missing provenance fields: {missing}")
@@ -1300,6 +1439,10 @@ def audit_consumed_audio_position(audio_item: Any) -> None:
         "pool_name": str(audio_item["pool_name"]),
         "task": str(audio_item["task"]),
         "uid": str(audio_item["uid"]),
+        "record_index": int(audio_item["record_index"]),
+        "pool_occurrence_index": int(audio_item["pool_occurrence_index"]),
+        "pool_epoch": int(audio_item["pool_epoch"]),
+        "pool_epoch_offset": int(audio_item["pool_epoch_offset"]),
     }
     audit_dir = Path(audit_dir_value)
     audit_dir.mkdir(parents=True, exist_ok=True)
@@ -1377,6 +1520,326 @@ def _write_distributed_rank_marker(kind: str, payload: dict[str, Any]) -> None:
     temporary_path = marker_path.with_suffix(".json.tmp")
     temporary_path.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary_path, marker_path)
+
+
+def _write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
+def _load_training_statistics_state(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        raise FileNotFoundError(f"Training statistics resume state is missing: {path}")
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise TypeError(f"Training statistics state is not an object: {path}")
+    if payload.get("statistics_version") != TRAINING_STATS_VERSION:
+        raise RuntimeError(f"Training statistics version mismatch: {payload.get('statistics_version')!r}")
+    if payload.get("sampler_version") != SAMPLER_VERSION:
+        raise RuntimeError(f"Training sampler version mismatch: {payload.get('sampler_version')!r}")
+    pools = payload.get("pools")
+    if not isinstance(pools, dict) or set(pools) != set(TRAINING_POOL_ORDER):
+        raise RuntimeError(f"Training statistics pool set mismatch: {pools}")
+    counts = [int(pools[name]["sample_count"]) for name in TRAINING_POOL_ORDER]
+    durations = [float(pools[name]["effective_duration_seconds"]) for name in TRAINING_POOL_ORDER]
+    if any(value < 0 for value in counts + durations):
+        raise RuntimeError(f"Training statistics state contains negative values: {payload}")
+    if sum(counts) != int(payload.get("total_samples", -1)):
+        raise RuntimeError(f"Training statistics sample total is inconsistent: {payload}")
+    if int(payload.get("next_global_position", -1)) != sum(counts):
+        raise RuntimeError(f"Training statistics next position is inconsistent: {payload}")
+    return payload
+
+
+def patch_training_statistics_callback() -> None:
+    """Aggregate actual forward-consumed samples and persist resumable statistics."""
+    statistics_dir_value = os.environ.get(TRAINING_STATS_DIR_ENV, "").strip()
+    if not statistics_dir_value:
+        return
+    from transformers import Trainer, TrainerCallback
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic90s_training_stats_patched", False):
+        return
+
+    class Dynamic90sTrainingStatisticsCallback(TrainerCallback):
+        _huginn_audio_dynamic90s_training_statistics_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.statistics_dir = Path(statistics_dir_value).expanduser().resolve()
+            self.statistics_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                self.log_steps = int(os.environ.get(TRAINING_STATS_LOG_STEPS_ENV, "100"))
+            except ValueError as exc:
+                raise ValueError(f"{TRAINING_STATS_LOG_STEPS_ENV} must be an integer") from exc
+            if self.log_steps <= 0:
+                raise ValueError(f"{TRAINING_STATS_LOG_STEPS_ENV} must be positive")
+            checkpoint_steps_value = os.environ.get(TRAINING_STATS_CHECKPOINT_STEPS_ENV, "").strip()
+            try:
+                self.checkpoint_steps = {
+                    int(value.strip())
+                    for value in checkpoint_steps_value.split(",")
+                    if value.strip()
+                }
+            except ValueError as exc:
+                raise ValueError(
+                    f"{TRAINING_STATS_CHECKPOINT_STEPS_ENV} must be a comma-separated integer list"
+                ) from exc
+            if any(value <= 0 for value in self.checkpoint_steps):
+                raise ValueError(f"{TRAINING_STATS_CHECKPOINT_STEPS_ENV} values must be positive")
+            resume_state_value = os.environ.get(TRAINING_STATS_RESUME_STATE_ENV, "").strip()
+            self.resume_state_path = Path(resume_state_value).expanduser().resolve() if resume_state_value else None
+            self.base_state = (
+                _load_training_statistics_state(self.resume_state_path)
+                if self.resume_state_path is not None
+                else None
+            )
+            self.base_counts = [
+                int(self.base_state["pools"][name]["sample_count"]) if self.base_state else 0
+                for name in TRAINING_POOL_ORDER
+            ]
+            self.base_durations = [
+                float(self.base_state["pools"][name]["effective_duration_seconds"]) if self.base_state else 0.0
+                for name in TRAINING_POOL_ORDER
+            ]
+            self.base_global_step = int(self.base_state.get("global_step", 0)) if self.base_state else 0
+            self.sampler_seed = int(os.environ.get("HUGINN_DYNAMIC90S_MIXTURE_SEED", "20260730"))
+            if self.base_state and int(self.base_state.get("sampler_seed", -1)) != self.sampler_seed:
+                raise RuntimeError(
+                    "Training statistics sampler seed differs from the resumed run: "
+                    f"state={self.base_state.get('sampler_seed')} current={self.sampler_seed}"
+                )
+            registry_value = os.environ.get("HUGINN_DYNAMIC90S_POOL_REGISTRY", "").strip()
+            if not registry_value:
+                raise RuntimeError("HUGINN_DYNAMIC90S_POOL_REGISTRY is required for training statistics")
+            registry = json.loads(Path(registry_value).expanduser().resolve().read_text(encoding="utf-8"))
+            self.pool_sizes = {
+                name: int(registry["pools"][name]["record_count"])
+                for name in TRAINING_POOL_ORDER
+            }
+            if self.base_state:
+                previous_sizes = {
+                    name: int(self.base_state["pools"][name]["pool_size"])
+                    for name in TRAINING_POOL_ORDER
+                }
+                if previous_sizes != self.pool_sizes:
+                    raise RuntimeError(
+                        f"Training statistics pool sizes changed across resume: "
+                        f"state={previous_sizes} current={self.pool_sizes}"
+                    )
+            self.last_snapshot: dict[str, Any] | None = None
+
+        @staticmethod
+        def _identity() -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Dynamic-90s training statistics require torch.distributed")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"Dynamic-90s training statistics require world_size=4, got {world_size}")
+            return rank, world_size
+
+        def _owner(self) -> torch.nn.Module | None:
+            owners = [
+                module
+                for module in self.tracked_model.modules()
+                if "_huginn_audio_training_sample_counts" in vars(module)
+            ]
+            if len(owners) > 1:
+                raise RuntimeError(f"Expected at most one direct training-statistics owner, found {len(owners)}")
+            return owners[0] if owners else None
+
+        def _snapshot(self, global_step: int, event: str) -> dict[str, Any]:
+            rank, world_size = self._identity()
+            owner = self._owner()
+            local_counts = (
+                list(owner._huginn_audio_training_sample_counts)
+                if owner is not None
+                else [0 for _ in TRAINING_POOL_ORDER]
+            )
+            local_durations = (
+                list(owner._huginn_audio_training_duration_seconds)
+                if owner is not None
+                else [0.0 for _ in TRAINING_POOL_ORDER]
+            )
+            backend = str(torch.distributed.get_backend()).lower()
+            device = torch.device("cuda", torch.cuda.current_device()) if "nccl" in backend else torch.device("cpu")
+            reduced = torch.tensor(local_counts + local_durations, dtype=torch.float64, device=device)
+            torch.distributed.all_reduce(reduced, op=torch.distributed.ReduceOp.SUM)
+            values = reduced.cpu().tolist()
+            delta_counts = [int(round(value)) for value in values[: len(TRAINING_POOL_ORDER)]]
+            delta_durations = [float(value) for value in values[len(TRAINING_POOL_ORDER):]]
+            counts = [base + delta for base, delta in zip(self.base_counts, delta_counts)]
+            durations = [base + delta for base, delta in zip(self.base_durations, delta_durations)]
+            total_samples = sum(counts)
+            total_duration = sum(durations)
+            if total_samples <= 0 or total_duration <= 0:
+                raise RuntimeError(
+                    f"Training statistics snapshot is empty: counts={counts} durations={durations}"
+                )
+            pools: dict[str, dict[str, Any]] = {}
+            for index, name in enumerate(TRAINING_POOL_ORDER):
+                count = counts[index]
+                duration = durations[index]
+                pool_size = self.pool_sizes[name]
+                pools[name] = {
+                    "sample_count": count,
+                    "sample_ratio": count / total_samples,
+                    "effective_duration_seconds": duration,
+                    "effective_duration_hours": duration / 3600.0,
+                    "duration_ratio": duration / total_duration,
+                    "pool_size": pool_size,
+                    "completed_pool_epochs": count // pool_size,
+                    "current_pool_epoch_offset": count % pool_size,
+                }
+            aac_samples = sum(counts[:3])
+            aac_duration = sum(durations[:3])
+            payload = {
+                "statistics_version": TRAINING_STATS_VERSION,
+                "sampler_version": SAMPLER_VERSION,
+                "sampler_seed": self.sampler_seed,
+                "event": event,
+                "global_step": int(global_step),
+                "world_size": world_size,
+                "total_samples": total_samples,
+                "next_global_position": total_samples,
+                "total_effective_duration_seconds": total_duration,
+                "total_effective_duration_hours": total_duration / 3600.0,
+                "tasks": {
+                    "AAC": {
+                        "sample_count": aac_samples,
+                        "sample_ratio": aac_samples / total_samples,
+                        "effective_duration_seconds": aac_duration,
+                        "duration_ratio": aac_duration / total_duration,
+                    },
+                    "ASR": {
+                        "sample_count": counts[3],
+                        "sample_ratio": counts[3] / total_samples,
+                        "effective_duration_seconds": durations[3],
+                        "duration_ratio": durations[3] / total_duration,
+                    },
+                },
+                "pools": pools,
+                "run_delta": {
+                    "sample_counts": {
+                        name: delta_counts[index]
+                        for index, name in enumerate(TRAINING_POOL_ORDER)
+                    },
+                    "effective_duration_seconds": {
+                        name: delta_durations[index]
+                        for index, name in enumerate(TRAINING_POOL_ORDER)
+                    },
+                },
+                "resume_state_path": str(self.resume_state_path) if self.resume_state_path else None,
+                "rank0_writer": rank == 0,
+            }
+            self.last_snapshot = payload
+            return payload
+
+        def _emit(self, global_step: int, event: str) -> dict[str, Any]:
+            payload = self._snapshot(global_step, event)
+            rank, _world_size = self._identity()
+            if rank == 0:
+                _write_json_atomic(self.statistics_dir / "latest.json", payload)
+                history_path = self.statistics_dir / "training_statistics.jsonl"
+                with history_path.open("a", encoding="utf-8") as handle:
+                    handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n")
+                    handle.flush()
+                    os.fsync(handle.fileno())
+                ratios = {name: round(payload["pools"][name]["sample_ratio"], 6) for name in TRAINING_POOL_ORDER}
+                duration_ratios = {
+                    name: round(payload["pools"][name]["duration_ratio"], 6)
+                    for name in TRAINING_POOL_ORDER
+                }
+                print(
+                    "[training-stats] "
+                    f"event={event} global_step={global_step} samples={payload['total_samples']} "
+                    f"hours={payload['total_effective_duration_hours']:.6f} "
+                    f"sample_ratios={ratios} duration_ratios={duration_ratios}",
+                    flush=True,
+                )
+            return payload
+
+        @staticmethod
+        def _checkpoint_dir(output_dir: str, global_step: int) -> Path:
+            root = Path(output_dir)
+            direct = root / f"checkpoint-{global_step}"
+            if direct.is_dir():
+                return direct
+            matches = sorted(path for path in root.rglob(f"checkpoint-{global_step}") if path.is_dir())
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Expected one checkpoint-{global_step} below {root}, found {matches}"
+                )
+            return matches[0]
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            del args, kwargs
+            expected_start = int(os.environ.get("HUGINN_DYNAMIC90S_MIXTURE_START_POSITION", "0"))
+            if sum(self.base_counts) != expected_start:
+                raise RuntimeError(
+                    "Training statistics resume position mismatch: "
+                    f"state_samples={sum(self.base_counts)} dataset_start={expected_start}"
+                )
+            if int(state.global_step) != self.base_global_step:
+                raise RuntimeError(
+                    "Training statistics checkpoint step mismatch: "
+                    f"state_step={self.base_global_step} trainer_step={state.global_step}"
+                )
+            return control
+
+        def on_step_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            if (
+                int(state.global_step) % self.log_steps == 0
+                or int(state.global_step) == int(state.max_steps)
+                or int(state.global_step) in self.checkpoint_steps
+            ):
+                self._emit(int(state.global_step), "step")
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            del kwargs
+            if self.last_snapshot is None or int(self.last_snapshot.get("global_step", -1)) != int(state.global_step):
+                raise RuntimeError(
+                    "Training statistics have no synchronized snapshot for checkpoint save; "
+                    f"add step {state.global_step} to {TRAINING_STATS_CHECKPOINT_STEPS_ENV}"
+                )
+            payload = dict(self.last_snapshot)
+            payload["event"] = "checkpoint"
+            rank, _world_size = self._identity()
+            if rank == 0:
+                checkpoint_dir = self._checkpoint_dir(args.output_dir, int(state.global_step))
+                _write_json_atomic(checkpoint_dir / TRAINING_STATS_STATE_FILENAME, payload)
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            self._emit(int(state.global_step), "train_end")
+            return control
+
+    @wraps(original_init)
+    def init_with_training_statistics(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic90s_training_statistics_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(Dynamic90sTrainingStatisticsCallback(self.model))
+
+    init_with_training_statistics._huginn_audio_dynamic90s_training_stats_patched = True
+    Trainer.__init__ = init_with_training_statistics
+    print(
+        "[HuginnAudioDynamic90s] installed cumulative training-statistics callback "
+        f"dir={statistics_dir_value}"
+    )
 
 
 def audit_stage34_fsdp_rank(model: torch.nn.Module, prefix_mask: torch.Tensor) -> None:
@@ -2345,7 +2808,8 @@ class HuginnAudioTemplate(Template):
             raise ValueError("Huginn audio Swift template currently supports exactly one audio clip per sample.")
 
         audit_consumed_audio_position(inputs.audios[0])
-        waveform = self._load_audio_item(inputs.audios[0])
+        audio_item = inputs.audios[0]
+        waveform = self._load_audio_item(audio_item)
         audio_chunks, audio_feature_lengths = split_audio_for_whisper(
             waveform,
             sample_rate=self.audio_sampling_rate,
@@ -2366,6 +2830,42 @@ class HuginnAudioTemplate(Template):
         encoded["audio_input_features"] = media_inputs["input_features"]
         encoded["audio_segment_feature_lengths"] = torch.tensor(audio_feature_lengths, dtype=torch.long)
         encoded["audio_segment_mask"] = torch.ones(len(audio_feature_lengths), dtype=torch.bool)
+        sampler_fields = (
+            "global_position",
+            "pool_name",
+            "record_index",
+            "pool_occurrence_index",
+            "pool_epoch",
+        )
+        if isinstance(audio_item, dict) and any(audio_item.get(field) is not None for field in sampler_fields):
+            missing = [field for field in sampler_fields if audio_item.get(field) is None]
+            if missing:
+                raise RuntimeError(f"Audio sampler provenance is incomplete: missing={missing}")
+            pool_name = str(audio_item["pool_name"])
+            if pool_name not in TRAINING_POOL_TO_ID:
+                raise RuntimeError(f"Unknown training pool in audio provenance: {pool_name!r}")
+            effective_duration_seconds = len(waveform) / float(self.audio_sampling_rate)
+            encoded["audio_training_global_positions"] = torch.tensor(
+                int(audio_item["global_position"]),
+                dtype=torch.long,
+            )
+            encoded["audio_training_pool_ids"] = torch.tensor(TRAINING_POOL_TO_ID[pool_name], dtype=torch.long)
+            encoded["audio_training_record_indices"] = torch.tensor(
+                int(audio_item["record_index"]),
+                dtype=torch.long,
+            )
+            encoded["audio_training_pool_occurrence_indices"] = torch.tensor(
+                int(audio_item["pool_occurrence_index"]),
+                dtype=torch.long,
+            )
+            encoded["audio_training_pool_epochs"] = torch.tensor(
+                int(audio_item["pool_epoch"]),
+                dtype=torch.long,
+            )
+            encoded["audio_training_effective_duration_seconds"] = torch.tensor(
+                effective_duration_seconds,
+                dtype=torch.float64,
+            )
         return encoded
 
     def _data_collator_mm_data(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -2397,11 +2897,29 @@ class HuginnAudioTemplate(Template):
             padded_features[index, :segment_count, :, : features.shape[2]] = features
             padded_lengths[index, :segment_count] = lengths
             padded_segment_mask[index, :segment_count] = masks
-        return {
+        collated = {
             "audio_input_features": padded_features,
             "audio_segment_feature_lengths": padded_lengths,
             "audio_segment_mask": padded_segment_mask,
         }
+        training_keys = (
+            "audio_training_global_positions",
+            "audio_training_pool_ids",
+            "audio_training_record_indices",
+            "audio_training_pool_occurrence_indices",
+            "audio_training_pool_epochs",
+            "audio_training_effective_duration_seconds",
+        )
+        items_with_training_metadata = [
+            all(key in item for key in training_keys)
+            for item in audio_items
+        ]
+        if any(items_with_training_metadata) and not all(items_with_training_metadata):
+            raise RuntimeError("A batch mixes audio records with and without training statistics provenance")
+        if all(items_with_training_metadata):
+            for key in training_keys:
+                collated[key] = torch.stack([item[key] for item in audio_items], dim=0)
+        return collated
 
 
 class HuginnAudioLoader(ModelLoader):
@@ -2502,6 +3020,7 @@ patch_accelerate_fsdp2_save_state_audit()
 patch_stage34_optimizer_step_callback()
 patch_stage5_stability_callback()
 patch_realdata_stability_callback()
+patch_training_statistics_callback()
 patch_checkpoint_resume_callback()
 patch_checkpoint_rng_restore_audit()
 

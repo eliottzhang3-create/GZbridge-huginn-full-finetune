@@ -30,6 +30,7 @@ SEED="${HUGINN_DYNAMIC90S_MIXTURE_SEED:-20260730}"
 SAVE_AUDIT_DIR="$RUN_ROOT/save_rank_audits"
 RESUME_AUDIT_DIR="$RUN_ROOT/resume_rank_audits"
 DATA_AUDIT_DIR="$RUN_ROOT/data_position_audits"
+FORWARD_AUDIT_DIR="$RUN_ROOT/forward_consumption_audits"
 SAVE_OUTPUT_DIR="$RUN_ROOT/save_phase"
 RESUME_OUTPUT_DIR="$RUN_ROOT/resume_phase"
 CONTENT_REPORT="$RUN_ROOT/checkpoint_content_report.json"
@@ -51,6 +52,7 @@ find_checkpoint() {
 
 for required_path in \
   "$SAVE_AUDIT_DIR" "$RESUME_AUDIT_DIR" "$DATA_AUDIT_DIR" \
+  "$FORWARD_AUDIT_DIR" \
   "$SAVE_OUTPUT_DIR" "$RESUME_OUTPUT_DIR" "$REGISTRY" \
   "$MARKER_INSPECTOR" "$CHECKPOINT_INSPECTOR"; do
   if [ ! -e "$required_path" ]; then
@@ -61,6 +63,14 @@ done
 
 SAVE_CHECKPOINT="$(find_checkpoint "$SAVE_OUTPUT_DIR" "checkpoint-$SAVE_STEP")"
 RESUME_CHECKPOINT="$(find_checkpoint "$RESUME_OUTPUT_DIR" "checkpoint-$RESUME_STEP")"
+SAVE_STATS_STATE="$SAVE_CHECKPOINT/audio_training_statistics.json"
+RESUME_STATS_STATE="$RESUME_CHECKPOINT/audio_training_statistics.json"
+for stats_state in "$SAVE_STATS_STATE" "$RESUME_STATS_STATE"; do
+  if [ ! -s "$stats_state" ]; then
+    echo "Required cumulative training statistics state is missing: $stats_state" >&2
+    exit 1
+  fi
+done
 
 echo "========== HUGINN WHISPER DYNAMIC90S EXISTING CHECKPOINT AUDIT START =========="
 echo "scope=posthoc_read_existing_markers_and_fsdp_checkpoints no_training=true no_model_load=true no_audio_decode=true"
@@ -73,6 +83,9 @@ python -u "$MARKER_INSPECTOR" \
   --save-audit-dir "$SAVE_AUDIT_DIR" \
   --resume-audit-dir "$RESUME_AUDIT_DIR" \
   --data-audit-dir "$DATA_AUDIT_DIR" \
+  --forward-audit-dir "$FORWARD_AUDIT_DIR" \
+  --save-stats-state "$SAVE_STATS_STATE" \
+  --resume-stats-state "$RESUME_STATS_STATE" \
   --registry "$REGISTRY" \
   --seed "$SEED" \
   --save-step "$SAVE_STEP" \

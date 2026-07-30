@@ -34,18 +34,21 @@ RESUME_OUTPUT_DIR="$RUN_ROOT/resume_phase"
 SAVE_AUDIT_DIR="$RUN_ROOT/save_rank_audits"
 RESUME_AUDIT_DIR="$RUN_ROOT/resume_rank_audits"
 DATA_AUDIT_DIR="$RUN_ROOT/data_position_audits"
+FORWARD_AUDIT_DIR="$RUN_ROOT/forward_consumption_audits"
+TRAINING_STATS_DIR="$RUN_ROOT/training_statistics"
 FSDP_CONFIG_PATH="$RUN_ROOT/fsdp2_lora_no_activation.json"
 CONTENT_REPORT="$RUN_ROOT/checkpoint_content_report.json"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-dynamic90s-v1"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py"
 REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/pool_registry.json}"
 REALDATA_REPORT="${HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/real_data_chain_report.json}"
+SAMPLER_REPORT="${HUGINN_DYNAMIC90S_SAMPLER_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/sampler/mixture_sampler_report.json}"
 MARKER_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_checkpoint_resume_markers.py"
 CHECKPOINT_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_fsdp_checkpoints.py"
 MODULES_TO_SAVE=(temporal_compressor audio_projector audio_boundary_embeddings)
 
 for required_path in \
-  "$MODEL_PATH" "$PLUGIN_PATH" "$REGISTRY" "$REALDATA_REPORT" \
+  "$MODEL_PATH" "$PLUGIN_PATH" "$REGISTRY" "$REALDATA_REPORT" "$SAMPLER_REPORT" \
   "$MARKER_INSPECTOR" "$CHECKPOINT_INSPECTOR"; do
   if [ ! -e "$required_path" ]; then
     echo "Required checkpoint smoke path is missing: $required_path" >&2
@@ -53,7 +56,7 @@ for required_path in \
   fi
 done
 
-python - "$REALDATA_REPORT" "$DATASET_MAX_SAMPLES" <<'PY'
+python - "$REALDATA_REPORT" "$SAMPLER_REPORT" "$DATASET_MAX_SAMPLES" <<'PY'
 import json
 import sys
 from dataclasses import fields
@@ -63,8 +66,14 @@ from swift.arguments.sft_args import SftArguments
 report = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 if not report.get('validation_passed'):
     raise SystemExit(f'Real data-chain prerequisite has not passed: {sys.argv[1]}')
-if int(sys.argv[2]) < 24:
-    raise SystemExit(f'Checkpoint dataset quota must be at least 24, got {sys.argv[2]}')
+sampler_report = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
+if (
+    not sampler_report.get('validation_passed')
+    or sampler_report.get('sampler_version') != 'deterministic_hierarchical_no_replacement_v2'
+):
+    raise SystemExit(f'No-replacement sampler prerequisite has not passed: {sys.argv[2]}')
+if int(sys.argv[3]) < 24:
+    raise SystemExit(f'Checkpoint dataset quota must be at least 24, got {sys.argv[3]}')
 available = {field.name for field in fields(SftArguments)}
 required = {
     'fsdp', 'modules_to_save', 'resume_from_checkpoint', 'ignore_data_skip',
@@ -74,12 +83,14 @@ required = {
 missing = sorted(required - available)
 if missing:
     raise SystemExit(f'Installed Swift lacks required checkpoint smoke arguments: {missing}')
-print('[precheck] real_data_chain=passed checkpoint_arguments=present dataset_quota=sufficient')
+print('[precheck] real_data_chain=passed no_replacement_sampler=passed checkpoint_arguments=present dataset_quota=sufficient')
 PY
 
 FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":false,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
 printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
-mkdir -p "$SAVE_OUTPUT_DIR" "$RESUME_OUTPUT_DIR" "$SAVE_AUDIT_DIR" "$RESUME_AUDIT_DIR" "$DATA_AUDIT_DIR"
+mkdir -p \
+  "$SAVE_OUTPUT_DIR" "$RESUME_OUTPUT_DIR" "$SAVE_AUDIT_DIR" "$RESUME_AUDIT_DIR" \
+  "$DATA_AUDIT_DIR" "$FORWARD_AUDIT_DIR" "$TRAINING_STATS_DIR"
 
 export HUGINN_DYNAMIC90S_POOL_REGISTRY="$REGISTRY"
 export HUGINN_DYNAMIC90S_MIXTURE_SEED="$SEED"
@@ -89,6 +100,10 @@ export HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT=1
 export HUGINN_AUDIO_DYNAMIC90S_PEFT_ALIGNER_MODULES_TO_SAVE=1
 export HUGINN_AUDIO_DYNAMIC90S_FSDP_SAVE_DEBUG=1
 export HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR="$DATA_AUDIT_DIR"
+export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR="$TRAINING_STATS_DIR"
+export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS=1
+export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CHECKPOINT_STEPS="$SAVE_STEP,$RESUME_STEP"
+export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_FORWARD_AUDIT_DIR="$FORWARD_AUDIT_DIR"
 
 echo "========== HUGINN WHISPER DYNAMIC90S CHECKPOINT RESUME FSDP4 START =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
@@ -97,7 +112,7 @@ echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH accumulation=$GR
 echo "phase1=fresh_process_positions_0_15_train_to_step_4_save_checkpoint_4"
 echo "phase2=new_process_group_positions_16_23_resume_checkpoint_4_train_to_step_6"
 echo "checkpoint_model_contract=lora_66+aligner_14 fsdp_state_dict=SHARDED_STATE_DICT"
-echo "checkpoint_state=model+optimizer+scheduler+rng+trainer_global_step+data_position"
+echo "checkpoint_state=model+optimizer+scheduler+rng+trainer_global_step+no_replacement_sampler_position+cumulative_data_statistics"
 echo "lr_scheduler=constant learning_rate=1e-4"
 echo "modules_to_save=${MODULES_TO_SAVE[*]}"
 echo "whisper_encoder=frozen aligner_lr=1e-4 lora_rank=8 lora_alpha=16 lora_dropout=0.05"
@@ -189,6 +204,8 @@ find_checkpoint() {
 run_save_phase() {
   export HUGINN_DYNAMIC90S_MIXTURE_START_POSITION=0
   export HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_PHASE=save
+  export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE=save
+  unset HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE || true
   export HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_AUDIT_DIR="$SAVE_AUDIT_DIR"
   export HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_PHASE=save
   export HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_START_STEP=0
@@ -237,11 +254,18 @@ run_phase save run_save_phase
 
 SAVE_CHECKPOINT="$(find_checkpoint "$SAVE_OUTPUT_DIR" "checkpoint-$SAVE_STEP")"
 echo "[checkpoint] saved=$SAVE_CHECKPOINT"
+SAVE_STATS_STATE="$SAVE_CHECKPOINT/audio_training_statistics.json"
+if [ ! -s "$SAVE_STATS_STATE" ]; then
+  echo "Saved checkpoint is missing cumulative training statistics: $SAVE_STATS_STATE" >&2
+  exit 1
+fi
 
 # The first torchrun has completely exited before this function starts.
 run_resume_phase() {
   export HUGINN_DYNAMIC90S_MIXTURE_START_POSITION=$((SAVE_STEP * WORLD_SIZE * PER_DEVICE_BATCH))
   export HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_PHASE=resume
+  export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE=resume
+  export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE="$SAVE_STATS_STATE"
   export HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_AUDIT_DIR="$RESUME_AUDIT_DIR"
   export HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_PHASE=resume
   export HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_START_STEP="$SAVE_STEP"
@@ -292,11 +316,19 @@ run_phase resume run_resume_phase
 
 RESUME_CHECKPOINT="$(find_checkpoint "$RESUME_OUTPUT_DIR" "checkpoint-$RESUME_STEP")"
 echo "[checkpoint] resumed=$RESUME_CHECKPOINT"
+RESUME_STATS_STATE="$RESUME_CHECKPOINT/audio_training_statistics.json"
+if [ ! -s "$RESUME_STATS_STATE" ]; then
+  echo "Resumed checkpoint is missing cumulative training statistics: $RESUME_STATS_STATE" >&2
+  exit 1
+fi
 
 python -u "$MARKER_INSPECTOR" \
   --save-audit-dir "$SAVE_AUDIT_DIR" \
   --resume-audit-dir "$RESUME_AUDIT_DIR" \
   --data-audit-dir "$DATA_AUDIT_DIR" \
+  --forward-audit-dir "$FORWARD_AUDIT_DIR" \
+  --save-stats-state "$SAVE_STATS_STATE" \
+  --resume-stats-state "$RESUME_STATS_STATE" \
   --registry "$REGISTRY" \
   --seed "$SEED" \
   --save-step "$SAVE_STEP" \

@@ -36,6 +36,7 @@ python -u code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_indexed_mix
   --seed "$SEED" \
   --world_size 4 \
   --simulation_draws "$SIMULATION_DRAWS" \
-  --schedule_records "$SCHEDULE_RECORDS"
+  --schedule_records "$SCHEDULE_RECORDS" \
+  --overwrite
 
 echo "========== INSPECT HUGINN WHISPER DYNAMIC90S INDEXED MIXTURE EXIT =========="

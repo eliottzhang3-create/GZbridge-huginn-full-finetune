@@ -108,7 +108,8 @@
     }
   },
   "sampling_contract": {
-    "unit": "hierarchical_sample_draw_probability",
+    "unit": "hierarchical_sample_draw_probability_with_per_pool_no_replacement_epochs_v2",
+    "record_selection": "Each atomic record appears exactly once in a deterministic shuffled pool epoch before that pool is reshuffled for its next epoch.",
     "task_weights": {
       "AAC": 0.6,
       "ASR": 0.4

@@ -11,6 +11,7 @@ from typing import Any, Iterator
 
 
 MASK64 = (1 << 64) - 1
+SAMPLER_VERSION = "deterministic_hierarchical_no_replacement_v2"
 POOL_ORDER = (
     "wavcaps_no_bbc_aac",
     "audiocaps_v2_aac",
@@ -23,6 +24,7 @@ GLOBAL_POOL_WEIGHTS = {
     "clotho_v2_aac": 0.06,
     "gigaspeech_l_asr": 0.40,
 }
+POOL_STREAM_IDS = {name: index + 1 for index, name in enumerate(POOL_ORDER)}
 
 
 def splitmix64(value: int) -> int:
@@ -41,6 +43,44 @@ class MixtureSelection:
     global_position: int
     pool_name: str
     record_index: int
+    pool_occurrence_index: int
+    pool_epoch: int
+    pool_epoch_offset: int
+
+
+def _feistel_permute(value: int, domain_bits: int, key: int) -> int:
+    """Apply a deterministic permutation over an even-bit power-of-two domain."""
+    if domain_bits <= 0 or domain_bits % 2:
+        raise ValueError(f"domain_bits must be a positive even integer, got {domain_bits}")
+    half_bits = domain_bits // 2
+    half_mask = (1 << half_bits) - 1
+    left = int(value) >> half_bits
+    right = int(value) & half_mask
+    for round_index in range(6):
+        round_key = splitmix64(key ^ ((round_index + 1) * 0xD6E8FEB86659FD93 & MASK64))
+        round_value = splitmix64(round_key ^ right) & half_mask
+        left, right = right, left ^ round_value
+    return (left << half_bits) | right
+
+
+def permute_bounded_index(index: int, size: int, key: int) -> int:
+    """Cycle-walk a keyed Feistel permutation into ``[0, size)``.
+
+    The mapping is a bijection for every key, so each dataset epoch covers
+    every atomic record exactly once without materializing a permutation.
+    """
+    if size <= 0 or index < 0 or index >= size:
+        raise ValueError(f"Invalid bounded permutation request: index={index} size={size}")
+    if size == 1:
+        return 0
+    domain_bits = max(2, (int(size) - 1).bit_length())
+    if domain_bits % 2:
+        domain_bits += 1
+    value = int(index)
+    while True:
+        value = _feistel_permute(value, domain_bits, int(key) & MASK64)
+        if value < size:
+            return value
 
 
 class IndexedJsonlPool:
@@ -120,7 +160,7 @@ class IndexedJsonlPool:
 
 
 class DeterministicHierarchicalMixture:
-    """Stateless task/source selection keyed only by seed and global position."""
+    """Deterministic hierarchical weighting with per-pool no-replacement epochs."""
 
     def __init__(self, pool_sizes: dict[str, int], seed: int = 20260730) -> None:
         if set(pool_sizes) != set(POOL_ORDER):
@@ -129,6 +169,7 @@ class DeterministicHierarchicalMixture:
             raise ValueError(f"Every pool size must be positive: {pool_sizes}")
         self.pool_sizes = {name: int(pool_sizes[name]) for name in POOL_ORDER}
         self.seed = int(seed) & MASK64
+        self.sampler_version = SAMPLER_VERSION
 
     def _draw(self, global_position: int, stream: int) -> int:
         if global_position < 0:
@@ -148,10 +189,100 @@ class DeterministicHierarchicalMixture:
             return "audiocaps_v2_aac"
         return "clotho_v2_aac"
 
-    def selection(self, global_position: int) -> MixtureSelection:
+    def pool_occurrence_counts_before(self, global_position: int) -> dict[str, int]:
+        """Count deterministic pool selections in ``[0, global_position)``."""
+        if global_position < 0:
+            raise ValueError(f"global_position must be non-negative, got {global_position}")
+        counts = {name: 0 for name in POOL_ORDER}
+        for position in range(int(global_position)):
+            counts[self.pool_for_position(position)] += 1
+        return counts
+
+    def record_index_for_occurrence(self, pool_name: str, pool_occurrence_index: int) -> tuple[int, int, int]:
+        """Map one pool-local occurrence to a unique record in its current epoch."""
+        if pool_name not in self.pool_sizes or pool_occurrence_index < 0:
+            raise ValueError(
+                f"Invalid pool occurrence request: pool={pool_name!r} occurrence={pool_occurrence_index}"
+            )
+        pool_size = self.pool_sizes[pool_name]
+        pool_epoch, pool_epoch_offset = divmod(int(pool_occurrence_index), pool_size)
+        pool_key = splitmix64(
+            self.seed
+            ^ (POOL_STREAM_IDS[pool_name] * 0xA24BAED4963EE407 & MASK64)
+            ^ (pool_epoch * 0x9FB21C651E98DF25 & MASK64)
+        )
+        record_index = permute_bounded_index(pool_epoch_offset, pool_size, pool_key)
+        return record_index, pool_epoch, pool_epoch_offset
+
+    def selection(
+        self,
+        global_position: int,
+        pool_occurrence_counts: dict[str, int] | None = None,
+    ) -> MixtureSelection:
+        """Select one record, reconstructing prior pool counts when needed."""
+        counts = (
+            self.pool_occurrence_counts_before(global_position)
+            if pool_occurrence_counts is None
+            else {name: int(pool_occurrence_counts[name]) for name in POOL_ORDER}
+        )
+        if sum(counts.values()) != global_position:
+            raise ValueError(
+                "Pool occurrence counts do not match global_position: "
+                f"position={global_position} counts={counts}"
+            )
         pool_name = self.pool_for_position(global_position)
-        record_index = self._draw(global_position, 3) % self.pool_sizes[pool_name]
-        return MixtureSelection(global_position, pool_name, record_index)
+        pool_occurrence_index = counts[pool_name]
+        record_index, pool_epoch, pool_epoch_offset = self.record_index_for_occurrence(
+            pool_name,
+            pool_occurrence_index,
+        )
+        return MixtureSelection(
+            global_position=int(global_position),
+            pool_name=pool_name,
+            record_index=record_index,
+            pool_occurrence_index=pool_occurrence_index,
+            pool_epoch=pool_epoch,
+            pool_epoch_offset=pool_epoch_offset,
+        )
+
+    def iter_selections(
+        self,
+        start_position: int = 0,
+        pool_occurrence_counts: dict[str, int] | None = None,
+    ) -> Iterator[MixtureSelection]:
+        """Yield an efficient sequential stream from an arbitrary exact position."""
+        if start_position < 0:
+            raise ValueError(f"start_position must be non-negative, got {start_position}")
+        counts = (
+            self.pool_occurrence_counts_before(start_position)
+            if pool_occurrence_counts is None
+            else {name: int(pool_occurrence_counts[name]) for name in POOL_ORDER}
+        )
+        if set(counts) != set(POOL_ORDER) or any(value < 0 for value in counts.values()):
+            raise ValueError(f"Invalid pool occurrence counts: {counts}")
+        if sum(counts.values()) != start_position:
+            raise ValueError(
+                "Pool occurrence counts do not match start_position: "
+                f"position={start_position} counts={counts}"
+            )
+        global_position = int(start_position)
+        while True:
+            pool_name = self.pool_for_position(global_position)
+            pool_occurrence_index = counts[pool_name]
+            record_index, pool_epoch, pool_epoch_offset = self.record_index_for_occurrence(
+                pool_name,
+                pool_occurrence_index,
+            )
+            yield MixtureSelection(
+                global_position=global_position,
+                pool_name=pool_name,
+                record_index=record_index,
+                pool_occurrence_index=pool_occurrence_index,
+                pool_epoch=pool_epoch,
+                pool_epoch_offset=pool_epoch_offset,
+            )
+            counts[pool_name] += 1
+            global_position += 1
 
     def target_index(self, global_position: int, target_count: int) -> int:
         if target_count <= 0:
