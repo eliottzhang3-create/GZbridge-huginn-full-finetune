@@ -266,6 +266,7 @@ def inspect_checkpoint(
             "dropout": 0.05,
             "tensor_count": 66,
             "target_module_count": 33,
+            "direct_lora_layer_count": 33,
             "restricted_to_huginn_transformer": True,
         }
         or runtime_contract.get("audio")

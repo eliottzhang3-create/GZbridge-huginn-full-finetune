@@ -107,6 +107,7 @@ def validate_lora_runtime(marker: dict[str, Any], *, phase: str, rank: int) -> N
     expected = {
         "tensor_count": 66,
         "target_module_count": 33,
+        "direct_lora_layer_count": 33,
         "rank": 8,
         "alpha": 16,
         "dropout": 0.05,

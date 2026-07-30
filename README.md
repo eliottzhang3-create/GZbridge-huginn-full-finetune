@@ -2407,6 +2407,13 @@ prefetched rows from statistics, cumulative sample/hour accounting, and AAC/ASR 
 checkpoint receives `huginn_training_runtime_contract.json`; the offline checkpoint inspector rejects any contract or
 trainable-state mismatch. Formal training must not be submitted until this updated smoke passes.
 
+The first launch of this updated smoke stopped before step 1 because the new LoRA audit reported 34 target modules while
+still observing exactly 66 LoRA A/B parameter tensors. This was an audit-only false positive: activation checkpointing's
+`CheckpointWrapper` delegates `lora_A` to the wrapped recurrent adapter, so an attribute-based scan counted both the
+wrapper and the real PEFT Linear. The audit now derives 33 targets from matched `lora_A`/`lora_B` parameter paths and
+separately requires 33 modules that directly register `lora_A`; delegated wrappers are not counted. No model topology,
+LoRA attachment, checkpoint state, or training behavior was changed by this correction.
+
 Formal training still targets more than `3000` realized, decoded, 30-second-capped hours, but max-step planning is now
 deliberately deferred until after the acceleration experiments and their FSDP4 smoke tests. WavCaps source metadata is
 not duration-complete, so the metadata-pool prerequisite must not fabricate a precise post-cap hour total. A separate

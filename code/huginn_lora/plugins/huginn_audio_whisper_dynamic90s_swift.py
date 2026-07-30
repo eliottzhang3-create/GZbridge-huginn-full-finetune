@@ -2532,12 +2532,34 @@ def _audit_lora_runtime_configuration(model: torch.nn.Module, *, context: str) -
         if "lora_B" in name and parameter.ndim == 2 and int(parameter.shape[1]) != 8:
             raise RuntimeError(f"{context} LoRA B rank mismatch: {name} shape={tuple(parameter.shape)}")
 
-    target_modules = 0
+    lora_a_target_paths = {
+        name.split(".lora_A.", 1)[0]
+        for name, _parameter in lora_parameters
+        if ".lora_A." in name
+    }
+    lora_b_target_paths = {
+        name.split(".lora_B.", 1)[0]
+        for name, _parameter in lora_parameters
+        if ".lora_B." in name
+    }
+    if lora_a_target_paths != lora_b_target_paths or len(lora_a_target_paths) != 33:
+        raise RuntimeError(
+            f"{context} parameter-backed LoRA target mismatch: "
+            f"lora_A={sorted(lora_a_target_paths)} lora_B={sorted(lora_b_target_paths)}"
+        )
+
+    # CheckpointWrapper forwards unknown attributes to its wrapped module. A
+    # plain getattr(module, "lora_A") therefore counts the wrapped recurrent
+    # adapter twice: once through the wrapper and once on the real PEFT Linear.
+    # Only modules that directly register lora_A in nn.Module._modules are
+    # actual LoRA layers.
+    direct_lora_layers = 0
     for module in model.modules():
-        lora_a = getattr(module, "lora_A", None)
+        registered_modules = getattr(module, "_modules", {})
+        lora_a = registered_modules.get("lora_A")
         if not lora_a:
             continue
-        target_modules += 1
+        direct_lora_layers += 1
         alpha_values = getattr(module, "lora_alpha", {})
         if not alpha_values or any(float(value) != 16.0 for value in alpha_values.values()):
             raise RuntimeError(f"{context} effective LoRA alpha mismatch: {alpha_values}")
@@ -2548,11 +2570,12 @@ def _audit_lora_runtime_configuration(model: torch.nn.Module, *, context: str) -
             probability = float(getattr(dropout, "p", -1.0))
             if abs(probability - 0.05) > 1e-12:
                 raise RuntimeError(f"{context} effective LoRA dropout mismatch: {probability}")
-    if target_modules != 33:
-        raise RuntimeError(f"{context} LoRA target-module count mismatch: {target_modules}")
+    if direct_lora_layers != 33:
+        raise RuntimeError(f"{context} direct LoRA-layer count mismatch: {direct_lora_layers}")
     return {
         "tensor_count": len(lora_parameters),
-        "target_module_count": target_modules,
+        "target_module_count": len(lora_a_target_paths),
+        "direct_lora_layer_count": direct_lora_layers,
         "rank": 8,
         "alpha": 16,
         "dropout": 0.05,
@@ -4612,6 +4635,9 @@ def patch_checkpoint_resume_callback() -> None:
                         "dropout": float(self.lora_runtime_audit["dropout"]),
                         "tensor_count": int(self.lora_runtime_audit["tensor_count"]),
                         "target_module_count": int(self.lora_runtime_audit["target_module_count"]),
+                        "direct_lora_layer_count": int(
+                            self.lora_runtime_audit["direct_lora_layer_count"]
+                        ),
                         "restricted_to_huginn_transformer": bool(
                             self.lora_runtime_audit["restricted_to_huginn_transformer"]
                         ),
