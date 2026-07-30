@@ -10,6 +10,7 @@ import random
 import shutil
 import subprocess
 import tarfile
+import time
 import wave
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -77,6 +78,7 @@ STAGE5_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_AUDIT_DIR"
 STAGE5_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_MAX_STEPS"
 MEMORY90_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_MEMORY90_AUDIT_DIR"
 ACCELERATION_STAGE0_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE0_AUDIT_DIR"
+ACCELERATION_STAGE1_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR"
 REALDATA_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_AUDIT_DIR"
 REALDATA_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_MAX_STEPS"
 DATA_POSITION_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR"
@@ -2525,6 +2527,45 @@ def _module_mro_names(module: torch.nn.Module | None) -> list[str]:
     return [base.__name__ for base in type(module).__mro__]
 
 
+def _audit_activation_checkpoint_wrappers(model: torch.nn.Module) -> list[dict[str, Any]]:
+    """Describe activation-checkpoint wrappers without changing their execution."""
+    wrappers: list[dict[str, Any]] = []
+    for name, module in model.named_modules():
+        is_wrapper = (
+            "CheckpointWrapper" in type(module).__name__
+            or hasattr(module, "_checkpoint_wrapped_module")
+        )
+        if not is_wrapper:
+            continue
+        inner = getattr(module, "_checkpoint_wrapped_module", None)
+        child_mro_names = sorted(
+            {
+                base_name
+                for child in module.modules()
+                for base_name in _module_mro_names(child)
+            }
+        )
+        contains_whisper_encoder = "WhisperEncoder" in child_mro_names
+        wrappers.append(
+            {
+                "path": name,
+                "wrapper_type": type(module).__name__,
+                "inner_type": type(inner).__name__ if inner is not None else None,
+                "inner_mro": _module_mro_names(inner),
+                "contains_whisper_encoder": contains_whisper_encoder,
+                "contains_whisper_fsdp_unit": "WhisperEncoderFSDPUnit" in child_mro_names,
+                # Compatibility alias for the Stage 0 report schema. Its old
+                # value was too narrow because FSDP activation checkpointing
+                # wraps the WhisperEncoder inside WhisperEncoderFSDPUnit.
+                "contains_whisper_unit": contains_whisper_encoder,
+                "contained_fsdp_units": [
+                    class_name for class_name in FSDP_UNIT_CLASS_NAMES if class_name in child_mro_names
+                ],
+            }
+        )
+    return wrappers
+
+
 def _read_fsdp_reshard_after_forward(module: torch.nn.Module) -> dict[str, Any]:
     """Read FSDP2's effective reshard setting without mutating the module."""
     candidates: list[tuple[str, Any]] = []
@@ -2630,35 +2671,7 @@ def patch_acceleration_stage0_callback() -> None:
             return matching[0]
 
         def _audit_checkpoint_wrappers(self) -> list[dict[str, Any]]:
-            wrappers: list[dict[str, Any]] = []
-            for name, module in self.tracked_model.named_modules():
-                is_wrapper = (
-                    "CheckpointWrapper" in type(module).__name__
-                    or hasattr(module, "_checkpoint_wrapped_module")
-                )
-                if not is_wrapper:
-                    continue
-                inner = getattr(module, "_checkpoint_wrapped_module", None)
-                child_mro_names = sorted(
-                    {
-                        base_name
-                        for child in module.modules()
-                        for base_name in _module_mro_names(child)
-                    }
-                )
-                wrappers.append(
-                    {
-                        "path": name,
-                        "wrapper_type": type(module).__name__,
-                        "inner_type": type(inner).__name__ if inner is not None else None,
-                        "inner_mro": _module_mro_names(inner),
-                        "contains_whisper_unit": "WhisperEncoderFSDPUnit" in child_mro_names,
-                        "contained_fsdp_units": [
-                            class_name for class_name in FSDP_UNIT_CLASS_NAMES if class_name in child_mro_names
-                        ],
-                    }
-                )
-            return wrappers
+            return _audit_activation_checkpoint_wrappers(self.tracked_model)
 
         def _install_sdpa_audit(self, whisper_unit: torch.nn.Module) -> None:
             def whisper_pre_hook(_module, _args):
@@ -2885,6 +2898,277 @@ def patch_acceleration_stage0_callback() -> None:
     patched_init._huginn_audio_dynamic30s_acceleration_stage0_patched = True
     Trainer.__init__ = patched_init
     print("[HuginnAudioSwift] installed dynamic30s acceleration Stage 0 audit callback")
+
+
+def patch_acceleration_stage1_callback() -> None:
+    """Audit removal of Whisper's internal checkpointing in an isolated smoke."""
+    audit_dir_value = os.environ.get(ACCELERATION_STAGE1_AUDIT_DIR_ENV, "").strip()
+    if not audit_dir_value:
+        return
+    if os.environ.get(ACCELERATION_STAGE0_AUDIT_DIR_ENV, "").strip():
+        raise RuntimeError("Acceleration Stage 0 and Stage 1 audit modes are mutually exclusive")
+    from transformers import Trainer, TrainerCallback
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic30s_acceleration_stage1_patched", False):
+        return
+
+    expected_wrapper_suffixes = (
+        "transformer.prelude.0",
+        "transformer.prelude.1",
+        "transformer.core_block.0",
+        "transformer.core_block.1",
+        "transformer.core_block.2",
+        "transformer.core_block.3",
+        "transformer.core_block.adapter",
+        "transformer.coda.0",
+        "transformer.coda.1",
+        "audio_encoder.encoder",
+        "audio_aligner.temporal_compressor",
+        "audio_aligner.audio_projector",
+        "audio_aligner.audio_boundary_embeddings",
+    )
+
+    class AccelerationStage1Callback(TrainerCallback):
+        _huginn_audio_dynamic30s_acceleration_stage1_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.audit_dir = Path(audit_dir_value)
+            self.loss_logs: list[float] = []
+            self.grad_norm_logs: list[float] = []
+            self.gradient_audit: dict[str, dict[str, int]] | None = None
+            self.optimizer_audit: list[dict[str, Any]] | None = None
+            self.fsdp_topology: dict[str, Any] | None = None
+            self.fsdp_units: dict[str, Any] = {}
+            self.checkpoint_wrappers: list[dict[str, Any]] = []
+            self.whisper_internal_checkpoint_modules: list[str] = []
+            self.whisper_outer_wrappers: list[dict[str, Any]] = []
+            self.whisper_attention: dict[str, Any] = {}
+            self.train_started_at: float | None = None
+
+        @staticmethod
+        def _identity() -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Acceleration Stage 1 requires initialized torch.distributed")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"Acceleration Stage 1 requires world_size=4, got {world_size}")
+            return rank, world_size
+
+        def _locate_unit(self, class_name: str) -> tuple[str, torch.nn.Module]:
+            matching = [
+                (name, module)
+                for name, module in self.tracked_model.named_modules()
+                if class_name in _module_mro_names(module)
+            ]
+            if len(matching) != 1:
+                raise RuntimeError(
+                    f"Acceleration Stage 1 expected one {class_name}, found "
+                    f"{[(name, type(module).__name__) for name, module in matching]}"
+                )
+            return matching[0]
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            rank, world_size = self._identity()
+            if (
+                int(args.per_device_train_batch_size) != 2
+                or int(args.gradient_accumulation_steps) != 4
+                or int(state.max_steps) != 1
+            ):
+                raise RuntimeError(
+                    "Acceleration Stage 1 requires B2/GA4/max_steps=1: "
+                    f"batch={args.per_device_train_batch_size} "
+                    f"ga={args.gradient_accumulation_steps} max_steps={state.max_steps}"
+                )
+            if bool(getattr(args, "gradient_checkpointing", False)):
+                raise RuntimeError("Acceleration Stage 1 must keep Huginn Trainer checkpointing disabled")
+            if bool(getattr(args, "vit_gradient_checkpointing", False)):
+                raise RuntimeError("Acceleration Stage 1 requires Whisper internal checkpointing disabled")
+
+            self.optimizer_audit = _audit_optimizer_parameter_groups(
+                self.tracked_model,
+                kwargs.get("optimizer"),
+                context="Acceleration Stage 1",
+            )
+            self.fsdp_topology = _audit_formal_fsdp_topology(self.tracked_model)
+            self.whisper_internal_checkpoint_modules = _whisper_gradient_checkpoint_modules(
+                self.tracked_model
+            )
+            if self.whisper_internal_checkpoint_modules:
+                raise RuntimeError(
+                    "Acceleration Stage 1 found active Whisper internal gradient checkpointing: "
+                    f"{self.whisper_internal_checkpoint_modules}"
+                )
+
+            self.checkpoint_wrappers = _audit_activation_checkpoint_wrappers(self.tracked_model)
+            self.whisper_outer_wrappers = [
+                wrapper
+                for wrapper in self.checkpoint_wrappers
+                if wrapper["contains_whisper_encoder"]
+            ]
+            if len(self.whisper_outer_wrappers) != 1:
+                raise RuntimeError(
+                    "Acceleration Stage 1 requires exactly one outer WhisperEncoder checkpoint wrapper: "
+                    f"{self.whisper_outer_wrappers}"
+                )
+            whisper_wrapper = self.whisper_outer_wrappers[0]
+            if (
+                not whisper_wrapper["path"].endswith("audio_encoder.encoder")
+                or "WhisperEncoder" not in whisper_wrapper["inner_mro"]
+            ):
+                raise RuntimeError(
+                    "Acceleration Stage 1 outer Whisper checkpoint ownership mismatch: "
+                    f"{whisper_wrapper}"
+                )
+
+            missing_wrapper_suffixes = [
+                suffix
+                for suffix in expected_wrapper_suffixes
+                if not any(wrapper["path"].endswith(suffix) for wrapper in self.checkpoint_wrappers)
+            ]
+            if missing_wrapper_suffixes:
+                raise RuntimeError(
+                    "Acceleration Stage 1 unexpectedly lost activation-checkpoint wrappers: "
+                    f"{missing_wrapper_suffixes}; observed={self.checkpoint_wrappers}"
+                )
+
+            whisper_path, whisper_unit = self._locate_unit("WhisperEncoderFSDPUnit")
+            encoder = getattr(whisper_unit, "encoder", None)
+            whisper_config = getattr(encoder, "config", None)
+            self.whisper_attention = {
+                "whisper_unit_path": whisper_path,
+                "config_attn_implementation": getattr(whisper_config, "_attn_implementation", None),
+                "config_attn_implementation_internal": getattr(
+                    whisper_config, "_attn_implementation_internal", None
+                ),
+                "attention_classes": sorted(
+                    {
+                        type(module).__name__
+                        for name, module in whisper_unit.named_modules()
+                        if name.endswith("self_attn") or "Attention" in type(module).__name__
+                    }
+                ),
+            }
+            if self.whisper_attention["config_attn_implementation"] != "sdpa":
+                raise RuntimeError(
+                    "Acceleration Stage 1 unexpectedly changed Whisper attention implementation: "
+                    f"{self.whisper_attention}"
+                )
+
+            for class_name in FSDP_UNIT_CLASS_NAMES:
+                unit_path, unit = self._locate_unit(class_name)
+                reshard = _read_fsdp_reshard_after_forward(unit)
+                if reshard["effective"] is not True:
+                    raise RuntimeError(
+                        f"Acceleration Stage 1 must preserve {class_name} reshard_after_forward=true: "
+                        f"{reshard}"
+                    )
+                self.fsdp_units[class_name] = {
+                    "path": unit_path,
+                    "runtime_type": type(unit).__name__,
+                    "mro": _module_mro_names(unit),
+                    "reshard_after_forward": reshard,
+                }
+
+            torch.cuda.reset_peak_memory_stats()
+            self.train_started_at = time.perf_counter()
+            print(
+                "[acceleration-stage1] "
+                f"rank={rank}/{world_size} internal_gc=false "
+                f"outer_whisper_checkpoint={whisper_wrapper['path']} "
+                f"checkpoint_wrappers={self.checkpoint_wrappers} "
+                f"fsdp_units={self.fsdp_units}",
+                flush=True,
+            )
+            return control
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            self.gradient_audit = _audit_local_trainable_gradients(
+                self.tracked_model,
+                context="Acceleration Stage 1 first optimizer update",
+            )
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, state, kwargs
+            for key, destination in (("loss", self.loss_logs), ("grad_norm", self.grad_norm_logs)):
+                value = (logs or {}).get(key)
+                if value is None:
+                    continue
+                numeric = float(value)
+                if not math.isfinite(numeric):
+                    raise RuntimeError(f"Acceleration Stage 1 logged non-finite {key}: {numeric}")
+                destination.append(numeric)
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            rank, world_size = self._identity()
+            if int(state.global_step) != 1:
+                raise RuntimeError(f"Acceleration Stage 1 ended at step {state.global_step}, expected 1")
+            if self.train_started_at is None:
+                raise RuntimeError("Acceleration Stage 1 lacks its training start timestamp")
+            train_wall_seconds = time.perf_counter() - self.train_started_at
+            if self.gradient_audit is None or not self.loss_logs or not self.grad_norm_logs:
+                raise RuntimeError(
+                    "Acceleration Stage 1 did not complete its gradient/loss audit: "
+                    f"gradient={self.gradient_audit is not None} losses={self.loss_logs} "
+                    f"grad_norms={self.grad_norm_logs}"
+                )
+
+            payload = {
+                "gate": "huginn_whisper_dynamic30s_acceleration_stage1_rank_v1",
+                "rank": rank,
+                "world_size": world_size,
+                "global_step": int(state.global_step),
+                "cuda_device": torch.cuda.current_device(),
+                "cuda_name": torch.cuda.get_device_name(torch.cuda.current_device()),
+                "vit_gradient_checkpointing_arg": False,
+                "whisper_internal_gradient_checkpointing": False,
+                "whisper_internal_gradient_checkpoint_modules": [],
+                "whisper_outer_activation_checkpointed": True,
+                "whisper_outer_checkpoint_wrappers": self.whisper_outer_wrappers,
+                "whisper_double_checkpoint_candidate": False,
+                "whisper_attention": self.whisper_attention,
+                "checkpoint_wrappers": self.checkpoint_wrappers,
+                "expected_wrapper_suffixes": list(expected_wrapper_suffixes),
+                "fsdp_units": self.fsdp_units,
+                "fsdp_topology": self.fsdp_topology,
+                "optimizer_groups": self.optimizer_audit,
+                "gradient_audit": self.gradient_audit,
+                "finite_losses": self.loss_logs,
+                "finite_grad_norms": self.grad_norm_logs,
+                "train_wall_seconds": train_wall_seconds,
+                "peak_memory_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
+                "peak_memory_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
+            }
+            self.audit_dir.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(self.audit_dir / f"rank-{rank}.json", payload)
+            print(
+                "[acceleration-stage1-marker] "
+                f"rank={rank} internal_whisper_checkpoint=false "
+                f"outer_whisper_checkpoint=true double_checkpoint=false "
+                f"train_wall_seconds={train_wall_seconds:.3f} "
+                f"peak_allocated_gib={payload['peak_memory_allocated_gib']:.3f} "
+                f"peak_reserved_gib={payload['peak_memory_reserved_gib']:.3f}",
+                flush=True,
+            )
+            return control
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic30s_acceleration_stage1_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(AccelerationStage1Callback(self.model))
+
+    patched_init._huginn_audio_dynamic30s_acceleration_stage1_patched = True
+    Trainer.__init__ = patched_init
+    print("[HuginnAudioSwift] installed dynamic30s acceleration Stage 1 audit callback")
 
 
 def patch_memory90_callback() -> None:
@@ -4154,6 +4438,7 @@ patch_swift_lora_llm_fsdp_dcp_resume()
 patch_accelerate_fsdp2_full_model_dcp()
 patch_accelerate_fsdp2_save_state_audit()
 patch_acceleration_stage0_callback()
+patch_acceleration_stage1_callback()
 patch_memory90_callback()
 patch_stage34_optimizer_step_callback()
 patch_stage5_stability_callback()

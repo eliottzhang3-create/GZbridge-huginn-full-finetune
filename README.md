@@ -2298,7 +2298,7 @@ Before any long remote run:
   - checkpoint audit/save-reload validation
   - retrieval / generation / benchmark evaluation
 
-### Huginn Whisper dynamic-30s current status (2026-07-30; supersedes all dynamic-90s execution guidance below)
+### Huginn Whisper dynamic-30s current status (2026-07-31; supersedes all dynamic-90s execution guidance below)
 
 The active Huginn route now uses exactly one dynamic Whisper chunk per sample. Existing `dynamic90s` filenames,
 environment variables, model type, and model directory are retained only for Swift/checkpoint tooling compatibility;
@@ -2332,10 +2332,15 @@ bash code/huginn_lora/run_prepare_huginn_whisper_dynamic30s_training_prerequisit
 # attention/checkpoint/reshard behavior and saves no model checkpoint.
 bash code/huginn_lora/run_smoke_huginn_whisper_dynamic30s_acceleration_stage0_fsdp4_5090.sh
 
+# Four-GPU, one-update acceleration Stage 1 candidate. It keeps FSDP activation
+# checkpointing, but disables only Whisper's internal per-layer checkpointing.
+bash code/huginn_lora/run_smoke_huginn_whisper_dynamic30s_acceleration_stage1_fsdp4_5090.sh
+
 # Four-GPU fresh save at step 4, process exit, cold resume to step 6.
 bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh
 
-# Only after both jobs pass: fresh formal training.
+# Only after the selected acceleration configuration and checkpoint/resume gates pass:
+# fresh formal training.
 bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
 ```
 
@@ -2346,6 +2351,22 @@ audits and the merged `acceleration_stage0_report.json` identify the actual Whis
 SDPA calls, map every activation-checkpoint wrapper to its contained FSDP unit, detect whether Whisper has simultaneous
 inner and outer checkpointing, report all five units' effective reshard state, and record peak CUDA memory. No attention
 backend, checkpoint policy, or FSDP reshard setting is changed by this gate.
+
+Stage 0 confirmed PyTorch SDPA execution and exposed that the original wrapper detector was too narrow: FSDP activation
+checkpointing wraps the complete `WhisperEncoder` inside `WhisperEncoderFSDPUnit`, not the FSDP unit class itself. The
+shared detector now reports that wrapper as Whisper's outer activation checkpoint, relative to Whisper's internal
+per-layer gradient checkpointing.
+
+Acceleration Stage 1 is isolated behind
+`HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR`; normal training is unchanged unless its dedicated smoke script
+is launched. It uses the same real deterministic data window, FSDP4, per-device batch `2`, gradient accumulation `4`,
+SDPA attention, and five coarse FSDP units as Stage 0. The only training-setting change is
+`vit_gradient_checkpointing=false`, while FSDP `activation_checkpointing=true` preserves exactly one checkpoint wrapper
+around the complete Whisper encoder. The gate requires zero Whisper internal checkpoint modules, exactly one outer
+Whisper wrapper, no double-checkpoint candidate, all five units at `reshard_after_forward=true`, finite loss/grad norm,
+nonzero gradients for Huginn LoRA + aligner + Whisper, and zero gradients for the frozen native Huginn backbone. It saves
+only per-rank audits and `acceleration_stage1_report.json`, not a model checkpoint. Formal training is not switched to
+this candidate until its FSDP4 result is reviewed and explicitly adopted.
 
 Formal training still targets more than `3000` realized, decoded, 30-second-capped hours, but max-step planning is now
 deliberately deferred until after the acceleration experiments and their FSDP4 smoke tests. WavCaps source metadata is
