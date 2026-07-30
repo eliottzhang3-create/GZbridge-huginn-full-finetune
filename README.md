@@ -2314,6 +2314,12 @@ The active trainability contract changed on 2026-07-30 and supersedes every froz
 - the native Huginn backbone and LM head remain frozen; Whisper and the aligner still receive no LoRA modules;
 - all old checkpoint-4/6 runs used a different optimizer/model contract and are invalid as resume evidence.
 
+For this isolated route, `audio_encoder` is registered as Swift's `vision_tower`, not as its always-frozen
+`generator` branch. Swift 4.1.3 `LoRALLMTuner` constructs LoRA only for the language-model target regex, then explicitly
+unfreezes `vision_tower + aligner` before optimizer construction. This gives full-parameter Whisper/aligner training
+without attaching LoRA to either module. Historical frozen-Whisper plugins retain their original `generator`
+registration.
+
 The first required gate for this contract is
 `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_memory90_fsdp4_5090.sh`. It performs one complete optimizer
 update with every sample exactly 90 seconds long, `B=2` per rank, four ranks, and `GA=4`, giving global batch `32`.

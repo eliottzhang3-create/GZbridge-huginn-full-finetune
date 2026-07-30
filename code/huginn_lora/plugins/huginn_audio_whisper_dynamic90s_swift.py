@@ -70,7 +70,6 @@ if _DERIVED_AUDIO_TOKEN_DURATION_MS != AUDIO_TOKEN_DURATION_MS:
         f"derived={_DERIVED_AUDIO_TOKEN_DURATION_MS}ms configured={AUDIO_TOKEN_DURATION_MS}ms"
     )
 INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT"
-FORCE_ALIGNER_TRAINABLE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FORCE_ALIGNER_TRAINABLE"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT"
 STAGE34_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE34_AUDIT_DIR"
@@ -504,9 +503,8 @@ def load_initial_aligner_state(model: torch.nn.Module, checkpoint_dir: Path) -> 
     }
 
 
-def force_audio_aligner_trainable(model: torch.nn.Module) -> None:
-    if os.environ.get(FORCE_ALIGNER_TRAINABLE_ENV) != "1":
-        return
+def force_audio_modules_trainable_after_peft_restore(model: torch.nn.Module) -> None:
+    """Repeat LoRALLMTuner's mixed unfreeze before resume optimizer creation."""
     audio_model = next(
         (
             module
@@ -518,8 +516,23 @@ def force_audio_aligner_trainable(model: torch.nn.Module) -> None:
     if audio_model is None:
         raise RuntimeError("Unable to locate the Huginn audio model after PEFT adapter loading")
 
-    audio_model.audio_aligner.requires_grad_(True)
     audio_model.audio_encoder.requires_grad_(True)
+    if _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV):
+        wrappers = [
+            (name, module)
+            for name, module in audio_model.named_modules()
+            if type(module).__name__ == "ModulesToSaveWrapper"
+            and any(name.endswith(aligner_name) for aligner_name in ALIGNER_MODULES_TO_SAVE)
+        ]
+        if len(wrappers) != len(ALIGNER_MODULES_TO_SAVE):
+            raise RuntimeError(
+                "Cold PEFT restore did not expose every guarded aligner wrapper: "
+                f"expected={ALIGNER_MODULES_TO_SAVE} actual={[name for name, _ in wrappers]}"
+            )
+        for name, wrapper in wrappers:
+            guard_peft_aligner_wrapper_trainability(wrapper, module_name=name)
+    else:
+        audio_model.audio_aligner.requires_grad_(True)
 
     aligner_trainable = sum(
         parameter.numel()
@@ -535,7 +548,7 @@ def force_audio_aligner_trainable(model: torch.nn.Module) -> None:
             f"audio_encoder={audio_encoder_trainable} aligner={aligner_trainable}"
         )
     print(
-        "[HuginnAudioSwift] forced_audio_trainables "
+        "[HuginnAudioSwift] restored_audio_trainables_after_peft "
         f"audio_encoder_parameters={audio_encoder_trainable} aligner_parameters={aligner_trainable}"
     )
 
@@ -815,7 +828,7 @@ def patch_peft_adapter_restore() -> None:
             )
         else:
             restored_model = original_from_pretrained(*args, **kwargs)
-        force_audio_aligner_trainable(restored_model)
+        force_audio_modules_trainable_after_peft_restore(restored_model)
         return restored_model
 
     PeftModel.from_pretrained = from_pretrained_with_audio_aligner
@@ -3343,7 +3356,10 @@ def register_huginn_audio_model_arch():
             if _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV)
             else ["audio_aligner"]
         ),
-        "generator": ["audio_encoder"],
+        # This active route full-tunes Whisper. Swift 4.1.3 LoRALLMTuner builds
+        # LLM-only LoRA, then explicitly unfreezes vision_tower + aligner before
+        # optimizer construction; generator modules remain outside that path.
+        "vision_tower": ["audio_encoder"],
     }
     try:
         multi_model_keys = MultiModelKeys(

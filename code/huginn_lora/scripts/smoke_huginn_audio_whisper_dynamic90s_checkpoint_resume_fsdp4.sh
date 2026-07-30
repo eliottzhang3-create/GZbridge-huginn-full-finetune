@@ -64,6 +64,8 @@ from dataclasses import fields
 from pathlib import Path
 from accelerate.utils import fsdp_utils
 from swift.arguments.sft_args import SftArguments
+from swift.tuner_plugin.lora_llm import LoRALLMTuner
+from swift.utils import get_multimodal_target_regex
 
 report = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
 if not report.get('validation_passed'):
@@ -78,13 +80,25 @@ if int(sys.argv[3]) < 24:
     raise SystemExit(f'Checkpoint dataset quota must be at least 24, got {sys.argv[3]}')
 available = {field.name for field in fields(SftArguments)}
 required = {
-    'fsdp', 'modules_to_save', 'resume_from_checkpoint', 'ignore_data_skip',
+    'fsdp', 'modules_to_save', 'resume_from_checkpoint', 'ignore_data_skip', 'vit_lr',
     'save_strategy', 'save_steps', 'save_only_model', 'lr_scheduler_type',
     'streaming', 'max_steps',
 }
 missing = sorted(required - available)
 if missing:
     raise SystemExit(f'Installed Swift lacks required checkpoint smoke arguments: {missing}')
+prepare_source = inspect.getsource(LoRALLMTuner.prepare_model)
+target_signature = inspect.signature(get_multimodal_target_regex)
+if (
+    'get_multimodal_target_regex(model)' not in prepare_source
+    or 'model_arch.vision_tower + model_arch.aligner' not in prepare_source
+    or target_signature.parameters['freeze_vit'].default is not True
+    or target_signature.parameters['freeze_aligner'].default is not True
+):
+    raise SystemExit(
+        'Installed Swift lora_llm does not provide the required contract: '
+        'Huginn-only LoRA plus full-parameter vision_tower/aligner training'
+    )
 for function_name in ('_get_model_state_dict', '_set_model_state_dict'):
     function = getattr(fsdp_utils, function_name, None)
     if function is None or 'adapter_only' not in inspect.signature(function).parameters:
@@ -92,7 +106,10 @@ for function_name in ('_get_model_state_dict', '_set_model_state_dict'):
             f'Installed Accelerate lacks paired full-model FSDP API {function_name}(..., adapter_only=...): '
             f'{function!r}'
         )
-print('[precheck] real_data_chain=passed no_replacement_sampler=passed checkpoint_arguments=present dataset_quota=sufficient')
+print(
+    '[precheck] real_data_chain=passed no_replacement_sampler=passed checkpoint_arguments=present '
+    'dataset_quota=sufficient lora_llm_mixed_tuning_contract=present'
+)
 PY
 
 FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":false,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
@@ -241,6 +258,7 @@ run_save_phase() {
     --modules_to_save "${MODULES_TO_SAVE[@]}" \
     --learning_rate 1e-4 \
     --aligner_lr 1e-4 \
+    --vit_lr 1e-4 \
     --lr_scheduler_type constant \
     --lora_rank 8 \
     --lora_alpha 16 \
@@ -301,6 +319,7 @@ run_resume_phase() {
     --modules_to_save "${MODULES_TO_SAVE[@]}" \
     --learning_rate 1e-4 \
     --aligner_lr 1e-4 \
+    --vit_lr 1e-4 \
     --lr_scheduler_type constant \
     --lora_rank 8 \
     --lora_alpha 16 \

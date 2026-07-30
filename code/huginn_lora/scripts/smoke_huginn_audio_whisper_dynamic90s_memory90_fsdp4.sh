@@ -37,18 +37,33 @@ for required_path in "$MODEL_PATH" "$PLUGIN_PATH" "$PREPARE_SCRIPT" "$MARKER_INS
 done
 
 python - <<'PY'
+import inspect
 from dataclasses import fields
 from swift.arguments.sft_args import SftArguments
+from swift.tuner_plugin.lora_llm import LoRALLMTuner
+from swift.utils import get_multimodal_target_regex
 
 available = {field.name for field in fields(SftArguments)}
 required = {
-    'fsdp', 'tuner_type', 'freeze_vit', 'freeze_aligner', 'lora_rank',
+    'fsdp', 'tuner_type', 'freeze_vit', 'freeze_aligner', 'vit_lr', 'lora_rank',
     'lora_alpha', 'lora_dropout', 'lr_scheduler_type', 'max_steps', 'save_strategy',
 }
 missing = sorted(required - available)
 if missing:
     raise SystemExit(f'Installed Swift lacks required memory90 arguments: {missing}')
-print('[precheck] swift_memory90_arguments=present')
+prepare_source = inspect.getsource(LoRALLMTuner.prepare_model)
+target_signature = inspect.signature(get_multimodal_target_regex)
+if (
+    'get_multimodal_target_regex(model)' not in prepare_source
+    or 'model_arch.vision_tower + model_arch.aligner' not in prepare_source
+    or target_signature.parameters['freeze_vit'].default is not True
+    or target_signature.parameters['freeze_aligner'].default is not True
+):
+    raise SystemExit(
+        'Installed Swift lora_llm does not provide the required contract: '
+        'Huginn-only LoRA plus full-parameter vision_tower/aligner training'
+    )
+print('[precheck] swift_memory90_arguments=present lora_llm_mixed_tuning_contract=present')
 PY
 
 python -u "$PREPARE_SCRIPT" --work-dir "$RUN_ROOT"
@@ -143,6 +158,7 @@ swift sft \
   --freeze_aligner false \
   --learning_rate 1e-4 \
   --aligner_lr 1e-4 \
+  --vit_lr 1e-4 \
   --lr_scheduler_type constant \
   --lora_rank 8 \
   --lora_alpha 16 \
