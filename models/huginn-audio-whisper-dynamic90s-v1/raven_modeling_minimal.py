@@ -80,7 +80,9 @@ class AudioBoundaryEmbeddings(nn.Module):
         nn.init.normal_(self.audio_bos, mean=0.0, std=init_std)
         nn.init.normal_(self.audio_eos, mean=0.0, std=init_std)
 
-    def forward(self) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, _reference: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        # PEFT's AuxiliaryTrainingWrapper requires one positional input even
+        # though these learned boundary embeddings are input-independent.
         return self.audio_bos * 1.0, self.audio_eos * 1.0
 
 
@@ -151,7 +153,7 @@ class AudioAlignerFSDPUnit(nn.Module):
         # Calling the module is required for PEFT's ModulesToSaveWrapper to
         # route execution through its active trainable copy. It also keeps both
         # parameters materialized inside this FSDP unit's wrapped forward.
-        audio_bos, audio_eos = self.audio_boundary_embeddings()
+        audio_bos, audio_eos = self.audio_boundary_embeddings(audio_hidden)
         return projected, audio_bos, audio_eos
 
 
