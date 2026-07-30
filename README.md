@@ -2328,12 +2328,24 @@ Run the current gates in this order after syncing code:
 # One metadata-only 1-GPU job: v2 pools -> CPU sampler audit -> four real decode probes.
 bash code/huginn_lora/run_prepare_huginn_whisper_dynamic30s_training_prerequisites_5090.sh
 
+# Four-GPU, one-update acceleration Stage 0 diagnostic. It does not change
+# attention/checkpoint/reshard behavior and saves no model checkpoint.
+bash code/huginn_lora/run_smoke_huginn_whisper_dynamic30s_acceleration_stage0_fsdp4_5090.sh
+
 # Four-GPU fresh save at step 4, process exit, cold resume to step 6.
 bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh
 
 # Only after both jobs pass: fresh formal training.
 bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
 ```
+
+The acceleration Stage 0 gate uses real deterministic mixture rows with FSDP4, per-device batch `2`, gradient
+accumulation `4`, and one optimizer update. It preserves the formal baseline settings
+`activation_checkpointing=true`, `vit_gradient_checkpointing=true`, and `reshard_after_forward=true`. Per-rank JSON
+audits and the merged `acceleration_stage0_report.json` identify the actual Whisper attention implementation and observed
+SDPA calls, map every activation-checkpoint wrapper to its contained FSDP unit, detect whether Whisper has simultaneous
+inner and outer checkpointing, report all five units' effective reshard state, and record peak CUDA memory. No attention
+backend, checkpoint policy, or FSDP reshard setting is changed by this gate.
 
 Formal training still targets more than `3000` realized, decoded, 30-second-capped hours, but max-step planning is now
 deliberately deferred until after the acceleration experiments and their FSDP4 smoke tests. WavCaps source metadata is

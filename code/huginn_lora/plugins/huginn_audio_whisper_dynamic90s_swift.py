@@ -76,6 +76,7 @@ STAGE34_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE34_AUDIT_DIR"
 STAGE5_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_AUDIT_DIR"
 STAGE5_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE5_MAX_STEPS"
 MEMORY90_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_MEMORY90_AUDIT_DIR"
+ACCELERATION_STAGE0_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE0_AUDIT_DIR"
 REALDATA_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_AUDIT_DIR"
 REALDATA_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_MAX_STEPS"
 DATA_POSITION_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR"
@@ -2518,6 +2519,374 @@ def _whisper_gradient_checkpoint_modules(model: torch.nn.Module) -> list[str]:
     ]
 
 
+def _module_mro_names(module: torch.nn.Module | None) -> list[str]:
+    if module is None:
+        return []
+    return [base.__name__ for base in type(module).__mro__]
+
+
+def _read_fsdp_reshard_after_forward(module: torch.nn.Module) -> dict[str, Any]:
+    """Read FSDP2's effective reshard setting without mutating the module."""
+    candidates: list[tuple[str, Any]] = []
+    for attribute in ("reshard_after_forward", "_reshard_after_forward"):
+        try:
+            candidates.append((f"module.{attribute}", getattr(module, attribute)))
+        except (AttributeError, RuntimeError):
+            pass
+
+    state = None
+    state_getter = getattr(module, "_get_fsdp_state", None)
+    if callable(state_getter):
+        try:
+            state = state_getter()
+        except (AttributeError, RuntimeError, TypeError):
+            state = None
+    if state is not None:
+        for attribute in ("reshard_after_forward", "_reshard_after_forward"):
+            if hasattr(state, attribute):
+                candidates.append((f"state.{attribute}", getattr(state, attribute)))
+        param_group = getattr(state, "_fsdp_param_group", None)
+        if param_group is not None:
+            for attribute in ("reshard_after_forward", "_reshard_after_forward"):
+                if hasattr(param_group, attribute):
+                    candidates.append((f"state._fsdp_param_group.{attribute}", getattr(param_group, attribute)))
+
+    rendered: list[dict[str, Any]] = []
+    effective: bool | None = None
+    for source, value in candidates:
+        if callable(value):
+            continue
+        if isinstance(value, bool):
+            rendered.append({"source": source, "value": value})
+            if effective is None:
+                effective = value
+        elif isinstance(value, int) and value in (0, 1):
+            rendered.append({"source": source, "value": bool(value)})
+            if effective is None:
+                effective = bool(value)
+        elif value is not None:
+            rendered.append({"source": source, "value_repr": repr(value)[:200]})
+    return {
+        "effective": effective,
+        "candidates": rendered,
+        "has_setter": callable(getattr(module, "set_reshard_after_forward", None)),
+        "has_fsdp_state": state is not None,
+    }
+
+
+def patch_acceleration_stage0_callback() -> None:
+    audit_dir_value = os.environ.get(ACCELERATION_STAGE0_AUDIT_DIR_ENV, "").strip()
+    if not audit_dir_value:
+        return
+    from transformers import Trainer, TrainerCallback
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_dynamic30s_acceleration_stage0_patched", False):
+        return
+
+    class AccelerationStage0Callback(TrainerCallback):
+        _huginn_audio_dynamic30s_acceleration_stage0_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.audit_dir = Path(audit_dir_value)
+            self.whisper_forward_calls = 0
+            self.whisper_sdpa_calls = 0
+            self.whisper_active_depth = 0
+            self.first_sdpa_call: dict[str, Any] | None = None
+            self.loss_logs: list[float] = []
+            self.grad_norm_logs: list[float] = []
+            self.gradient_audit: dict[str, dict[str, int]] | None = None
+            self.optimizer_audit: list[dict[str, Any]] | None = None
+            self.fsdp_topology: dict[str, Any] | None = None
+            self.fsdp_units: dict[str, Any] = {}
+            self.checkpoint_wrappers: list[dict[str, Any]] = []
+            self.whisper_internal_checkpoint_modules: list[str] = []
+            self.whisper_attention: dict[str, Any] = {}
+            self._whisper_hook_handles: list[Any] = []
+            self._original_sdpa = None
+
+        @staticmethod
+        def _identity() -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Acceleration Stage 0 requires initialized torch.distributed")
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+            if world_size != 4:
+                raise RuntimeError(f"Acceleration Stage 0 requires world_size=4, got {world_size}")
+            return rank, world_size
+
+        def _locate_whisper_unit(self) -> tuple[str, torch.nn.Module]:
+            matching = [
+                (name, module)
+                for name, module in self.tracked_model.named_modules()
+                if "WhisperEncoderFSDPUnit" in _module_mro_names(module)
+            ]
+            if len(matching) != 1:
+                raise RuntimeError(
+                    f"Acceleration Stage 0 expected one WhisperEncoderFSDPUnit, found "
+                    f"{[(name, type(module).__name__) for name, module in matching]}"
+                )
+            return matching[0]
+
+        def _audit_checkpoint_wrappers(self) -> list[dict[str, Any]]:
+            wrappers: list[dict[str, Any]] = []
+            for name, module in self.tracked_model.named_modules():
+                is_wrapper = (
+                    "CheckpointWrapper" in type(module).__name__
+                    or hasattr(module, "_checkpoint_wrapped_module")
+                )
+                if not is_wrapper:
+                    continue
+                inner = getattr(module, "_checkpoint_wrapped_module", None)
+                child_mro_names = sorted(
+                    {
+                        base_name
+                        for child in module.modules()
+                        for base_name in _module_mro_names(child)
+                    }
+                )
+                wrappers.append(
+                    {
+                        "path": name,
+                        "wrapper_type": type(module).__name__,
+                        "inner_type": type(inner).__name__ if inner is not None else None,
+                        "inner_mro": _module_mro_names(inner),
+                        "contains_whisper_unit": "WhisperEncoderFSDPUnit" in child_mro_names,
+                        "contained_fsdp_units": [
+                            class_name for class_name in FSDP_UNIT_CLASS_NAMES if class_name in child_mro_names
+                        ],
+                    }
+                )
+            return wrappers
+
+        def _install_sdpa_audit(self, whisper_unit: torch.nn.Module) -> None:
+            def whisper_pre_hook(_module, _args):
+                self.whisper_forward_calls += 1
+                self.whisper_active_depth += 1
+
+            def whisper_post_hook(_module, _args, _output):
+                self.whisper_active_depth -= 1
+                if self.whisper_active_depth < 0:
+                    raise RuntimeError("Whisper SDPA audit depth became negative")
+
+            self._whisper_hook_handles.append(whisper_unit.register_forward_pre_hook(whisper_pre_hook))
+            self._whisper_hook_handles.append(whisper_unit.register_forward_hook(whisper_post_hook))
+            self._original_sdpa = F.scaled_dot_product_attention
+
+            @wraps(self._original_sdpa)
+            def audited_sdpa(*args, **kwargs):
+                if self.whisper_active_depth > 0:
+                    self.whisper_sdpa_calls += 1
+                    if self.first_sdpa_call is None:
+                        query = args[0] if args else kwargs.get("query")
+                        key = args[1] if len(args) > 1 else kwargs.get("key")
+                        value = args[2] if len(args) > 2 else kwargs.get("value")
+                        attn_mask = args[3] if len(args) > 3 else kwargs.get("attn_mask")
+                        self.first_sdpa_call = {
+                            "query_shape": list(query.shape) if torch.is_tensor(query) else None,
+                            "key_shape": list(key.shape) if torch.is_tensor(key) else None,
+                            "value_shape": list(value.shape) if torch.is_tensor(value) else None,
+                            "query_dtype": str(query.dtype) if torch.is_tensor(query) else None,
+                            "query_device": str(query.device) if torch.is_tensor(query) else None,
+                            "attn_mask_shape": list(attn_mask.shape) if torch.is_tensor(attn_mask) else None,
+                            "attn_mask_dtype": str(attn_mask.dtype) if torch.is_tensor(attn_mask) else None,
+                            "dropout_p": float(kwargs.get("dropout_p", args[4] if len(args) > 4 else 0.0)),
+                            "is_causal": bool(kwargs.get("is_causal", args[5] if len(args) > 5 else False)),
+                        }
+                return self._original_sdpa(*args, **kwargs)
+
+            F.scaled_dot_product_attention = audited_sdpa
+
+        def _remove_sdpa_audit(self) -> None:
+            if self._original_sdpa is not None:
+                F.scaled_dot_product_attention = self._original_sdpa
+                self._original_sdpa = None
+            for handle in self._whisper_hook_handles:
+                handle.remove()
+            self._whisper_hook_handles.clear()
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            rank, world_size = self._identity()
+            if (
+                int(args.per_device_train_batch_size) != 2
+                or int(args.gradient_accumulation_steps) != 4
+                or int(state.max_steps) != 1
+            ):
+                raise RuntimeError(
+                    "Acceleration Stage 0 requires B2/GA4/max_steps=1: "
+                    f"batch={args.per_device_train_batch_size} "
+                    f"ga={args.gradient_accumulation_steps} max_steps={state.max_steps}"
+                )
+            if not bool(getattr(args, "vit_gradient_checkpointing", False)):
+                raise RuntimeError("Acceleration Stage 0 requires Whisper gradient checkpointing enabled")
+
+            self.optimizer_audit = _audit_optimizer_parameter_groups(
+                self.tracked_model,
+                kwargs.get("optimizer"),
+                context="Acceleration Stage 0",
+            )
+            self.fsdp_topology = _audit_formal_fsdp_topology(self.tracked_model)
+            self.whisper_internal_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
+            whisper_path, whisper_unit = self._locate_whisper_unit()
+
+            attention_modules = [
+                (name, module)
+                for name, module in whisper_unit.named_modules()
+                if name.endswith("self_attn") or "Attention" in type(module).__name__
+            ]
+            attention_classes = sorted({type(module).__name__ for _, module in attention_modules})
+            encoder = getattr(whisper_unit, "encoder", None)
+            whisper_config = getattr(encoder, "config", None)
+            self.whisper_attention = {
+                "whisper_unit_path": whisper_path,
+                "attention_module_count": len(attention_modules),
+                "attention_classes": attention_classes,
+                "attention_module_examples": [name for name, _ in attention_modules[:8]],
+                "config_attn_implementation": getattr(whisper_config, "_attn_implementation", None),
+                "config_attn_implementation_internal": getattr(
+                    whisper_config, "_attn_implementation_internal", None
+                ),
+                "config_model_type": getattr(whisper_config, "model_type", None),
+            }
+            self.checkpoint_wrappers = self._audit_checkpoint_wrappers()
+
+            for class_name in FSDP_UNIT_CLASS_NAMES:
+                matching = [
+                    (name, module)
+                    for name, module in self.tracked_model.named_modules()
+                    if class_name in _module_mro_names(module)
+                ]
+                if len(matching) != 1:
+                    raise RuntimeError(
+                        f"Acceleration Stage 0 expected one {class_name}, found "
+                        f"{[(name, type(module).__name__) for name, module in matching]}"
+                    )
+                unit_path, unit = matching[0]
+                self.fsdp_units[class_name] = {
+                    "path": unit_path,
+                    "runtime_type": type(unit).__name__,
+                    "mro": _module_mro_names(unit),
+                    "reshard_after_forward": _read_fsdp_reshard_after_forward(unit),
+                }
+
+            self._install_sdpa_audit(whisper_unit)
+            torch.cuda.reset_peak_memory_stats()
+            print(
+                "[acceleration-stage0] "
+                f"rank={rank}/{world_size} whisper_attention={self.whisper_attention} "
+                f"internal_gc={self.whisper_internal_checkpoint_modules} "
+                f"checkpoint_wrappers={self.checkpoint_wrappers} fsdp_units={self.fsdp_units}",
+                flush=True,
+            )
+            return control
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            self.gradient_audit = _audit_local_trainable_gradients(
+                self.tracked_model,
+                context="Acceleration Stage 0 first optimizer update",
+            )
+            return control
+
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            del args, state, kwargs
+            for key, destination in (("loss", self.loss_logs), ("grad_norm", self.grad_norm_logs)):
+                value = (logs or {}).get(key)
+                if value is None:
+                    continue
+                numeric = float(value)
+                if not math.isfinite(numeric):
+                    raise RuntimeError(f"Acceleration Stage 0 logged non-finite {key}: {numeric}")
+                destination.append(numeric)
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            rank, world_size = self._identity()
+            self._remove_sdpa_audit()
+            if int(state.global_step) != 1:
+                raise RuntimeError(f"Acceleration Stage 0 ended at step {state.global_step}, expected 1")
+            if self.whisper_forward_calls <= 0:
+                raise RuntimeError("Acceleration Stage 0 did not observe a Whisper forward call")
+            if self.gradient_audit is None or not self.loss_logs or not self.grad_norm_logs:
+                raise RuntimeError(
+                    "Acceleration Stage 0 did not complete its gradient/loss audit: "
+                    f"gradient={self.gradient_audit is not None} losses={self.loss_logs} "
+                    f"grad_norms={self.grad_norm_logs}"
+                )
+
+            whisper_outer_checkpointed = any(
+                wrapper["contains_whisper_unit"] for wrapper in self.checkpoint_wrappers
+            )
+
+            def cuda_backend_enabled(function_name: str) -> bool | None:
+                function = getattr(torch.backends.cuda, function_name, None)
+                return bool(function()) if callable(function) else None
+
+            payload = {
+                "gate": "huginn_whisper_dynamic30s_acceleration_stage0_rank_v1",
+                "rank": rank,
+                "world_size": world_size,
+                "global_step": int(state.global_step),
+                "cuda_device": torch.cuda.current_device(),
+                "cuda_name": torch.cuda.get_device_name(torch.cuda.current_device()),
+                "whisper_attention": self.whisper_attention,
+                "whisper_forward_calls": self.whisper_forward_calls,
+                "whisper_sdpa_calls": self.whisper_sdpa_calls,
+                "whisper_uses_sdpa": self.whisper_sdpa_calls > 0,
+                "first_whisper_sdpa_call": self.first_sdpa_call,
+                "cuda_sdpa_backends_enabled": {
+                    "flash": cuda_backend_enabled("flash_sdp_enabled"),
+                    "memory_efficient": cuda_backend_enabled("mem_efficient_sdp_enabled"),
+                    "math": cuda_backend_enabled("math_sdp_enabled"),
+                },
+                "whisper_internal_gradient_checkpointing": bool(
+                    self.whisper_internal_checkpoint_modules
+                ),
+                "whisper_internal_gradient_checkpoint_modules": self.whisper_internal_checkpoint_modules,
+                "checkpoint_wrappers": self.checkpoint_wrappers,
+                "whisper_outer_activation_checkpointed": whisper_outer_checkpointed,
+                "whisper_double_checkpoint_candidate": bool(
+                    self.whisper_internal_checkpoint_modules and whisper_outer_checkpointed
+                ),
+                "fsdp_units": self.fsdp_units,
+                "fsdp_topology": self.fsdp_topology,
+                "optimizer_groups": self.optimizer_audit,
+                "gradient_audit": self.gradient_audit,
+                "finite_losses": self.loss_logs,
+                "finite_grad_norms": self.grad_norm_logs,
+                "peak_memory_allocated_gib": torch.cuda.max_memory_allocated() / 1024**3,
+                "peak_memory_reserved_gib": torch.cuda.max_memory_reserved() / 1024**3,
+            }
+            self.audit_dir.mkdir(parents=True, exist_ok=True)
+            _write_json_atomic(self.audit_dir / f"rank-{rank}.json", payload)
+            print(
+                "[acceleration-stage0-marker] "
+                f"rank={rank} sdpa={payload['whisper_uses_sdpa']} "
+                f"sdpa_calls={self.whisper_sdpa_calls} "
+                f"outer_whisper_checkpoint={whisper_outer_checkpointed} "
+                f"internal_whisper_checkpoint={bool(self.whisper_internal_checkpoint_modules)} "
+                f"double_checkpoint={payload['whisper_double_checkpoint_candidate']} "
+                f"peak_allocated_gib={payload['peak_memory_allocated_gib']:.3f} "
+                f"peak_reserved_gib={payload['peak_memory_reserved_gib']:.3f}",
+                flush=True,
+            )
+            return control
+
+    def patched_init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_dynamic30s_acceleration_stage0_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(AccelerationStage0Callback(self.model))
+
+    patched_init._huginn_audio_dynamic30s_acceleration_stage0_patched = True
+    Trainer.__init__ = patched_init
+    print("[HuginnAudioSwift] installed dynamic30s acceleration Stage 0 audit callback")
+
+
 def patch_memory90_callback() -> None:
     if not os.environ.get(MEMORY90_AUDIT_DIR_ENV, "").strip():
         return
@@ -3784,6 +4153,7 @@ patch_peft_adapter_restore()
 patch_swift_lora_llm_fsdp_dcp_resume()
 patch_accelerate_fsdp2_full_model_dcp()
 patch_accelerate_fsdp2_save_state_audit()
+patch_acceleration_stage0_callback()
 patch_memory90_callback()
 patch_stage34_optimizer_step_callback()
 patch_stage5_stability_callback()
