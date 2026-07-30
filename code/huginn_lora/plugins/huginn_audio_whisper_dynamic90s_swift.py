@@ -1,4 +1,4 @@
-"""Swift registration for isolated Whisper-large dynamic-90s Huginn audio."""
+"""Swift registration for isolated Whisper-large dynamic single-30s Huginn audio."""
 
 from __future__ import annotations
 
@@ -49,13 +49,14 @@ WHISPER_MODEL_DIR = Path("/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-larg
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant that can understand audio and respond accurately."
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_AUDIO_CHUNK_SECONDS = 30.0
-DEFAULT_MAX_AUDIO_SECONDS = 90.0
+DEFAULT_MAX_AUDIO_SECONDS = 30.0
+DISCARD_AUDIO_ABOVE_SECONDS = 90.0
 WHISPER_MAX_FEATURE_FRAMES = 3000
 WHISPER_FEATURE_HOP_LENGTH = 160
 WHISPER_ENCODER_DOWNSAMPLE = 2
-DYNAMIC_COMPRESSOR_KERNEL = 6
-DYNAMIC_COMPRESSOR_STRIDE = 6
-AUDIO_TOKEN_DURATION_MS = 120
+DYNAMIC_COMPRESSOR_KERNEL = 8
+DYNAMIC_COMPRESSOR_STRIDE = 8
+AUDIO_TOKEN_DURATION_MS = 160
 DYNAMIC_LORA_DROPOUT = 0.05
 _DERIVED_AUDIO_TOKEN_DURATION_MS = (
     WHISPER_FEATURE_HOP_LENGTH
@@ -95,7 +96,7 @@ TRAINING_STATS_CHECKPOINT_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CH
 TRAINING_STATS_FORWARD_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_FORWARD_AUDIT_DIR"
 TRAINING_STATS_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE"
 TRAINING_STATS_STATE_FILENAME = "audio_training_statistics.json"
-TRAINING_STATS_VERSION = "huginn_dynamic90s_training_statistics_v1"
+TRAINING_STATS_VERSION = "huginn_dynamic30s_training_statistics_v2"
 SAMPLER_VERSION = "deterministic_hierarchical_no_replacement_v2"
 TRAINING_POOL_ORDER = (
     "wavcaps_no_bbc_aac",
@@ -1150,7 +1151,7 @@ def normalize_audio_array(audio: np.ndarray) -> np.ndarray:
 class WhisperAudioPlan:
     """Production duration plan shared by preprocessing and validation.
 
-    Token counts are dynamic. A complete 120 ms block produces one audio
+    Token counts are dynamic. A complete 160 ms block produces one audio
     token; shorter residual tails are not padded into an additional token.
     """
 
@@ -1176,12 +1177,17 @@ def plan_audio_for_whisper(
     chunk_seconds: float = DEFAULT_AUDIO_CHUNK_SECONDS,
     max_audio_seconds: float = DEFAULT_MAX_AUDIO_SECONDS,
 ) -> WhisperAudioPlan:
-    """Plan non-overlapping Whisper chunks, truncating every input to 90 seconds."""
+    """Plan exactly one dynamic Whisper chunk, retaining at most the first 30 seconds."""
     if total_samples <= 0:
         raise ValueError(f"total_samples must be positive, got {total_samples}")
     if sample_rate <= 0:
         raise ValueError(f"sample_rate must be positive, got {sample_rate}")
 
+    if not math.isclose(chunk_seconds, max_audio_seconds, rel_tol=0.0, abs_tol=1e-9):
+        raise ValueError(
+            "The current Whisper route requires one chunk whose size equals the retained maximum: "
+            f"chunk_seconds={chunk_seconds} max_audio_seconds={max_audio_seconds}"
+        )
     chunk_samples = int(round(chunk_seconds * sample_rate))
     included_samples = min(total_samples, int(round(max_audio_seconds * sample_rate)))
     if chunk_samples <= 0 or included_samples <= 0:
@@ -1193,8 +1199,8 @@ def plan_audio_for_whisper(
     feature_lengths: list[int] = []
     encoder_lengths: list[int] = []
     token_counts: list[int] = []
-    for start in range(0, included_samples, chunk_samples):
-        end = min(start + chunk_samples, included_samples)
+    for start in (0,):
+        end = included_samples
         chunk_size = end - start
         if chunk_size <= 0:
             continue
@@ -1229,9 +1235,9 @@ def split_audio_for_whisper(
     chunk_seconds: float = DEFAULT_AUDIO_CHUNK_SECONDS,
     max_audio_seconds: float = DEFAULT_MAX_AUDIO_SECONDS,
 ) -> tuple[list[np.ndarray], list[int]]:
-    """Split audio into Whisper windows and return true mel-frame lengths.
+    """Return one Whisper window and its true mel-frame length.
 
-    Each returned waveform is at most one Whisper window. The feature extractor
+    The returned waveform is at most one Whisper window. The feature extractor
     later pads every window to 3000 mel frames, while the returned lengths keep
     the padding out of the encoder attention and compressed token sequence.
     """
@@ -1280,6 +1286,8 @@ def load_wav_mono(path: Path, target_sr: int, max_audio_seconds: float | None) -
         sample_width = wf.getsampwidth()
         source_sr = wf.getframerate()
         num_frames = wf.getnframes()
+        if max_audio_seconds is not None:
+            num_frames = min(num_frames, int(math.ceil(max_audio_seconds * source_sr)))
         frames = wf.readframes(num_frames)
 
     if sample_width != 2:
@@ -1293,28 +1301,46 @@ def load_wav_mono(path: Path, target_sr: int, max_audio_seconds: float | None) -
     return trim_audio(audio, target_sr, max_audio_seconds)
 
 
-def _decode_audio_with_soundfile(source: str | io.BytesIO) -> tuple[np.ndarray, int]:
+def _decode_audio_with_soundfile(
+    source: str | io.BytesIO,
+    max_audio_seconds: float | None = None,
+) -> tuple[np.ndarray, int]:
     try:
         import soundfile as sf
     except ImportError as exc:  # pragma: no cover - depends on remote env
         raise RuntimeError("soundfile is not available") from exc
 
-    audio, source_sr = sf.read(source, dtype="float32", always_2d=False)
+    info = sf.info(source)
+    if hasattr(source, "seek"):
+        source.seek(0)
+    frames = -1 if max_audio_seconds is None else int(math.ceil(max_audio_seconds * int(info.samplerate)))
+    audio, source_sr = sf.read(source, frames=frames, dtype="float32", always_2d=False)
     return normalize_audio_array(np.asarray(audio)), int(source_sr)
 
 
-def _decode_audio_with_torchaudio(source: str | io.BytesIO) -> tuple[np.ndarray, int]:
+def _decode_audio_with_torchaudio(
+    source: str | io.BytesIO,
+    max_audio_seconds: float | None = None,
+) -> tuple[np.ndarray, int]:
     try:
         import torchaudio
     except ImportError as exc:  # pragma: no cover - depends on remote env
         raise RuntimeError("torchaudio is not available") from exc
 
-    waveform, source_sr = torchaudio.load(source)
+    info = torchaudio.info(source)
+    if hasattr(source, "seek"):
+        source.seek(0)
+    num_frames = -1 if max_audio_seconds is None else int(math.ceil(max_audio_seconds * int(info.sample_rate)))
+    waveform, source_sr = torchaudio.load(source, num_frames=num_frames)
     audio = waveform.mean(dim=0).cpu().numpy().astype(np.float32, copy=False)
     return audio, int(source_sr)
 
 
-def decode_audio_bytes(audio_bytes: bytes, source_label: str) -> tuple[np.ndarray, int]:
+def decode_audio_bytes(
+    audio_bytes: bytes,
+    source_label: str,
+    max_audio_seconds: float | None = None,
+) -> tuple[np.ndarray, int]:
     errors: list[str] = []
     buffer = io.BytesIO(audio_bytes)
     for backend_name, backend in (
@@ -1323,7 +1349,7 @@ def decode_audio_bytes(audio_bytes: bytes, source_label: str) -> tuple[np.ndarra
     ):
         try:
             buffer.seek(0)
-            return backend(buffer)
+            return backend(buffer, max_audio_seconds=max_audio_seconds)
         except Exception as exc:  # pragma: no cover - backend dependent
             errors.append(f"{backend_name}={type(exc).__name__}: {exc}")
 
@@ -1331,7 +1357,12 @@ def decode_audio_bytes(audio_bytes: bytes, source_label: str) -> tuple[np.ndarra
     raise RuntimeError(f"Failed to decode audio bytes from {source_label}. Tried: {joined}")
 
 
-def decode_audio_with_ffmpeg_bytes(audio_bytes: bytes, source_label: str, target_sr: int) -> np.ndarray:
+def decode_audio_with_ffmpeg_bytes(
+    audio_bytes: bytes,
+    source_label: str,
+    target_sr: int,
+    max_audio_seconds: float | None = None,
+) -> np.ndarray:
     ffmpeg_path = get_ffmpeg_path()
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg is not available")
@@ -1344,14 +1375,10 @@ def decode_audio_with_ffmpeg_bytes(audio_bytes: bytes, source_label: str, target
         "error",
         "-i",
         "pipe:0",
-        "-f",
-        "f32le",
-        "-ac",
-        "1",
-        "-ar",
-        str(target_sr),
-        "pipe:1",
     ]
+    if max_audio_seconds is not None:
+        cmd.extend(["-t", f"{max_audio_seconds:.9f}"])
+    cmd.extend(["-f", "f32le", "-ac", "1", "-ar", str(target_sr), "pipe:1"])
     result = subprocess.run(
         cmd,
         input=audio_bytes,
@@ -1367,7 +1394,11 @@ def decode_audio_with_ffmpeg_bytes(audio_bytes: bytes, source_label: str, target
     return np.frombuffer(result.stdout, dtype=np.float32).astype(np.float32, copy=False)
 
 
-def decode_audio_with_ffmpeg_file(path: Path, target_sr: int) -> np.ndarray:
+def decode_audio_with_ffmpeg_file(
+    path: Path,
+    target_sr: int,
+    max_audio_seconds: float | None = None,
+) -> np.ndarray:
     ffmpeg_path = get_ffmpeg_path()
     if ffmpeg_path is None:
         raise RuntimeError("ffmpeg is not available")
@@ -1380,14 +1411,10 @@ def decode_audio_with_ffmpeg_file(path: Path, target_sr: int) -> np.ndarray:
         "error",
         "-i",
         str(path),
-        "-f",
-        "f32le",
-        "-ac",
-        "1",
-        "-ar",
-        str(target_sr),
-        "pipe:1",
     ]
+    if max_audio_seconds is not None:
+        cmd.extend(["-t", f"{max_audio_seconds:.9f}"])
+    cmd.extend(["-f", "f32le", "-ac", "1", "-ar", str(target_sr), "pipe:1"])
     result = subprocess.run(
         cmd,
         stdout=subprocess.PIPE,
@@ -1461,13 +1488,13 @@ def load_audio_file(path: Path, target_sr: int, max_audio_seconds: float | None)
             ("torchaudio", _decode_audio_with_torchaudio),
         ):
             try:
-                audio, source_sr = backend(str(path))
+                audio, source_sr = backend(str(path), max_audio_seconds=max_audio_seconds)
                 audio = resample_waveform(audio, source_sr, target_sr)
                 return trim_audio(audio, target_sr, max_audio_seconds)
             except Exception as exc:  # pragma: no cover - backend dependent
                 errors.append(f"{backend_name}={type(exc).__name__}: {exc}")
         try:
-            audio = decode_audio_with_ffmpeg_file(path, target_sr)
+            audio = decode_audio_with_ffmpeg_file(path, target_sr, max_audio_seconds=max_audio_seconds)
             return trim_audio(audio, target_sr, max_audio_seconds)
         except Exception as exc:  # pragma: no cover - backend dependent
             errors.append(f"ffmpeg={type(exc).__name__}: {exc}")
@@ -1504,13 +1531,22 @@ def load_audio_from_tar(
     audio_bytes = extracted.read()
     source_label = f"{tar_path}:{member_name}"
     try:
-        audio, source_sr = decode_audio_bytes(audio_bytes, source_label)
+        audio, source_sr = decode_audio_bytes(
+            audio_bytes,
+            source_label,
+            max_audio_seconds=max_audio_seconds,
+        )
         audio = resample_waveform(audio, source_sr, target_sr)
         return trim_audio(audio, target_sr, max_audio_seconds)
     except Exception as exc:
         ffmpeg_errors = [f"python_backends={type(exc).__name__}: {exc}"]
         try:
-            audio = decode_audio_with_ffmpeg_bytes(audio_bytes, source_label, target_sr)
+            audio = decode_audio_with_ffmpeg_bytes(
+                audio_bytes,
+                source_label,
+                target_sr,
+                max_audio_seconds=max_audio_seconds,
+            )
             return trim_audio(audio, target_sr, max_audio_seconds)
         except Exception as ffmpeg_exc:
             ffmpeg_errors.append(f"ffmpeg={type(ffmpeg_exc).__name__}: {ffmpeg_exc}")
@@ -2956,7 +2992,7 @@ def patch_realdata_stability_callback() -> None:
             if (
                 audio_statistics["realized_audio_tokens"] <= 0
                 or audio_statistics["min_audio_tokens"] < 0
-                or audio_statistics["max_audio_tokens"] > 750
+                or audio_statistics["max_audio_tokens"] > 187
                 or audio_statistics["min_audio_tokens"] > audio_statistics["max_audio_tokens"]
             ):
                 raise RuntimeError(f"Invalid real-data dynamic audio-token statistics: {audio_statistics}")
@@ -3358,9 +3394,9 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
                 boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
                 valid_prefix_tokens = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
                 valid_audio_tokens = [value - boundary_tokens for value in valid_prefix_tokens]
-                if not valid_audio_tokens or any(value < 0 or value > 750 for value in valid_audio_tokens):
+                if not valid_audio_tokens or any(value < 0 or value > 187 for value in valid_audio_tokens):
                     raise RuntimeError(
-                        "Real-data runtime audio-token count is outside [0, 750]: "
+                        "Real-data runtime audio-token count is outside [0, 187]: "
                         f"prefix_tokens={valid_prefix_tokens} boundary_tokens={boundary_tokens}"
                     )
                 if not hasattr(self, "_huginn_audio_realdata_sample_count"):
@@ -3390,7 +3426,7 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
             )
             boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
             valid_prefix_tokens = prefix_mask.sum(dim=1).tolist()
-            max_audio_tokens = int(getattr(self.config, "audio_max_token_count", 750))
+            max_audio_tokens = int(getattr(self.config, "audio_max_token_count", 187))
             if any(tokens < boundary_tokens or tokens - boundary_tokens > max_audio_tokens for tokens in valid_prefix_tokens):
                 raise RuntimeError(
                     "Audio prefix token count exceeds dynamic bounds: "
@@ -3459,8 +3495,8 @@ def build_huginn_audio_model(model_dir: str):
     config.audio_encoder_hidden_size = int(getattr(whisper_config, "d_model", 1280))
     config.audio_dynamic_tokens = True
     config.audio_token_duration_ms = AUDIO_TOKEN_DURATION_MS
-    config.audio_reference_30s_token_count = 250
-    config.audio_max_token_count = 750
+    config.audio_reference_30s_token_count = 187
+    config.audio_max_token_count = 187
     config.audio_chunk_seconds = DEFAULT_AUDIO_CHUNK_SECONDS
     config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
     config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL
@@ -3528,11 +3564,23 @@ class HuginnAudioTemplate(Template):
 
         audit_consumed_audio_position(inputs.audios[0])
         audio_item = inputs.audios[0]
+        if isinstance(audio_item, dict) and audio_item.get("raw_duration_sec") is not None:
+            raw_duration_seconds = float(audio_item["raw_duration_sec"])
+            if raw_duration_seconds > DISCARD_AUDIO_ABOVE_SECONDS:
+                raise RuntimeError(
+                    "A duration-filtered training pool emitted an ineligible audio sample: "
+                    f"duration={raw_duration_seconds:.6f}s limit={DISCARD_AUDIO_ABOVE_SECONDS:.6f}s"
+                )
         waveform = self._load_audio_item(audio_item)
         audio_chunks, audio_feature_lengths = split_audio_for_whisper(
             waveform,
             sample_rate=self.audio_sampling_rate,
         )
+        if len(audio_chunks) != 1 or len(audio_feature_lengths) != 1:
+            raise RuntimeError(
+                "The current Whisper route must produce exactly one audio chunk per sample: "
+                f"chunks={len(audio_chunks)} feature_lengths={len(audio_feature_lengths)}"
+            )
         media_inputs = self.audio_feature_extractor(
             audio_chunks,
             sampling_rate=self.audio_sampling_rate,
@@ -3602,7 +3650,10 @@ class HuginnAudioTemplate(Template):
             raise RuntimeError(
                 "Each encoded audio_input_features item must have shape [segments, 80, frames]"
             )
-        max_segments = max(int(features.shape[0]) for features in feature_batches)
+        segment_counts = [int(features.shape[0]) for features in feature_batches]
+        if any(count != 1 for count in segment_counts):
+            raise RuntimeError(f"Every collated sample must contain exactly one audio chunk: {segment_counts}")
+        max_segments = 1
         mel_bins = int(feature_batches[0].shape[1])
         max_feature_frames = max(int(features.shape[2]) for features in feature_batches)
         feature_dtype = feature_batches[0].dtype
@@ -3656,8 +3707,8 @@ class HuginnAudioLoader(ModelLoader):
         config.audio_encoder_hidden_size = int(getattr(whisper_config, "d_model", 1280))
         config.audio_dynamic_tokens = True
         config.audio_token_duration_ms = AUDIO_TOKEN_DURATION_MS
-        config.audio_reference_30s_token_count = 250
-        config.audio_max_token_count = 750
+        config.audio_reference_30s_token_count = 187
+        config.audio_max_token_count = 187
         config.audio_chunk_seconds = DEFAULT_AUDIO_CHUNK_SECONDS
         config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
         config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL

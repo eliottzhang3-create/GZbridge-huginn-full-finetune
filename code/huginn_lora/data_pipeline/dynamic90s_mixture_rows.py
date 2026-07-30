@@ -26,6 +26,7 @@ EXPECTED_TASKS = {
     "clotho_v2_aac": "AAC",
     "gigaspeech_l_asr": "ASR",
 }
+EXPECTED_CONTRACT_VERSION = "huginn_whisper_dynamic30s_data_v2"
 
 
 def load_pool_registry(path: str | Path) -> dict[str, Any]:
@@ -35,6 +36,11 @@ def load_pool_registry(path: str | Path) -> dict[str, Any]:
     payload = json.loads(registry_path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
         raise ValueError(f"Pool registry must be a JSON object: {registry_path}")
+    if payload.get("contract_version") != EXPECTED_CONTRACT_VERSION:
+        raise ValueError(
+            "Pool registry contract is incompatible with the current single-30s route: "
+            f"actual={payload.get('contract_version')!r} expected={EXPECTED_CONTRACT_VERSION!r}"
+        )
     pools = payload.get("pools")
     if not isinstance(pools, dict) or set(pools) != set(POOL_ORDER):
         raise ValueError(f"Unexpected registry pool set: {sorted(pools) if isinstance(pools, dict) else pools!r}")
@@ -49,7 +55,13 @@ def load_pool_registry(path: str | Path) -> dict[str, Any]:
         entry = pools[name]
         if not isinstance(entry, dict):
             raise ValueError(f"Registry pool entry is not an object: {name}")
-        required = ("manifest_path", "index_path", "record_count", "task")
+        required = (
+            "manifest_path",
+            "index_path",
+            "record_count",
+            "task",
+            "planning_effective_duration_hours",
+        )
         missing = [key for key in required if key not in entry]
         if missing:
             raise ValueError(f"Registry pool {name} is missing fields: {missing}")
@@ -59,6 +71,11 @@ def load_pool_registry(path: str | Path) -> dict[str, Any]:
             )
         if int(entry["record_count"]) <= 0:
             raise ValueError(f"Registry pool {name} has invalid record_count={entry['record_count']!r}")
+        if float(entry["planning_effective_duration_hours"]) <= 0:
+            raise ValueError(
+                f"Registry pool {name} has invalid planning effective hours="
+                f"{entry['planning_effective_duration_hours']!r}"
+            )
     return payload
 
 
@@ -115,6 +132,9 @@ def render_training_row(
         "format": str(raw_audio.get("format", "")),
         "start_sec": float(raw_audio["start_sec"]) if raw_audio.get("start_sec") is not None else None,
         "end_sec": float(raw_audio["end_sec"]) if raw_audio.get("end_sec") is not None else None,
+        "raw_duration_sec": (
+            float(record["raw_duration_sec"]) if record.get("raw_duration_sec") is not None else None
+        ),
         # These provenance fields survive the Swift/HF iterable boundary and
         # let the checkpoint smoke audit the exact samples encoded after a
         # cold resume. The production audio loader intentionally ignores them.
@@ -179,6 +199,12 @@ def iter_dynamic90s_mixture_rows(
                 break
             global_position = selection.global_position
             record = pools[selection.pool_name].record(selection.record_index)
+            raw_duration = record.get("raw_duration_sec")
+            if raw_duration is not None and float(raw_duration) > 90.0:
+                raise RuntimeError(
+                    "The duration-filtered registry contains an ineligible record: "
+                    f"pool={selection.pool_name} index={selection.record_index} duration={raw_duration}"
+                )
             targets = record.get("targets")
             if not isinstance(targets, list) or not targets:
                 raise ValueError(

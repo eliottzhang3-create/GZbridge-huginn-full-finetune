@@ -1,4 +1,4 @@
-"""Stream the four complete Huginn dynamic-90s metadata pools to atomic JSONL.
+"""Stream duration-filtered Huginn audio metadata pools to atomic JSONL.
 
 Requires the passed metadata inventory and atomic pilot. Audio files are never
 decoded, copied, converted, or exhaustively stat-checked. Token accounting is
@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import shutil
 import struct
@@ -41,7 +42,7 @@ DEFAULT_INVENTORY = (
 DEFAULT_PILOT_REPORT = (
     REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/pilot/atomic_pilot_report.json"
 )
-DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v1"
+DEFAULT_OUTPUT_ROOT = REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s"
 DEFAULT_AUDIOCAPS_MANIFEST = REPO_ROOT / "data/audio_swift/audiocaps_v2/audiocaps_v2_train_swift.jsonl"
 DEFAULT_CLOTHO_ROOT = Path("/hpc_stor03/sjtu_home/jinwei.zhang/data/clotho_caption_huginn")
 DEFAULT_GIGASPEECH_ROOT = Path("/hpc_stor03/public/shared/data/asr/am/GigaSpeech")
@@ -57,6 +58,45 @@ POOL_WEIGHTS = {
     "clotho_v2_aac": 0.06,
     "gigaspeech_l_asr": 0.40,
 }
+MAX_ELIGIBLE_DURATION_SECONDS = 90.0
+MAX_RETAINED_DURATION_SECONDS = 30.0
+FALLBACK_EFFECTIVE_POOL_HOURS = {
+    "audiocaps_v2_aac": 136.0,
+    "clotho_v2_aac": 24.0,
+}
+
+
+def metadata_duration_seconds(record: dict[str, Any]) -> float | None:
+    """Read a positive duration already present in source metadata."""
+    candidates = [record]
+    for key in ("metadata", "meta"):
+        nested = record.get(key)
+        if isinstance(nested, dict):
+            candidates.append(nested)
+    audio_metadata = record.get("audio")
+    if isinstance(audio_metadata, dict):
+        candidates.append(audio_metadata)
+    for candidate in candidates:
+        for key in ("duration", "duration_sec", "duration_secs", "duration_seconds", "length_seconds"):
+            value = candidate.get(key)
+            if value is None or isinstance(value, bool):
+                continue
+            try:
+                if isinstance(value, str) and ":" in value:
+                    parts = [float(part) for part in value.strip().split(":")]
+                    if len(parts) == 3:
+                        duration = parts[0] * 3600.0 + parts[1] * 60.0 + parts[2]
+                    elif len(parts) == 2:
+                        duration = parts[0] * 60.0 + parts[1]
+                    else:
+                        continue
+                else:
+                    duration = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(duration) and duration > 0:
+                return duration
+    return None
 
 
 def parse_args() -> argparse.Namespace:
@@ -109,6 +149,8 @@ class AtomicPoolWriter:
         self.source_counts: Counter[str] = Counter()
         self.target_count_histogram: Counter[int] = Counter()
         self.raw_duration_seconds = 0.0
+        self.effective_duration_seconds = 0.0
+        self.duration_record_count = 0
 
     def write(self, record: dict[str, Any]) -> None:
         validate_atomic_record(record)
@@ -123,7 +165,10 @@ class AtomicPoolWriter:
         self.source_counts[record["source"]] += 1
         self.target_count_histogram[len(record["targets"])] += 1
         if "raw_duration_sec" in record:
-            self.raw_duration_seconds += float(record["raw_duration_sec"])
+            raw_duration = float(record["raw_duration_sec"])
+            self.raw_duration_seconds += raw_duration
+            self.effective_duration_seconds += min(raw_duration, MAX_RETAINED_DURATION_SECONDS)
+            self.duration_record_count += 1
 
     def finish_temporary(self, extra_stats: dict[str, Any]) -> dict[str, Any]:
         self.manifest_handle.flush()
@@ -150,6 +195,9 @@ class AtomicPoolWriter:
                 str(key): value for key, value in sorted(self.target_count_histogram.items())
             },
             "raw_duration_hours_from_metadata": self.raw_duration_seconds / 3600.0,
+            "effective_duration_hours_after_30s_cap": self.effective_duration_seconds / 3600.0,
+            "duration_metadata_record_count": self.duration_record_count,
+            "duration_metadata_complete": self.duration_record_count == self.record_count,
             "effective_audio_tokens_present": False,
             "audio_decode_performed": False,
             "audio_copy_performed": False,
@@ -169,8 +217,9 @@ class AtomicPoolWriter:
         os.replace(self.stats_tmp, self.stats_path)
 
 
-def audiocaps_records(manifest: Path) -> Iterator[dict[str, Any]]:
+def audiocaps_records(manifest: Path, counters: Counter[str]) -> Iterator[dict[str, Any]]:
     for source_record in iter_jsonl(manifest):
+        counters["source_records"] += 1
         audios = source_record.get("audios")
         if not isinstance(audios, list) or len(audios) != 1 or not isinstance(audios[0], str):
             raise ValueError(f"Unexpected AudioCaps audio field: {audios!r}")
@@ -180,7 +229,7 @@ def audiocaps_records(manifest: Path) -> Iterator[dict[str, Any]]:
             raise ValueError("Verified AudioCaps record has no assistant caption")
         metadata = source_record.get("metadata") if isinstance(source_record.get("metadata"), dict) else {}
         sample_id = normalize_text(metadata.get("sample_id")) or path.stem
-        yield {
+        record = {
             "schema_version": SCHEMA_VERSION,
             "uid": f"audiocaps_v2:{sample_id}",
             "dataset": "AudioCaps-v2",
@@ -195,9 +244,18 @@ def audiocaps_records(manifest: Path) -> Iterator[dict[str, Any]]:
                 "audiocap_id": normalize_text(metadata.get("audiocap_id")),
             },
         }
+        duration = metadata_duration_seconds(source_record)
+        if duration is not None:
+            if duration > MAX_ELIGIBLE_DURATION_SECONDS:
+                counters["excluded_over_90s"] += 1
+                continue
+            record["raw_duration_sec"] = duration
+            counters["duration_metadata_records"] += 1
+        counters["eligible_records"] += 1
+        yield record
 
 
-def wavcaps_records(pilot: dict[str, Any]) -> Iterator[dict[str, Any]]:
+def wavcaps_records(pilot: dict[str, Any], counters: Counter[str]) -> Iterator[dict[str, Any]]:
     mapping_root = pilot["pools"]["wavcaps_no_bbc_aac"]["mapping"]
     if mapping_root.get("bbc_records") != 0:
         raise ValueError("Passed pilot does not prove zero BBC records")
@@ -211,9 +269,24 @@ def wavcaps_records(pilot: dict[str, Any]) -> Iterator[dict[str, Any]]:
         metadata_path = Path(source_mapping["metadata_path"])
         suffix = str(source_mapping["audio_suffix"])
         for metadata_record in iter_wavcaps_metadata(metadata_path):
+            counters["source_records"] += 1
             sample_id = extract_wavcaps_id(metadata_record, source)
             targets = extract_targets(metadata_record)
             path = audio_dir / f"{sample_id}{suffix}"
+            duration = metadata_duration_seconds(metadata_record)
+            if duration is None and source == "AudioSet_SL":
+                # AudioSet clips are fixed 10-second excerpts; some WavCaps
+                # metadata releases omit an explicit duration field.
+                duration = 10.0
+            if duration is None:
+                raise ValueError(
+                    "WavCaps duration metadata is required for the >90s exclusion contract: "
+                    f"source={source} sample_id={sample_id} metadata={metadata_path}"
+                )
+            if duration > MAX_ELIGIBLE_DURATION_SECONDS:
+                counters["excluded_over_90s"] += 1
+                continue
+            counters["eligible_records"] += 1
             yield {
                 "schema_version": SCHEMA_VERSION,
                 "uid": f"wavcaps:{source}:{sample_id}",
@@ -222,6 +295,7 @@ def wavcaps_records(pilot: dict[str, Any]) -> Iterator[dict[str, Any]]:
                 "task": "AAC",
                 "split": "train",
                 "audio": {"path": str(path), "format": suffix.lstrip(".")},
+                "raw_duration_sec": duration,
                 "targets": targets,
                 "metadata": {"sample_id": sample_id, "metadata_path": str(metadata_path)},
             }
@@ -286,6 +360,11 @@ def gigaspeech_records(root: Path, metadata_name: str, counters: Counter[str]) -
             end = float(segment["end_time"])
             if begin < 0 or end <= begin:
                 raise ValueError(f"Invalid GigaSpeech-L bounds: sid={sid} begin={begin} end={end}")
+            duration = end - begin
+            if duration > MAX_ELIGIBLE_DURATION_SECONDS:
+                counters["excluded_over_90s"] += 1
+                continue
+            counters["eligible_l_segments"] += 1
             yield {
                 "schema_version": SCHEMA_VERSION,
                 "uid": f"gigaspeech_l:{sid}",
@@ -299,7 +378,7 @@ def gigaspeech_records(root: Path, metadata_name: str, counters: Counter[str]) -
                     "start_sec": begin,
                     "end_sec": end,
                 },
-                "raw_duration_sec": end - begin,
+                "raw_duration_sec": duration,
                 "targets": [cleaned_text],
                 "metadata": {"sid": sid, "text_tn_raw": raw_text, "subsets": segment.get("subsets")},
             }
@@ -364,31 +443,63 @@ def main() -> None:
         if existing_top:
             raise FileExistsError(f"Refusing to overwrite completed full-pool files: {existing_top}")
 
-    print("========== HUGINN WHISPER DYNAMIC90S FULL ATOMIC POOLS START ==========", flush=True)
+    print("========== HUGINN WHISPER DYNAMIC30S FULL ATOMIC POOLS START ==========", flush=True)
     print("[scope] audio_decode=false audio_copy=false full_audio_scan=false token_accounting=false", flush=True)
     print(f"[preflight] free_gib={free_gib:.3f} required_free_gib={args.min_free_gib:.3f}", flush=True)
     writers = {name: AtomicPoolWriter(name, pools_dir, args.overwrite) for name in POOL_ORDER}
     pool_stats: dict[str, dict[str, Any]] = {}
 
+    wavcaps_counters: Counter[str] = Counter()
     stream_pool(
         writers["wavcaps_no_bbc_aac"],
-        wavcaps_records(pilot),
+        wavcaps_records(pilot, wavcaps_counters),
         args.progress_every,
         check_uids=True,
     )
     pool_stats["wavcaps_no_bbc_aac"] = writers["wavcaps_no_bbc_aac"].finish_temporary(
-        {"excluded_sources": ["BBC_Sound_Effects"], "bbc_record_count": 0}
+        {
+            "excluded_sources": ["BBC_Sound_Effects"],
+            "bbc_record_count": 0,
+            "duration_filter": {
+                "discard_above_seconds": MAX_ELIGIBLE_DURATION_SECONDS,
+                "retained_cap_seconds": MAX_RETAINED_DURATION_SECONDS,
+                **dict(wavcaps_counters),
+            },
+        }
     )
+    if (
+        wavcaps_counters["source_records"]
+        != wavcaps_counters["eligible_records"] + wavcaps_counters["excluded_over_90s"]
+        or not pool_stats["wavcaps_no_bbc_aac"]["duration_metadata_complete"]
+    ):
+        raise ValueError(
+            "WavCaps duration filtering did not account for every metadata record: "
+            f"counters={dict(wavcaps_counters)} stats={pool_stats['wavcaps_no_bbc_aac']}"
+        )
     print(f"[full-pool] pool=wavcaps_no_bbc_aac records={pool_stats['wavcaps_no_bbc_aac']['record_count']} ready=true", flush=True)
+    print(
+        "[duration] pool=wavcaps_no_bbc_aac "
+        f"excluded_over_90s={wavcaps_counters['excluded_over_90s']} "
+        f"effective_hours_30s_cap={pool_stats['wavcaps_no_bbc_aac']['effective_duration_hours_after_30s_cap']:.6f}",
+        flush=True,
+    )
 
+    audiocaps_counters: Counter[str] = Counter()
     stream_pool(
         writers["audiocaps_v2_aac"],
-        audiocaps_records(Path(args.audiocaps_manifest)),
+        audiocaps_records(Path(args.audiocaps_manifest), audiocaps_counters),
         args.progress_every,
         check_uids=True,
     )
     pool_stats["audiocaps_v2_aac"] = writers["audiocaps_v2_aac"].finish_temporary(
-        {"source_manifest": str(Path(args.audiocaps_manifest))}
+        {
+            "source_manifest": str(Path(args.audiocaps_manifest)),
+            "duration_filter": {
+                "discard_above_seconds": MAX_ELIGIBLE_DURATION_SECONDS,
+                "retained_cap_seconds": MAX_RETAINED_DURATION_SECONDS,
+                **dict(audiocaps_counters),
+            },
+        }
     )
     print(f"[full-pool] pool=audiocaps_v2_aac records={pool_stats['audiocaps_v2_aac']['record_count']} ready=true", flush=True)
 
@@ -416,16 +527,31 @@ def main() -> None:
         check_uids=False,
     )
     giga_expected = int(inventory["pools"]["gigaspeech_l_asr"]["l_segment_count"])
-    if writers["gigaspeech_l_asr"].record_count != giga_expected or giga_counters["l_segments"] != giga_expected:
+    if (
+        giga_counters["l_segments"] != giga_expected
+        or writers["gigaspeech_l_asr"].record_count != giga_counters["eligible_l_segments"]
+        or giga_counters["eligible_l_segments"] + giga_counters["excluded_over_90s"] != giga_expected
+    ):
         raise ValueError(
             "GigaSpeech-L count changed: "
             f"expected={giga_expected} emitted={writers['gigaspeech_l_asr'].record_count} "
-            f"seen={giga_counters['l_segments']}"
+            f"eligible={giga_counters['eligible_l_segments']} "
+            f"excluded_over_90s={giga_counters['excluded_over_90s']} seen={giga_counters['l_segments']}"
         )
     pool_stats["gigaspeech_l_asr"] = writers["gigaspeech_l_asr"].finish_temporary(
         {"metadata_counters": dict(giga_counters), "duplicate_sid_audit": "passed by prerequisite inventory"}
     )
     print(f"[full-pool] pool=gigaspeech_l_asr records={pool_stats['gigaspeech_l_asr']['record_count']} ready=true", flush=True)
+    print(
+        "[duration] pool=gigaspeech_l_asr "
+        f"excluded_over_90s={giga_counters['excluded_over_90s']} "
+        f"effective_hours_30s_cap={pool_stats['gigaspeech_l_asr']['effective_duration_hours_after_30s_cap']:.6f}",
+        flush=True,
+    )
+
+    for pool_name in ("wavcaps_no_bbc_aac", "gigaspeech_l_asr"):
+        if not pool_stats[pool_name]["duration_metadata_complete"]:
+            raise ValueError(f"Planning requires complete duration metadata for {pool_name}")
 
     registry = {
         "contract_version": contract.get("contract_version"),
@@ -439,6 +565,16 @@ def main() -> None:
                 "index_path": pool_stats[pool_name]["index_path"],
                 "stats_path": str(writers[pool_name].stats_path),
                 "record_count": pool_stats[pool_name]["record_count"],
+                "planning_effective_duration_hours": (
+                    FALLBACK_EFFECTIVE_POOL_HOURS[pool_name]
+                    if pool_name in FALLBACK_EFFECTIVE_POOL_HOURS
+                    else pool_stats[pool_name]["effective_duration_hours_after_30s_cap"]
+                ),
+                "planning_duration_source": (
+                    "fixed_verified_pool_hours_all_samples_le_30s"
+                    if pool_name in FALLBACK_EFFECTIVE_POOL_HOURS
+                    else "complete_source_metadata_after_gt90_filter_and_30s_cap"
+                ),
                 "global_weight": POOL_WEIGHTS[pool_name],
                 "task": "ASR" if pool_name == "gigaspeech_l_asr" else "AAC",
             }
@@ -446,12 +582,17 @@ def main() -> None:
         },
     }
     report = {
-        "gate": "huginn_whisper_dynamic90s_full_atomic_pools_v1",
+        "gate": "huginn_whisper_dynamic30s_full_atomic_pools_v2",
         "validation_passed": True,
         "audio_decode": False,
         "audio_copy": False,
         "full_audio_path_scan": False,
         "token_accounting": False,
+        "duration_policy": {
+            "discard_above_seconds": MAX_ELIGIBLE_DURATION_SECONDS,
+            "retain_at_most_seconds": MAX_RETAINED_DURATION_SECONDS,
+            "audio_decode_for_filtering": False,
+        },
         "preflight_free_gib": free_gib,
         "required_free_gib": args.min_free_gib,
         "pool_stats": pool_stats,
@@ -465,7 +606,7 @@ def main() -> None:
     os.replace(report_tmp, report_path)
     print(f"[full-pool] registry={registry_path}", flush=True)
     print(f"[full-pool] report={report_path}", flush=True)
-    print("========== HUGINN WHISPER DYNAMIC90S FULL ATOMIC POOLS PASSED ==========", flush=True)
+    print("========== HUGINN WHISPER DYNAMIC30S FULL ATOMIC POOLS PASSED ==========", flush=True)
 
 
 if __name__ == "__main__":

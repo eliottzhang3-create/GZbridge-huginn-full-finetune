@@ -38,7 +38,7 @@ DEFAULT_REGISTRY = (
     / "data"
     / "audio_swift"
     / "huginn_whisper_dynamic90s_multitask"
-    / "v1"
+    / "v2_dynamic30s"
     / "pool_registry.json"
 )
 DEFAULT_REPORT = (
@@ -46,7 +46,7 @@ DEFAULT_REPORT = (
     / "data"
     / "audio_swift"
     / "huginn_whisper_dynamic90s_multitask"
-    / "v1"
+    / "v2_dynamic30s"
     / "real_data_chain_report.json"
 )
 DEFAULT_PLUGIN = (
@@ -127,6 +127,9 @@ def normalize_audio_mapping(value: Any) -> dict[str, Any]:
         "format": str(value.get("format", "")),
         "start_sec": None if value.get("start_sec") is None else float(value["start_sec"]),
         "end_sec": None if value.get("end_sec") is None else float(value["end_sec"]),
+        "raw_duration_sec": (
+            None if value.get("raw_duration_sec") is None else float(value["raw_duration_sec"])
+        ),
     }
 
 
@@ -174,6 +177,9 @@ def validate_row(
         "end_sec": (
             float(record["audio"]["end_sec"]) if record["audio"].get("end_sec") is not None else None
         ),
+        "raw_duration_sec": (
+            float(record["raw_duration_sec"]) if record.get("raw_duration_sec") is not None else None
+        ),
     }
     actual_audio = normalize_audio_mapping(audios[0])
     if actual_audio != expected_audio:
@@ -220,7 +226,7 @@ def main() -> None:
     os.environ["HUGINN_DYNAMIC90S_MIXTURE_START_POSITION"] = "0"
     os.environ["HUGINN_DYNAMIC90S_MIXTURE_MAX_SAMPLES"] = str(args.rows)
 
-    print("========== HUGINN WHISPER DYNAMIC90S REAL DATA CHAIN START ==========")
+    print("========== HUGINN WHISPER DYNAMIC30S REAL DATA CHAIN START ==========", flush=True)
     print(
         f"[scope] rows={args.rows} real_audio_decodes={len(POOL_ORDER)} "
         "model_load=false whisper_load=false audio_copy=false opus_conversion=false",
@@ -300,7 +306,7 @@ def main() -> None:
             plugin._BASE_PLUGIN.DEFAULT_SAMPLE_RATE * plugin._BASE_PLUGIN.DEFAULT_MAX_AUDIO_SECONDS
         )
         if waveform.size > max_samples:
-            raise RuntimeError(f"Decoded waveform exceeds 90 seconds for {pool_name}: samples={waveform.size}")
+            raise RuntimeError(f"Decoded waveform exceeds 30 seconds for {pool_name}: samples={waveform.size}")
         if audio_reference["start_sec"] is not None:
             expected_seconds = min(
                 float(audio_reference["end_sec"]) - float(audio_reference["start_sec"]),
@@ -325,8 +331,10 @@ def main() -> None:
         )
 
     report = {
-        "gate": "huginn_whisper_dynamic90s_real_data_chain_v1",
+        "gate": "huginn_whisper_dynamic30s_real_data_chain_v2",
         "validation_passed": True,
+        "contract_version": registry.get("contract_version"),
+        "duration_policy": "discard_gt90s_then_cap_at30s",
         "registry": str(registry_path),
         "seed": args.seed,
         "swift_rows_checked": len(baseline_rows),
@@ -348,7 +356,7 @@ def main() -> None:
     }
     write_json_atomic(report_path, report)
     print(f"[report] path={report_path}", flush=True)
-    print("========== HUGINN WHISPER DYNAMIC90S REAL DATA CHAIN PASSED ==========")
+    print("========== HUGINN WHISPER DYNAMIC30S REAL DATA CHAIN PASSED ==========", flush=True)
 
 
 if __name__ == "__main__":

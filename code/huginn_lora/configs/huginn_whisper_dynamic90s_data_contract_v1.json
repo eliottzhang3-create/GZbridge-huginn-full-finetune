@@ -1,5 +1,5 @@
 {
-  "contract_version": "huginn_whisper_dynamic90s_data_v1",
+  "contract_version": "huginn_whisper_dynamic30s_data_v2",
   "route": "huginn_audio_whisper_dynamic90s",
   "scope": "Huginn only",
   "audio_runtime_contract": {
@@ -7,13 +7,14 @@
     "channels": 1,
     "sample_rate_hz": 16000,
     "chunk_seconds": 30.0,
-    "max_included_seconds": 90.0,
-    "long_audio_policy": "retain_first_90_seconds",
+    "max_included_seconds": 30.0,
+    "discard_above_seconds": 90.0,
+    "long_audio_policy": "discard above 90 seconds; otherwise retain only the first 30 seconds",
     "whisper_feature_hop_samples": 160,
     "whisper_encoder_downsample": 2,
-    "compressor_kernel": 6,
-    "compressor_stride": 6,
-    "audio_token_duration_ms": 120,
+    "compressor_kernel": 8,
+    "compressor_stride": 8,
+    "audio_token_duration_ms": 160,
     "storage_policy": "Keep source audio read-only and decode/resample at training time; any materialized cache must be private.",
     "accepted_source_formats_for_inventory": [
       ".wav",

@@ -13,14 +13,14 @@ export PYTHONUNBUFFERED=1
 export PYTHONHASHSEED=0
 
 CONTRACT="${HUGINN_DYNAMIC90S_DATA_CONTRACT:-$REPO_ROOT/code/huginn_lora/configs/huginn_whisper_dynamic90s_data_contract_v1.json}"
-REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/pool_registry.json}"
-FULL_REPORT="${HUGINN_DYNAMIC90S_FULL_POOL_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/full_pool_report.json}"
-OUTPUT_DIR="${HUGINN_DYNAMIC90S_SAMPLER_DIR:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/sampler}"
+REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/pool_registry.json}"
+FULL_REPORT="${HUGINN_DYNAMIC90S_FULL_POOL_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/full_pool_report.json}"
+OUTPUT_DIR="${HUGINN_DYNAMIC90S_SAMPLER_DIR:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/sampler}"
 SEED="${HUGINN_DYNAMIC90S_MIXTURE_SEED:-20260730}"
 SIMULATION_DRAWS="${HUGINN_DYNAMIC90S_MIXTURE_SIMULATION_DRAWS:-1000000}"
 SCHEDULE_RECORDS="${HUGINN_DYNAMIC90S_MIXTURE_PILOT_RECORDS:-4096}"
 
-echo "========== INSPECT HUGINN WHISPER DYNAMIC90S INDEXED MIXTURE =========="
+echo "========== INSPECT HUGINN WHISPER DYNAMIC30S INDEXED MIXTURE =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "registry=$REGISTRY"
 echo "full_report=$FULL_REPORT"
@@ -39,4 +39,4 @@ python -u code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_indexed_mix
   --schedule_records "$SCHEDULE_RECORDS" \
   --overwrite
 
-echo "========== INSPECT HUGINN WHISPER DYNAMIC90S INDEXED MIXTURE EXIT =========="
+echo "========== INSPECT HUGINN WHISPER DYNAMIC30S INDEXED MIXTURE EXIT =========="

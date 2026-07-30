@@ -25,7 +25,7 @@ from data_pipeline.indexed_atomic_mixture import (  # noqa: E402
 )
 
 
-TRAINING_STATS_VERSION = "huginn_dynamic90s_training_statistics_v1"
+TRAINING_STATS_VERSION = "huginn_dynamic30s_training_statistics_v2"
 
 
 EXPECTED_TRAINABLE_TENSORS = {
@@ -403,7 +403,7 @@ def validate_forward_window(
                 f"actual={actual} expected={expected}"
             )
         duration = float(record["effective_duration_seconds"])
-        if not (0.0 < duration <= 90.001):
+        if not (0.0 < duration <= 30.001):
             raise AssertionError(f"Phase {phase} invalid effective duration at {position}: {duration}")
         pool_counts[selection.pool_name] += 1
         pool_durations[selection.pool_name] += duration
@@ -597,7 +597,7 @@ def main() -> None:
         f"resume_delta_effective_hours={sum(resume_forward_durations.values()) / 3600.0:.9f} "
         "prefetch_counted_in_statistics=false four_rank_aggregation=true"
     )
-    print("========== HUGINN WHISPER DYNAMIC90S CHECKPOINT RESUME MARKERS PASSED ==========")
+    print("========== HUGINN WHISPER DYNAMIC30S CHECKPOINT RESUME MARKERS PASSED ==========")
 
 
 if __name__ == "__main__":

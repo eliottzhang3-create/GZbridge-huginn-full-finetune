@@ -2298,7 +2298,54 @@ Before any long remote run:
   - checkpoint audit/save-reload validation
   - retrieval / generation / benchmark evaluation
 
-### Huginn Whisper dynamic-90s status update (2026-07-29; supersedes the immediate next step for the active Huginn task)
+### Huginn Whisper dynamic-30s current status (2026-07-30; supersedes all dynamic-90s execution guidance below)
+
+The active Huginn route now uses exactly one dynamic Whisper chunk per sample. Existing `dynamic90s` filenames,
+environment variables, model type, and model directory are retained only for Swift/checkpoint tooling compatibility;
+their active runtime semantics are now:
+
+- source duration `>90s`: exclude the atomic record before it enters the no-replacement sampling pool;
+- source duration `(30s, 90s]`: decode and retain only the first `30s`;
+- source duration `<=30s`: retain the real duration;
+- no 2/3-chunk splitting or concatenation; every local sample has exactly one Whisper chunk;
+- one Conv1d compressor with kernel `8`, stride `8`, padding `0`, giving one token per complete `160ms`;
+- a complete 30-second input produces `187` audio tokens, plus trainable audio BOS/EOS; shorter inputs remain dynamic;
+- local-batch audio-prefix padding is still only to that rank's longest sample and padded prefix positions remain `-100`;
+- Whisper, the complete aligner, and Huginn-only rank-8 LoRA remain trainable at `1e-4`; the native Huginn backbone
+  and LM head remain frozen.
+
+The old v1 metadata pools cannot safely implement `>90s` rejection without introducing gaps into global sampler
+positions. The active data route therefore builds metadata-only v2 pools under
+`data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/`. It reads source metadata, writes new JSONL/index
+files, and does not copy, download, or exhaustively decode audio. WavCaps and GigaSpeech use complete metadata duration
+accounting; AudioCaps and Clotho retain their verified pool-hour assumptions because those datasets are already at or
+below 30 seconds. The same deterministic hierarchical no-replacement sampler is used unchanged over the filtered pool
+sizes, preserving complete per-pool epochs and exact arbitrary-position resume.
+
+Run the current gates in this order after syncing code:
+
+```bash
+# One metadata-only 1-GPU job: v2 pools -> CPU sampler audit -> four real decode probes.
+bash code/huginn_lora/run_prepare_huginn_whisper_dynamic30s_training_prerequisites_5090.sh
+
+# Four-GPU fresh save at step 4, process exit, cold resume to step 6.
+bash code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh
+
+# Only after both jobs pass: fresh formal training.
+bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
+```
+
+Formal training now targets more than `3000` realized, decoded, 30-second-capped hours. The planner reads each v2
+registry pool's post-filter/post-cap planning hours, adds a `5%` reserve, follows the exact deterministic pool selection
+sequence, and rounds `max_steps` upward to an even multiple of `100`. The generated remote
+`formal_training_plan.json` is authoritative because the exact WavCaps post-cap hours are not available in the local
+code-only workspace. The job retains exactly two full-model checkpoints at halfway and completion. If final realized
+statistics do not exceed 3000 hours, the final checkpoint remains saved and the terminal audit exits with an error.
+
+The full Torch Profiler route is paused after a Kineto/native `SIGSEGV` on the old recurrent dynamic-90s workload and is
+not part of the current launch sequence.
+
+### Historical Huginn Whisper dynamic-90s status update (2026-07-29)
 
 The active Huginn task is now the isolated Whisper-large dynamic-90s route, not a LoSATok continuation and not formal
 dataset training. The historical fixed-32 Whisper model/plugin and its dataset-specific training/evaluation scripts have
@@ -2457,7 +2504,7 @@ HUGINN_AUDIO_DYNAMIC90S_FORMAL_RUN_ROOT=/absolute/path/to/new-resume-run \
 bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
 ```
 
-#### Full-path Torch Profiler for the formal Whisper dynamic-90s route
+#### Historical/paused full-path Torch Profiler for the formal Whisper dynamic-90s route
 
 Before changing the formal topology for throughput, use the isolated four-GPU profiler route:
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Freeze the formal dynamic-90s training length from the registered data pools."""
+"""Freeze the formal dynamic-30s training length from the registered data pools."""
 
 from __future__ import annotations
 
@@ -26,26 +26,14 @@ from data_pipeline.indexed_atomic_mixture import (  # noqa: E402
 )
 
 
-PLAN_VERSION = "huginn_whisper_dynamic90s_formal_plan_v1"
+PLAN_VERSION = "huginn_whisper_dynamic30s_formal_plan_v2"
 DEFAULT_SEED = 20260730
-DEFAULT_TARGET_HOURS = 4000.0
+DEFAULT_TARGET_HOURS = 3000.0
 DEFAULT_RESERVE_RATIO = 1.05
 DEFAULT_STEP_ROUNDING = 100
 DEFAULT_WORLD_SIZE = 4
 DEFAULT_PER_DEVICE_BATCH = 2
 DEFAULT_GRADIENT_ACCUMULATION = 4
-
-# These are the fixed source-pool sizes supplied for this formal run. They are
-# deliberately recorded in the plan because AAC atomic rows do not carry
-# duration metadata. Actual decoded/capped duration remains the completion
-# authority and is written into every checkpoint by the runtime callback.
-POOL_SOURCE_HOURS = {
-    "wavcaps_no_bbc_aac": 6500.0,
-    "audiocaps_v2_aac": 136.0,
-    "clotho_v2_aac": 24.0,
-    "gigaspeech_l_asr": 2498.217,
-}
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -105,7 +93,13 @@ def main() -> None:
     registry_path = args.registry.expanduser().resolve()
     registry = load_pool_registry(registry_path)
     pool_sizes = {name: int(registry["pools"][name]["record_count"]) for name in POOL_ORDER}
-    average_hours = {name: POOL_SOURCE_HOURS[name] / pool_sizes[name] for name in POOL_ORDER}
+    effective_pool_hours = {
+        name: float(registry["pools"][name]["planning_effective_duration_hours"])
+        for name in POOL_ORDER
+    }
+    if any(value <= 0 for value in effective_pool_hours.values()):
+        raise ValueError(f"Registry planning effective hours must be positive: {effective_pool_hours}")
+    average_hours = {name: effective_pool_hours[name] / pool_sizes[name] for name in POOL_ORDER}
     expected_hours_per_sample = sum(
         GLOBAL_POOL_WEIGHTS[name] * average_hours[name]
         for name in POOL_ORDER
@@ -150,7 +144,8 @@ def main() -> None:
         "planning_hours": planning_hours,
         "duration_estimate_is_completion_authority": False,
         "completion_authority": "checkpoint audio_training_statistics.json total_effective_duration_hours",
-        "source_pool_hours_assumption": POOL_SOURCE_HOURS,
+        "effective_pool_hours_assumption": effective_pool_hours,
+        "duration_policy": "discard_gt90s_then_cap_at30s",
         "pool_sizes": pool_sizes,
         "pool_average_source_hours_per_record": average_hours,
         "configured_pool_weights": GLOBAL_POOL_WEIGHTS,
@@ -183,6 +178,7 @@ def main() -> None:
     )
     print(f"[formal-plan] scheduled_pool_counts={scheduled_counts}")
     print(f"[formal-plan] scheduled_pool_ratios={scheduled_ratios}")
+    print(f"[formal-plan] effective_pool_hours={effective_pool_hours}")
     print(f"[formal-plan] output={output_path}")
 
 

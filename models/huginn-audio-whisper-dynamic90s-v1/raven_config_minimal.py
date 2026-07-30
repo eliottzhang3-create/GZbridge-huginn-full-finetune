@@ -1,4 +1,4 @@
-"""Configuration for the isolated Whisper-large dynamic-90s branch."""
+"""Configuration for the isolated Whisper-large dynamic single-chunk branch."""
 
 from ._base import RavenConfig
 
@@ -10,17 +10,17 @@ class HuginnAudioConfig(RavenConfig):
         self,
         audio_encoder_name: str = "/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large",
         audio_encoder_hidden_size: int = 1280,
-        audio_pooling_type: str = "conv1d_stride6_dynamic90s",
+        audio_pooling_type: str = "conv1d_stride8_dynamic30s",
         audio_dynamic_tokens: bool = True,
-        audio_token_duration_ms: int = 120,
-        audio_reference_30s_token_count: int = 250,
-        audio_max_token_count: int = 750,
+        audio_token_duration_ms: int = 160,
+        audio_reference_30s_token_count: int = 187,
+        audio_max_token_count: int = 187,
         audio_chunk_seconds: float = 30.0,
-        audio_max_seconds: float = 90.0,
+        audio_max_seconds: float = 30.0,
         audio_feature_hop_length: int = 160,
         audio_encoder_frame_rate: int = 50,
-        audio_compressor_kernel_size: int = 6,
-        audio_compressor_stride: int = 6,
+        audio_compressor_kernel_size: int = 8,
+        audio_compressor_stride: int = 8,
         audio_projector_hidden_size: int = 2048,
         freeze_audio_encoder: bool = False,
         freeze_text_backbone: bool = True,

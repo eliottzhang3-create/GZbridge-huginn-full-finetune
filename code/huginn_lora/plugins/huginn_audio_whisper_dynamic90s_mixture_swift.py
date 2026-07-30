@@ -1,4 +1,4 @@
-"""Swift dataset registration for the indexed Huginn Whisper dynamic-90s mixture."""
+"""Swift dataset registration for the indexed Huginn Whisper dynamic-30s mixture."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ DEFAULT_REGISTRY = (
     / "data"
     / "audio_swift"
     / "huginn_whisper_dynamic90s_multitask"
-    / "v1"
+    / "v2_dynamic30s"
     / "pool_registry.json"
 )
 REGISTRY_ENV = "HUGINN_DYNAMIC90S_POOL_REGISTRY"
@@ -26,7 +26,7 @@ SEED_ENV = "HUGINN_DYNAMIC90S_MIXTURE_SEED"
 START_POSITION_ENV = "HUGINN_DYNAMIC90S_MIXTURE_START_POSITION"
 MAX_SAMPLES_ENV = "HUGINN_DYNAMIC90S_MIXTURE_MAX_SAMPLES"
 TRAINING_STATS_RESUME_STATE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE"
-TRAINING_STATS_VERSION = "huginn_dynamic90s_training_statistics_v1"
+TRAINING_STATS_VERSION = "huginn_dynamic30s_training_statistics_v2"
 DATASET_NAME = "huginn_whisper_dynamic90s_mixture"
 DEFAULT_SEED = 20260730
 

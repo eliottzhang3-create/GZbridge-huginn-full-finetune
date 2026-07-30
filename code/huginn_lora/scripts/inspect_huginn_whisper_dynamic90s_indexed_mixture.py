@@ -28,9 +28,9 @@ from data_pipeline.indexed_atomic_mixture import (  # noqa: E402
 
 
 DEFAULT_CONTRACT = HUGINN_LORA_ROOT / "configs/huginn_whisper_dynamic90s_data_contract_v1.json"
-DEFAULT_REGISTRY = REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/pool_registry.json"
-DEFAULT_FULL_REPORT = REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/full_pool_report.json"
-DEFAULT_OUTPUT_DIR = REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/sampler"
+DEFAULT_REGISTRY = REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/pool_registry.json"
+DEFAULT_FULL_REPORT = REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/full_pool_report.json"
+DEFAULT_OUTPUT_DIR = REPO_ROOT / "data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/sampler"
 EXPECTED_TASKS = {
     "wavcaps_no_bbc_aac": "AAC",
     "audiocaps_v2_aac": "AAC",
@@ -123,6 +123,9 @@ def validate_record(pool_name: str, record: dict[str, Any]) -> None:
             raise ValueError(f"Invalid GigaSpeech segment audio reference: {audio!r}")
     if "effective_audio_tokens" in record:
         raise ValueError(f"Pool {pool_name} unexpectedly precomputed effective_audio_tokens")
+    raw_duration = record.get("raw_duration_sec")
+    if raw_duration is not None and (float(raw_duration) <= 0 or float(raw_duration) > 90.0):
+        raise ValueError(f"Pool {pool_name} contains an ineligible duration: {raw_duration}")
 
 
 def probe_indices(record_count: int, probe_count: int, seed: int) -> list[int]:
@@ -228,6 +231,10 @@ def main() -> None:
     registry_pools = registry.get("pools", {})
     if set(registry_pools) != set(POOL_ORDER):
         raise ValueError(f"Registry pool set mismatch: {sorted(registry_pools)}")
+    for pool_name, entry in registry_pools.items():
+        planning_hours = float(entry.get("planning_effective_duration_hours", -1.0))
+        if planning_hours <= 0:
+            raise ValueError(f"Pool {pool_name} has invalid planning effective hours: {planning_hours}")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -236,7 +243,7 @@ def main() -> None:
     if not args.overwrite and (report_path.exists() or schedule_path.exists()):
         raise FileExistsError(f"Refusing to overwrite sampler outputs under {output_dir}")
 
-    print("========== HUGINN WHISPER DYNAMIC90S INDEXED MIXTURE START ==========", flush=True)
+    print("========== HUGINN WHISPER DYNAMIC30S INDEXED MIXTURE START ==========", flush=True)
     print("[scope] audio_read=false audio_decode=false token_accounting=false", flush=True)
     print(
         f"[sampler] seed={args.seed} world_size={args.world_size} "
@@ -395,8 +402,10 @@ def main() -> None:
             )
 
         report = {
-            "gate": "huginn_whisper_dynamic90s_indexed_mixture_no_replacement_v2",
+            "gate": "huginn_whisper_dynamic30s_indexed_mixture_no_replacement_v2",
             "validation_passed": True,
+            "contract_version": registry.get("contract_version"),
+            "duration_policy": "discard_gt90s_then_cap_at30s",
             "sampler_version": SAMPLER_VERSION,
             "seed": args.seed,
             "world_size": args.world_size,
@@ -436,7 +445,7 @@ def main() -> None:
         for pool in pools.values():
             pool.close()
 
-    print("========== HUGINN WHISPER DYNAMIC90S INDEXED MIXTURE PASSED ==========", flush=True)
+    print("========== HUGINN WHISPER DYNAMIC30S INDEXED MIXTURE PASSED ==========", flush=True)
 
 
 if __name__ == "__main__":

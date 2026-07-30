@@ -27,7 +27,7 @@ vc submit \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 32 -m 128G -g 4 \
   -n 1 \
-  -j train-whisper-dyn90-multitask-4000h-fsdp4-$(date +%m%d%H%M) \
+  -j train-whisper-dyn30-multitask-3000h-fsdp4-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/train_huginn_audio_whisper_dynamic90s_multitask_fsdp4.sh"

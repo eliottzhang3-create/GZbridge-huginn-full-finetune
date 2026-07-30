@@ -1,4 +1,4 @@
-"""Isolated Whisper-large dynamic-90s wrapper around Huginn-0125."""
+"""Isolated Whisper-large dynamic single-30s wrapper around Huginn-0125."""
 
 from __future__ import annotations
 
@@ -19,8 +19,8 @@ class TrainableTemporalCompressor(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        kernel_size: int = 6,
-        stride: int = 6,
+        kernel_size: int = 8,
+        stride: int = 8,
     ):
         super().__init__()
         if kernel_size <= 0 or stride <= 0:
@@ -46,7 +46,7 @@ class TrainableTemporalCompressor(nn.Module):
             )
 
         # Whisper-large emits approximately 20 ms per encoder frame.  A
-        # kernel/stride of 6 therefore produces one audio token per 120 ms.
+        # kernel/stride of 8 therefore produces one audio token per 160 ms.
         x = x.transpose(1, 2)
         x = self.downsample(x)
         return x.transpose(1, 2)
@@ -428,6 +428,11 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
             )
 
         batch_size, segment_count, _, feature_frame_count = audio_input_features.shape
+        if segment_count != 1:
+            raise ValueError(
+                "The current Whisper route accepts exactly one dynamic audio chunk per sample, "
+                f"got segment_count={segment_count}"
+            )
         if audio_segment_feature_lengths is None:
             audio_segment_feature_lengths = torch.full(
                 (batch_size, segment_count),
@@ -473,15 +478,14 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         aligner_device = aligner_parameter.device
         compressor_kernel = int(self.temporal_compressor.kernel_size)
         compressor_stride = int(self.temporal_compressor.stride)
-        max_audio_token_count = int(getattr(self.config, "audio_max_token_count", 750))
+        max_audio_token_count = int(getattr(self.config, "audio_max_token_count", 187))
 
         valid_positions = audio_segment_mask.nonzero(as_tuple=False)
         if valid_positions.size(0) == 0:
             raise ValueError("Every audio batch must contain at least one valid segment")
 
-        # Flatten all local segments so each large FSDP unit is entered exactly
-        # once per model forward, independent of whether samples use 1, 2, or 3
-        # Whisper chunks.
+        # Flatten the one valid chunk from every local sample so Whisper and
+        # the aligner are each entered exactly once per model forward.
         segment_features = audio_input_features[audio_segment_mask].to(
             device=audio_encoder_device,
             dtype=audio_encoder_dtype,

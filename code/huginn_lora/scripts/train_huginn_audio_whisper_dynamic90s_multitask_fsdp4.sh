@@ -21,7 +21,7 @@ PER_DEVICE_BATCH=2
 GRADIENT_ACCUMULATION_STEPS=4
 GLOBAL_BATCH=$((WORLD_SIZE * PER_DEVICE_BATCH * GRADIENT_ACCUMULATION_STEPS))
 SEED="${HUGINN_DYNAMIC90S_MIXTURE_SEED:-20260730}"
-TARGET_HOURS=4000
+TARGET_HOURS=3000
 PLANNING_RESERVE_RATIO=1.05
 STEP_ROUNDING=100
 LEARNING_RATE=1e-4
@@ -35,13 +35,13 @@ STATISTICS_LOG_STEPS=100
 MIN_FREE_GB="${HUGINN_AUDIO_DYNAMIC90S_FORMAL_MIN_FREE_GB:-100}"
 REPORT_TO="${HUGINN_AUDIO_DYNAMIC90S_FORMAL_REPORT_TO:-tensorboard}"
 RESUME_CHECKPOINT="${HUGINN_AUDIO_DYNAMIC90S_FORMAL_RESUME_CHECKPOINT:-}"
-RUN_ROOT="${HUGINN_AUDIO_DYNAMIC90S_FORMAL_RUN_ROOT:-outputs/huginn_audio_whisper_dynamic90s_multitask_4000h_fsdp4/run-$(date +%Y%m%d_%H%M%S)}"
+RUN_ROOT="${HUGINN_AUDIO_DYNAMIC90S_FORMAL_RUN_ROOT:-outputs/huginn_audio_whisper_dynamic30s_multitask_3000h_fsdp4/run-$(date +%Y%m%d_%H%M%S)}"
 
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-dynamic90s-v1"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py"
-REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/pool_registry.json}"
-REALDATA_REPORT="${HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/real_data_chain_report.json}"
-SAMPLER_REPORT="${HUGINN_DYNAMIC90S_SAMPLER_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/sampler/mixture_sampler_report.json}"
+REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/pool_registry.json}"
+REALDATA_REPORT="${HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/real_data_chain_report.json}"
+SAMPLER_REPORT="${HUGINN_DYNAMIC90S_SAMPLER_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/sampler/mixture_sampler_report.json}"
 PLANNER="$REPO_ROOT/code/huginn_lora/scripts/plan_huginn_whisper_dynamic90s_formal_training.py"
 CHECKPOINT_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_fsdp_checkpoints.py"
 MODULES_TO_SAVE=(temporal_compressor audio_projector audio_boundary_embeddings)
@@ -68,7 +68,9 @@ for required_path in \
   fi
 done
 
-python - "$REALDATA_REPORT" "$SAMPLER_REPORT" <<'PY'
+python -u "$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_contract.py"
+
+python - "$REALDATA_REPORT" "$SAMPLER_REPORT" "$SEED" <<'PY'
 import inspect
 import json
 import sys
@@ -86,13 +88,24 @@ from swift.utils import get_multimodal_target_regex
 
 real_data = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 sampler = json.loads(Path(sys.argv[2]).read_text(encoding="utf-8"))
-if not real_data.get("validation_passed"):
+if (
+    not real_data.get("validation_passed")
+    or real_data.get("gate") != "huginn_whisper_dynamic30s_real_data_chain_v2"
+    or real_data.get("contract_version") != "huginn_whisper_dynamic30s_data_v2"
+):
     raise SystemExit(f"Real data-chain prerequisite has not passed: {sys.argv[1]}")
 if (
     not sampler.get("validation_passed")
     or sampler.get("sampler_version") != "deterministic_hierarchical_no_replacement_v2"
+    or sampler.get("gate") != "huginn_whisper_dynamic30s_indexed_mixture_no_replacement_v2"
+    or sampler.get("contract_version") != "huginn_whisper_dynamic30s_data_v2"
 ):
     raise SystemExit(f"No-replacement sampler prerequisite has not passed: {sys.argv[2]}")
+if int(real_data.get("seed", -1)) != int(sys.argv[3]) or int(sampler.get("seed", -1)) != int(sys.argv[3]):
+    raise SystemExit(
+        f"Prerequisite seed mismatch: real={real_data.get('seed')} sampler={sampler.get('seed')} "
+        f"current={sys.argv[3]}"
+    )
 if set(TASK_PROMPTS) != {"AAC", "ASR"} or TASK_PROMPTS["AAC"] == TASK_PROMPTS["ASR"]:
     raise SystemExit(f"AAC and ASR require distinct task prompts: {TASK_PROMPTS}")
 if EXPECTED_TASKS.get("gigaspeech_l_asr") != "ASR" or any(
@@ -182,6 +195,8 @@ state = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 halfway = int(sys.argv[2])
 global_batch = int(sys.argv[3])
 seed = int(sys.argv[4])
+if state.get("statistics_version") != "huginn_dynamic30s_training_statistics_v2":
+    raise SystemExit(f"Resume checkpoint uses an incompatible audio contract: {state.get('statistics_version')!r}")
 if int(state.get("global_step", -1)) != halfway:
     raise SystemExit(f"Resume checkpoint must be the halfway checkpoint-{halfway}: {state.get('global_step')}")
 if int(state.get("sampler_seed", -1)) != seed:
@@ -218,6 +233,7 @@ export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR="$TRAINING_STATS_DIR"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS="$STATISTICS_LOG_STEPS"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CHECKPOINT_STEPS="$HALFWAY_STEP,$MAX_STEPS"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE=formal
+unset HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT
 unset HUGINN_AUDIO_DYNAMIC90S_FSDP_SAVE_DEBUG
 unset HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_AUDIT_DIR
 unset HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR
@@ -228,7 +244,7 @@ else
   unset HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE
 fi
 
-echo "========== HUGINN WHISPER DYNAMIC90S MULTITASK FORMAL FSDP4 START =========="
+echo "========== HUGINN WHISPER DYNAMIC30S MULTITASK FORMAL FSDP4 START =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "run_root=$RUN_ROOT"
 echo "registry=$REGISTRY sampler=deterministic_hierarchical_no_replacement_v2 seed=$SEED start_position=$START_POSITION"
@@ -237,7 +253,7 @@ echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH accumulation=$GR
 echo "target_realized_hours_gt=$TARGET_HOURS planning_reserve_ratio=$PLANNING_RESERVE_RATIO"
 echo "max_steps=$MAX_STEPS halfway_step=$HALFWAY_STEP total_scheduled_samples=$TOTAL_SAMPLES"
 echo "checkpoints=checkpoint-$HALFWAY_STEP,checkpoint-$MAX_STEPS save_total_limit=2 full_model_dcp=true"
-echo "audio=dynamic_up_to_90s token_rate=120ms padding=local_batch_longest labels=-100"
+echo "audio=single_dynamic_chunk discard_gt90s retain_first30s token_rate=160ms padding=local_batch_longest labels=-100"
 echo "whisper=fully_trainable aligner=fully_trainable huginn_backbone=frozen huginn_lora_only=true"
 echo "learning_rates=whisper:$WHISPER_LR,aligner:$ALIGNER_LR,lora:$LEARNING_RATE"
 echo "lora=rank8,alpha16,dropout0.05 scheduler=cosine warmup_ratio=$WARMUP_RATIO weight_decay=$WEIGHT_DECAY max_grad_norm=$MAX_GRAD_NORM"
@@ -250,7 +266,7 @@ TRAIN_PID=""
 MONITOR_PID=""
 
 print_resource_snapshot() {
-  echo "========== DYNAMIC90S FORMAL RESOURCE SNAPSHOT =========="
+  echo "========== DYNAMIC30S FORMAL RESOURCE SNAPSHOT =========="
   echo "snapshot_time=$(date '+%Y-%m-%d %H:%M:%S')"
   if [ -n "$TRAIN_PID" ] && kill -0 "$TRAIN_PID" 2>/dev/null; then
     ps -o pid,ppid,rss,vsz,%mem,etime,stat,cmd -p "$TRAIN_PID" || true
@@ -282,7 +298,7 @@ on_exit() {
   status=$?
   trap - EXIT
   stop_resource_monitor
-  echo "========== HUGINN WHISPER DYNAMIC90S MULTITASK FORMAL FSDP4 EXIT =========="
+  echo "========== HUGINN WHISPER DYNAMIC30S MULTITASK FORMAL FSDP4 EXIT =========="
   echo "exit_status=$status"
   echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
   exit "$status"
@@ -393,7 +409,7 @@ python -u "$CHECKPOINT_INSPECTOR" \
   --world-size "$WORLD_SIZE" \
   --output-report "$FINAL_AUDIT_REPORT"
 
-echo "========== HUGINN WHISPER DYNAMIC90S MULTITASK FORMAL FSDP4 PASSED =========="
+echo "========== HUGINN WHISPER DYNAMIC30S MULTITASK FORMAL FSDP4 PASSED =========="
 echo "half_checkpoint=$HALF_CHECKPOINT"
 echo "final_checkpoint=$FINAL_CHECKPOINT"
 echo "formal_plan=$PLAN_PATH"

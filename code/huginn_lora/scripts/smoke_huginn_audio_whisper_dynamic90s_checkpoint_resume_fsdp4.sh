@@ -23,7 +23,7 @@ SAVE_STEP=4
 RESUME_STEP=6
 SEED="${HUGINN_DYNAMIC90S_MIXTURE_SEED:-20260730}"
 DATASET_MAX_SAMPLES="${HUGINN_DYNAMIC90S_CHECKPOINT_DATASET_MAX_SAMPLES:-64}"
-RUN_ROOT="${HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_RUN_ROOT:-outputs/huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4/run-$(date +%Y%m%d_%H%M%S)}"
+RUN_ROOT="${HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_RUN_ROOT:-outputs/huginn_audio_whisper_dynamic30s_checkpoint_resume_fsdp4/run-$(date +%Y%m%d_%H%M%S)}"
 if [ -e "$RUN_ROOT" ]; then
   echo "Checkpoint smoke root already exists; choose a fresh HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_RUN_ROOT: $RUN_ROOT" >&2
   exit 1
@@ -41,9 +41,9 @@ FSDP_CONFIG_PATH="$RUN_ROOT/fsdp2_lora_no_activation.json"
 CONTENT_REPORT="$RUN_ROOT/checkpoint_content_report.json"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-dynamic90s-v1"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py"
-REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/pool_registry.json}"
-REALDATA_REPORT="${HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/real_data_chain_report.json}"
-SAMPLER_REPORT="${HUGINN_DYNAMIC90S_SAMPLER_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v1/sampler/mixture_sampler_report.json}"
+REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/pool_registry.json}"
+REALDATA_REPORT="${HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/real_data_chain_report.json}"
+SAMPLER_REPORT="${HUGINN_DYNAMIC90S_SAMPLER_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/sampler/mixture_sampler_report.json}"
 MARKER_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_checkpoint_resume_markers.py"
 CHECKPOINT_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_fsdp_checkpoints.py"
 MODULES_TO_SAVE=(temporal_compressor audio_projector audio_boundary_embeddings)
@@ -57,7 +57,9 @@ for required_path in \
   fi
 done
 
-python - "$REALDATA_REPORT" "$SAMPLER_REPORT" "$DATASET_MAX_SAMPLES" <<'PY'
+python -u "$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_contract.py"
+
+python - "$REALDATA_REPORT" "$SAMPLER_REPORT" "$DATASET_MAX_SAMPLES" "$SEED" <<'PY'
 import json
 import inspect
 import sys
@@ -69,14 +71,25 @@ from swift.tuner_plugin.lora_llm import LoRALLMTuner
 from swift.utils import get_multimodal_target_regex
 
 report = json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
-if not report.get('validation_passed'):
+if (
+    not report.get('validation_passed')
+    or report.get('gate') != 'huginn_whisper_dynamic30s_real_data_chain_v2'
+    or report.get('contract_version') != 'huginn_whisper_dynamic30s_data_v2'
+):
     raise SystemExit(f'Real data-chain prerequisite has not passed: {sys.argv[1]}')
 sampler_report = json.loads(Path(sys.argv[2]).read_text(encoding='utf-8'))
 if (
     not sampler_report.get('validation_passed')
     or sampler_report.get('sampler_version') != 'deterministic_hierarchical_no_replacement_v2'
+    or sampler_report.get('gate') != 'huginn_whisper_dynamic30s_indexed_mixture_no_replacement_v2'
+    or sampler_report.get('contract_version') != 'huginn_whisper_dynamic30s_data_v2'
 ):
     raise SystemExit(f'No-replacement sampler prerequisite has not passed: {sys.argv[2]}')
+if int(report.get('seed', -1)) != int(sys.argv[4]) or int(sampler_report.get('seed', -1)) != int(sys.argv[4]):
+    raise SystemExit(
+        f'Prerequisite seed mismatch: real={report.get("seed")} sampler={sampler_report.get("seed")} '
+        f'current={sys.argv[4]}'
+    )
 if int(sys.argv[3]) < 24:
     raise SystemExit(f'Checkpoint dataset quota must be at least 24, got {sys.argv[3]}')
 available = {field.name for field in fields(SftArguments)}
@@ -133,8 +146,9 @@ export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR="$TRAINING_STATS_DIR"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS=1
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_CHECKPOINT_STEPS="$SAVE_STEP,$RESUME_STEP"
 export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_FORWARD_AUDIT_DIR="$FORWARD_AUDIT_DIR"
+unset HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT
 
-echo "========== HUGINN WHISPER DYNAMIC90S CHECKPOINT RESUME FSDP4 START =========="
+echo "========== HUGINN WHISPER DYNAMIC30S CHECKPOINT RESUME FSDP4 START =========="
 echo "ACTIVE_ENV=$CONDA_DEFAULT_ENV"
 echo "run_root=$RUN_ROOT"
 echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH accumulation=$GRADIENT_ACCUMULATION_STEPS"
@@ -145,6 +159,7 @@ echo "checkpoint_state=model+optimizer+scheduler+rng+trainer_global_step+no_repl
 echo "lr_scheduler=constant learning_rate=1e-4"
 echo "modules_to_save=${MODULES_TO_SAVE[*]}"
 echo "whisper_encoder=fully_trainable learning_rate=1e-4 aligner_lr=1e-4"
+echo "audio=single_dynamic_chunk retain_first30s discard_gt90s token_rate=160ms"
 echo "gradient_checkpointing=false vit_gradient_checkpointing=true use_reentrant=false"
 echo "pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"
 echo "huginn_backbone=frozen lora_rank=8 lora_alpha=16 lora_dropout=0.05 full_model_dcp=true"
@@ -154,7 +169,7 @@ ACTIVE_PHASE=""
 MONITOR_PID=""
 
 print_resource_snapshot() {
-  echo "========== DYNAMIC90S CHECKPOINT RESOURCE SNAPSHOT =========="
+  echo "========== DYNAMIC30S CHECKPOINT RESOURCE SNAPSHOT =========="
   echo "snapshot_time=$(date '+%Y-%m-%d %H:%M:%S') phase=${ACTIVE_PHASE:-none}"
   if [ -n "$ACTIVE_PID" ] && kill -0 "$ACTIVE_PID" 2>/dev/null; then
     ps -o pid,ppid,rss,vsz,%mem,etime,stat,cmd -p "$ACTIVE_PID" || true
@@ -203,7 +218,7 @@ on_exit() {
   status=$?
   trap - EXIT
   stop_resource_monitor
-  echo "========== HUGINN WHISPER DYNAMIC90S CHECKPOINT RESUME FSDP4 EXIT =========="
+  echo "========== HUGINN WHISPER DYNAMIC30S CHECKPOINT RESUME FSDP4 EXIT =========="
   echo "exit_status=$status"
   echo "exit_time=$(date '+%Y-%m-%d %H:%M:%S')"
   exit "$status"
@@ -381,7 +396,7 @@ python -u "$CHECKPOINT_INSPECTOR" \
   --world-size "$WORLD_SIZE" \
   --output-report "$CONTENT_REPORT"
 
-echo "========== HUGINN WHISPER DYNAMIC90S CHECKPOINT RESUME FSDP4 PASSED =========="
+echo "========== HUGINN WHISPER DYNAMIC30S CHECKPOINT RESUME FSDP4 PASSED =========="
 echo "save_checkpoint=$SAVE_CHECKPOINT"
 echo "resume_checkpoint=$RESUME_CHECKPOINT"
 echo "content_report=$CONTENT_REPORT"

@@ -12,7 +12,7 @@ vc submit \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 8 -m 32G -g 1 \
   -n 1 \
-  -j prepare-huginn-dyn90-full-pools-$(date +%m%d%H%M) \
+  -j prepare-huginn-dyn30-full-pools-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/prepare_huginn_whisper_dynamic90s_full_atomic_pools_5090.JOB.log" \
   --cmd "bash scripts/prepare_huginn_whisper_dynamic90s_full_atomic_pools.sh"
