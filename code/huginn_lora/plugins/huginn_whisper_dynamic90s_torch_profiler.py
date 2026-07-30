@@ -193,6 +193,13 @@ if _enabled():
             original = getattr(module, "randomized_iteration_sampler", None)
             if not callable(original) or getattr(original, "_huginn_profiled", False):
                 continue
+            # PEFT's PeftModel/LoraModel wrappers proxy unknown attributes to
+            # the wrapped Huginn model. ``getattr`` therefore exposes the same
+            # bound sampler through several wrapper modules even though only
+            # the real Huginn module owns it. Patch only the method whose
+            # binding owner is the module currently being visited.
+            if getattr(original, "__self__", None) is not module:
+                continue
 
             def sampled(self, *args, __original=original, **kwargs):
                 result = __original(*args, **kwargs)
@@ -210,6 +217,11 @@ if _enabled():
             sampled._huginn_profiled = True
             module.randomized_iteration_sampler = MethodType(sampled, module)
             patched += 1
+            print(
+                f"[torch-profiler] rank={RANK} recurrence_sampler_owner="
+                f"{type(module).__module__}.{type(module).__name__}",
+                flush=True,
+            )
         return patched
 
     def _patch_profiled_modules(model: torch.nn.Module) -> dict[str, list[str]]:
