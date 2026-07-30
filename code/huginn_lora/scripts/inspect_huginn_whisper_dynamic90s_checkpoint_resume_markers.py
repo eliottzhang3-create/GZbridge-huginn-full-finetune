@@ -459,7 +459,6 @@ def main() -> None:
         resume_forward_records = read_forward_records(args.forward_audit_dir, "resume", args.world_size)
         save_forward_counts, save_forward_durations = validate_forward_window(
             save_forward_records,
-            args.seed,
             "save",
             0,
             args.save_step * args.world_size,
