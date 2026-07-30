@@ -183,12 +183,40 @@ def validate_data_window(
 ) -> Counter[str]:
     expected_positions = list(range(start_position, end_position))
     actual_positions = [int(record["global_position"]) for record in records]
-    if sorted(actual_positions) != expected_positions or len(set(actual_positions)) != len(actual_positions):
+    position_counts = Counter(actual_positions)
+    if sorted(position_counts) != expected_positions:
         raise AssertionError(
-            f"Phase {phase} data positions mismatch: expected={expected_positions} actual={sorted(actual_positions)}"
+            f"Phase {phase} unique data positions mismatch: "
+            f"expected={expected_positions} actual={sorted(position_counts)}"
         )
-    pool_counts: Counter[str] = Counter()
+    multiplicities = set(position_counts.values())
+    if len(multiplicities) != 1 or not multiplicities.issubset({1, 2}):
+        raise AssertionError(
+            f"Phase {phase} has inconsistent template-encode multiplicities: {dict(position_counts)}"
+        )
+    # Swift 4.1.3 may invoke template encoding twice per raw streaming row
+    # (length/preparation plus actual collation). This is instrumentation
+    # duplication, not a second model sample: the per-rank prefix counters
+    # above independently prove the exact number of model-consumed samples.
+    # Every duplicate must carry identical provenance before it is collapsed.
+    unique_records: dict[int, dict[str, Any]] = {}
+    provenance_fields = ("pool_name", "task", "uid")
     for record in records:
+        position = int(record["global_position"])
+        previous = unique_records.get(position)
+        if previous is None:
+            unique_records[position] = record
+            continue
+        previous_provenance = {key: previous.get(key) for key in provenance_fields}
+        current_provenance = {key: record.get(key) for key in provenance_fields}
+        if current_provenance != previous_provenance:
+            raise AssertionError(
+                f"Phase {phase} duplicate provenance mismatch at position {position}: "
+                f"first={previous_provenance} duplicate={current_provenance}"
+            )
+    pool_counts: Counter[str] = Counter()
+    for position in expected_positions:
+        record = unique_records[position]
         position = int(record["global_position"])
         selection = planner.selection(position)
         atomic = pools[selection.pool_name].record(selection.record_index)
@@ -205,7 +233,8 @@ def validate_data_window(
         pool_counts[selection.pool_name] += 1
     print(
         f"[data-window] phase={phase} positions={start_position}..{end_position - 1} "
-        f"records={len(records)} pool_counts={dict(pool_counts)}"
+        f"unique_records={len(unique_records)} raw_encode_records={len(records)} "
+        f"encode_multiplicity={next(iter(multiplicities))} pool_counts={dict(pool_counts)}"
     )
     return pool_counts
 

@@ -2340,7 +2340,7 @@ trainable aligner, finite losses/gradient norms, and per-rank realized dynamic a
 global sample window is positions `0..31`, which covers all four pools (`11` WavCaps, `6` AudioCaps, `2` Clotho, and
 `13` GigaSpeech; `19` AAC and `13` ASR). Checkpoint save/restart remains the following separate gate.
 
-The real-mixture FSDP4 gate has passed. The active next gate is
+The real-mixture FSDP4 gate has passed. The checkpoint gate is
 `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh`. Phase 1 uses one fresh
 four-rank process group to consume global mixture positions `0..15`, train through step `4`, and save a complete
 adapter-only FSDP DCP. Phase 2 starts a distinct four-rank process group, restores checkpoint `4`, starts the stateless
@@ -2349,6 +2349,16 @@ mixture explicitly at position `16` with Trainer data skipping disabled, consume
 `4`, exact per-rank Python/NumPy/CPU/CUDA RNG restoration, Trainer global step continuity, disjoint process-launch IDs,
 and actual LoRA plus aligner tensor changes between checkpoints `4` and `6`. Constant LR is used only for this short
 gate so the first phase cannot decay to zero before the resumed updates.
+
+The first checkpoint smoke completed both four-rank training phases and produced checkpoint `4` and checkpoint `6`.
+Its initial post-run marker audit exposed that Swift 4.1.3 calls template encoding twice for each streaming row. The
+data audit now requires a uniform encode multiplicity of one or two, requires duplicate pool/task/uid provenance to be
+identical, and only then collapses records by global mixture position. This does not relax the independent per-rank
+model-consumption counters. The completed run can be audited without repeating training by submitting
+`code/huginn_lora/run_inspect_existing_huginn_audio_whisper_dynamic90s_checkpoint_resume_5090.sh` with
+`HUGINN_AUDIO_DYNAMIC90S_EXISTING_CHECKPOINT_RUN_ROOT` set to its existing run directory. That posthoc job performs no
+audio decode or model forward; it validates the saved markers and reads the FSDP DCP checkpoints to compare LoRA and
+aligner tensors between steps `4` and `6`.
 
 Formal-training constraints already fixed by the user, but not yet implemented or launched:
 
