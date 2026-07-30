@@ -2456,3 +2456,34 @@ HUGINN_AUDIO_DYNAMIC90S_FORMAL_RESUME_CHECKPOINT=/absolute/path/to/checkpoint-HA
 HUGINN_AUDIO_DYNAMIC90S_FORMAL_RUN_ROOT=/absolute/path/to/new-resume-run \
 bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
 ```
+
+#### Full-path Torch Profiler for the formal Whisper dynamic-90s route
+
+Before changing the formal topology for throughput, use the isolated four-GPU profiler route:
+
+- profiler hook: `code/huginn_lora/plugins/huginn_whisper_dynamic90s_torch_profiler.py`;
+- combined real-mixture plugin: `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_profiler_swift.py`;
+- runtime: `code/huginn_lora/scripts/profile_huginn_audio_whisper_dynamic90s_multitask_fsdp4.sh`;
+- four-rank result gate: `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_profiler_results.py`;
+- submit wrapper: `code/huginn_lora/run_profile_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh`.
+
+The profiler uses the real no-replacement mixture and the formal four-GPU `B2/GA4` model, optimizer, FSDP,
+checkpointing, and dataloader configuration. It deliberately saves no checkpoint and reports to no online service. The
+default eight optimizer steps provide `32` microbatches per rank: four wait, four warmup, eight active trace collection,
+and sixteen post-active microbatches for lower-overhead timing. The default global forward window is positions `0..255`.
+It captures CPU/CUDA operators, shapes, FLOP estimates, memory, DataLoaderDispatcher latency, NCCL/FSDP collectives,
+coarse module ranges, recurrence draws and recomputation calls, dynamic prefix/segment lengths, local padding, cross-rank
+length imbalance, GPU utilization samples, NCCL topology logs, and per-rank TensorBoard/Chrome traces. Python stacks are
+off by default because they greatly increase trace size and perturb this recurrent workload; set
+`HUGINN_TORCH_PROFILER_WITH_STACK=1` only for a targeted second run.
+
+The aggregate report projects the `17700`-step formal duration from the post-active phase only and labels the projection
+as a short-run estimate. Active trace timing must not be used as the formal ETA. Submit through:
+
+```bash
+bash code/huginn_lora/run_profile_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh
+```
+
+The authoritative outputs are `profiler_aggregate.json`, four `profiler_summary_rank*.json` files, the per-rank trace
+directories, `resource_samples.log`, `nvidia_topology.txt`, and the per-process `nccl.*.log` files below the generated
+profiler run root.
