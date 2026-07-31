@@ -23,6 +23,7 @@ REGISTRY_ENV = "HUGINN_MULTIPLIER_POOL_REGISTRY"
 START_POSITION_ENV = "HUGINN_MULTIPLIER_START_POSITION"
 MAX_SAMPLES_ENV = "HUGINN_MULTIPLIER_MAX_SAMPLES"
 RESUME_STATE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE"
+BASE_START_POSITION_ENV = "HUGINN_DYNAMIC90S_MIXTURE_START_POSITION"
 DATASET_NAME = "huginn_whisper_dynamic30s_multiplier"
 FORMAL_PLAN_ENV = "HUGINN_MULTIPLIER_FORMAL_PLAN_PATH"
 FORMAL_PLAN_FILENAME = "multiplier_formal_training_plan.json"
@@ -38,6 +39,18 @@ from data_pipeline.finite_multiplier_pool import (  # noqa: E402
     iter_multiplier_rows,
     load_multiplier_registry,
 )
+
+
+def _synchronize_base_plugin_environment() -> None:
+    # The reused statistics callback still reads the historical mixture name.
+    # Keep the finite multiplier position authoritative for both fresh and resumed runs.
+    start_position = os.environ.get(START_POSITION_ENV, "0").strip() or "0"
+    if int(start_position) < 0:
+        raise ValueError(f"{START_POSITION_ENV} must be non-negative, got {start_position}")
+    os.environ[BASE_START_POSITION_ENV] = start_position
+
+
+_synchronize_base_plugin_environment()
 
 
 def _load_base_plugin() -> Any:

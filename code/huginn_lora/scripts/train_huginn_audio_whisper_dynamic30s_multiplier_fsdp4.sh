@@ -182,7 +182,7 @@ fi
 echo "========== HUGINN WHISPER DYNAMIC30S MULTIPLIER FORMAL START =========="
 echo "registry=$REGISTRY seed=$SEED schedule=single_frozen_global_epoch"
 echo "records=$TOTAL_RECORDS max_steps=$MAX_STEPS global_batch=$GLOBAL_BATCH"
-echo "checkpoints=$CHECKPOINT_STEPS_CSV save_total_limit=4"
+echo "checkpoints=$CHECKPOINT_STEPS_CSV save_total_limit=2"
 echo "world_size=4 per_device_batch=2 gradient_accumulation=4"
 echo "audio=dynamic_first30s token_rate=160ms prompts=AAC+ASR_specific"
 echo "trainable=whisper+aligner+huginn_lora frozen=huginn_native_backbone"
@@ -201,7 +201,7 @@ CMD+=(--lr_scheduler_type cosine --warmup_ratio "$WARMUP_RATIO" --weight_decay "
 CMD+=(--fsdp "$FSDP_CONFIG_PATH" --max_steps "$MAX_STEPS")
 CMD+=(--per_device_train_batch_size "$PER_DEVICE_BATCH" --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS")
 CMD+=(--gradient_checkpointing false --vit_gradient_checkpointing false --gradient_checkpointing_kwargs '{"use_reentrant": false}')
-CMD+=(--logging_steps "$LOGGING_STEPS" --save_strategy steps --save_steps "$CHECKPOINT_INTERVAL" --save_total_limit 4)
+CMD+=(--logging_steps "$LOGGING_STEPS" --save_strategy steps --save_steps "$CHECKPOINT_INTERVAL" --save_total_limit 2)
 CMD+=(--dataloader_num_workers 0 --dataloader_pin_memory false --dataset_num_proc 1)
 CMD+=(--save_only_model false --report_to "$REPORT_TO" --bf16 true --seed "$SEED" --data_seed "$SEED")
 CMD+=("${RESUME_ARGS[@]}")
@@ -209,8 +209,8 @@ CMD+=("${RESUME_ARGS[@]}")
 "${CMD[@]}"
 
 mapfile -t CHECKPOINT_PATHS < <(find "$OUTPUT_DIR" -type d -name 'checkpoint-*' -print | sort -V)
-if [ "${#CHECKPOINT_PATHS[@]}" -lt 1 ] || [ "${#CHECKPOINT_PATHS[@]}" -gt 4 ]; then
-  echo "Expected one to four retained multiplier checkpoints, found ${#CHECKPOINT_PATHS[@]}" >&2
+if [ "${#CHECKPOINT_PATHS[@]}" -lt 1 ] || [ "${#CHECKPOINT_PATHS[@]}" -gt 2 ]; then
+  echo "Expected one or two retained multiplier checkpoints, found ${#CHECKPOINT_PATHS[@]}" >&2
   exit 1
 fi
 FINAL_CHECKPOINT_MATCHES=()
@@ -234,4 +234,3 @@ echo "========== HUGINN WHISPER DYNAMIC30S MULTIPLIER FORMAL PASSED =========="
 echo "checkpoints=${CHECKPOINT_PATHS[*]}"
 echo "formal_plan=$PLAN_PATH"
 echo "formal_audit=$FINAL_AUDIT_REPORT"
-

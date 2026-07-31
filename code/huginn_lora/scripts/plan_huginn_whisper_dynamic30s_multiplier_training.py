@@ -112,7 +112,7 @@ def main() -> None:
         "checkpoint_interval": args.checkpoint_interval,
         "checkpoint_steps": checkpoint_steps,
         "checkpoint_count_before_retention": len(checkpoint_steps),
-        "save_total_limit": 4,
+        "save_total_limit": 2,
         "schedule_path": str(schedule_path.resolve()),
         "schedule_sha256": registry["schedule_sha256"],
         "source_registry_path": registry["source_registry_path"],
