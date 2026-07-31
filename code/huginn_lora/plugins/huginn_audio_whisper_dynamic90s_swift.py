@@ -2079,6 +2079,10 @@ def patch_training_statistics_callback() -> None:
                     context="Formal dynamic-30s training",
                 )
                 self.formal_lora_runtime_audit = lora_audit
+                self.formal_audio_tokenization_audit = _audit_dynamic_audio_tokenization(
+                    self.tracked_model,
+                    context="Formal dynamic-30s training",
+                )
                 fsdp_audit = _audit_formal_fsdp_topology(self.tracked_model)
                 whisper_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
                 if bool(getattr(args, "vit_gradient_checkpointing", False)) or whisper_checkpoint_modules:
