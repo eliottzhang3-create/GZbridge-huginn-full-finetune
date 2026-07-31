@@ -87,17 +87,64 @@ def resolve_run_root(args: argparse.Namespace) -> Path:
             raise FileNotFoundError(f"Multiplier formal run root is missing: {run_root}")
         return run_root
     formal_root = args.formal_root.expanduser().resolve()
-    candidates = [
-        path
-        for path in formal_root.glob("run-*")
-        if (path / "multiplier_formal_training_plan.json").is_file()
-        and (path / "training_statistics/latest.json").is_file()
-    ]
+    search_roots = []
+    for root in (formal_root, REPO_ROOT / "outputs"):
+        resolved = root.resolve()
+        if resolved.is_dir() and resolved not in search_roots:
+            search_roots.append(resolved)
+    candidates_by_path: dict[Path, float] = {}
+    discovered_plans: list[Path] = []
+    discovered_statistics: list[Path] = []
+    skipped_names = {
+        "swift_output",
+        "save_phase",
+        "resume_phase",
+        "pytorch_model_fsdp_0",
+        "training_statistics",
+        "tensorboard",
+    }
+
+    def bounded_directories(root: Path, maximum_depth: int = 3):
+        pending = [(root, 0)]
+        while pending:
+            directory, depth = pending.pop()
+            yield directory
+            if depth >= maximum_depth:
+                continue
+            try:
+                children = list(directory.iterdir())
+            except OSError:
+                continue
+            for child in children:
+                if (
+                    not child.is_dir()
+                    or child.name in skipped_names
+                    or child.name.startswith("checkpoint-")
+                    or child.name.startswith("optimizer_")
+                ):
+                    continue
+                pending.append((child, depth + 1))
+
+    for search_root in search_roots:
+        for candidate in bounded_directories(search_root):
+            plan_path = candidate / "multiplier_formal_training_plan.json"
+            latest = candidate / "training_statistics/latest.json"
+            if plan_path.is_file():
+                discovered_plans.append(plan_path)
+            if latest.is_file():
+                discovered_statistics.append(latest)
+            if plan_path.is_file() and latest.is_file():
+                candidates_by_path[candidate.resolve()] = latest.stat().st_mtime
+    candidates = list(candidates_by_path)
     if not candidates:
         raise FileNotFoundError(
-            f"No multiplier formal run with live statistics exists below {formal_root}"
+            "No multiplier formal run with a paired plan and live statistics was found. "
+            f"searched={search_roots} "
+            f"plans={[str(path) for path in sorted(set(discovered_plans))[-10:]]} "
+            f"statistics={[str(path) for path in sorted(set(discovered_statistics))[-10:]]}. "
+            "Set HUGINN_MULTIPLIER_LIVE_AUDIT_RUN_ROOT to the exact active run root if it is outside outputs."
         )
-    return max(candidates, key=lambda path: (path / "training_statistics/latest.json").stat().st_mtime)
+    return max(candidates, key=lambda path: candidates_by_path[path])
 
 
 def load_history(path: Path) -> list[dict[str, Any]]:
