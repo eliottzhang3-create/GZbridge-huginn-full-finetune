@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import sys
 from collections import Counter
 from contextlib import ExitStack
@@ -63,6 +65,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--save-step", type=int, default=4)
     parser.add_argument("--resume-step", type=int, default=6)
     parser.add_argument("--world-size", type=int, default=4)
+    parser.add_argument("--save-checkpoint", type=Path)
+    parser.add_argument("--resume-checkpoint", type=Path)
+    parser.add_argument("--artifact-fingerprint", type=Path)
+    parser.add_argument("--output-report", type=Path)
     return parser.parse_args()
 
 
@@ -73,6 +79,17 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict):
         raise TypeError(f"Checkpoint marker is not an object: {path}")
     return payload
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
 
 
 def validate_optimizer_groups(
@@ -574,6 +591,125 @@ def validate_forward_window(
     return pool_counts, pool_durations
 
 
+def consumed_template_records(records: list[dict[str, Any]], positions: set[int]) -> dict[int, dict[str, Any]]:
+    selected: dict[int, dict[str, Any]] = {}
+    identity_fields = (
+        "pool_name",
+        "uid",
+        "record_index",
+        "pool_occurrence_index",
+        "pool_epoch",
+        "pool_epoch_offset",
+    )
+    for record in records:
+        position = int(record["global_position"])
+        if position not in positions:
+            continue
+        previous = selected.get(position)
+        if previous is None:
+            selected[position] = record
+            continue
+        if any(previous.get(field) != record.get(field) for field in identity_fields):
+            raise AssertionError(
+                f"Template provenance changed across duplicate encodes at position {position}: "
+                f"first={previous} duplicate={record}"
+            )
+    if set(selected) != positions:
+        raise AssertionError(
+            f"Template provenance does not cover actual forward positions: "
+            f"expected={sorted(positions)} actual={sorted(selected)}"
+        )
+    return selected
+
+
+def provenance_entries(
+    forward_records: list[dict[str, Any]],
+    template_records: list[dict[str, Any]],
+    planner: DeterministicHierarchicalMixture,
+    pools: dict[str, Any],
+) -> list[dict[str, Any]]:
+    positions = {int(record["global_position"]) for record in forward_records}
+    templates = consumed_template_records(template_records, positions)
+    entries: list[dict[str, Any]] = []
+    for forward in sorted(forward_records, key=lambda record: int(record["global_position"])):
+        position = int(forward["global_position"])
+        selection = planner.selection(position)
+        atomic = pools[selection.pool_name].record(selection.record_index)
+        template = templates[position]
+        entry = {
+            "global_position": position,
+            "pool_name": str(forward["pool_name"]),
+            "record_index": int(forward["record_index"]),
+            "uid": str(template["uid"]),
+            "pool_occurrence_index": int(forward["pool_occurrence_index"]),
+            "pool_epoch": int(forward["pool_epoch"]),
+            "pool_epoch_offset": int(template["pool_epoch_offset"]),
+        }
+        expected = {
+            "global_position": position,
+            "pool_name": selection.pool_name,
+            "record_index": selection.record_index,
+            "uid": str(atomic["uid"]),
+            "pool_occurrence_index": selection.pool_occurrence_index,
+            "pool_epoch": selection.pool_epoch,
+            "pool_epoch_offset": selection.pool_epoch_offset,
+        }
+        if entry != expected:
+            raise AssertionError(
+                f"Actual forward provenance identity mismatch at position {position}: "
+                f"actual={entry} expected={expected}"
+            )
+        entries.append(entry)
+    return entries
+
+
+def provenance_digest(entries: list[dict[str, Any]]) -> str:
+    digest = hashlib.sha256()
+    for entry in sorted(entries, key=lambda value: int(value["global_position"])):
+        rendered = json.dumps(entry, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        digest.update(rendered.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def summarize_per_rank(
+    forward_records: list[dict[str, Any]],
+    entries: list[dict[str, Any]],
+    world_size: int,
+) -> dict[str, Any]:
+    entry_by_position = {int(entry["global_position"]): entry for entry in entries}
+    summary: dict[str, Any] = {}
+    for rank in range(world_size):
+        records = sorted(
+            (record for record in forward_records if int(record["rank"]) == rank),
+            key=lambda record: int(record["global_position"]),
+        )
+        rank_entries = [entry_by_position[int(record["global_position"])] for record in records]
+        positions = [int(record["global_position"]) for record in records]
+        pool_counts = Counter(str(record["pool_name"]) for record in records)
+        pool_durations = {
+            name: sum(
+                float(record["effective_duration_seconds"])
+                for record in records
+                if str(record["pool_name"]) == name
+            )
+            for name in POOL_ORDER
+        }
+        summary[str(rank)] = {
+            "sample_count": len(records),
+            "positions": positions,
+            "position_min": min(positions) if positions else None,
+            "position_max": max(positions) if positions else None,
+            "pool_sample_counts": {name: int(pool_counts[name]) for name in POOL_ORDER},
+            "pool_effective_duration_seconds": pool_durations,
+            "effective_duration_seconds": sum(pool_durations.values()),
+            "provenance_sha256": provenance_digest(rank_entries),
+        }
+    if sum(int(entry["sample_count"]) for entry in summary.values()) != len(forward_records):
+        raise AssertionError(f"Per-rank statistics do not sum to the forward window: {summary}")
+    return summary
+
+
 def validate_statistics_state(
     path: Path,
     expected_step: int,
@@ -635,6 +771,24 @@ def main() -> None:
     args = parse_args()
     if args.world_size != 4 or not (0 < args.save_step < args.resume_step):
         raise ValueError("Expected world_size=4 and 0 < save_step < resume_step")
+    enhanced_values = (
+        args.save_checkpoint,
+        args.resume_checkpoint,
+        args.artifact_fingerprint,
+        args.output_report,
+    )
+    if any(value is not None for value in enhanced_values) and not all(
+        value is not None for value in enhanced_values
+    ):
+        raise ValueError(
+            "Enhanced checkpoint audit requires --save-checkpoint, --resume-checkpoint, "
+            "--artifact-fingerprint, and --output-report together"
+        )
+    enhanced_enabled = all(value is not None for value in enhanced_values)
+    if enhanced_enabled:
+        for checkpoint in (args.save_checkpoint, args.resume_checkpoint):
+            if not checkpoint.is_dir() or not (checkpoint / "pytorch_model_fsdp_0").is_dir():
+                raise FileNotFoundError(f"Enhanced smoke checkpoint is incomplete: {checkpoint}")
     save_pids, save_launch_ids = validate_phase_markers(
         args.save_audit_dir, "save", 0, args.save_step, args.world_size
     )
@@ -700,6 +854,46 @@ def main() -> None:
                 f"save_template={save_counts} save_forward={save_forward_counts} "
                 f"resume_template={resume_counts} resume_forward={resume_forward_counts}"
             )
+        if enhanced_enabled:
+            save_entries = provenance_entries(
+                save_forward_records,
+                save_records,
+                planner,
+                pools,
+            )
+            resume_entries = provenance_entries(
+                resume_forward_records,
+                resume_records,
+                planner,
+                pools,
+            )
+            combined_entries = sorted(
+                save_entries + resume_entries,
+                key=lambda entry: int(entry["global_position"]),
+            )
+            provenance_digests = {
+                "algorithm": "sha256_ordered_canonical_jsonl_v1",
+                "save": provenance_digest(save_entries),
+                "resume_delta": provenance_digest(resume_entries),
+                "cumulative": provenance_digest(combined_entries),
+            }
+            per_rank_statistics = {
+                "save": summarize_per_rank(
+                    save_forward_records,
+                    save_entries,
+                    args.world_size,
+                ),
+                "resume_delta": summarize_per_rank(
+                    resume_forward_records,
+                    resume_entries,
+                    args.world_size,
+                ),
+                "cumulative": summarize_per_rank(
+                    save_forward_records + resume_forward_records,
+                    combined_entries,
+                    args.world_size,
+                ),
+            }
         combined_forward_records = save_forward_records + resume_forward_records
         epoch_record_keys = [
             (str(record["pool_name"]), int(record["pool_epoch"]), int(record["record_index"]))
@@ -745,6 +939,65 @@ def main() -> None:
                 )
         if int(save_state["next_global_position"]) != args.save_step * args.world_size:
             raise AssertionError(f"Save statistics did not persist the exact resume position: {save_state}")
+    if enhanced_enabled:
+        artifact_fingerprint = read_json(args.artifact_fingerprint)
+        if (
+            artifact_fingerprint.get("gate")
+            != "huginn_whisper_dynamic30s_smoke_data_identity_v1"
+            or artifact_fingerprint.get("hash_algorithm") != "sha256"
+        ):
+            raise AssertionError(f"Invalid data artifact fingerprint: {artifact_fingerprint}")
+        checkpoint_fingerprint_paths = {
+            "save": args.save_checkpoint / "smoke_data_artifact_fingerprint.json",
+            "resume": args.resume_checkpoint / "smoke_data_artifact_fingerprint.json",
+        }
+        for checkpoint_role, checkpoint_fingerprint_path in checkpoint_fingerprint_paths.items():
+            checkpoint_fingerprint = read_json(checkpoint_fingerprint_path)
+            if checkpoint_fingerprint != artifact_fingerprint:
+                raise AssertionError(
+                    f"{checkpoint_role} checkpoint data identity does not match the frozen "
+                    f"smoke fingerprint: checkpoint={checkpoint_fingerprint_path}"
+                )
+        save_sidecar = {
+            "gate": "huginn_whisper_dynamic30s_smoke_checkpoint_rank_statistics_v1",
+            "checkpoint_role": "save",
+            "global_step": args.save_step,
+            "provenance_digest": provenance_digests["save"],
+            "per_rank": per_rank_statistics["save"],
+            "data_artifact_fingerprint": artifact_fingerprint,
+        }
+        resume_sidecar = {
+            "gate": "huginn_whisper_dynamic30s_smoke_checkpoint_rank_statistics_v1",
+            "checkpoint_role": "resume",
+            "global_step": args.resume_step,
+            "provenance_digests": provenance_digests,
+            "per_rank_resume_delta": per_rank_statistics["resume_delta"],
+            "per_rank_cumulative": per_rank_statistics["cumulative"],
+            "data_artifact_fingerprint": artifact_fingerprint,
+        }
+        save_sidecar_path = args.save_checkpoint / "smoke_rank_statistics.json"
+        resume_sidecar_path = args.resume_checkpoint / "smoke_rank_statistics.json"
+        write_json_atomic(save_sidecar_path, save_sidecar)
+        write_json_atomic(resume_sidecar_path, resume_sidecar)
+        report = {
+            "gate": "huginn_whisper_dynamic30s_enhanced_checkpoint_resume_smoke_v1",
+            "validation_passed": True,
+            "save_step": args.save_step,
+            "resume_step": args.resume_step,
+            "world_size": args.world_size,
+            "provenance_digests": provenance_digests,
+            "per_rank_statistics": per_rank_statistics,
+            "data_artifact_fingerprint": artifact_fingerprint,
+            "checkpoint_sidecars": {
+                "save": str(save_sidecar_path.resolve()),
+                "resume": str(resume_sidecar_path.resolve()),
+            },
+            "checkpoint_data_identity": {
+                role: str(path.resolve())
+                for role, path in checkpoint_fingerprint_paths.items()
+            },
+        }
+        write_json_atomic(args.output_report, report)
     print(
         f"[process-groups] save_launch={sorted(save_launch_ids)} resume_launch={sorted(resume_launch_ids)} "
         f"save_pids={sorted(save_pids)} resume_pids={sorted(resume_pids)} distinct_launches=true"
@@ -756,6 +1009,16 @@ def main() -> None:
         f"resume_delta_effective_hours={sum(resume_forward_durations.values()) / 3600.0:.9f} "
         "prefetch_counted_in_statistics=false four_rank_aggregation=true"
     )
+    if enhanced_enabled:
+        print(
+            f"[provenance-digest] algorithm={provenance_digests['algorithm']} "
+            f"save={provenance_digests['save']} resume_delta={provenance_digests['resume_delta']} "
+            f"cumulative={provenance_digests['cumulative']}"
+        )
+        print(
+            f"[rank-statistics] save={save_sidecar_path} resume={resume_sidecar_path} "
+            f"report={args.output_report.resolve()}"
+        )
     print("========== HUGINN WHISPER DYNAMIC30S CHECKPOINT RESUME MARKERS PASSED ==========")
 
 

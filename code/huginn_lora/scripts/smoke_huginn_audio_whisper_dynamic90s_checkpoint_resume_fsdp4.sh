@@ -39,18 +39,21 @@ FORWARD_AUDIT_DIR="$RUN_ROOT/forward_consumption_audits"
 TRAINING_STATS_DIR="$RUN_ROOT/training_statistics"
 FSDP_CONFIG_PATH="$RUN_ROOT/fsdp2_checkpoint_accelerated.json"
 CONTENT_REPORT="$RUN_ROOT/checkpoint_content_report.json"
+ENHANCED_AUDIT_REPORT="$RUN_ROOT/enhanced_checkpoint_resume_audit.json"
+DATA_ARTIFACT_FINGERPRINT="$RUN_ROOT/data_artifact_fingerprint.json"
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-dynamic90s-v1"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py"
 REGISTRY="${HUGINN_DYNAMIC90S_POOL_REGISTRY:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/pool_registry.json}"
 REALDATA_REPORT="${HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/real_data_chain_report.json}"
 SAMPLER_REPORT="${HUGINN_DYNAMIC90S_SAMPLER_REPORT:-$REPO_ROOT/data/audio_swift/huginn_whisper_dynamic90s_multitask/v2_dynamic30s/sampler/mixture_sampler_report.json}"
 MARKER_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_checkpoint_resume_markers.py"
-CHECKPOINT_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_fsdp_checkpoints.py"
+CHECKPOINT_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_smoke_fsdp_checkpoints.py"
+DATA_INTEGRITY_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_smoke_data_integrity.py"
 MODULES_TO_SAVE=(temporal_compressor audio_projector audio_boundary_embeddings)
 
 for required_path in \
   "$MODEL_PATH" "$PLUGIN_PATH" "$REGISTRY" "$REALDATA_REPORT" "$SAMPLER_REPORT" \
-  "$MARKER_INSPECTOR" "$CHECKPOINT_INSPECTOR"; do
+  "$MARKER_INSPECTOR" "$CHECKPOINT_INSPECTOR" "$DATA_INTEGRITY_INSPECTOR"; do
   if [ ! -e "$required_path" ]; then
     echo "Required checkpoint smoke path is missing: $required_path" >&2
     exit 1
@@ -142,6 +145,11 @@ print(
     'dataset_quota=sufficient task_prompts=distinct lora_llm_mixed_tuning_contract=present'
 )
 PY
+
+python -u "$DATA_INTEGRITY_INSPECTOR" self-test
+python -u "$DATA_INTEGRITY_INSPECTOR" freeze \
+  --registry "$REGISTRY" \
+  --output "$DATA_ARTIFACT_FINGERPRINT"
 
 FSDP_CONFIG='{"fsdp":"full_shard auto_wrap","fsdp_config":{"activation_checkpointing":true,"auto_wrap_policy":"TRANSFORMER_BASED_WRAP","cpu_ram_efficient_loading":true,"fsdp_version":2,"reshard_after_forward":true,"state_dict_type":"SHARDED_STATE_DICT"}}'
 printf '%s\n' "$FSDP_CONFIG" > "$FSDP_CONFIG_PATH"
@@ -335,10 +343,20 @@ if [ ! -s "$SAVE_RUNTIME_CONTRACT" ]; then
   echo "Saved checkpoint is missing the accelerated runtime contract: $SAVE_RUNTIME_CONTRACT" >&2
   exit 1
 fi
+SAVE_GLOBAL_POSITION=$((SAVE_STEP * WORLD_SIZE * PER_DEVICE_BATCH * GRADIENT_ACCUMULATION_STEPS))
+python -u "$DATA_INTEGRITY_INSPECTOR" verify \
+  --registry "$REGISTRY" \
+  --fingerprint "$DATA_ARTIFACT_FINGERPRINT"
+python -u "$DATA_INTEGRITY_INSPECTOR" verify-resume-state \
+  --registry "$REGISTRY" \
+  --state "$SAVE_STATS_STATE" \
+  --seed "$SEED" \
+  --start-position "$SAVE_GLOBAL_POSITION"
+cp "$DATA_ARTIFACT_FINGERPRINT" "$SAVE_CHECKPOINT/smoke_data_artifact_fingerprint.json"
 
 # The first torchrun has completely exited before this function starts.
 run_resume_phase() {
-  export HUGINN_DYNAMIC90S_MIXTURE_START_POSITION=$((SAVE_STEP * WORLD_SIZE * PER_DEVICE_BATCH))
+  export HUGINN_DYNAMIC90S_MIXTURE_START_POSITION="$SAVE_GLOBAL_POSITION"
   export HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_PHASE=resume
   export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE=resume
   export HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE="$SAVE_STATS_STATE"
@@ -405,6 +423,10 @@ if [ ! -s "$RESUME_RUNTIME_CONTRACT" ]; then
   echo "Resumed checkpoint is missing the accelerated runtime contract: $RESUME_RUNTIME_CONTRACT" >&2
   exit 1
 fi
+python -u "$DATA_INTEGRITY_INSPECTOR" verify \
+  --registry "$REGISTRY" \
+  --fingerprint "$DATA_ARTIFACT_FINGERPRINT"
+cp "$DATA_ARTIFACT_FINGERPRINT" "$RESUME_CHECKPOINT/smoke_data_artifact_fingerprint.json"
 
 python -u "$MARKER_INSPECTOR" \
   --save-audit-dir "$SAVE_AUDIT_DIR" \
@@ -417,7 +439,11 @@ python -u "$MARKER_INSPECTOR" \
   --seed "$SEED" \
   --save-step "$SAVE_STEP" \
   --resume-step "$RESUME_STEP" \
-  --world-size "$WORLD_SIZE"
+  --world-size "$WORLD_SIZE" \
+  --save-checkpoint "$SAVE_CHECKPOINT" \
+  --resume-checkpoint "$RESUME_CHECKPOINT" \
+  --artifact-fingerprint "$DATA_ARTIFACT_FINGERPRINT" \
+  --output-report "$ENHANCED_AUDIT_REPORT"
 
 python -u "$CHECKPOINT_INSPECTOR" \
   --save-checkpoint "$SAVE_CHECKPOINT" \
@@ -431,3 +457,4 @@ echo "========== HUGINN WHISPER DYNAMIC30S CHECKPOINT RESUME FSDP4 PASSED ======
 echo "save_checkpoint=$SAVE_CHECKPOINT"
 echo "resume_checkpoint=$RESUME_CHECKPOINT"
 echo "content_report=$CONTENT_REPORT"
+echo "enhanced_audit_report=$ENHANCED_AUDIT_REPORT"
