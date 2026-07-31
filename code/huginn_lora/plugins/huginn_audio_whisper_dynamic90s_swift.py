@@ -54,9 +54,12 @@ DEFAULT_MAX_AUDIO_SECONDS = 30.0
 WHISPER_MAX_FEATURE_FRAMES = 3000
 WHISPER_FEATURE_HOP_LENGTH = 160
 WHISPER_ENCODER_DOWNSAMPLE = 2
-DYNAMIC_COMPRESSOR_KERNEL = 8
-DYNAMIC_COMPRESSOR_STRIDE = 8
-AUDIO_TOKEN_DURATION_MS = 160
+DYNAMIC_COMPRESSOR_KERNEL = 12
+DYNAMIC_COMPRESSOR_STRIDE = 12
+AUDIO_TOKEN_DURATION_MS = 240
+AUDIO_REFERENCE_30S_TOKEN_COUNT = 125
+AUDIO_MAX_PREFIX_TOKEN_COUNT = 127
+AUDIO_POOLING_TYPE = "conv1d_stride12_dynamic30s"
 DYNAMIC_LORA_DROPOUT = 0.05
 _DERIVED_AUDIO_TOKEN_DURATION_MS = (
     WHISPER_FEATURE_HOP_LENGTH
@@ -1158,7 +1161,7 @@ def normalize_audio_array(audio: np.ndarray) -> np.ndarray:
 class WhisperAudioPlan:
     """Production duration plan shared by preprocessing and validation.
 
-    Token counts are dynamic. A complete 160 ms block produces one audio
+    Token counts are dynamic. A complete 240 ms block produces one audio
     token; shorter residual tails are not padded into an additional token.
     """
 
@@ -2772,7 +2775,7 @@ def _build_dynamic30s_training_runtime_contract(
     formal_training: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     contract = {
-        "gate": "huginn_whisper_dynamic30s_training_runtime_contract_v1",
+        "gate": "huginn_whisper_dynamic30s_240ms_training_runtime_contract_v2",
         "phase": phase,
         "global_step": int(global_step),
         "world_size": int(world_size),
@@ -2810,8 +2813,8 @@ def _build_dynamic30s_training_runtime_contract(
         },
         "audio": {
             "maximum_seconds": 30.0,
-            "token_duration_ms": 160,
-            "maximum_content_tokens": 187,
+            "token_duration_ms": AUDIO_TOKEN_DURATION_MS,
+            "maximum_content_tokens": AUDIO_REFERENCE_30S_TOKEN_COUNT,
             "trainable_boundary_tokens": ["audio_bos", "audio_eos"],
         },
         "loss": {
@@ -2906,6 +2909,70 @@ def _module_mro_names(module: torch.nn.Module | None) -> list[str]:
     if module is None:
         return []
     return [base.__name__ for base in type(module).__mro__]
+
+
+def _audit_dynamic_audio_tokenization(model: torch.nn.Module, *, context: str) -> dict[str, Any]:
+    audio_models = [
+        module
+        for module in model.modules()
+        if "HuginnAudioForConditionalGeneration" in _module_mro_names(module)
+    ]
+    if len(audio_models) != 1:
+        raise RuntimeError(
+            f"{context} expected one concrete Huginn audio model, found "
+            f"{[type(module).__name__ for module in audio_models]}"
+        )
+    audio_model = audio_models[0]
+    compressors = [
+        module
+        for module in audio_model.modules()
+        if "TrainableTemporalCompressor" in _module_mro_names(module)
+    ]
+    if not compressors:
+        raise RuntimeError(f"{context} found no temporal compressor implementation")
+    observed = []
+    for compressor in compressors:
+        conv = getattr(compressor, "downsample", None)
+        kernel = int(getattr(compressor, "kernel_size", -1))
+        stride = int(getattr(compressor, "stride", -1))
+        conv_kernel = tuple(int(value) for value in getattr(conv, "kernel_size", ()))
+        conv_stride = tuple(int(value) for value in getattr(conv, "stride", ()))
+        observed.append(
+            {
+                "kernel_size": kernel,
+                "stride": stride,
+                "conv_kernel_size": conv_kernel,
+                "conv_stride": conv_stride,
+            }
+        )
+    expected_module = {
+        "kernel_size": DYNAMIC_COMPRESSOR_KERNEL,
+        "stride": DYNAMIC_COMPRESSOR_STRIDE,
+        "conv_kernel_size": (DYNAMIC_COMPRESSOR_KERNEL,),
+        "conv_stride": (DYNAMIC_COMPRESSOR_STRIDE,),
+    }
+    config = audio_model.config
+    expected_config = {
+        "audio_pooling_type": AUDIO_POOLING_TYPE,
+        "audio_token_duration_ms": AUDIO_TOKEN_DURATION_MS,
+        "audio_reference_30s_token_count": AUDIO_REFERENCE_30S_TOKEN_COUNT,
+        "audio_max_token_count": AUDIO_REFERENCE_30S_TOKEN_COUNT,
+        "audio_compressor_kernel_size": DYNAMIC_COMPRESSOR_KERNEL,
+        "audio_compressor_stride": DYNAMIC_COMPRESSOR_STRIDE,
+    }
+    actual_config = {key: getattr(config, key, None) for key in expected_config}
+    if any(item != expected_module for item in observed) or actual_config != expected_config:
+        raise RuntimeError(
+            f"{context} dynamic 240-ms audio-token contract mismatch: "
+            f"compressors={observed} config={actual_config}"
+        )
+    return {
+        "token_duration_ms": AUDIO_TOKEN_DURATION_MS,
+        "maximum_content_tokens": AUDIO_REFERENCE_30S_TOKEN_COUNT,
+        "maximum_prefix_tokens": AUDIO_MAX_PREFIX_TOKEN_COUNT,
+        "compressors": observed,
+        "config": actual_config,
+    }
 
 
 def _audit_activation_checkpoint_wrappers(model: torch.nn.Module) -> list[dict[str, Any]]:
@@ -3825,7 +3892,7 @@ def patch_acceleration_stage2_callback() -> None:
             prefix_tokens = list(
                 getattr(audio_model, "_huginn_audio_acceleration_stage2_prefix_tokens", [])
             )
-            if prefix_tokens != [189] * 8:
+            if prefix_tokens != [AUDIO_MAX_PREFIX_TOKEN_COUNT] * 8:
                 raise RuntimeError(
                     "Acceleration Stage 2 requires eight exact 30-second prefixes per rank: "
                     f"observed={prefix_tokens}"
@@ -3837,8 +3904,10 @@ def patch_acceleration_stage2_callback() -> None:
             loss_contract = {
                 "full_labels_shape": list(full_labels.shape),
                 "shift_labels_shape": list(shift_labels.shape),
-                "prefix_tokens": 189,
-                "prefix_labels_all_ignored": bool(full_labels[:, :189].eq(-100).all().item()),
+                "prefix_tokens": AUDIO_MAX_PREFIX_TOKEN_COUNT,
+                "prefix_labels_all_ignored": bool(
+                    full_labels[:, :AUDIO_MAX_PREFIX_TOKEN_COUNT].eq(-100).all().item()
+                ),
                 "supervised_shift_tokens": int(shift_labels.ne(-100).sum().item()),
                 "shift_length_valid": int(shift_labels.size(1)) == int(full_labels.size(1)) - 1,
             }
@@ -3874,8 +3943,8 @@ def patch_acceleration_stage2_callback() -> None:
                 "gradient_accumulation_steps": 4,
                 "global_batch_size": 32,
                 "synthetic_audio_seconds": 30.0,
-                "expected_audio_tokens": 187,
-                "expected_prefix_tokens": 189,
+                "expected_audio_tokens": AUDIO_REFERENCE_30S_TOKEN_COUNT,
+                "expected_prefix_tokens": AUDIO_MAX_PREFIX_TOKEN_COUNT,
                 "observed_prefix_tokens": prefix_tokens,
                 "core_forward_calls": self.core_forward_calls,
                 "vit_gradient_checkpointing_arg": False,
@@ -4396,7 +4465,7 @@ def patch_realdata_stability_callback() -> None:
             if (
                 audio_statistics["realized_audio_tokens"] <= 0
                 or audio_statistics["min_audio_tokens"] < 0
-                or audio_statistics["max_audio_tokens"] > 187
+                or audio_statistics["max_audio_tokens"] > AUDIO_REFERENCE_30S_TOKEN_COUNT
                 or audio_statistics["min_audio_tokens"] > audio_statistics["max_audio_tokens"]
             ):
                 raise RuntimeError(f"Invalid real-data dynamic audio-token statistics: {audio_statistics}")
@@ -4675,6 +4744,10 @@ def patch_checkpoint_resume_callback() -> None:
                 self.tracked_model,
                 context=f"Checkpoint {phase} phase",
             )
+            self.audio_tokenization_audit = _audit_dynamic_audio_tokenization(
+                self.tracked_model,
+                context=f"Checkpoint {phase} phase",
+            )
             self.whisper_gradient_checkpoint_modules = _whisper_gradient_checkpoint_modules(self.tracked_model)
             if bool(getattr(args, "vit_gradient_checkpointing", False)) or self.whisper_gradient_checkpoint_modules:
                 raise RuntimeError(
@@ -4926,7 +4999,7 @@ def patch_checkpoint_resume_callback() -> None:
             }
             if (
                 prefix_length <= 2
-                or prefix_length > 189
+                or prefix_length > AUDIO_MAX_PREFIX_TOKEN_COUNT
                 or not loss_contract["prefix_labels_all_ignored"]
                 or not loss_contract["shift_length_valid"]
                 or loss_contract["supervised_shift_tokens"] <= 0
@@ -5126,9 +5199,13 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
                 boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
                 valid_prefix_tokens = [int(value) for value in prefix_mask.sum(dim=1).tolist()]
                 valid_audio_tokens = [value - boundary_tokens for value in valid_prefix_tokens]
-                if not valid_audio_tokens or any(value < 0 or value > 187 for value in valid_audio_tokens):
+                if not valid_audio_tokens or any(
+                    value < 0 or value > AUDIO_REFERENCE_30S_TOKEN_COUNT
+                    for value in valid_audio_tokens
+                ):
                     raise RuntimeError(
-                        "Real-data runtime audio-token count is outside [0, 187]: "
+                        f"Real-data runtime audio-token count is outside "
+                        f"[0, {AUDIO_REFERENCE_30S_TOKEN_COUNT}]: "
                         f"prefix_tokens={valid_prefix_tokens} boundary_tokens={boundary_tokens}"
                     )
                 if not hasattr(self, "_huginn_audio_realdata_sample_count"):
@@ -5158,7 +5235,9 @@ def patch_huginn_audio_train_chain_audit(model: torch.nn.Module) -> None:
             )
             boundary_tokens = int(self.audio_bos is not None) + int(self.audio_eos is not None)
             valid_prefix_tokens = prefix_mask.sum(dim=1).tolist()
-            max_audio_tokens = int(getattr(self.config, "audio_max_token_count", 187))
+            max_audio_tokens = int(
+                getattr(self.config, "audio_max_token_count", AUDIO_REFERENCE_30S_TOKEN_COUNT)
+            )
             if any(tokens < boundary_tokens or tokens - boundary_tokens > max_audio_tokens for tokens in valid_prefix_tokens):
                 raise RuntimeError(
                     "Audio prefix token count exceeds dynamic bounds: "
@@ -5226,9 +5305,10 @@ def build_huginn_audio_model(model_dir: str):
     config.audio_encoder_name = str(WHISPER_MODEL_DIR)
     config.audio_encoder_hidden_size = int(getattr(whisper_config, "d_model", 1280))
     config.audio_dynamic_tokens = True
+    config.audio_pooling_type = AUDIO_POOLING_TYPE
     config.audio_token_duration_ms = AUDIO_TOKEN_DURATION_MS
-    config.audio_reference_30s_token_count = 187
-    config.audio_max_token_count = 187
+    config.audio_reference_30s_token_count = AUDIO_REFERENCE_30S_TOKEN_COUNT
+    config.audio_max_token_count = AUDIO_REFERENCE_30S_TOKEN_COUNT
     config.audio_chunk_seconds = DEFAULT_AUDIO_CHUNK_SECONDS
     config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
     config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL
@@ -5431,9 +5511,10 @@ class HuginnAudioLoader(ModelLoader):
         config.audio_encoder_name = str(WHISPER_MODEL_DIR)
         config.audio_encoder_hidden_size = int(getattr(whisper_config, "d_model", 1280))
         config.audio_dynamic_tokens = True
+        config.audio_pooling_type = AUDIO_POOLING_TYPE
         config.audio_token_duration_ms = AUDIO_TOKEN_DURATION_MS
-        config.audio_reference_30s_token_count = 187
-        config.audio_max_token_count = 187
+        config.audio_reference_30s_token_count = AUDIO_REFERENCE_30S_TOKEN_COUNT
+        config.audio_max_token_count = AUDIO_REFERENCE_30S_TOKEN_COUNT
         config.audio_chunk_seconds = DEFAULT_AUDIO_CHUNK_SECONDS
         config.audio_max_seconds = DEFAULT_MAX_AUDIO_SECONDS
         config.audio_compressor_kernel_size = DYNAMIC_COMPRESSOR_KERNEL

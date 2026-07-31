@@ -12,9 +12,9 @@
     "long_audio_policy": "retain every eligible dataset record and decode only the first 30 seconds",
     "whisper_feature_hop_samples": 160,
     "whisper_encoder_downsample": 2,
-    "compressor_kernel": 8,
-    "compressor_stride": 8,
-    "audio_token_duration_ms": 160,
+    "compressor_kernel": 12,
+    "compressor_stride": 12,
+    "audio_token_duration_ms": 240,
     "storage_policy": "Keep source audio read-only and decode/resample at training time; any materialized cache must be private.",
     "accepted_source_formats_for_inventory": [
       ".wav",

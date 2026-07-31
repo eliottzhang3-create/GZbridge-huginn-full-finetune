@@ -61,8 +61,15 @@ def main() -> None:
         raise ValueError("Multiplier formal checkpoint audit requires world_size=4")
     plan = load_json(args.plan.expanduser().resolve())
     if (
-        plan.get("plan_version") != "huginn_dynamic30s_multiplier_single_epoch_plan_v1"
+        plan.get("plan_version")
+        != "huginn_dynamic30s_240ms_multiplier_single_epoch_plan_v2"
         or plan.get("sampler_version") != SAMPLER_VERSION
+        or plan.get("training_contract", {}).get("audio")
+        != {
+            "maximum_seconds": 30.0,
+            "token_duration_ms": 240,
+            "maximum_content_tokens": 125,
+        }
     ):
         raise ValueError(f"Invalid multiplier formal plan: {plan}")
     max_steps = int(plan["max_steps"])

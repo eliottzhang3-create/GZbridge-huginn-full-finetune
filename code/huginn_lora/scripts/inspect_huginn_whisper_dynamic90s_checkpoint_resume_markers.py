@@ -356,7 +356,7 @@ def validate_phase_markers(
         validate_lora_runtime(end, phase=phase, rank=rank)
         loss_contract = end.get("loss_contract", {})
         if (
-            not (2 < int(loss_contract.get("prefix_length", 0)) <= 189)
+            not (2 < int(loss_contract.get("prefix_length", 0)) <= 127)
             or loss_contract.get("prefix_labels_all_ignored") is not True
             or loss_contract.get("shift_length_valid") is not True
             or int(loss_contract.get("supervised_shift_tokens", 0)) <= 0

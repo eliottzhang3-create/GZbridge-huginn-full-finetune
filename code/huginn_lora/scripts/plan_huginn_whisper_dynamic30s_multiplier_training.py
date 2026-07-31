@@ -97,7 +97,7 @@ def main() -> None:
     if checkpoint_steps != sorted(set(checkpoint_steps)):
         raise AssertionError(f"Invalid multiplier checkpoint schedule: {checkpoint_steps}")
     plan = {
-        "plan_version": "huginn_dynamic30s_multiplier_single_epoch_plan_v1",
+        "plan_version": "huginn_dynamic30s_240ms_multiplier_single_epoch_plan_v2",
         "step_policy": "finite_expanded_pool_exactly_one_global_epoch",
         "sampler_version": SAMPLER_VERSION,
         "sampler_epoch_policy": "one_frozen_global_permutation_no_wraparound",
@@ -143,7 +143,11 @@ def main() -> None:
             "huginn_native_backbone_trainable": False,
             "learning_rates": {"whisper": 1e-4, "aligner": 1e-4, "lora": 1e-4},
             "lora": {"rank": 8, "alpha": 16, "dropout": 0.05},
-            "audio": {"maximum_seconds": 30.0, "token_duration_ms": 160},
+            "audio": {
+                "maximum_seconds": 30.0,
+                "token_duration_ms": 240,
+                "maximum_content_tokens": 125,
+            },
             "loss": "assistant_response_only_shifted_next_token_prediction",
         },
     }

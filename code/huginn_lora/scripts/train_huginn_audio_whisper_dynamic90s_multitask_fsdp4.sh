@@ -249,7 +249,7 @@ expected_formal = {
     "total_scheduled_samples": int(current_plan["total_scheduled_samples"]),
 }
 if (
-    runtime.get("gate") != "huginn_whisper_dynamic30s_training_runtime_contract_v1"
+    runtime.get("gate") != "huginn_whisper_dynamic30s_240ms_training_runtime_contract_v2"
     or runtime.get("phase") != "formal_checkpoint"
     or resume_step not in checkpoint_steps[:-1]
     or formal != expected_formal
@@ -351,7 +351,7 @@ echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH accumulation=$GR
 echo "target_realized_hours_gt=$TARGET_HOURS max_steps_policy=user_fixed_no_duration_estimation"
 echo "max_steps=$MAX_STEPS halfway_step=$HALFWAY_STEP total_scheduled_samples=$TOTAL_SAMPLES"
 echo "checkpoints=$CHECKPOINT_STEPS_CSV checkpoint_interval=$CHECKPOINT_INTERVAL_FROM_PLAN save_total_limit=4 full_model_dcp=true"
-echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=160ms padding=local_batch_longest labels=-100"
+echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=240ms max_content_tokens=125 padding=local_batch_longest labels=-100"
 echo "whisper=fully_trainable aligner=fully_trainable huginn_backbone=frozen huginn_lora_only=true"
 echo "learning_rates=whisper:$WHISPER_LR,aligner:$ALIGNER_LR,lora:$LEARNING_RATE"
 echo "lora=rank8,alpha16,dropout0.05 scheduler=cosine warmup_ratio=$WARMUP_RATIO weight_decay=$WEIGHT_DECAY max_grad_norm=$MAX_GRAD_NORM"

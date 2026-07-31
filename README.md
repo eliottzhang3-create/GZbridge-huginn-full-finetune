@@ -2308,8 +2308,8 @@ their active runtime semantics are now:
 - source duration `>30s`: decode and retain only the first `30s`;
 - source duration `<=30s`: retain the real duration;
 - no 2/3-chunk splitting or concatenation; every local sample has exactly one Whisper chunk;
-- one Conv1d compressor with kernel `8`, stride `8`, padding `0`, giving one token per complete `160ms`;
-- a complete 30-second input produces `187` audio tokens, plus trainable audio BOS/EOS; shorter inputs remain dynamic;
+- one Conv1d compressor with kernel `12`, stride `12`, padding `0`, giving one token per complete `240ms`;
+- a complete 30-second input produces `125` audio tokens, plus trainable audio BOS/EOS; shorter inputs remain dynamic;
 - local-batch audio-prefix padding is still only to that rank's longest sample and padded prefix positions remain `-100`;
 - Whisper, the complete aligner, and Huginn-only rank-8 LoRA remain trainable at `1e-4`; the native Huginn backbone
   and LM head remain frozen.
@@ -2386,8 +2386,8 @@ unless the dedicated Stage 2 environment variable is present. The Stage 2 candid
 training; Stage 0/1/2 audit modes remain unset in those production paths.
 
 The Stage 2 gate generates one deterministic mono 16-kHz 30-second WAV and 64 synthetic manifest rows, then consumes
-one complete B2/FSDP4/GA4 global batch of 32 samples. Every sample must produce exactly 187 audio content tokens and 189
-valid prefix tokens including trainable audio BOS/EOS; every rank must observe eight 189-token prefixes. It retains
+one complete B2/FSDP4/GA4 global batch of 32 samples. Every sample must produce exactly 125 audio content tokens and 127
+valid prefix tokens including trainable audio BOS/EOS; every rank must observe eight 127-token prefixes. It retains
 Whisper SDPA, one outer complete-Whisper checkpoint, zero internal Whisper checkpoint modules, all existing per-block
 activation-checkpoint wrappers, trainable Whisper + aligner + Huginn-only LoRA, and response-only shifted NTP loss. The
 gate records recurrent-core forward counts, finite gradients/losses, wall time, and peak CUDA memory. It fails if peak

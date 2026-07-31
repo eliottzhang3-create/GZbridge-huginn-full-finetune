@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Audit the single-chunk 30-second / 160-ms Huginn Whisper contract."""
+"""Audit the single-chunk 30-second / 240-ms Huginn Whisper contract."""
 
 from __future__ import annotations
 
@@ -15,8 +15,8 @@ PLUGIN_SOURCE = REPO_ROOT / "code/huginn_lora/plugins/huginn_audio_whisper_dynam
 SAMPLE_RATE = 16000
 FEATURE_HOP = 160
 ENCODER_DOWNSAMPLE = 2
-KERNEL = 8
-STRIDE = 8
+KERNEL = 12
+STRIDE = 12
 RETAIN_SECONDS = 30.0
 
 
@@ -35,14 +35,14 @@ def main() -> None:
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
     data_contract = json.loads(DATA_CONTRACT_PATH.read_text(encoding="utf-8"))
     expected = {
-        "audio_pooling_type": "conv1d_stride8_dynamic30s",
-        "audio_token_duration_ms": 160,
-        "audio_reference_30s_token_count": 187,
-        "audio_max_token_count": 187,
+        "audio_pooling_type": "conv1d_stride12_dynamic30s",
+        "audio_token_duration_ms": 240,
+        "audio_reference_30s_token_count": 125,
+        "audio_max_token_count": 125,
         "audio_chunk_seconds": 30.0,
         "audio_max_seconds": 30.0,
-        "audio_compressor_kernel_size": 8,
-        "audio_compressor_stride": 8,
+        "audio_compressor_kernel_size": 12,
+        "audio_compressor_stride": 12,
     }
     mismatches = {
         key: {"actual": config.get(key), "expected": value}
@@ -61,22 +61,23 @@ def main() -> None:
         raise AssertionError(f"Dynamic-30s data duration policy mismatch: {runtime_contract}")
 
     derived_ms = FEATURE_HOP * ENCODER_DOWNSAMPLE * STRIDE * 1000 // SAMPLE_RATE
-    if derived_ms != 160:
+    if derived_ms != 240:
         raise AssertionError(f"Derived token duration changed: {derived_ms}ms")
 
     cases = {
         0.08: 0,
-        0.16: 1,
-        1.0: 6,
-        10.0: 62,
-        29.999: 187,
-        30.0: 187,
-        30.001: 187,
-        60.0: 187,
-        90.0: 187,
-        90.001: 187,
-        120.0: 187,
-        3600.0: 187,
+        0.16: 0,
+        0.24: 1,
+        1.0: 4,
+        10.0: 41,
+        29.999: 124,
+        30.0: 125,
+        30.001: 125,
+        60.0: 125,
+        90.0: 125,
+        90.001: 125,
+        120.0: 125,
+        3600.0: 125,
     }
     observed = {duration: token_count(duration) for duration in cases}
     if observed != cases:
@@ -105,7 +106,7 @@ def main() -> None:
         raise AssertionError(f"Obsolete duration-discard guards remain: {present_forbidden}")
 
     print("========== HUGINN WHISPER DYNAMIC30S CONTRACT PASSED ==========")
-    print(f"[contract] token_duration_ms={derived_ms} max_audio_tokens=187 boundary_tokens=2")
+    print(f"[contract] token_duration_ms={derived_ms} max_audio_tokens=125 boundary_tokens=2")
     print(f"[contract] duration_cases={observed}")
     print("[contract] chunks_per_sample=1 local_batch_prefix_padding=true retain_all_cap_at_30s=true")
 

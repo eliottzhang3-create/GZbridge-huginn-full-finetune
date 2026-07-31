@@ -187,7 +187,7 @@ echo "checkpoint_state=model+optimizer+scheduler+rng+trainer_global_step+no_repl
 echo "lr_scheduler=constant learning_rate=1e-4"
 echo "modules_to_save=${MODULES_TO_SAVE[*]}"
 echo "whisper_encoder=fully_trainable learning_rate=1e-4 aligner_lr=1e-4"
-echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=160ms"
+echo "audio=single_dynamic_chunk retain_all_retain_first30s token_rate=240ms"
 echo "activation_checkpointing=true gradient_checkpointing=false vit_gradient_checkpointing=false use_reentrant=false"
 echo "fsdp_reshard=whisper_true aligner_true prelude_true recurrent_core_false coda_true"
 echo "pytorch_cuda_alloc_conf=$PYTORCH_CUDA_ALLOC_CONF"

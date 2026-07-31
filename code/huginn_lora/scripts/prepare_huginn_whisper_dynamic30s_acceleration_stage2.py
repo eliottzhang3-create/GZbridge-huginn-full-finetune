@@ -15,8 +15,8 @@ from pathlib import Path
 SAMPLE_RATE = 16_000
 DURATION_SECONDS = 30.0
 EXPECTED_SEGMENTS = 1
-EXPECTED_AUDIO_TOKENS = 187
-EXPECTED_PREFIX_TOKENS = 189
+EXPECTED_AUDIO_TOKENS = 125
+EXPECTED_PREFIX_TOKENS = 127
 RECORD_COUNT = 64
 
 
@@ -90,7 +90,7 @@ def main() -> None:
             output_file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     summary = {
-        "gate": "huginn_whisper_dynamic30s_acceleration_stage2_fixture_v1",
+        "gate": "huginn_whisper_dynamic30s_240ms_acceleration_stage2_fixture_v2",
         "dataset": "synthetic_dynamic30s_acceleration_stage2_fsdp4",
         "record_count": RECORD_COUNT,
         "duration_seconds": DURATION_SECONDS,

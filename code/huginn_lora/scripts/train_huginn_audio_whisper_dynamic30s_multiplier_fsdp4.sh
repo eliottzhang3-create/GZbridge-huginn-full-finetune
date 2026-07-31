@@ -80,8 +80,16 @@ if (
     raise SystemExit(f'Multiplier pool audit is invalid: {audit}')
 if (
     not gate_payload.get('validation_passed')
-    or gate_payload.get('gate') != 'huginn_whisper_dynamic30s_multiplier_checkpoint_resume_gate_v1'
+    or gate_payload.get('gate')
+    != 'huginn_whisper_dynamic30s_240ms_multiplier_checkpoint_resume_gate_v2'
     or Path(gate_payload.get('registry', '')).resolve() != registry
+    or gate_payload.get('audio_contract')
+    != {
+        'maximum_seconds': 30.0,
+        'token_duration_ms': 240,
+        'maximum_content_tokens': 125,
+        'maximum_prefix_tokens': 127,
+    }
 ):
     raise SystemExit(f'Multiplier checkpoint/resume gate is invalid: {gate}')
 print('[multiplier-formal-preflight] pool_audit=passed checkpoint_resume=passed')
@@ -184,7 +192,7 @@ echo "registry=$REGISTRY seed=$SEED schedule=single_frozen_global_epoch"
 echo "records=$TOTAL_RECORDS max_steps=$MAX_STEPS global_batch=$GLOBAL_BATCH"
 echo "checkpoints=$CHECKPOINT_STEPS_CSV save_total_limit=2"
 echo "world_size=4 per_device_batch=2 gradient_accumulation=4"
-echo "audio=dynamic_first30s token_rate=160ms prompts=AAC+ASR_specific"
+echo "audio=dynamic_first30s token_rate=240ms max_content_tokens=125 prompts=AAC+ASR_specific"
 echo "trainable=whisper+aligner+huginn_lora frozen=huginn_native_backbone"
 echo "resume_checkpoint=${RESUME_CHECKPOINT:-<fresh>} start_position=$START_POSITION"
 

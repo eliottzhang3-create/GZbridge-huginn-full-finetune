@@ -297,8 +297,14 @@ if (
 ):
     raise SystemExit('Multiplier checkpoint gate cannot be written from failed reports')
 payload = {
-    'gate': 'huginn_whisper_dynamic30s_multiplier_checkpoint_resume_gate_v1',
+    'gate': 'huginn_whisper_dynamic30s_240ms_multiplier_checkpoint_resume_gate_v2',
     'validation_passed': True,
+    'audio_contract': {
+        'maximum_seconds': 30.0,
+        'token_duration_ms': 240,
+        'maximum_content_tokens': 125,
+        'maximum_prefix_tokens': 127,
+    },
     'registry': str(registry),
     'marker_report': str(marker_path),
     'content_report': str(content_path),

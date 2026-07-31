@@ -19,8 +19,8 @@ class TrainableTemporalCompressor(nn.Module):
     def __init__(
         self,
         hidden_size: int,
-        kernel_size: int = 8,
-        stride: int = 8,
+        kernel_size: int = 12,
+        stride: int = 12,
     ):
         super().__init__()
         if kernel_size <= 0 or stride <= 0:
@@ -46,7 +46,7 @@ class TrainableTemporalCompressor(nn.Module):
             )
 
         # Whisper-large emits approximately 20 ms per encoder frame.  A
-        # kernel/stride of 8 therefore produces one audio token per 160 ms.
+        # kernel/stride of 12 therefore produces one audio token per 240 ms.
         x = x.transpose(1, 2)
         x = self.downsample(x)
         return x.transpose(1, 2)
@@ -478,7 +478,7 @@ class HuginnAudioForConditionalGeneration(RavenForCausalLM):
         aligner_device = aligner_parameter.device
         compressor_kernel = int(self.temporal_compressor.kernel_size)
         compressor_stride = int(self.temporal_compressor.stride)
-        max_audio_token_count = int(getattr(self.config, "audio_max_token_count", 187))
+        max_audio_token_count = int(getattr(self.config, "audio_max_token_count", 125))
 
         valid_positions = audio_segment_mask.nonzero(as_tuple=False)
         if valid_positions.size(0) == 0:

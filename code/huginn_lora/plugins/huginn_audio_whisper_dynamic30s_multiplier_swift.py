@@ -217,8 +217,20 @@ def _install_multiplier_formal_callback() -> None:
             self.tracked_model = tracked_model
             self.plan_path = Path(plan_value).expanduser().resolve()
             self.plan = json.loads(self.plan_path.read_text(encoding="utf-8"))
-            if self.plan.get("plan_version") != "huginn_dynamic30s_multiplier_single_epoch_plan_v1":
+            if (
+                self.plan.get("plan_version")
+                != "huginn_dynamic30s_240ms_multiplier_single_epoch_plan_v2"
+            ):
                 raise RuntimeError(f"Invalid multiplier formal plan: {self.plan}")
+            expected_audio = {
+                "maximum_seconds": 30.0,
+                "token_duration_ms": 240,
+                "maximum_content_tokens": 125,
+            }
+            if self.plan.get("training_contract", {}).get("audio") != expected_audio:
+                raise RuntimeError(
+                    f"Invalid multiplier 240-ms audio plan: {self.plan.get('training_contract')}"
+                )
             self.gradient_audited = False
             self.finite_loss_logs = 0
             self.finite_grad_norm_logs = 0
@@ -283,6 +295,10 @@ def _install_multiplier_formal_callback() -> None:
                 allow_scheduled_learning_rate=True,
             )
             _BASE_PLUGIN._audit_lora_runtime_configuration(
+                self.tracked_model,
+                context="Multiplier formal training",
+            )
+            _BASE_PLUGIN._audit_dynamic_audio_tokenization(
                 self.tracked_model,
                 context="Multiplier formal training",
             )

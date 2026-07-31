@@ -28,7 +28,7 @@ export HUGINN_DYNAMIC90S_REAL_DATA_CHAIN_REPORT="$REALDATA_REPORT"
 
 echo "========== HUGINN WHISPER DYNAMIC30S TRAINING PREREQUISITES START =========="
 echo "data_root=$DATA_ROOT"
-echo "duration_policy=retain_all_retain_first30s token_rate=160ms chunks_per_sample=1"
+echo "duration_policy=retain_all_retain_first30s token_rate=240ms chunks_per_sample=1"
 echo "scope=metadata_rebuild+sampler_cpu_audit+four_real_audio_decodes"
 
 if [ ! -s "$REGISTRY" ] || [ ! -s "$FULL_REPORT" ]; then

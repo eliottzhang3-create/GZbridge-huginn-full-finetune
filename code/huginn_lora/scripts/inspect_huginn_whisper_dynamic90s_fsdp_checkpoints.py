@@ -240,7 +240,8 @@ def inspect_checkpoint(
         "double_checkpoint_candidate": False,
     }
     if (
-        runtime_contract.get("gate") != "huginn_whisper_dynamic30s_training_runtime_contract_v1"
+        runtime_contract.get("gate")
+        != "huginn_whisper_dynamic30s_240ms_training_runtime_contract_v2"
         or runtime_contract.get("phase") != expected_phase
         or int(runtime_contract.get("global_step", -1)) != expected_step
         or int(runtime_contract.get("world_size", -1)) != world_size
@@ -272,8 +273,8 @@ def inspect_checkpoint(
         or runtime_contract.get("audio")
         != {
             "maximum_seconds": 30.0,
-            "token_duration_ms": 160,
-            "maximum_content_tokens": 187,
+            "token_duration_ms": 240,
+            "maximum_content_tokens": 125,
             "trainable_boundary_tokens": ["audio_bos", "audio_eos"],
         }
         or runtime_contract.get("loss")

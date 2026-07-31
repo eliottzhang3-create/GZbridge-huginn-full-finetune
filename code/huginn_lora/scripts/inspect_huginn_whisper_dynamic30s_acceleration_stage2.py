@@ -83,7 +83,7 @@ def validate_rank(
         or fsdp.get("stage") != "acceleration_stage2"
         or int(fsdp.get("rank", -1)) != rank
         or int(fsdp.get("world_size", -1)) != world_size
-        or fsdp.get("valid_prefix_tokens") != [189, 189]
+        or fsdp.get("valid_prefix_tokens") != [127, 127]
     ):
         raise ValueError(f"Rank {rank} invalid Stage 2 FSDP marker: {fsdp}")
     fsdp_units = fsdp.get("fsdp_units", {})
@@ -106,9 +106,9 @@ def validate_rank(
 
     if (
         float(payload.get("synthetic_audio_seconds", -1.0)) != 30.0
-        or int(payload.get("expected_audio_tokens", -1)) != 187
-        or int(payload.get("expected_prefix_tokens", -1)) != 189
-        or payload.get("observed_prefix_tokens") != [189] * 8
+        or int(payload.get("expected_audio_tokens", -1)) != 125
+        or int(payload.get("expected_prefix_tokens", -1)) != 127
+        or payload.get("observed_prefix_tokens") != [127] * 8
     ):
         raise ValueError(f"Rank {rank} exact-30-second prefix contract mismatch: {payload}")
     if int(payload.get("core_forward_calls", 0)) < 4:
@@ -167,7 +167,7 @@ def validate_rank(
 
     loss_contract = payload.get("loss_contract", {})
     if (
-        loss_contract.get("prefix_tokens") != 189
+        loss_contract.get("prefix_tokens") != 127
         or loss_contract.get("prefix_labels_all_ignored") is not True
         or int(loss_contract.get("supervised_shift_tokens", 0)) <= 0
         or loss_contract.get("shift_length_valid") is not True
@@ -221,13 +221,13 @@ def main() -> None:
     )
 
     report = {
-        "gate": "huginn_whisper_dynamic30s_acceleration_stage2_fsdp4_v1",
+        "gate": "huginn_whisper_dynamic30s_240ms_acceleration_stage2_fsdp4_v2",
         "validation_passed": memory_gate_passed,
         "world_size": args.world_size,
         "global_batch_size": 32,
         "synthetic_audio_seconds": 30.0,
-        "audio_tokens_per_sample": 187,
-        "prefix_tokens_per_sample": 189,
+        "audio_tokens_per_sample": 125,
+        "prefix_tokens_per_sample": 127,
         "prefix_observations_per_rank": 8,
         "reshard_before": {class_name: True for class_name in EXPECTED_UNITS},
         "reshard_after": {
@@ -266,7 +266,7 @@ def main() -> None:
 
     print(f"[stage2-reshard-before] {report['reshard_before']}")
     print(f"[stage2-reshard-after] {report['reshard_after']}")
-    print(f"[stage2-prefix] per_rank={[189] * 8} global_samples=32")
+    print(f"[stage2-prefix] per_rank={[127] * 8} global_samples=32")
     print(f"[stage2-core-calls] {core_calls}")
     print(f"[stage2-time] {report['train_wall_seconds_by_rank']}")
     print(

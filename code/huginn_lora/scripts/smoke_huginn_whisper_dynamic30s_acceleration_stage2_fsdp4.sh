@@ -97,14 +97,14 @@ from pathlib import Path
 
 summary = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
 expected = {
-    "gate": "huginn_whisper_dynamic30s_acceleration_stage2_fixture_v1",
+    "gate": "huginn_whisper_dynamic30s_240ms_acceleration_stage2_fixture_v2",
     "record_count": 64,
     "duration_seconds": 30.0,
     "sample_rate": 16000,
     "sample_count": 480000,
     "segments_per_sample": 1,
-    "audio_tokens_per_sample": 187,
-    "prefix_tokens_per_sample": 189,
+    "audio_tokens_per_sample": 125,
+    "prefix_tokens_per_sample": 127,
     "global_batch_size": 32,
 }
 observed = {key: summary.get(key) for key in expected}
@@ -137,7 +137,7 @@ echo "========== HUGINN WHISPER DYNAMIC30S ACCELERATION STAGE 2 START ==========
 echo "run_root=$RUN_ROOT"
 echo "scope=recurrent_core_reshard_only no_checkpoint_save=true"
 echo "data=synthetic_exact30s records=64 consumed_global_samples=32"
-echo "audio=one_chunk content_tokens=187 prefix_tokens=189 no_audio_padding=true"
+echo "audio=one_chunk token_rate=240ms content_tokens=125 prefix_tokens=127 no_audio_padding=true"
 echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH accumulation=$GRADIENT_ACCUMULATION_STEPS global_batch=$GLOBAL_BATCH max_steps=$MAX_STEPS"
 echo "checkpointing=fsdp_activation_true whisper_internal_false whisper_outer_true"
 echo "reshard_before=all_true reshard_after=core_false_all_other_true"
