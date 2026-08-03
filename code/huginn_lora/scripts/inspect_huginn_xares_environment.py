@@ -50,6 +50,7 @@ PACKAGE_IMPORTS = (
     "transformers",
     "accelerate",
     "peft",
+    "jiwer",
     "soundfile",
     "webdataset",
     "numpy",
