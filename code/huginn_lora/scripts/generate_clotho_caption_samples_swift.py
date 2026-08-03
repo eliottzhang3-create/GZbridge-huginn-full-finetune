@@ -273,7 +273,16 @@ def load_full_fsdp_base_model(
     peft_model = None
     lora_report: dict[str, Any] = {}
     restore_model: torch.nn.Module = base_model
-    if is_losatok:
+    # Both the historical LoSATok and the current Whisper FSDP2 training
+    # routes can store LoRA tensors directly in the full-model DCP state.
+    # Recreate PEFT whenever the checkpoint metadata contains those tensors;
+    # otherwise a non-LoSATok evaluation would silently restore only the base
+    # model and discard the trained Huginn LoRA update.
+    has_lora_metadata = any(
+        ".lora_A." in str(key) or ".lora_B." in str(key)
+        for key in state_metadata
+    )
+    if is_losatok or has_lora_metadata:
         peft_model, lora_report = infer_fsdp_lora_model(base_model, state_metadata)
         restore_model = peft_model
     target_state = restore_model.state_dict()
@@ -346,7 +355,7 @@ def load_full_fsdp_base_model(
     normalized_restored_keys = {
         candidate for key in restored_target_keys for candidate in candidate_target_keys(key)
     }
-    if is_losatok:
+    if peft_model is not None:
         base_target_keys = set(base_model.state_dict())
         missing_critical = [
             key
@@ -379,6 +388,10 @@ def load_full_fsdp_base_model(
             f"(total={len(missing_critical)})"
         )
     missing_target_keys = [key for key in target_state if key not in restored_target_keys]
+    # Evaluation is inference-only even though the current formal training
+    # route intentionally trains Whisper. Freeze only this reconstructed
+    # evaluation model before the existing safety check.
+    base_model.audio_encoder.requires_grad_(False)
     if any(parameter.requires_grad for parameter in base_model.audio_encoder.parameters()):
         raise RuntimeError("Audio encoder unexpectedly became trainable during FSDP generation restore")
 
