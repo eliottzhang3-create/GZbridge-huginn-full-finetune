@@ -255,10 +255,128 @@ This repo contains **two major experiment families**:
      - the current **Swift multimodal route** in `code/huginn_lora`
    - objective: audio-to-text understanding and modality alignment, not speech generation
 
-### Current highest-priority tasks (updated 2026-07-27)
+For the current project handoff, Huginn is the primary line. The independent HRM-Text section above is preserved for
+background and isolation, but it must not be mixed into Huginn model, data, plugin, or checkpoint decisions unless the
+user explicitly switches lines.
 
-The active Huginn work has two **incompatible LoSATok LoRA routes**. Keep their model construction, checkpoint format,
-checkpoint paths, and evaluation restore paths strictly separate. Neither route trains any official LoSATok parameter.
+### Authoritative current Huginn Whisper mainline (updated 2026-08-03)
+
+The active Huginn formal-training route is **Whisper-large + dynamic-30s audio + 240ms/token + Swift FSDP4**. Some
+filenames and environment variables still contain `dynamic90s` because the already-validated model/plugin and checkpoint
+tooling were retained for compatibility; the current runtime semantics are dynamic-30s, not dynamic-90s. This route is
+isolated from the historical fixed-32 Whisper route and from both LoSATok routes.
+
+#### Current formal schedules
+
+Both formal jobs use the same model, optimizer ownership, loss, FSDP topology, audio decode contract, and checkpoint
+contract. They differ only in their data registry/schedule, total steps, and checkpoint retention.
+
+1. **Hierarchical multitask/no-replacement schedule**
+
+   - Tasks: AAC `60%`, ASR `40%`.
+   - AAC split: WavCaps without BBC Sound Effects `60%`, AudioCaps-v2 `30%`, Clotho-v2 train `10%`.
+   - Pools: `wavcaps_no_bbc_aac`, `audiocaps_v2_aac`, `clotho_v2_aac`, and `gigaspeech_l_asr`.
+   - Each pool is sampled without replacement within its current pool epoch. After exhaustion it is deterministically
+     reshuffled for the next pool epoch. The seed and exact global position define deterministic arbitrary-position resume.
+   - Formal script: `code/huginn_lora/scripts/train_huginn_audio_whisper_dynamic90s_multitask_fsdp4.sh`.
+   - Schedule: `20000` optimizer steps, FSDP4 global batch `32`, `640000` scheduled samples, checkpoints at
+     `5000/10000/15000/20000`, `save_total_limit=4`. The runtime final audit checks whether realized, decoded,
+     first-30-second-capped duration exceeded `3000` hours.
+
+2. **Finite multiplier/single-global-epoch schedule**
+
+   - GigaSpeech-M `1x`, AudioCaps-v2 `3x`, Clotho-v2 train `3x`, WavCaps AudioSet `2x`, WavCaps SoundBible `2x`, and
+     a deterministic quarter of WavCaps FreeSound `1x`.
+   - All expanded occurrences are concatenated into one finite pool and globally shuffled once. Training then consumes
+     that frozen permutation sequentially; dataset and dataloader reshuffling are disabled. A multiplier means that a
+     source record occurs the requested number of times in the expanded schedule.
+   - Current prepared schedule: `1,473,600` occurrences, `46050` optimizer steps at global batch `32`.
+   - Formal script: `code/huginn_lora/scripts/train_huginn_audio_whisper_dynamic30s_multiplier_fsdp4.sh`.
+   - Checkpoints are saved every `5000` steps and at the final step, while at most the most recent two are retained
+     (`save_total_limit=2`).
+
+The supplied 2026-08-03 logs showed approximately `13 s/step` for the multiplier route and `39 s/step` for the
+multitask route. These are runtime observations only; a run is complete only after its final success banner and formal
+checkpoint/statistics audit.
+
+#### Current architecture and training contract
+
+- Local waveform input is mono 16 kHz. Every source record is retained. Audio longer than `30s` is decoded/truncated to
+  the first `30s`; shorter audio keeps its real effective duration. There is exactly one audio chunk per sample: no
+  90-second splitting, no multi-chunk concatenation, and no duration discard threshold.
+- Whisper-large receives up to `3000` log-mel frames with `80` channels. The feature tensor is collated to that model
+  limit, but true feature lengths/masks are carried through the encoder and downstream compressor, so padding is not
+  treated as valid audio. Its encoder is approximately `50` frames/s, hidden size `1280`, and produces about `1500` time
+  steps for a full 30-second input. The complete encoder is one trainable FSDP unit with learning rate `1e-4`.
+- The complete aligner is one FSDP unit. Its temporal compressor is exactly one trainable
+  `Conv1d(1280,1280,kernel_size=12,stride=12,padding=0)`. With approximately `20ms` per Whisper encoder frame, this
+  produces one content token per `240ms`. A full 30-second sample has `125` content tokens; shorter samples remain
+  dynamic. Trainable `audio_bos` and `audio_eos` add two boundary positions, for a maximum valid prefix of `127`.
+- The audio projector is `LayerNorm(1280)`, parallel `Linear(1280,2048)` branches with a SiLU gate, then
+  `Linear(2048,5280)` and `LayerNorm(5280)`. The resulting prefix is concatenated before the text embeddings.
+- Prefix padding is local-batch dynamic: each batch pads only to its longest valid prefix. Padding positions have
+  attention-mask `0` and label `-100`; shorter samples are not padded to 125 content tokens or to 30 seconds. The
+  flattened valid segments preserve the original audio/text pairs and are encoded by Whisper once and aligned once per
+  model forward.
+- AAC and ASR have distinct user prompts. AAC asks for an audible-event description; ASR asks for speech transcription.
+  Clotho-v2 uses the training split and one deterministic caption per occurrence.
+- Loss is response-only shifted causal next-token prediction: `shift_logits = logits[:, :-1]` against
+  `shift_labels = labels[:, 1:]`. Audio prefix, prompt, prefix padding, and other non-response positions are `-100`.
+  Audio BOS/EOS participate in the prefix forward path and are trainable/saved, but are not direct text targets.
+- Swift `--max_length 192` is the text-side limit used by these routes; it is not a fixed combined audio-plus-text
+  sequence length. The actual combined prefix-plus-text sequence remains bounded by Huginn's model context contract.
+- Native Huginn backbone and LM head are frozen. Only Huginn transformer LoRA is trainable: rank `8`, alpha `16`,
+  dropout `0.05`, learning rate `1e-4`. Whisper and the aligner do not receive LoRA. The only trainable groups are the
+  Whisper encoder, aligner (compressor/projector/boundaries), and Huginn LoRA.
+- FSDP4 uses five coarse units: complete Whisper encoder; complete aligner; Prelude two `SandwichBlock`s; recurrent
+  adapter plus all four core `SandwichBlock`s; and Coda two `SandwichBlock`s. Only the recurrent-core unit uses
+  `reshard_after_forward=false`; all other units remain resharded. Whisper internal per-layer checkpointing is disabled,
+  while one outer FSDP activation-checkpoint wrapper covers the complete Whisper unit. Whisper attention uses PyTorch
+  SDPA.
+- Checkpoints are paired full-model FSDP2 DCP checkpoints, not adapter-only checkpoints. They include model shards,
+  optimizer state, scheduler, per-rank RNG, Trainer state, and cumulative `audio_training_statistics.json`.
+  Same-world-size four-card save/resume has passed, including exact data position, no-replacement continuity,
+  effective-duration accounting, and trainable/frozen-state audits. Direct four-card to eight-card continuation has not
+  been validated and must not be assumed safe.
+
+#### Current remote/data rules
+
+- This Windows checkout contains code and documentation only. Model weights, public data, manifests generated remotely,
+  outputs, checkpoints, and large logs remain on Linux. Sync through GitHub and launch remote work only through
+  `vc submit` wrappers.
+- Current remote repository root is `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune`; current
+  formal jobs use the remote `swift_huginn` environment. Whisper-large weights are remote at
+  `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large` and are not part of this checkout.
+- Current formal jobs use `pdgpu-5090`, four RTX 5090 GPUs, and `-c32 -m128G -g4`, which is within the enforced maximum
+  of `8` CPU cores and `32G` host memory per GPU. Do not replace this with an oversized request.
+- WavCaps and GigaSpeech public roots are read-only. Pool preparation is metadata/index/registry-only and does not
+  download, copy, or bulk-decode the public audio. WavCaps FLAC and GigaSpeech Opus are decoded on demand at training
+  time; GigaSpeech segment rows use their metadata start/end bounds and ffmpeg when needed.
+- The passed metadata inventory recorded `91254` AudioCaps-v2 rows, `18364` Clotho source records grouped into `3839`
+  audios, and `2264528` GigaSpeech-L segments representing about `2498.217` metadata hours. The full atomic-pool,
+  indexed-mixture, multiplier-pool, and representative real-decode audits have passed; these audits do not imply that
+  every public audio file was pre-decoded or copied locally.
+- Effective training hours are measured after successful runtime decode/resample/truncation, using the actual retained
+  waveform duration (`len(waveform)/16000`). Prefetch-only or duplicate template rows are not counted; raw metadata
+  duration is not used for the cumulative training-hours statistic.
+- Current model/plugin paths are `models/huginn-audio-whisper-dynamic90s-v1/`,
+  `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`,
+  `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py`, and
+  `code/huginn_lora/plugins/huginn_audio_whisper_dynamic30s_multiplier_swift.py`.
+
+#### Required validation state
+
+The following have passed for the current contract: metadata-only pool preparation and audits, CPU no-replacement
+sampler audit, real-audio decode chain, dynamic30s contract, acceleration Stage 0/1/2, four-GPU Stage 3-4 and Stage 5
+history, and the updated four-GPU full-model checkpoint/resume smoke. The current production switches are Whisper SDPA,
+no Whisper internal checkpointing, one outer Whisper checkpoint wrapper, and recurrent-core `reshard_after_forward=false`.
+Do not reuse old dynamic90s checkpoint-4/6 artifacts or old with-replacement sampler evidence as current resume sources.
+
+### Historical LoSATok task record (updated 2026-07-27; superseded by the dynamic-30s Whisper mainline below)
+
+This section records the previously active LoSATok work. It remains useful for reproducibility, but it is no longer the
+current formal-training mainline. Keep its model construction, checkpoint format, checkpoint paths, and evaluation restore
+paths strictly separate from the current Whisper route. Neither LoSATok route trains any official LoSATok parameter.
 
 1. **Legacy fixed-32 LoSATok / single-5090 route — completed ACAVCAPS-quarter training; evaluation pending.** It uses
    first-30-second audio, compressor stride `4`, and `AdaptiveAvgPool1d(32)`, so the audio prefix is exactly
@@ -267,7 +385,7 @@ checkpoint paths, and evaluation restore paths strictly separate. Neither route 
    It is a normal Swift adapter checkpoint: `adapter_model.safetensors` contains `66` LoRA tensors and
    `vit.safetensors` contains the `20` aligner tensors (including trainable `audio_bos/audio_eos`). This run was a
    **weight warm-start** from the completed legacy AudioCaps-v2 `checkpoint-2802`, not a Trainer resume.
-2. **Dynamic-90s LoSATok / two-5090 FSDP2 route — current training mainline.** It uses first-90-second audio,
+2. **Dynamic-90s LoSATok / two-5090 FSDP2 route — historical/parallel training line.** It uses first-90-second audio,
    kernel `11` / stride `6` / padding `5`, no final adaptive pool, a cap of `375` compressed tokens, and therefore at
    most `377` audio-prefix positions after the trainable boundaries. The repaired two-rank FSDP2 save format is a
    sharded DCP containing exactly `66` LoRA plus `20` aligner tensors. Dynamic AudioCaps-v2 two-epoch training is
@@ -307,12 +425,14 @@ checkpoint paths, and evaluation restore paths strictly separate. Neither route 
   `outputs/huginn_losatok_dynamic90s_audiocaps_v2_e3_b4ga4_fsdp2/v0-20260723-054928/checkpoint-{2802,5604}`: each has
   `66` LoRA and `0` aligner tensors, so it cannot be evaluated, resumed, or used as a warm-start.
 
-The shared audio architecture is:
+The historical shared audio architecture was:
 
-- frozen audio encoder: Whisper-large on the Whisper route, or full LoSATok on the LoSATok route
+- frozen audio encoder: Whisper-large on the historical Whisper route, or full LoSATok on the LoSATok route
 - trainable aligner: temporal compressor, audio projector, and audio boundary embeddings
 - Huginn text backbone
-- audio prefix concatenated before text embeddings: the legacy route uses `audio_bos + 32 compressed tokens + audio_eos`; the opt-in dynamic route uses up to `audio_bos + 375 compressed tokens + audio_eos`
+- audio prefix concatenated before text embeddings: historical fixed-32 used `audio_bos + 32 compressed tokens + audio_eos`,
+  while the former dynamic-90s route used up to `audio_bos + 375 compressed tokens + audio_eos`.
+The current dynamic-30s Whisper architecture is documented in the authoritative section above.
 
 There are two distinct Swift fine-tuning policies; do not confuse them:
 
@@ -320,20 +440,24 @@ There are two distinct Swift fine-tuning policies; do not confuse them:
   - audio encoder frozen
   - aligner full-trainable
   - Huginn base frozen, Huginn LoRA trainable
-- current FSDP full-training route:
+- historical FSDP full-training route:
   - audio encoder frozen
   - aligner full-trainable
   - Huginn backbone full-trainable
 
-Whisper is never LoRA-wrapped or full-trained in either policy.
+In the historical policies below, Whisper was not LoRA-wrapped and was often frozen. This does **not** describe the
+current dynamic-30s Whisper mainline: its complete Whisper encoder is full-trainable, but still receives no LoRA.
 
 The equivalent rule for the new LoSATok LoRA branch is stricter: the complete official LoSATok stack, including its semantic and acoustic components, is always frozen. Only the new temporal compressor/projector/boundary embeddings and Huginn LoRA tensors may train.
 
-**Current-status precedence rule:** this top section and the dated LoSATok/ACAVCAPS sections below are the source of truth for active work. Older sections retained later in this README document historical routes and reusable infrastructure; they must not override a newer dated status entry.
+**Current-status precedence rule:** the authoritative dynamic-30s Whisper section near the top and the dated dynamic-30s
+section below are the source of truth for active Huginn Whisper work. LoSATok/ACAVCAPS sections are parallel or historical
+unless explicitly selected by the user. Older sections retained later in this README document reusable infrastructure;
+they must not override a newer dated status entry.
 
 ### Current execution status
 
-#### LoSATok Swift LoRA replacement branch: completed training and active evaluation
+#### Historical/parallel LoSATok Swift LoRA replacement branch: completed training and evaluation pending
 
 - The official LoSATok code and weights are remote-only assets; they are deliberately not committed to this sync repository.
 - Remote LoSATok asset roots:
@@ -623,11 +747,12 @@ The equivalent rule for the new LoSATok LoRA branch is stricter: the complete of
 - same-world-size FSDP save/resume is remote-verified. Cross-world-size resume is deliberately not used by the current plan.
 - FSDP sharded checkpoints must not be loaded as LoRA adapters. The current evaluators restore `pytorch_model_fsdp_0` directly through DCP, one tensor at a time, into an ordinary one-GPU model. Do not use an all-at-once full-weight merge: the 32G single-GPU queue cap kills that CPU-heavy operation. The streaming restore later completed a caption-generation run successfully.
 
-#### Current isolated Whisper-large dynamic-90s LoRA route (Whisper-unfrozen validation pending)
+#### Superseded Whisper-large dynamic-90s route (historical architecture record)
 
-The new dynamic route is isolated from the historical fixed-32 Whisper route. Historical files remain at
+The former dynamic-90s route was isolated from the historical fixed-32 Whisper route. Historical files remain at
 `models/huginn-audio-whisper-v1/` and `code/huginn_lora/plugins/huginn_audio_swift.py`; do not point historical
-checkpoints or evaluation scripts at the dynamic package.
+checkpoints or evaluation scripts at the dynamic package. The current runtime has since been simplified to one
+dynamic-30s chunk and 240ms/token; use the authoritative section above and the dated dynamic-30s section below.
 
 - dynamic model package: `models/huginn-audio-whisper-dynamic90s-v1/`
 - dynamic Swift plugin: `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`
@@ -1227,19 +1352,20 @@ The audio work now has **two stages** that must not be confused:
 
 2. **Current Swift multimodal LoRA branch**
    - lives mainly in `code/huginn_lora`
-   - goal is to move to a more reusable **ms-swift training path**
-   - current requirement is:
+   - uses the reusable **ms-swift training path**
+   - current dynamic-30s requirement is:
      - original Huginn backbone
      - Whisper-large encoder
-     - adapter trainable
-     - Huginn backbone LoRA trainable
-     - audio encoder frozen
+     - Whisper encoder and aligner fully trainable at `1e-4`
+     - Huginn native backbone frozen; Huginn-only rank-8 LoRA trainable
+     - one 30-second-capped chunk per sample and dynamic 240ms/token prefix
 
 When the user says "current audio task", prefer to interpret it as the **Swift multimodal LoRA branch**, unless they explicitly refer to the older standalone training scripts.
 
-### V1 architecture
+### V1 architecture and historical variants
 
-Current experiment branch:
+The following older V1 descriptions are retained to explain checkpoint/script separation. The current Whisper contract is
+the dynamic-30s architecture in the authoritative section near the top.
 
 - audio encoder:
   - historical standalone branch:
@@ -1247,14 +1373,9 @@ Current experiment branch:
   - current Swift mainline target:
     - **Whisper-large**
 - temporal compressor:
-  - historical version:
-    - Conv1d downsampling + normalization + activation + adaptive pooling
-  - current updated design:
-    - **Conv-GMLP-style compressor with shortcut path**
-    - downsample with strided 1D conv branches
-    - gate branch + feature branch
-    - residual shortcut branch
-    - final adaptive pool back to fixed token count
+  - historical fixed-32 versions used Conv-GMLP/shortcut variants and adaptive pooling;
+  - current Whisper dynamic-30s version uses exactly one `Conv1d(1280,1280,kernel=12,stride=12,padding=0)` and no
+    adaptive pool, producing dynamic token counts at `240ms/token`.
 - audio projector:
   - project audio-side features into Huginn text hidden space
   - current implementation uses a **SwiGLU-style gated MLP projector**
@@ -1276,24 +1397,25 @@ Important clarification:
 
 - the policy above describes the **earlier standalone adapter-only branch**
 - it is **not** the current Swift mainline policy
-- the current Swift mainline policy is:
-  - freeze `audio_encoder`
-  - full-train `aligner`
-  - LoRA-train Huginn language model only
+- the current Whisper dynamic-30s Swift policy is:
+  - full-train `audio_encoder` at `1e-4`
+  - full-train `aligner` at `1e-4`
+  - freeze native Huginn backbone/LM head
+  - LoRA-train Huginn transformer only at rank `8`, alpha `16`, dropout `0.05`, learning rate `1e-4`
 
 ### Whisper architecture details that matter
 
-For the Whisper-specific `models/huginn-audio-whisper-v1` implementation:
+For the **historical fixed-32** Whisper-specific `models/huginn-audio-whisper-v1` implementation:
 
 - Whisper output:
   - `last_hidden_state: [B, T_audio, hidden_audio]`
 - compressor:
-  - Conv-GMLP style temporal compression
-  - current config target:
-    - kernel size `7`
-    - stride `12`
-    - residual shortcut enabled
-    - final `AdaptiveAvgPool1d(32)`
+  - historical Conv-GMLP style temporal compression
+  - historical kernel/stride/adaptive-pool settings belong only to that fixed-32 package
+- current Whisper dynamic-30s compressor:
+  - located under `models/huginn-audio-whisper-dynamic90s-v1/`
+  - one Conv1d, kernel/stride `12`, padding `0`, no adaptive pooling
+  - 125 content tokens at 30 seconds and dynamic shorter prefixes
 - projector:
   - LayerNorm
   - `w1`, `w2`
@@ -1551,7 +1673,7 @@ The following points are already important confirmed project memory:
 ### Historical ACAVCAPS status and design
 
 ACAVCAPS was a validated Swift audio training route after the early Clotho-only smoke work. Those JSONL/chunk routes remain
-historical infrastructure. A **new, separate current LoSATok continuation route** now uses the private WebDataset manifests
+historical infrastructure. A **separate historical/parallel LoSATok continuation route** uses the private WebDataset manifests
 documented in the dated section near the beginning of this README; do not substitute either representation for the other.
 
 Important ACAVCAPS facts:
@@ -1725,22 +1847,21 @@ Note:
 
 ### Swift multimodal training policies
 
-All current Swift policies keep the same frozen-audio rule:
+The policy depends on the isolated experiment line; do not generalize a historical route to the current Whisper
+mainline:
 
-- `audio_encoder`: frozen
-- `aligner`: full parameters trainable
-  - `temporal_compressor`
-  - `audio_projector`
-  - `audio_boundary_embeddings`, including `audio_bos` and `audio_eos`
+- **Current Whisper dynamic-30s formal route:** `audio_encoder`/Whisper fully trainable at `1e-4`; aligner fully
+  trainable at `1e-4`; native Huginn backbone and LM head frozen; Huginn-only LoRA rank `8`, alpha `16`, dropout
+  `0.05`, and learning rate `1e-4`. No LoRA is attached to Whisper or the aligner.
+- **Historical LoSATok LoRA route:** complete official LoSATok stack frozen; new aligner and Huginn LoRA trainable;
+  Huginn base frozen.
+- **Historical Swift full-parameter route:** aligner and Huginn base trainable, no Huginn LoRA; its old frozen-Whisper
+  setting must not be confused with current Whisper dynamic-30s training.
 
-The Huginn language-model policy depends on experiment type:
+In every route, `audio_bos` and `audio_eos` belong to the aligner when present and must be included in the correct
+trainable/checkpoint contract.
 
-- LoRA experiments: base Huginn frozen, Huginn LoRA trainable.
-- FSDP full experiments: Huginn base parameters trainable, no LoRA tensors expected.
-
-Do not change the audio encoder's policy without an explicit new experiment decision.
-
-### Swift audio status that new agents must assume (updated 2026-07-27)
+### Historical Swift audio status and reusable validation facts (updated 2026-07-27)
 
 Historical validation facts are retained here; the dated top-level Huginn handoff is authoritative for live status:
 
@@ -1863,14 +1984,15 @@ Historical validation facts are retained here; the dated top-level Huginn handof
   - mini is for local development and has answers
   - the formal hidden-answer set is a separate acquisition/submission step; final predictions must preserve the selected complete option text in the official submission JSON format
 
-### Current useful Swift training entrypoints
+### Historical/parallel LoSATok Swift training entrypoints
 
-For the current LoSATok handoff, prefer these exact entrypoints over similarly named historical scripts:
+These are the reproducible LoSATok entrypoints, not the current Whisper dynamic-30s formal launchers. Prefer the exact
+paths below only when the user explicitly selects the LoSATok branch; never cross-load their checkpoints into Whisper.
 
 - dynamic-90s two-GPU FSDP2 AudioCaps-v2 formal source training (completed; retains the reproducible route):
   - `code/huginn_lora/scripts/train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2.sh`
   - `code/huginn_lora/run_train_audiocaps_v2_huginn_losatok_dynamic90s_swift_lora_fsdp2_5090.sh`
-- dynamic-90s two-GPU FSDP2 quarter-ACAVCAPS formal continuation (currently the active job route):
+- dynamic-90s two-GPU FSDP2 quarter-ACAVCAPS formal continuation (historical/parallel route):
   - `code/huginn_lora/scripts/train_acavcaps_wds_huginn_losatok_dynamic90s_quarter_fsdp2_5090.sh`
   - `code/huginn_lora/run_train_acavcaps_wds_huginn_losatok_dynamic90s_quarter_fsdp2_5090.sh`
   - `code/huginn_lora/scripts/smoke_acavcaps_wds_huginn_losatok_dynamic90s_quarter_warmstart_save_reload_fsdp2.sh`
@@ -2003,6 +2125,39 @@ This is important context if later training behavior changes after the mask fix.
 ## Current Active Files
 
 If a new Codex / AI agent chat needs to start working immediately, the most relevant files are usually:
+
+### Current Huginn Whisper dynamic-30s formal line
+
+- model/config:
+  - `models/huginn-audio-whisper-dynamic90s-v1/raven_modeling_minimal.py`
+  - `models/huginn-audio-whisper-dynamic90s-v1/raven_config_minimal.py`
+  - `models/huginn-audio-whisper-dynamic90s-v1/config.json`
+- shared runtime/plugin:
+  - `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`
+  - `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py`
+  - `code/huginn_lora/plugins/huginn_audio_whisper_dynamic30s_multiplier_swift.py`
+- data and sampler:
+  - `code/huginn_lora/data_pipeline/dynamic90s_mixture_rows.py`
+  - `code/huginn_lora/data_pipeline/indexed_atomic_mixture.py`
+  - `code/huginn_lora/data_pipeline/finite_multiplier_pool.py`
+  - `code/huginn_lora/scripts/prepare_huginn_whisper_dynamic30s_training_prerequisites.sh`
+  - `code/huginn_lora/scripts/prepare_huginn_whisper_dynamic30s_multiplier_prerequisites.sh`
+- formal training:
+  - `code/huginn_lora/scripts/train_huginn_audio_whisper_dynamic90s_multitask_fsdp4.sh`
+  - `code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_5090.sh`
+  - `code/huginn_lora/scripts/train_huginn_audio_whisper_dynamic30s_multiplier_fsdp4.sh`
+  - `code/huginn_lora/run_train_huginn_audio_whisper_dynamic30s_multiplier_fsdp4_5090.sh`
+- validation/audit:
+  - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_contract.py`
+  - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_multiplier_pool.py`
+  - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_multiplier_checkpoint_resume.py`
+  - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_formal_checkpoints.py`
+  - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_checkpoint_resume_markers.py`
+  - `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh`
+  - `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic30s_multiplier_checkpoint_resume_fsdp4_5090.sh`
+
+The word `dynamic90s` in these shared paths is a compatibility name. Always read the current 30-second contract and the
+formal launcher before changing or submitting a job.
 
 ### Backbone / model logic
 
@@ -2158,25 +2313,25 @@ Any new chat should assume the following:
 5. Windows local paths and Linux remote paths must never be mixed up.
 6. The project is no longer only about GSM8K:
    - there is now a substantial **audio branch**
-7. The current audio branch is:
+7. The current Huginn audio branch is:
+   - **current Whisper Swift dynamic-30s formal branch:**
+     - original Huginn backbone with Whisper-large audio encoder
+     - mono 16-kHz one-chunk input, first-30-second cap, dynamic prefix at 240ms/token
+     - Whisper encoder and aligner fully trainable; Huginn native backbone frozen; Huginn-only rank-8 LoRA trainable
+     - four-card FSDP4, coarse five-unit wrapping, full-model paired DCP save/resume
+     - two separate schedules: hierarchical AAC/ASR no-replacement and finite global multiplier pool
    - historical standalone branch:
-     - original Huginn backbone
-     - Whisper-small encoder
-     - frozen backbone + frozen encoder
-     - trainable compressor/projector
-   - separate Whisper Swift branch:
-     - original Huginn backbone
-     - Whisper-large encoder
-     - Swift multimodal training path
-     - frozen audio encoder and full-trainable aligner
-     - historical LoRA and separate FSDP full-parameter modes
-   - current encoder-replacement LoSATok branch:
+     - original Huginn backbone and earlier Whisper-small experiments
+     - retained only as historical code/reference; not the current formal route
+   - historical fixed-32 Whisper branch:
+     - separate model/plugin and checkpoint path; do not cross-load with dynamic-30s checkpoints
+   - historical/parallel encoder-replacement LoSATok branch:
      - LoSATok with 16 kHz waveform input and `unified_emb` output
      - Swift LoRA registration/model/template code is locally implemented
      - complete LoSATok is frozen; only aligner plus Huginn LoRA train
      - legacy fixed-32 uses a normal `66`-LoRA plus `20`-aligner adapter/vit checkpoint and completed quarter-ACAVCAPS
        at `checkpoint-36741`; its evaluation wrappers are prepared, with no result yet reported
-     - dynamic 90-second two-GPU FSDP2 uses a sharded `66`-LoRA plus `20`-aligner DCP and completed two AudioCaps-v2
+     - historical dynamic 90-second two-GPU FSDP2 uses a sharded `66`-LoRA plus `20`-aligner DCP and completed two AudioCaps-v2
        epochs at `checkpoint-2802` and `checkpoint-5604` under `...v0-20260724-115115/`
      - the dynamic quarter-ACAVCAPS formal job starts from `checkpoint-5604` as a weight warm-start; only progress to
        `50/36741` is recorded, so do not claim final completion
@@ -2228,7 +2383,10 @@ Any new chat should assume the following:
    - the older standalone audio scripts in `code/recurrent-pretraining-main`
    - the newer Swift multimodal LoRA and FSDP route in `code/huginn_lora`
 9. Do not forget that the Swift branch has already passed remote smoke and mid training; do not regress it back into an "unverified" mental model.
-10. For Whisper full-training requests, default to the **Swift multimodal FSDP full-training path**. For encoder replacement requests, use the dedicated LoSATok Swift files. Both legacy fixed-32 checkpoint validation and the repaired dynamic-90s FSDP2 complete save/resume validation pass; the older dynamic `66` / `0` checkpoints are still invalid. Do not modify the verified Whisper plugin or cross-load Whisper and LoSATok checkpoints.
+10. For current Whisper training requests, use the **dynamic-30s/240ms/token Swift FSDP4 path** documented at the top. The
+    shared filenames still contain `dynamic90s`, but the runtime contract is 30 seconds, one chunk, and 240ms/token.
+    Keep current Whisper checkpoints separate from fixed-32 Whisper and all LoSATok checkpoints. The old dynamic `66` /
+    `0` LoSATok DCPs and old dynamic-90s Whisper smoke artifacts are not valid current resume sources.
 11. For current Swift audio training and evaluation, use the `pdgpu-5090` submit wrappers unless an existing legacy smoke/preparation wrapper explicitly targets `pdgpu-3090`.
 12. For ACAVCAPS, use the current private WebDataset stage manifest: global tar-order shuffle within each stage plus runtime buffer shuffle within each tar, with FLAC decoded only during training. Never modify the shared public dataset root or add manual rank sharding on top of Accelerate's `DataLoaderDispatcher` behavior.
 13. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
@@ -2256,6 +2414,8 @@ Any new chat should assume the following:
 - Current audio and GSM8K branches coexist in the same sync repo.
 - The repo already contains both training and evaluation entrypoints for each line.
 - The audio line itself now contains:
+  - the current Whisper dynamic-30s/240ms/token formal FSDP4 route with trainable Whisper, aligner, and Huginn-only LoRA
+  - two isolated current data schedules: hierarchical no-replacement multitask and finite globally shuffled multiplier
   - a historical standalone PyTorch training route
   - a validated legacy fixed-32 LoSATok Swift LoRA route
   - a validated Swift FSDP2 full-parameter route with separate Whisper checkpoint handling
@@ -2265,7 +2425,24 @@ Any new chat should assume the following:
   dynamic continuation. The old `20260723-054928` checkpoints still have `66` / `0` and remain permanently excluded from
   evaluation or continuation.
 
-### Current immediate next-step expectation (updated 2026-07-27)
+### Current immediate next-step expectation (updated 2026-08-03)
+
+For a new Huginn Whisper request, first determine whether it targets the current formal route or a historical branch.
+For the current formal route:
+
+1. Use the dynamic-30s contract: one mono 16-kHz chunk, cap at 30 seconds, 240ms/token, local-longest-prefix padding,
+   response-only shifted NTP, Whisper + aligner + Huginn-only LoRA trainable, native Huginn frozen.
+2. Keep the two schedules separate: hierarchical AAC/ASR no-replacement multitask versus finite globally shuffled
+   multiplier pool. Do not substitute one registry, plugin, statistics file, or checkpoint audit for the other.
+3. Use four-card FSDP4 with the validated coarse units and current acceleration switches. A 4-to-8-card continuation is
+   unvalidated and requires a dedicated smoke before any resume.
+4. Before a long run, verify the metadata/real-decode/sampler prerequisites and the four-card save/resume smoke. For a
+   resume, require the embedded plan, checkpoint statistics, exact next global position, optimizer/scheduler/RNG state,
+   and matching registry identity.
+5. Treat a formal job as complete only after its terminal success banner, retained checkpoint audit, and cumulative
+   statistics report. A high step count or an intermediate loss line is not completion evidence.
+
+### Historical LoSATok immediate-next-step expectation (updated 2026-07-27)
 
 If a new agent is asked "what should we do now", the best default interpretation is:
 
@@ -2298,7 +2475,7 @@ Before any long remote run:
   - checkpoint audit/save-reload validation
   - retrieval / generation / benchmark evaluation
 
-### Huginn Whisper dynamic-30s current status (2026-07-31; supersedes all dynamic-90s execution guidance below)
+### Huginn Whisper dynamic-30s current status (2026-08-03; supersedes all dynamic-90s execution guidance below)
 
 The active Huginn route now uses exactly one dynamic Whisper chunk per sample. Existing `dynamic90s` filenames,
 environment variables, model type, and model directory are retained only for Swift/checkpoint tooling compatibility;
@@ -2321,6 +2498,12 @@ metadata is allowed because duration no longer controls sample eligibility. Giga
 AudioCaps and Clotho retain their existing metadata/verified assumptions. The deterministic hierarchical no-replacement
 sampler runs over every non-BBC WavCaps record and every GigaSpeech-L segment, preserving complete per-pool epochs and
 exact arbitrary-position resume.
+
+The separate finite multiplier preparation is under
+`data/audio_swift/huginn_whisper_dynamic30s_multiplier/v1_gigaspeech_m/`. Its registry expands GigaSpeech-M/AudioCaps/
+Clotho/WavCaps components by the requested multipliers, selects a deterministic FreeSound quarter, concatenates the
+expanded occurrences, and writes one global permutation. Its production launcher consumes that finite permutation in
+order with shuffle disabled; it is not the hierarchical task-weight sampler above.
 
 Run the current gates in this order after syncing code:
 
@@ -2436,13 +2619,17 @@ bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_
 The full Torch Profiler route is paused after a Kineto/native `SIGSEGV` on the old recurrent dynamic-90s workload and is
 not part of the current launch sequence.
 
-### Historical Huginn Whisper dynamic-90s status update (2026-07-29)
+### Historical Huginn Whisper dynamic-90s status update (2026-07-29; superseded)
 
-The active Huginn task is now the isolated Whisper-large dynamic-90s route, not a LoSATok continuation and not formal
-dataset training. The historical fixed-32 Whisper model/plugin and its dataset-specific training/evaluation scripts have
-been restored to their original paths. The new route is isolated under
+At that time, the active Huginn task was an isolated Whisper-large dynamic-90s route, not a LoSATok continuation and not
+formal dataset training. The historical fixed-32 Whisper model/plugin and its dataset-specific training/evaluation scripts
+were restored to their original paths. The experimental route was isolated under
 `models/huginn-audio-whisper-dynamic90s-v1/` and
 `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`.
+
+This section is retained as an audit/history record only. The active contract is now the single dynamic-30s chunk,
+240ms/token, recurrent-core `reshard_after_forward=false` route documented above; do not use the old 90-second values,
+old duration planner, or old checkpoint artifacts for new work.
 
 The active trainability contract changed on 2026-07-30 and supersedes every frozen-Whisper validation result below:
 
@@ -2480,11 +2667,10 @@ stability smoke also passed on all ranks with finite losses/gradient norms throu
 predate Whisper unfreezing and remain architecture/history evidence only; the active gate order is the trainable-Whisper
 90-second memory smoke followed by the replacement checkpoint/resume smoke documented below.
 
-The current duration contract has no discard threshold: every input longer than 90 seconds, including inputs beyond
-120 seconds, is retained by truncating it to the first 90 seconds. Stage 0-2 sends a 120.01-second WAV through the real
-Swift path and separately checks the production planner with 180-second and one-hour inputs.
+The former duration contract had no discard threshold and retained inputs through a 90-second cap. That behavior is no
+longer active: current training caps every record at 30 seconds and never splits or concatenates chunks.
 
-### Huginn Whisper dynamic-90s data status update (2026-07-30)
+### Historical Huginn Whisper dynamic-90s data status update (2026-07-30; superseded)
 
 The four full atomic pools are complete: WavCaps excluding BBC Sound Effects, AudioCaps-v2, Clotho-v2 train grouped by
 audio, and GigaSpeech-L segment-level ASR. The deterministic indexed hierarchical mixture gate has passed with the
@@ -2548,14 +2734,17 @@ The checkpoint job still refuses to start unless the no-replacement v2 report ha
 short smoke so the audit can prove four-rank aggregation, exact save/resume continuity, zero cross-checkpoint repeats,
 and exclusion of the template/prefetch-only rows.
 
-Formal-training constraints fixed by the user:
+The following was the **superseded** formal-training plan for the former dynamic-90s route and is retained only as a
+historical audit record. It must not be used to plan new work; the current dynamic-30s plans and checkpoint retention
+are defined in the authoritative section above.
 
 - train for more than `4000` realized source-audio hours;
 - retain exactly two formal checkpoints, one at half of the final global-step count and one at completion;
 - before formal training, pass a four-GPU FSDP checkpoint smoke that saves, exits all training processes, starts a new
   process group, resumes model/optimizer/scheduler/RNG/data position, and then performs additional finite updates.
 
-The four-GPU checkpoint save/cold-resume smoke has now passed. Formal training is implemented but has not been launched:
+The former four-GPU checkpoint save/cold-resume smoke passed. The old planner and its `17800`-step/90-second estimates
+are historical:
 
 - step planner: `code/huginn_lora/scripts/plan_huginn_whisper_dynamic90s_formal_training.py`;
 - runtime: `code/huginn_lora/scripts/train_huginn_audio_whisper_dynamic90s_multitask_fsdp4.sh`;
@@ -2569,11 +2758,9 @@ steps, so the expected checkpoints are approximately `checkpoint-8900` and `chec
 accounting: the final gate requires `audio_training_statistics.json` to report more than `4000` actually decoded,
 90-second-capped hours.
 
-Formal topology is the passed worst-case-memory configuration: four GPUs, per-device batch `2`, gradient accumulation
-`4`, global batch `32`, fully trainable Whisper and aligner at `1e-4`, Huginn-only rank-8/alpha-16/dropout-0.05 LoRA at
-`1e-4`, frozen native Huginn backbone, cosine schedule with `5%` warmup, and the five coarse FSDP units with
-`reshard_after_forward=true`. Whisper and FSDP activation checkpointing remain enabled. The job retains exactly the
-halfway and final full-model DCP checkpoints and writes cumulative sample/hour ratios every `100` steps.
+The former topology used the same four-GPU batch and trainability groups but had different dynamic-90s and checkpoint
+settings. Current production uses dynamic-30s/240ms tokens, recurrent-core `reshard_after_forward=false`, no Whisper
+internal checkpointing plus one outer Whisper wrapper, and the schedule-specific checkpoint limits documented above.
 
 The formal first-forward audit requires response-only contiguous labels, full audio-prefix `-100` masking, shifted NTP
 (`logits[:, :-1]` against `labels[:, 1:]`), the exact optimizer ownership split, all trainables sharded as DTensors,
