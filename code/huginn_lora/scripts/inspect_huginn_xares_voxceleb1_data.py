@@ -192,6 +192,11 @@ def main() -> None:
     report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     print(f"[voxceleb1] task_import={task_import.get('ok')}", flush=True)
+    if not task_import.get("ok"):
+        print(f"[voxceleb1][task-import-error] {task_import.get('error')}", flush=True)
+        traceback_text = task_import.get("traceback")
+        if traceback_text:
+            print(f"[voxceleb1][task-import-traceback]\n{traceback_text}", flush=True)
     print(f"[voxceleb1] data_root={data_root}", flush=True)
     print(f"[voxceleb1] audio_sources={existing_audio_sources}", flush=True)
     print(f"[voxceleb1] text_file_samples={len(text_files)} audio_file_samples={len(audio_samples)}", flush=True)
