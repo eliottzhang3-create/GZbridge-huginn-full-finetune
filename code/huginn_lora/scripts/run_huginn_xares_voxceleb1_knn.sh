@@ -19,8 +19,12 @@ CHECKPOINT="${HUGINN_XARES_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/G
 PLUGIN_PATH="${HUGINN_XARES_PLUGIN_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py}"
 DATA_ROOT="${HUGINN_XARES_VOXCELEB1_ROOT:-/hpc_stor03/public/shared/data/mml/VoxCeleb1_origin}"
 WORK_ROOT="${HUGINN_XARES_VOXCELEB1_WORK_ROOT:-$REPO_ROOT/outputs/xares_voxceleb1_knn}"
-ENCODER_PATH="$SCRIPT_DIR/huginn_whisper_xares_encoder_entry.py"
-TASK_PATH="$SCRIPT_DIR/huginn_xares_voxceleb1_task.py"
+# xares.run converts these arguments to importable module names. Passing an
+# absolute path makes it generate a leading-dot relative import such as
+# ``.hpc_stor03...``. The scripts directory is already on PYTHONPATH, so use
+# basenames here.
+ENCODER_PATH="huginn_whisper_xares_encoder_entry.py"
+TASK_PATH="huginn_xares_voxceleb1_task.py"
 
 export HUGINN_XARES_ROOT="$XARES_ROOT"
 export HUGINN_XARES_CHECKPOINT="$CHECKPOINT"
@@ -48,4 +52,3 @@ echo "do_knn=${HUGINN_XARES_VOXCELEB1_DO_KNN:-1}"
 python -u -m xares.run   --max-jobs 1   "$ENCODER_PATH"   "$TASK_PATH"
 
 echo "========== HUGINN X-ARES VOXCELEB1 KNN EXIT =========="
-
