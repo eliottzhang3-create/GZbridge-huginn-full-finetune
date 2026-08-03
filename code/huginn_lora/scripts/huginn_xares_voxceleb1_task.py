@@ -85,6 +85,20 @@ def _set_if_present(config: Any, name: str, value: Any) -> None:
     setattr(config, name, value)
 
 
+def _prepare_writable_task_root() -> Path:
+    """Mirror the public VoxCeleb1 layout with symlinks, never copy audio."""
+    task_root = WORK_ROOT / "voxceleb1"
+    task_root.mkdir(parents=True, exist_ok=True)
+    if not DATA_ROOT.is_dir():
+        raise FileNotFoundError(f"Public VoxCeleb1 root does not exist: {DATA_ROOT}")
+    for source in sorted(DATA_ROOT.iterdir(), key=lambda path: path.name):
+        destination = task_root / source.name
+        if destination.exists() or destination.is_symlink():
+            continue
+        destination.symlink_to(source, target_is_directory=source.is_dir())
+    return task_root
+
+
 def _redirect_encoded_outputs(config: Any) -> None:
     """Keep generated X-ARES embeddings outside the public read-only tree."""
     names = getattr(config, "encoded_tar_name_of_split", None)
@@ -114,11 +128,12 @@ def _write_config_report(config: Any) -> None:
 def voxceleb1_config(encoder):
     official = _load_official_task()
     config = official.voxceleb1_config(encoder)
+    _prepare_writable_task_root()
 
-    # The public VoxCeleb1 tree is read-only. The task owns its standard split
-    # and label protocol; we only override execution/cache controls and the
-    # shared data root supplied by the user.
-    _set_if_present(config, "env_root", DATA_ROOT)
+    # The public VoxCeleb1 tree is read-only. Keep the official task's layout
+    # and split protocol, but point env_root at a writable symlink mirror so
+    # X-ARES can create embeddings under work_root/voxceleb1.
+    _set_if_present(config, "env_root", WORK_ROOT)
     _set_if_present(
         config,
         "batch_size_encode",
@@ -156,6 +171,7 @@ def voxceleb1_config(encoder):
 
     print(
         f"[xares-voxceleb1-task] data_root={DATA_ROOT} "
+        f"env_root={WORK_ROOT} "
         f"mini={config.use_mini_dataset} force_encode={config.force_encode} "
         f"do_knn={config.do_knn} batch_size_encode={config.batch_size_encode} "
         f"num_encoder_workers={config.num_encoder_workers}",
