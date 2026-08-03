@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
+import sys
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -49,7 +50,19 @@ def _load_module(path: Path, name: str) -> ModuleType:
     if spec is None or spec.loader is None:
         raise ImportError(f"Unable to import module from {path}")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    # dataclasses resolves ``cls.__module__`` through sys.modules while the
+    # dynamically loaded plugin is being executed.  Register it before
+    # exec_module, exactly as a normal import would do.
+    previous = sys.modules.get(name)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except BaseException:
+        if previous is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = previous
+        raise
     return module
 
 
