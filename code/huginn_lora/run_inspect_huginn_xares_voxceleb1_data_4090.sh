@@ -15,11 +15,11 @@ for name in HUGINN_XARES_CONDA_ENV HUGINN_XARES_ROOT HUGINN_XARES_VOXCELEB1_ROOT
 done
 
 vc submit \
-  -p pdgpu-4090 \
+  -p pdgpu-v100 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 8 -m 32G -g 1 \
   -n 1 \
-  -j inspect-huginn-xares-voxceleb1-data-4090-$(date +%m%d%H%M) \
+  -j inspect-huginn-xares-voxceleb1-data-v100-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/inspect_huginn_xares_voxceleb1_data_4090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/inspect_huginn_xares_voxceleb1_data.sh"
