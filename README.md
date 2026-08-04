@@ -259,12 +259,35 @@ For the current project handoff, Huginn is the primary line. The independent HRM
 background and isolation, but it must not be mixed into Huginn model, data, plugin, or checkpoint decisions unless the
 user explicitly switches lines.
 
-### Authoritative current Huginn Whisper mainline (updated 2026-08-03)
+### Authoritative current Huginn Whisper mainline (updated 2026-08-04)
 
 The active Huginn formal-training route is **Whisper-large + dynamic-30s audio + 240ms/token + Swift FSDP4**. Some
 filenames and environment variables still contain `dynamic90s` because the already-validated model/plugin and checkpoint
 tooling were retained for compatibility; the current runtime semantics are dynamic-30s, not dynamic-90s. This route is
 isolated from the historical fixed-32 Whisper route and from both LoSATok routes.
+
+#### Current status snapshot (2026-08-04)
+
+This is the authoritative handoff snapshot for the Huginn line. The project is currently in the Whisper-large
+dynamic-30s/240ms-token phase; the old dynamic-90s names are compatibility names only.
+
+- The active model path is the original Huginn-0125 backbone plus a trainable Whisper-large encoder and trainable audio
+  aligner. The native Huginn backbone and LM head are frozen; only Huginn-side rank-8 LoRA is trainable on the language
+  model. Whisper, aligner, audio BOS/EOS, and Huginn LoRA use the validated `1e-4` optimizer groups.
+- The active audio contract is one mono 16-kHz chunk per record, first-30-second truncation for longer input, real
+  dynamic length for shorter input, and one content token per `240ms`. There is no 90-second splitting or chunk
+  concatenation in the current runtime.
+- The four-GPU FSDP4 topology, SDPA attention, removal of Whisper's internal per-layer checkpointing, outer Whisper
+  activation checkpointing, recurrent-core `reshard_after_forward=false`, real-data chain, sampler audit, acceleration
+  Stage 0/1/2, Stage 3/4, Stage 5, and full-model four-rank save/cold-resume smoke have passed. These are validation
+  gates; they are not themselves evidence that a long formal run has completed.
+- The two formal data schedules are isolated: hierarchical AAC/ASR no-replacement multitask and finite globally shuffled
+  multiplier. Their registries, plugins, statistics, plans, and checkpoints must never be mixed.
+- Formal-training completion is not inferred from an intermediate loss line, step count, or an output directory. It
+  requires the final success banner, retained-checkpoint audit, and cumulative training-statistics audit.
+- **X-ARES modality-alignment evaluation is explicitly unfinished.** Environment setup, checkpoint inspection, VoxCeleb1
+  path audit, encoder synthetic/real smoke, and the API-contract gate have passed. The VoxCeleb1 K-NN run has not yet
+  completed successfully, no X-ARES score is available, and no full evaluation result may be reported as completed.
 
 #### Current formal schedules
 
@@ -280,8 +303,11 @@ contract. They differ only in their data registry/schedule, total steps, and che
      reshuffled for the next pool epoch. The seed and exact global position define deterministic arbitrary-position resume.
    - Formal script: `code/huginn_lora/scripts/train_huginn_audio_whisper_dynamic90s_multitask_fsdp4.sh`.
    - Schedule: `20000` optimizer steps, FSDP4 global batch `32`, `640000` scheduled samples, checkpoints at
-     `5000/10000/15000/20000`, `save_total_limit=4`. The runtime final audit checks whether realized, decoded,
-     first-30-second-capped duration exceeded `3000` hours.
+     `5000/10000/15000/20000`. The latest retention requirement is to keep at most the two most recent checkpoints;
+     the multiplier launcher already passes `save_total_limit=2`, but the multitask launcher currently still contains
+     `--save_total_limit 4` and must be synchronized before a new multitask formal launch. Do not assume the live
+     multitask job has two-checkpoint retention until its source script and launch log agree. The runtime final audit
+     checks whether realized, decoded, first-30-second-capped duration exceeded `3000` hours.
 
 2. **Finite multiplier/single-global-epoch schedule**
 
@@ -356,6 +382,9 @@ checkpoint/statistics audit.
   audios, and `2264528` GigaSpeech-L segments representing about `2498.217` metadata hours. The full atomic-pool,
   indexed-mixture, multiplier-pool, and representative real-decode audits have passed; these audits do not imply that
   every public audio file was pre-decoded or copied locally.
+- The intended `wavcaps_no_bbc_aac` pool excludes BBC Sound Effects. An earlier inventory exposed a BBC source label in
+  the public WavCaps metadata; therefore the final registry/manifest is the authoritative exclusion check. Do not infer
+  BBC removal from the pool name alone, and do not alter the read-only public WavCaps root.
 - Effective training hours are measured after successful runtime decode/resample/truncation, using the actual retained
   waveform duration (`len(waveform)/16000`). Prefetch-only or duplicate template rows are not counted; raw metadata
   duration is not used for the cumulative training-hours statistic.
@@ -371,6 +400,35 @@ sampler audit, real-audio decode chain, dynamic30s contract, acceleration Stage 
 history, and the updated four-GPU full-model checkpoint/resume smoke. The current production switches are Whisper SDPA,
 no Whisper internal checkpointing, one outer Whisper checkpoint wrapper, and recurrent-core `reshard_after_forward=false`.
 Do not reuse old dynamic90s checkpoint-4/6 artifacts or old with-replacement sampler evidence as current resume sources.
+
+#### X-ARES modality-alignment evaluation (unfinished; updated 2026-08-04)
+
+X-ARES is a separate evaluation branch for measuring the representation quality of the Huginn audio encoder/aligner
+output with the official X-ARES task/K-NN framework. It does not change the training route and must not be treated as a
+training checkpoint or a completed benchmark.
+
+- Official X-ARES code is remote-only; the actual uploaded third-party checkout is
+  `/hpc_stor03/sjtu_home/jinwei.zhang/third_party/xares`. The active evaluation environment is the copied
+  `env_xares` conda environment, separate from `swift_huginn`.
+- The current reference checkpoint is the multiplier-line checkpoint
+  `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_whisper_dynamic30s_multiplier_single_epoch_fsdp4/run-20260731_084946/swift_output/v0-20260731-085036/checkpoint-20000`.
+- The wrapper restores the Whisper encoder and audio aligner from the paired full-model FSDP DCP checkpoint and returns
+  the projected audio-prefix frame sequence for X-ARES. It deliberately does not use the Huginn recurrent core or
+  Huginn LoRA as the X-ARES encoder representation, and audio BOS/EOS are excluded from the frame embedding sequence.
+- Public evaluation data currently under consideration is read-only VoxCeleb1 at
+  `/hpc_stor03/public/shared/data/mml/VoxCeleb1_origin`. Jobs use `pdgpu-4090`, `-c8 -m32G -g1`; no audio is copied
+  into the repository. The X-ARES task is adapted through
+  `code/huginn_lora/scripts/huginn_xares_voxceleb1_task.py`, and the wrapper is in
+  `code/huginn_lora/scripts/huginn_whisper_xares_encoder.py` plus its entry module.
+- Passed gates: `env_xares` import/package preflight, checkpoint read-only inspection, VoxCeleb1 path audit, synthetic/
+  real encoder smoke, and the X-ARES API-contract inspection.
+- Pending gates: rerun the VoxCeleb1 K-NN smoke with its writable work-root/cache fix, verify embeddings and task
+  outputs, then run the complete VoxCeleb1 K-NN evaluation. Until those gates produce a final report and score, X-ARES
+  must be labeled **未完成**.
+- A previous K-NN attempt failed first because an absolute script path was converted into an invalid relative import, and
+  then because X-ARES tried to create its embedding cache under the read-only public dataset root. The current task
+  adapter uses script basenames/PYTHONPATH and a writable isolated output work root with links to the public data; this
+  fix has not yet been confirmed by a successful remote K-NN run.
 
 ### Historical LoSATok task record (updated 2026-07-27; superseded by the dynamic-30s Whisper mainline below)
 
@@ -830,8 +888,9 @@ Stage 5 is the synthetic four-GPU multi-step stability gate. It deliberately rem
 real optimizer updates with per-device batch size 1 and gradient accumulation 1. It keeps the exact Stage 3-4 model,
 LoRA, learning-rate, FSDP, and dynamic-audio contracts; checks raw training loss plus logged loss/gradient norms for
 non-finite values; requires one finite loss log per update on every rank; and revalidates the five FSDP units and all
-`80` trainable DTensors. It uses `save_strategy=no`: checkpoint save/reload belongs to the later Stage 6 and is not
-implemented or launched yet.
+`80` trainable DTensors. It uses `save_strategy=no`; checkpoint save/reload was a later gate at the time of this
+historical run and has since been implemented and passed separately. This paragraph is retained as historical Stage 5
+evidence, not as the current checkpoint status.
 
 - runtime: `code/huginn_lora/scripts/smoke_huginn_audio_whisper_dynamic90s_stage5_stability_fsdp4.sh`
 - marker inspector: `code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic90s_stage5_markers.py`
@@ -847,8 +906,9 @@ Stage 5 passed remotely on all four ranks. Every rank completed `20` finite loss
 retained `640` DTensor parameters, used `AcceleratedOptimizer`, and reached `global_step=20`; the job ended with
 `HUGINN WHISPER DYNAMIC90S STAGE 5 STABILITY PASSED` and `exit_status=0`.
 
-The next active work is formal data preparation, before the intentionally deferred Stage 6 checkpoint gate. The fixed
-eligible pools and hierarchical sample-draw policy are:
+At the time, the next active work was formal data preparation before the checkpoint gate. That data preparation, sampler
+audit, real-data chain, and four-GPU save/resume gate have since passed; the following policy is retained as historical
+Stage 5 context. The fixed eligible pools and hierarchical sample-draw policy were:
 
 - AAC `60%`, composed of WavCaps without BBC Sound Effects `60%`, AudioCaps-v2 `30%`, and Clotho-v2 train only `10%`;
 - ASR `40%`, composed of GigaSpeech segment-level `{L}` records;
@@ -2159,6 +2219,26 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
 The word `dynamic90s` in these shared paths is a compatibility name. Always read the current 30-second contract and the
 formal launcher before changing or submitting a job.
 
+### X-ARES evaluation (unfinished)
+
+- environment/checkpoint/data/API audits:
+  - `code/huginn_lora/scripts/inspect_huginn_xares_environment.py`
+  - `code/huginn_lora/scripts/inspect_huginn_xares_checkpoint.py`
+  - `code/huginn_lora/scripts/inspect_huginn_xares_voxceleb1_data.py`
+  - `code/huginn_lora/scripts/inspect_huginn_xares_voxceleb1_api.py`
+- encoder/task wrapper:
+  - `code/huginn_lora/scripts/huginn_whisper_xares_encoder.py`
+  - `code/huginn_lora/scripts/huginn_whisper_xares_encoder_entry.py`
+  - `code/huginn_lora/scripts/huginn_xares_voxceleb1_task.py`
+- smoke/K-NN launchers:
+  - `code/huginn_lora/scripts/smoke_huginn_whisper_xares_encoder.py`
+  - `code/huginn_lora/scripts/run_huginn_xares_voxceleb1_knn.sh`
+  - `code/huginn_lora/run_smoke_huginn_xares_voxceleb1_knn_4090.sh`
+  - `code/huginn_lora/run_eval_huginn_xares_voxceleb1_knn_4090.sh`
+
+This branch is **未完成**: the preflight, checkpoint, data-path, encoder smoke, and API-contract gates passed, but the
+writable-cache VoxCeleb1 K-NN smoke and complete K-NN evaluation have not yet produced a validated score.
+
 ### Backbone / model logic
 
 - `models/huginn-0125/raven_modeling_minimal.py`
@@ -2320,6 +2400,8 @@ Any new chat should assume the following:
      - Whisper encoder and aligner fully trainable; Huginn native backbone frozen; Huginn-only rank-8 LoRA trainable
      - four-card FSDP4, coarse five-unit wrapping, full-model paired DCP save/resume
      - two separate schedules: hierarchical AAC/ASR no-replacement and finite global multiplier pool
+     - X-ARES modality-alignment evaluation is a separate, currently **未完成** evaluation branch; do not report a K-NN
+       score until its writable-cache smoke and full VoxCeleb1 run pass
    - historical standalone branch:
      - original Huginn backbone and earlier Whisper-small experiments
      - retained only as historical code/reference; not the current formal route
@@ -2359,6 +2441,7 @@ Any new chat should assume the following:
      - Clotho embedding-retrieval evaluation scripts
      - MMAU environment inspection, smoke, and resumable full-mini evaluation scripts
      - LoSATok remote encoder inspection and Swift trainable-split inspection entrypoints
+     - X-ARES environment/checkpoint/data/API/encoder smoke and VoxCeleb1 K-NN entrypoints; K-NN result still pending
 
 ---
 
@@ -2388,8 +2471,11 @@ Any new chat should assume the following:
     Keep current Whisper checkpoints separate from fixed-32 Whisper and all LoSATok checkpoints. The old dynamic `66` /
     `0` LoSATok DCPs and old dynamic-90s Whisper smoke artifacts are not valid current resume sources.
 11. For current Swift audio training and evaluation, use the `pdgpu-5090` submit wrappers unless an existing legacy smoke/preparation wrapper explicitly targets `pdgpu-3090`.
-12. For ACAVCAPS, use the current private WebDataset stage manifest: global tar-order shuffle within each stage plus runtime buffer shuffle within each tar, with FLAC decoded only during training. Never modify the shared public dataset root or add manual rank sharding on top of Accelerate's `DataLoaderDispatcher` behavior.
-13. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
+12. The latest checkpoint-retention requirement is at most two retained checkpoints. The multiplier formal launcher is
+    synchronized to `save_total_limit=2`; the multitask formal source currently still passes `4`, so reconcile that
+    source/configuration before launching a new multitask formal run.
+13. For ACAVCAPS, use the current private WebDataset stage manifest: global tar-order shuffle within each stage plus runtime buffer shuffle within each tar, with FLAC decoded only during training. Never modify the shared public dataset root or add manual rank sharding on top of Accelerate's `DataLoaderDispatcher` behavior.
+14. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
 
 ---
 
@@ -2475,7 +2561,7 @@ Before any long remote run:
   - checkpoint audit/save-reload validation
   - retrieval / generation / benchmark evaluation
 
-### Huginn Whisper dynamic-30s current status (2026-08-03; supersedes all dynamic-90s execution guidance below)
+### Huginn Whisper dynamic-30s current status (2026-08-04; supersedes all dynamic-90s execution guidance below)
 
 The active Huginn route now uses exactly one dynamic Whisper chunk per sample. Existing `dynamic90s` filenames,
 environment variables, model type, and model directory are retained only for Swift/checkpoint tooling compatibility;

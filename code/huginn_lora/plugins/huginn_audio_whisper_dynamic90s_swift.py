@@ -74,6 +74,7 @@ if _DERIVED_AUDIO_TOKEN_DURATION_MS != AUDIO_TOKEN_DURATION_MS:
         f"derived={_DERIVED_AUDIO_TOKEN_DURATION_MS}ms configured={AUDIO_TOKEN_DURATION_MS}ms"
     )
 INIT_ALIGNER_CHECKPOINT_ENV = "HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT"
+INIT_FSDP_DCP_CHECKPOINT_ENV = "HUGINN_AUDIO_DYNAMIC90S_INIT_FSDP_DCP_CHECKPOINT"
 FSDP2_NONPERSISTENT_ROPE_ENV = "HUGINN_AUDIO_DYNAMIC90S_FSDP2_NONPERSISTENT_ROPE"
 TRAIN_CHAIN_AUDIT_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAIN_CHAIN_AUDIT"
 STAGE34_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_STAGE34_AUDIT_DIR"
@@ -84,6 +85,7 @@ ACCELERATION_STAGE0_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE0
 ACCELERATION_STAGE1_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE1_AUDIT_DIR"
 ACCELERATION_STAGE2_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC30S_ACCELERATION_STAGE2_AUDIT_DIR"
 RECURRENT_CORE_NO_RESHARD_ENV = "HUGINN_AUDIO_DYNAMIC30S_RECURRENT_CORE_RESHARD_AFTER_FORWARD_FALSE"
+RECURRENT_CORE_EXPECTED_WORLD_SIZE_ENV = "HUGINN_AUDIO_DYNAMIC30S_RECURRENT_CORE_EXPECTED_WORLD_SIZE"
 REALDATA_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_AUDIT_DIR"
 REALDATA_MAX_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_REALDATA_MAX_STEPS"
 DATA_POSITION_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_DATA_POSITION_AUDIT_DIR"
@@ -96,6 +98,11 @@ CHECKPOINT_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_PHASE"
 CHECKPOINT_START_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_START_STEP"
 CHECKPOINT_END_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_END_STEP"
 CHECKPOINT_LAUNCH_ID_ENV = "HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_LAUNCH_ID"
+MODEL_ONLY_WARMSTART_AUDIT_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_AUDIT_DIR"
+MODEL_ONLY_WARMSTART_EXPECTED_WORLD_SIZE_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_EXPECTED_WORLD_SIZE"
+MODEL_ONLY_WARMSTART_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_PHASE"
+MODEL_ONLY_WARMSTART_AUDIT_MODE_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_AUDIT_MODE"
+MODEL_ONLY_WARMSTART_EXPECTED_START_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_EXPECTED_START_STEP"
 TRAINING_STATS_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR"
 TRAINING_STATS_RESUME_STATE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE"
 TRAINING_STATS_LOG_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS"
@@ -500,6 +507,47 @@ def checkpoint_key_aliases(key: str) -> list[str]:
     return list(normalized)
 
 
+def ordered_checkpoint_key_aliases(key: str) -> list[str]:
+    """Return deterministic aliases while retaining PEFT ownership branches.
+
+    The full-model DCP contains both the original aligner branch and the
+    PEFT-owned ``modules_to_save.default`` branch.  Flattening those aliases
+    too early can copy a frozen original tensor into the trainable branch.
+    Exact and ownership-preserving aliases therefore always precede the
+    compatibility aliases.
+    """
+    raw_aliases: list[str] = [key]
+    index = 0
+    while index < len(raw_aliases):
+        alias = raw_aliases[index]
+        index += 1
+        for prefix in ("base_model.model.", "base_model.", "model.", "module."):
+            if alias.startswith(prefix):
+                stripped = alias[len(prefix):]
+                if stripped not in raw_aliases:
+                    raw_aliases.append(stripped)
+
+    ordered: list[str] = []
+
+    def add(value: str) -> None:
+        if value not in ordered:
+            ordered.append(value)
+
+    for alias in raw_aliases:
+        add(alias)
+        add(alias.replace(".lora_A.default.", ".lora_A."))
+        add(alias.replace(".lora_B.default.", ".lora_B."))
+    for alias in raw_aliases:
+        add(alias.replace(".modules_to_save.default.", "."))
+        add(alias.replace(".original_module.", "."))
+    for alias in list(ordered):
+        if alias.startswith("audio_aligner."):
+            add(alias[len("audio_aligner."):])
+        elif alias.startswith(ALIGNER_PREFIXES):
+            add(f"audio_aligner.{alias}")
+    return ordered
+
+
 def read_tensor_state_dict(path: Path) -> dict[str, torch.Tensor]:
     if path.suffix == ".safetensors":
         from safetensors import safe_open
@@ -861,6 +909,184 @@ def _fsdp_dcp_lora_resume_model(
     return restored
 
 
+def _dynamic_fsdp_dcp_weight_warmstart_requested(checkpoint_dir: Path) -> bool:
+    """Return whether a DCP path is an explicit model-only warm-start source."""
+    configured = os.environ.get(INIT_FSDP_DCP_CHECKPOINT_ENV, "").strip()
+    if not configured:
+        return False
+    requested = Path(configured).expanduser().resolve()
+    actual = checkpoint_dir.resolve()
+    if requested != actual:
+        return False
+    if not _requested(PEFT_ALIGNER_MODULES_TO_SAVE_ENV) or not _requested(FULL_MODEL_DCP_ENV):
+        raise RuntimeError(
+            "Dynamic Whisper model-only DCP warm-start requires both PEFT aligner "
+            "modules-to-save and FULL_MODEL_DCP"
+        )
+    return True
+
+
+def _classify_model_warmstart_key(key: str) -> str:
+    groups = _fsdp_save_state_groups({key: None})
+    for group, keys in groups.items():
+        if keys:
+            return group
+    raise RuntimeError(f"Unable to classify model-only warm-start key: {key}")
+
+
+def load_dynamic_fsdp_dcp_model_warmstart(
+    model: torch.nn.Module,
+    checkpoint_dir: Path,
+) -> dict[str, Any]:
+    """Restore model tensors only from a full-model FSDP DCP checkpoint.
+
+    This runs after PEFT topology reconstruction but before FSDP wrapping and
+    optimizer construction.  It deliberately reads only model DCP tensors;
+    optimizer, scheduler, RNG, Trainer state, and old data statistics are not
+    touched.  The frozen native Huginn tensors are validated in the source
+    contract but skipped because the new run rebuilds them from the canonical
+    Huginn-0125 base.
+    """
+    source_dir = checkpoint_dir / "pytorch_model_fsdp_0"
+    if not source_dir.is_dir():
+        raise FileNotFoundError(f"Dynamic Whisper model-only DCP directory is missing: {source_dir}")
+    try:
+        import torch.distributed.checkpoint as dcp
+        from torch.distributed.checkpoint import FileSystemReader
+    except Exception as exc:
+        raise RuntimeError(
+            "torch.distributed.checkpoint is required for Dynamic Whisper model-only warm-start"
+        ) from exc
+
+    metadata = FileSystemReader(str(source_dir)).read_metadata()
+    state_metadata = getattr(metadata, "state_dict_metadata", {})
+    if not state_metadata:
+        raise RuntimeError(f"Dynamic Whisper model-only DCP metadata is empty: {source_dir}")
+
+    source_groups = _fsdp_save_state_groups(state_metadata)
+    source_counts = {name: len(keys) for name, keys in source_groups.items()}
+    if (
+        source_counts["lora"] != 66
+        or source_counts["aligner"] < 14
+        or source_counts["audio_encoder"] <= 0
+        or source_counts["huginn_base"] <= 0
+        or source_counts["other"] != 0
+    ):
+        raise RuntimeError(
+            "Dynamic Whisper model-only warm-start source is not a complete full-model DCP: "
+            f"counts={source_counts}"
+        )
+
+    target_state = model.state_dict()
+    target_aliases: dict[str, list[str]] = {}
+    for target_key in target_state:
+        for alias in ordered_checkpoint_key_aliases(str(target_key)):
+            target_aliases.setdefault(alias, []).append(str(target_key))
+
+    restore_groups = {"lora", "aligner", "audio_encoder"}
+    restore_plan: list[tuple[str, str, tuple[int, ...], torch.dtype, str]] = []
+    selected_targets: dict[str, str] = {}
+    unmatched: list[str] = []
+    duplicate_targets: list[tuple[str, str, str]] = []
+    restored_source_counts = {name: 0 for name in source_groups}
+
+    for raw_source_key, entry in state_metadata.items():
+        source_key = str(raw_source_key)
+        group = _classify_model_warmstart_key(source_key)
+        if group not in restore_groups:
+            continue
+        restored_source_counts[group] += 1
+        shape_value = getattr(entry, "size", None)
+        dtype = getattr(getattr(entry, "properties", None), "dtype", None)
+        if shape_value is None or not isinstance(dtype, torch.dtype):
+            raise RuntimeError(
+                "Dynamic Whisper model-only warm-start metadata lacks tensor shape/dtype: "
+                f"key={source_key} shape={shape_value} dtype={dtype}"
+            )
+        shape = tuple(int(value) for value in shape_value)
+        target_key: str | None = None
+        for alias in ordered_checkpoint_key_aliases(source_key):
+            for candidate in target_aliases.get(alias, []):
+                if tuple(target_state[candidate].shape) == shape:
+                    target_key = candidate
+                    break
+            if target_key is not None:
+                break
+        if target_key is None:
+            unmatched.append(source_key)
+            continue
+        previous_source = selected_targets.get(target_key)
+        if previous_source is not None:
+            duplicate_targets.append((target_key, previous_source, source_key))
+            continue
+        selected_targets[target_key] = source_key
+        restore_plan.append((source_key, target_key, shape, dtype, group))
+
+    expected_restore_count = sum(source_counts[group] for group in restore_groups)
+    if (
+        unmatched
+        or duplicate_targets
+        or len(restore_plan) != expected_restore_count
+        or restored_source_counts != {name: (source_counts[name] if name in restore_groups else 0) for name in source_counts}
+    ):
+        raise RuntimeError(
+            "Dynamic Whisper model-only warm-start mapping is incomplete: "
+            f"source_counts={source_counts} restored_source_counts={restored_source_counts} "
+            f"restore_plan={len(restore_plan)}/{expected_restore_count} "
+            f"unmatched={unmatched[:10]} duplicate_targets={duplicate_targets[:5]}"
+        )
+
+    restored_counts = {name: 0 for name in source_groups}
+    verified_tensor_count = 0
+    for index, (source_key, target_key, shape, source_dtype, group) in enumerate(restore_plan, start=1):
+        streamed = torch.empty(shape, dtype=source_dtype, device="cpu")
+        dcp.load({source_key: streamed}, checkpoint_id=str(source_dir))
+        target = target_state[target_key]
+        if target.device.type == "meta":
+            raise RuntimeError(
+                "Dynamic Whisper model-only warm-start encountered a meta target before FSDP preparation: "
+                f"target={target_key}"
+            )
+        if not bool(torch.isfinite(streamed).all().item()):
+            raise RuntimeError(f"Dynamic Whisper warm-start source tensor is non-finite: {source_key}")
+        with torch.no_grad():
+            restored_value = streamed.to(device=target.device, dtype=target.dtype)
+            target.copy_(restored_value)
+            if not torch.equal(target.detach().cpu(), restored_value.detach().cpu()):
+                raise RuntimeError(
+                    "Dynamic Whisper model-only warm-start target verification failed: "
+                    f"source={source_key} target={target_key}"
+                )
+        verified_tensor_count += 1
+        restored_counts[group] += 1
+        del restored_value
+        del streamed
+        if index == 1 or index % 100 == 0 or index == len(restore_plan):
+            print(
+                "[HuginnAudioDynamic30s] model-only DCP warm-start restored "
+                f"tensors={index}/{len(restore_plan)}",
+                flush=True,
+            )
+
+    report = {
+        "checkpoint_dir": str(checkpoint_dir),
+        "dcp_source_dir": str(source_dir),
+        "semantics": "model_weights_only_new_optimizer_scheduler_global_step_rng_data_position",
+        "source_tensor_counts": source_counts,
+        "restored_tensor_counts": restored_counts,
+        "skipped_tensor_counts": {
+            "huginn_base": source_counts["huginn_base"],
+            "other": source_counts["other"],
+        },
+        "restored_tensor_count": len(restore_plan),
+        "verified_tensor_count": verified_tensor_count,
+        "source_key_preview": [source_key for source_key, _, _, _, _ in restore_plan[:12]],
+    }
+    model._huginn_audio_model_only_warmstart_report = report
+    print(f"[HuginnAudioDynamic30s] model-only DCP warm-start complete report={report}", flush=True)
+    return report
+
+
 def patch_peft_adapter_restore() -> None:
     """PEFT freezes base modules on adapter load; re-enable our separately trained aligner."""
     if getattr(patch_peft_adapter_restore, "_patched", False):
@@ -888,6 +1114,13 @@ def patch_peft_adapter_restore() -> None:
                 checkpoint_dir,
                 adapter_name=str(kwargs.get("adapter_name", "default")),
             )
+            if _dynamic_fsdp_dcp_weight_warmstart_requested(checkpoint_dir):
+                report = load_dynamic_fsdp_dcp_model_warmstart(restored_model, checkpoint_dir)
+                print(
+                    "[HuginnAudioDynamic30s] applied model-only DCP warm-start "
+                    f"report={report}",
+                    flush=True,
+                )
         else:
             restored_model = original_from_pretrained(*args, **kwargs)
         force_audio_modules_trainable_after_peft_restore(restored_model)
@@ -4556,9 +4789,11 @@ def patch_recurrent_core_no_reshard_callback() -> None:
                 raise RuntimeError("Recurrent-core no-reshard requires initialized torch.distributed")
             rank = torch.distributed.get_rank()
             world_size = torch.distributed.get_world_size()
-            if world_size != 4:
+            expected_world_size = int(os.environ.get(RECURRENT_CORE_EXPECTED_WORLD_SIZE_ENV, "4"))
+            if world_size != expected_world_size:
                 raise RuntimeError(
-                    f"Recurrent-core no-reshard requires world_size=4, got {world_size}"
+                    "Recurrent-core no-reshard world-size mismatch: "
+                    f"expected={expected_world_size} got={world_size}"
                 )
             units = self._units()
             before: dict[str, Any] = {}
@@ -4630,6 +4865,259 @@ def patch_recurrent_core_no_reshard_callback() -> None:
     init_with_recurrent_core_no_reshard._huginn_audio_recurrent_core_no_reshard_patched = True
     Trainer.__init__ = init_with_recurrent_core_no_reshard
     print("[HuginnAudioDynamic30s] installed recurrent-core no-reshard callback")
+
+
+def patch_model_only_warmstart_audit_callback() -> None:
+    """Audit a fresh run initialized from model weights only.
+
+    This callback is opt-in and intentionally separate from the Trainer
+    checkpoint-resume audit.  In ``fresh`` mode it requires global step zero
+    and an empty new optimizer state; in ``resume`` mode it checks that the
+    newly-created smoke checkpoint restored optimizer/scheduler state.  Both
+    modes validate the post-FSDP trainable split and write a normal
+    current-runtime contract into each smoke checkpoint.
+    """
+    audit_dir_value = os.environ.get(MODEL_ONLY_WARMSTART_AUDIT_DIR_ENV, "").strip()
+    if not audit_dir_value:
+        return
+    from transformers import Trainer, TrainerCallback
+
+    audit_dir = Path(audit_dir_value).expanduser().resolve()
+    expected_world_value = os.environ.get(MODEL_ONLY_WARMSTART_EXPECTED_WORLD_SIZE_ENV, "").strip()
+    expected_world_size = int(expected_world_value) if expected_world_value else None
+    phase_name = os.environ.get(MODEL_ONLY_WARMSTART_PHASE_ENV, "acavcaps_warmstart").strip()
+    if not phase_name:
+        raise ValueError(f"{MODEL_ONLY_WARMSTART_PHASE_ENV} must not be empty")
+    audit_mode = os.environ.get(MODEL_ONLY_WARMSTART_AUDIT_MODE_ENV, "fresh").strip().lower()
+    if audit_mode not in {"fresh", "resume"}:
+        raise ValueError(
+            f"{MODEL_ONLY_WARMSTART_AUDIT_MODE_ENV} must be fresh or resume, got {audit_mode!r}"
+        )
+    expected_start_step_value = os.environ.get(MODEL_ONLY_WARMSTART_EXPECTED_START_STEP_ENV, "").strip()
+    expected_start_step = int(expected_start_step_value) if expected_start_step_value else (0 if audit_mode == "fresh" else None)
+    if expected_start_step is not None and expected_start_step < 0:
+        raise ValueError(f"{MODEL_ONLY_WARMSTART_EXPECTED_START_STEP_ENV} must be non-negative")
+
+    original_init = Trainer.__init__
+    if getattr(original_init, "_huginn_audio_model_only_warmstart_audit_patched", False):
+        return
+
+    def find_warmstart_report(model: torch.nn.Module) -> dict[str, Any]:
+        reports: list[dict[str, Any]] = []
+        for module in model.modules():
+            report = vars(module).get("_huginn_audio_model_only_warmstart_report")
+            if isinstance(report, dict):
+                reports.append(report)
+        if len(reports) != 1:
+            raise RuntimeError(
+                "Model-only warm-start audit expected exactly one warm-start report, "
+                f"found={len(reports)}"
+            )
+        return reports[0]
+
+    class ModelOnlyWarmstartCallback(TrainerCallback):
+        _huginn_audio_model_only_warmstart_audit_callback = True
+
+        def __init__(self, tracked_model: torch.nn.Module):
+            self.tracked_model = tracked_model
+            self.warmstart_report: dict[str, Any] | None = None
+            self.optimizer_group_audit: list[dict[str, Any]] | None = None
+            self.lora_runtime_audit: dict[str, Any] | None = None
+            self.gradient_audit: dict[str, dict[str, int]] | None = None
+
+        @staticmethod
+        def identity() -> tuple[int, int]:
+            if not torch.distributed.is_available() or not torch.distributed.is_initialized():
+                raise RuntimeError("Model-only warm-start audit requires initialized torch.distributed")
+            return torch.distributed.get_rank(), torch.distributed.get_world_size()
+
+        @staticmethod
+        def checkpoint_dir(output_dir: str, step: int) -> Path:
+            direct = Path(output_dir) / f"checkpoint-{step}"
+            if direct.is_dir():
+                return direct
+            matches = sorted(Path(output_dir).glob(f"*/checkpoint-{step}"))
+            if len(matches) != 1:
+                raise FileNotFoundError(
+                    f"Expected one checkpoint-{step} below {output_dir}, found {matches}"
+                )
+            return matches[0]
+
+        def on_train_begin(self, args, state, control, **kwargs):
+            rank, world_size = self.identity()
+            if expected_world_size is not None and world_size != expected_world_size:
+                raise RuntimeError(
+                    "Model-only warm-start world-size mismatch: "
+                    f"expected={expected_world_size} actual={world_size}"
+                )
+            if expected_start_step is not None and int(state.global_step) != expected_start_step:
+                raise RuntimeError(
+                    "Model-only warm-start audit start-step mismatch: "
+                    f"expected={expected_start_step} actual={state.global_step}"
+                )
+            if audit_mode == "fresh":
+                self.warmstart_report = find_warmstart_report(self.tracked_model)
+            optimizer = kwargs.get("optimizer")
+            inner_optimizer = getattr(optimizer, "optimizer", optimizer)
+            optimizer_state_count = len(getattr(inner_optimizer, "state", {}))
+            optimizer_steps: list[int] = []
+            for optimizer_state in getattr(inner_optimizer, "state", {}).values():
+                if not isinstance(optimizer_state, dict) or "step" not in optimizer_state:
+                    continue
+                step_value = optimizer_state["step"]
+                if torch.is_tensor(step_value) and step_value.numel() == 1:
+                    optimizer_steps.append(int(step_value.item()))
+                elif isinstance(step_value, (int, float)):
+                    optimizer_steps.append(int(step_value))
+            if audit_mode == "fresh" and optimizer_state_count != 0:
+                raise RuntimeError(
+                    "Model-only warm-start received a non-empty new optimizer state: "
+                    f"count={optimizer_state_count}"
+                )
+            if audit_mode == "resume" and optimizer_state_count <= 0:
+                raise RuntimeError(
+                    "ACAVCAPS cold-resume did not restore optimizer state: "
+                    f"count={optimizer_state_count}"
+                )
+            scheduler = kwargs.get("lr_scheduler")
+            scheduler_last_epoch = int(getattr(scheduler, "last_epoch", -999)) if scheduler is not None else None
+            if audit_mode == "resume" and (
+                not optimizer_steps
+                or min(optimizer_steps) != expected_start_step
+                or max(optimizer_steps) != expected_start_step
+                or scheduler_last_epoch != expected_start_step
+            ):
+                raise RuntimeError(
+                    "ACAVCAPS cold-resume optimizer/scheduler state mismatch: "
+                    f"expected_step={expected_start_step} optimizer_steps={optimizer_steps[:20]} "
+                    f"scheduler_last_epoch={scheduler_last_epoch}"
+                )
+            self.optimizer_group_audit = _audit_optimizer_parameter_groups(
+                self.tracked_model,
+                optimizer,
+                context="Model-only ACAVCAPS warm-start",
+            )
+            self.lora_runtime_audit = _audit_lora_runtime_configuration(
+                self.tracked_model,
+                context="Model-only ACAVCAPS warm-start",
+            )
+            _audit_dynamic_audio_tokenization(
+                self.tracked_model,
+                context="Model-only ACAVCAPS warm-start",
+            )
+            topology = _audit_formal_fsdp_topology(self.tracked_model)
+            if rank == 0:
+                _write_json_atomic(
+                    audit_dir / "model_only_warmstart_start.json",
+                    {
+                        "phase": phase_name,
+                        "audit_mode": audit_mode,
+                        "world_size": world_size,
+                        "global_step": int(state.global_step),
+                        "optimizer_state_count": optimizer_state_count,
+                        "optimizer_step_min": min(optimizer_steps) if optimizer_steps else None,
+                        "optimizer_step_max": max(optimizer_steps) if optimizer_steps else None,
+                        "scheduler_last_epoch": scheduler_last_epoch,
+                        "warmstart_report": self.warmstart_report,
+                        "optimizer_group_audit": self.optimizer_group_audit,
+                        "lora_runtime_audit": self.lora_runtime_audit,
+                        "fsdp_topology": topology,
+                    },
+                )
+            print(
+                "[HuginnAudioDynamic30s] MODEL_ONLY_WARMSTART_START "
+                f"mode={audit_mode} world_size={world_size} global_step={state.global_step} "
+                f"optimizer_state_count={optimizer_state_count} "
+                f"restored={self.warmstart_report.get('restored_tensor_counts') if self.warmstart_report else 'checkpoint_resume'}",
+                flush=True,
+            )
+            return control
+
+        def on_pre_optimizer_step(self, args, state, control, **kwargs):
+            del args, state, kwargs
+            if self.gradient_audit is None:
+                self.gradient_audit = _audit_local_trainable_gradients(
+                    self.tracked_model,
+                    context="Model-only ACAVCAPS warm-start first update",
+                )
+            return control
+
+        def on_save(self, args, state, control, **kwargs):
+            del kwargs
+            rank, world_size = self.identity()
+            if rank != 0:
+                return control
+            step = int(state.global_step)
+            checkpoint_dir = self.checkpoint_dir(args.output_dir, step)
+            lora_audit = _audit_lora_runtime_configuration(
+                self.tracked_model,
+                context=f"Model-only ACAVCAPS checkpoint-{step}",
+            )
+            contract = _build_dynamic30s_training_runtime_contract(
+                phase=phase_name,
+                global_step=step,
+                world_size=world_size,
+                lora_runtime_audit=lora_audit,
+                formal_training={
+                    "checkpoint_role": "acavcaps_model_only_warmstart_smoke",
+                    "checkpoint_step": step,
+                    "dataset_contract": "acavcaps_flat_global_tar_shuffle_v1",
+                },
+            )
+            _write_json_atomic(checkpoint_dir / TRAINING_RUNTIME_CONTRACT_FILENAME, contract)
+            _write_json_atomic(
+                checkpoint_dir / "model_only_warmstart.json",
+                {
+                    "phase": phase_name,
+                    "audit_mode": audit_mode,
+                    "warmstart_report": self.warmstart_report,
+                    "optimizer_group_audit": self.optimizer_group_audit,
+                    "lora_runtime_audit": lora_audit,
+                },
+            )
+            print(
+                f"[HuginnAudioDynamic30s] MODEL_ONLY_WARMSTART_CHECKPOINT step={step} "
+                f"path={checkpoint_dir}",
+                flush=True,
+            )
+            return control
+
+        def on_train_end(self, args, state, control, **kwargs):
+            del args, kwargs
+            if self.gradient_audit is None:
+                raise RuntimeError("Model-only warm-start audit observed no optimizer-step gradients")
+            rank, world_size = self.identity()
+            if rank == 0:
+                _write_json_atomic(
+                    audit_dir / "model_only_warmstart_end.json",
+                    {
+                        "phase": phase_name,
+                        "audit_mode": audit_mode,
+                        "world_size": world_size,
+                        "global_step": int(state.global_step),
+                        "warmstart_report": self.warmstart_report,
+                        "optimizer_group_audit": self.optimizer_group_audit,
+                        "gradient_audit": self.gradient_audit,
+                    },
+                )
+            return control
+
+    @wraps(original_init)
+    def init_with_model_only_warmstart_audit(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if not any(
+            getattr(callback, "_huginn_audio_model_only_warmstart_audit_callback", False)
+            for callback in self.callback_handler.callbacks
+        ):
+            self.add_callback(ModelOnlyWarmstartCallback(self.model))
+
+    init_with_model_only_warmstart_audit._huginn_audio_model_only_warmstart_audit_patched = True
+    Trainer.__init__ = init_with_model_only_warmstart_audit
+    print(
+        "[HuginnAudioDynamic30s] installed model-only warm-start audit callback "
+        f"phase={phase_name} expected_world_size={expected_world_size}",
+        flush=True,
+    )
 
 
 def patch_checkpoint_resume_callback() -> None:
@@ -5613,6 +6101,7 @@ patch_recurrent_core_no_reshard_callback()
 patch_training_statistics_callback()
 patch_checkpoint_resume_callback()
 patch_checkpoint_rng_restore_audit()
+patch_model_only_warmstart_audit_callback()
 
 register_model(
     ModelMeta(
