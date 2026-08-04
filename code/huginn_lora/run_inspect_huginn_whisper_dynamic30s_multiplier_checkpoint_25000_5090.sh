@@ -15,11 +15,11 @@ for name in HUGINN_AUDIO_DYNAMIC30S_MULTIPLIER_CHECKPOINT_25000 HUGINN_AUDIO_DYN
 done
 
 vc submit \
-  -p pdgpu-5090 \
+  -p pdgpu-4090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 8 -m 32G -g 1 \
   -n 1 \
-  -j inspect-whisper-dyn30-checkpoint25000-5090-$(date +%m%d%H%M) \
+  -j inspect-whisper-dyn30-checkpoint25000-4090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
-  JOB=1:1 "$SCRIPT_DIR/log/inspect_huginn_whisper_dynamic30s_multiplier_checkpoint_25000_5090.JOB.log" \
+  JOB=1:1 "$SCRIPT_DIR/log/inspect_huginn_whisper_dynamic30s_multiplier_checkpoint_25000_4090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/inspect_huginn_whisper_dynamic30s_multiplier_checkpoint_25000_5090.sh"
