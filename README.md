@@ -259,14 +259,14 @@ For the current project handoff, Huginn is the primary line. The independent HRM
 background and isolation, but it must not be mixed into Huginn model, data, plugin, or checkpoint decisions unless the
 user explicitly switches lines.
 
-### Authoritative current Huginn Whisper mainline (updated 2026-08-04)
+### Authoritative current Huginn Whisper mainline (updated 2026-08-05)
 
 The active Huginn formal-training route is **Whisper-large + dynamic-30s audio + 240ms/token + Swift FSDP4**. Some
 filenames and environment variables still contain `dynamic90s` because the already-validated model/plugin and checkpoint
 tooling were retained for compatibility; the current runtime semantics are dynamic-30s, not dynamic-90s. This route is
 isolated from the historical fixed-32 Whisper route and from both LoSATok routes.
 
-#### Current status snapshot (2026-08-04)
+#### Current status snapshot (2026-08-05)
 
 This is the authoritative handoff snapshot for the Huginn line. The project is currently in the Whisper-large
 dynamic-30s/240ms-token phase; the old dynamic-90s names are compatibility names only.
@@ -285,6 +285,20 @@ dynamic-30s/240ms-token phase; the old dynamic-90s names are compatibility names
   multiplier. Their registries, plugins, statistics, plans, and checkpoints must never be mixed.
 - Formal-training completion is not inferred from an intermediate loss line, step count, or an output directory. It
   requires the final success banner, retained-checkpoint audit, and cumulative training-statistics audit.
+- The current finite multiplier run is still the active remote training job. The expected final
+  `checkpoint-46050` had not yet been confirmed at the last handoff, so it must not be used as a warm-start source
+  until the checkpoint directory and final formal audit exist. If the current run root is unchanged, the expected path
+  is `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_whisper_dynamic30s_multiplier_single_epoch_fsdp4/run-20260731_084946/swift_output/v0-20260731-085036/checkpoint-46050`;
+  verify this on Linux rather than assuming it exists.
+- The latest confirmed intermediate multiplier checkpoint,
+  `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_whisper_dynamic30s_multiplier_single_epoch_fsdp4/run-20260731_084946/swift_output/v0-20260731-085036/checkpoint-25000`,
+  passed the read-only full-model FSDP DCP audit. This validates the source checkpoint contract, but it is not the
+  requested final warm-start source and does not mean the multiplier run is complete.
+- The complete ACAVCAPS flat manifest has now been generated and strictly audited: all `1071` tar files from all
+  three source stages are flattened into one deterministic global tar permutation, with `4,664,169` JSON/FLAC pairs.
+  The manifest is ready; it is not itself a training result.
+- The current 8-card ACAVCAPS model-only warm-start/save/resume smoke is implemented but intentionally not launched
+  until `checkpoint-46050` is available and formally verified.
 - **X-ARES modality-alignment evaluation is explicitly unfinished.** Environment setup, checkpoint inspection, VoxCeleb1
   path audit, encoder synthetic/real smoke, and the API-contract gate have passed. The VoxCeleb1 K-NN run has not yet
   completed successfully, no X-ARES score is available, and no full evaluation result may be reported as completed.
@@ -321,9 +335,71 @@ contract. They differ only in their data registry/schedule, total steps, and che
    - Checkpoints are saved every `5000` steps and at the final step, while at most the most recent two are retained
      (`save_total_limit=2`).
 
+   - Current execution status: the 4-card formal run is still in progress; `checkpoint-46050` is the required final
+     source for the next ACAVCAPS warm-start phase and must be confirmed together with the formal terminal/audit
+     output before starting that phase.
+
 The supplied 2026-08-03 logs showed approximately `13 s/step` for the multiplier route and `39 s/step` for the
 multitask route. These are runtime observations only; a run is complete only after its final success banner and formal
 checkpoint/statistics audit.
+
+#### Current ACAVCAPS flat global-tar route
+
+This is the next dataset route for the **current Whisper-large dynamic-30s mainline**. It must not be confused with the
+historical LoSATok ACAVCAPS-quarter routes documented later in this README.
+
+- The source full preflight manifest is:
+  `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps_wds/acavcaps_wds_stage_schedule_full_seed20260723.json`.
+- The completed private flat manifest is:
+  `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps/acavcaps_flat_global_tar_shuffle_seed20260723.json`.
+  Its companion stats file is the same path with `.stats.json`.
+- The manifest contains exactly `1071` tars and `4,664,169` JSON/FLAC pairs. Source tar counts are `stage1=651`,
+  `stage2=398`, and `stage3=22`; these fields are provenance only.
+- Training order is one global permutation over the concatenation of all three source stages, using seed `20260723`.
+  There are no stage-level training boundaries. Within each tar, WebDataset uses a runtime sample shuffle buffer of
+  `512`. The public ACAVCAPS root remains read-only; only private manifest/stats files are generated.
+- The flat-manifest preparation and strict preflight both passed, including source lineage, exact permutation,
+  tar-count/sample-count consistency, category counts, and tar-file existence checks. The preflight's reported
+  `145756` updates is only the nominal `ceil(4,664,169 / 32)` count for an 8-card `B=1, GA=4` configuration; it is
+  not a completed training run.
+- The current Whisper loader is
+  `code/huginn_lora/plugins/huginn_audio_whisper_dynamic30s_acavcaps_swift.py`. It opens one tar at a time, performs
+  the per-tar buffer shuffle, validates JSON/FLAC pairs and the non-empty `long` caption, and passes
+  `tar_path + audio_member` metadata to the current Whisper template for lazy decoding. It deliberately does not add
+  manual rank sharding because Accelerate's `DataLoaderDispatcher` owns rank-level batch dispatch for this route.
+- For formal ACAVCAPS training, `ACAVCAPS_FLAT_MAX_TARS` must be unset so all `1071` tars are consumed. A positive
+  `ACAVCAPS_FLAT_MAX_TARS` is allowed only for the bounded smoke test and is not a formal data configuration.
+
+#### Current 4-card-to-8-card model-only warm-start plan
+
+The user explicitly chose a new training, not a Trainer continuation of the 4-card multiplier job. Therefore the
+semantics are:
+
+1. Use the completed multiplier `checkpoint-46050` only as a full-model DCP **model-weight source**.
+2. Restore Whisper encoder tensors, aligner tensors, and the `66` Huginn-only LoRA tensors. The frozen native Huginn
+   backbone is rebuilt from the canonical Huginn-0125 base and is not copied as a continuation state.
+3. Initialize a new optimizer covering only current trainable Whisper/aligner/LoRA parameters; do not restore the old
+   optimizer, scheduler, Trainer global step, RNG state, multiplier statistics, or old data position.
+4. Start a fresh 8-card FSDP2 process group and fresh ACAVCAPS data stream. The source 4-card DCP shard count is not
+   assumed to match the target world size; the loader streams source tensors through `torch.distributed.checkpoint`
+   before the new FSDP wrapping.
+5. Run the bounded smoke: real ACAVCAPS tar decode, forward, backward, save at a short step, then start a separate
+   8-card process and resume from that newly-created smoke checkpoint. The second phase tests ordinary same-world-size
+   checkpoint resume inside the new ACAVCAPS run; it is not a resume of the old 4-card multiplier run.
+
+The implementation and gates are:
+
+- model-only DCP loader/audit in `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`;
+- ACAVCAPS route in `code/huginn_lora/plugins/huginn_audio_whisper_dynamic30s_acavcaps_swift.py`;
+- 8-card smoke runtime:
+  `code/huginn_lora/scripts/smoke_huginn_audio_whisper_dynamic30s_acavcaps_fsdp8_warmstart_save_resume.sh`;
+- strict save/resume inspector:
+  `code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic30s_acavcaps_warmstart_resume.py`.
+
+The smoke is pending only on the final source checkpoint and remote execution. It must verify restored Whisper,
+aligner, and LoRA tensors, exact source-to-target tensor copy verification, empty fresh optimizer state in phase 1,
+optimizer ownership limited to current trainables, restored optimizer/scheduler state in phase 2, and frozen Huginn
+backbone equality across the smoke save/resume boundary.
 
 #### Current architecture and training contract
 
@@ -363,7 +439,10 @@ checkpoint/statistics audit.
   optimizer state, scheduler, per-rank RNG, Trainer state, and cumulative `audio_training_statistics.json`.
   Same-world-size four-card save/resume has passed, including exact data position, no-replacement continuity,
   effective-duration accounting, and trainable/frozen-state audits. Direct four-card to eight-card continuation has not
-  been validated and must not be assumed safe.
+  been validated and is not the planned operation. The planned cross-world-size step is a **model-only DCP
+  warm-start**: load only Whisper/aligner/LoRA model tensors into a fresh 8-card run, rebuild optimizer/scheduler,
+  start global step and RNG fresh, and start ACAVCAPS data position fresh. The dedicated 8-card smoke must pass before
+  any formal ACAVCAPS training.
 
 #### Current remote/data rules
 
@@ -373,8 +452,11 @@ checkpoint/statistics audit.
 - Current remote repository root is `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune`; current
   formal jobs use the remote `swift_huginn` environment. Whisper-large weights are remote at
   `/hpc_stor03/sjtu_home/jinwei.zhang/models/whisper-large` and are not part of this checkout.
-- Current formal jobs use `pdgpu-5090`, four RTX 5090 GPUs, and `-c32 -m128G -g4`, which is within the enforced maximum
-  of `8` CPU cores and `32G` host memory per GPU. Do not replace this with an oversized request.
+- The active 4-card multiplier formal job uses `pdgpu-5090`, four RTX 5090 GPUs, and `-c32 -m128G -g4`, which is
+  within the enforced maximum of `8` CPU cores and `32G` host memory per GPU. Do not replace this with an oversized
+  request. The completed ACAVCAPS manifest-preparation and checkpoint-25000 audit jobs were deliberately submitted to
+  `pdgpu-4090` because the 5090 queue was occupied; their wrapper filenames retain `_5090` for repository naming
+  compatibility, but their actual resource pool, job names, and log names are `4090`.
 - WavCaps and GigaSpeech public roots are read-only. Pool preparation is metadata/index/registry-only and does not
   download, copy, or bulk-decode the public audio. WavCaps FLAC and GigaSpeech Opus are decoded on demand at training
   time; GigaSpeech segment rows use their metadata start/end bounds and ffmpeg when needed.
@@ -392,14 +474,23 @@ checkpoint/statistics audit.
   `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`,
   `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py`, and
   `code/huginn_lora/plugins/huginn_audio_whisper_dynamic30s_multiplier_swift.py`.
+- Current ACAVCAPS flat-manifest paths are under the private remote repo tree at
+  `data/audio_swift/acavcaps/`; the public tar files remain under
+  `/hpc_stor03/public/shared/data/raa/ACAVCAPS` and are opened read-only at training time.
 
 #### Required validation state
 
 The following have passed for the current contract: metadata-only pool preparation and audits, CPU no-replacement
 sampler audit, real-audio decode chain, dynamic30s contract, acceleration Stage 0/1/2, four-GPU Stage 3-4 and Stage 5
-history, and the updated four-GPU full-model checkpoint/resume smoke. The current production switches are Whisper SDPA,
-no Whisper internal checkpointing, one outer Whisper checkpoint wrapper, and recurrent-core `reshard_after_forward=false`.
-Do not reuse old dynamic90s checkpoint-4/6 artifacts or old with-replacement sampler evidence as current resume sources.
+history, and the updated four-GPU full-model checkpoint/resume smoke. The read-only audit of multiplier
+`checkpoint-25000` also passed the current full-model DCP, model trainability, optimizer, scheduler, RNG, and runtime
+contract checks. The ACAVCAPS flat global-tar manifest preflight passed for all `1071` tars and `4,664,169` pairs.
+The current production switches are Whisper SDPA, no Whisper internal checkpointing, one outer Whisper checkpoint
+wrapper, and recurrent-core `reshard_after_forward=false`.
+
+Still pending: the current multiplier run's final `checkpoint-46050` and final formal completion audit, followed by the
+8-card ACAVCAPS model-only warm-start/save/resume smoke. Do not reuse old dynamic90s checkpoint-4/6 artifacts, old
+with-replacement sampler evidence, or any intermediate multiplier checkpoint as the intended final warm-start source.
 
 #### X-ARES modality-alignment evaluation (unfinished; updated 2026-08-04)
 
@@ -424,7 +515,7 @@ training checkpoint or a completed benchmark.
   real encoder smoke, and the X-ARES API-contract inspection.
 - Pending gates: rerun the VoxCeleb1 K-NN smoke with its writable work-root/cache fix, verify embeddings and task
   outputs, then run the complete VoxCeleb1 K-NN evaluation. Until those gates produce a final report and score, X-ARES
-  must be labeled **未完成**.
+  must be labeled **unfinished**.
 - A previous K-NN attempt failed first because an absolute script path was converted into an invalid relative import, and
   then because X-ARES tried to create its embedding cache under the read-only public dataset root. The current task
   adapter uses script basenames/PYTHONPATH and a writable isolated output work root with links to the public data; this
@@ -689,6 +780,10 @@ they must not override a newer dated status entry.
   architecture-conversion procedure is implemented and separately validated.
 
 #### ACAVCAPS WebDataset preparation and continuation routes (updated 2026-07-27)
+
+This subsection is historical LoSATok infrastructure, including the quarter-curriculum route. It is retained for
+reproducibility but is not the current Whisper ACAVCAPS training plan. The current Whisper route uses the flat global
+manifest and one permutation across all `1071` tars described in the authoritative mainline above.
 
 - The full read-only ACAVCAPS preflight completed successfully:
   - `1071` tar shards;
@@ -2196,6 +2291,7 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
   - `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`
   - `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_mixture_swift.py`
   - `code/huginn_lora/plugins/huginn_audio_whisper_dynamic30s_multiplier_swift.py`
+  - `code/huginn_lora/plugins/huginn_audio_whisper_dynamic30s_acavcaps_swift.py`
 - data and sampler:
   - `code/huginn_lora/data_pipeline/dynamic90s_mixture_rows.py`
   - `code/huginn_lora/data_pipeline/indexed_atomic_mixture.py`
@@ -2213,8 +2309,25 @@ If a new Codex / AI agent chat needs to start working immediately, the most rele
   - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_multiplier_checkpoint_resume.py`
   - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_formal_checkpoints.py`
   - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic90s_checkpoint_resume_markers.py`
+  - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_single_checkpoint.py`
+  - `code/huginn_lora/scripts/inspect_huginn_whisper_dynamic30s_multiplier_checkpoint_25000_5090.sh`
+  - `code/huginn_lora/run_inspect_huginn_whisper_dynamic30s_multiplier_checkpoint_25000_5090.sh`
   - `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic90s_checkpoint_resume_fsdp4_5090.sh`
   - `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic30s_multiplier_checkpoint_resume_fsdp4_5090.sh`
+
+### Current ACAVCAPS global manifest and 8-card warm-start
+
+- `code/huginn_lora/scripts/prepare_acavcaps_flat_global_tar_manifest.py`
+- `code/huginn_lora/scripts/inspect_acavcaps_flat_global_tar_manifest.py`
+- `code/huginn_lora/scripts/prepare_acavcaps_flat_global_tar_manifest_5090.sh`
+- `code/huginn_lora/run_prepare_acavcaps_flat_global_tar_manifest_5090.sh`
+- `code/huginn_lora/scripts/smoke_huginn_audio_whisper_dynamic30s_acavcaps_fsdp8_warmstart_save_resume.sh`
+- `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic30s_acavcaps_fsdp8_warmstart_save_resume_5090.sh`
+- `code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic30s_acavcaps_warmstart_resume.py`
+
+The two wrappers whose filenames retain `_5090` but were explicitly moved to the `pdgpu-4090` pool are the manifest
+preparation wrapper and the checkpoint-25000 audit wrapper. The 8-card ACAVCAPS smoke wrapper remains a later `-g8`
+remote smoke and must not be submitted before the final `checkpoint-46050` is available and audited.
 
 The word `dynamic90s` in these shared paths is a compatibility name. Always read the current 30-second contract and the
 formal launcher before changing or submitting a job.
@@ -2236,7 +2349,7 @@ formal launcher before changing or submitting a job.
   - `code/huginn_lora/run_smoke_huginn_xares_voxceleb1_knn_4090.sh`
   - `code/huginn_lora/run_eval_huginn_xares_voxceleb1_knn_4090.sh`
 
-This branch is **未完成**: the preflight, checkpoint, data-path, encoder smoke, and API-contract gates passed, but the
+This branch is **unfinished**: the preflight, checkpoint, data-path, encoder smoke, and API-contract gates passed, but the
 writable-cache VoxCeleb1 K-NN smoke and complete K-NN evaluation have not yet produced a validated score.
 
 ### Backbone / model logic
@@ -2470,11 +2583,19 @@ Any new chat should assume the following:
     shared filenames still contain `dynamic90s`, but the runtime contract is 30 seconds, one chunk, and 240ms/token.
     Keep current Whisper checkpoints separate from fixed-32 Whisper and all LoSATok checkpoints. The old dynamic `66` /
     `0` LoSATok DCPs and old dynamic-90s Whisper smoke artifacts are not valid current resume sources.
-11. For current Swift audio training and evaluation, use the `pdgpu-5090` submit wrappers unless an existing legacy smoke/preparation wrapper explicitly targets `pdgpu-3090`.
+11. For current Swift audio training and evaluation, inspect the actual resource flag in the selected wrapper. The active
+    four-card multiplier formal run uses `pdgpu-5090`; the manifest-preparation and checkpoint-25000 audit wrappers were
+    explicitly changed to `pdgpu-4090` because 5090 was occupied. Filename suffixes such as `_5090` are compatibility
+    names and do not by themselves prove the submitted pool.
 12. The latest checkpoint-retention requirement is at most two retained checkpoints. The multiplier formal launcher is
     synchronized to `save_total_limit=2`; the multitask formal source currently still passes `4`, so reconcile that
     source/configuration before launching a new multitask formal run.
-13. For ACAVCAPS, use the current private WebDataset stage manifest: global tar-order shuffle within each stage plus runtime buffer shuffle within each tar, with FLAC decoded only during training. Never modify the shared public dataset root or add manual rank sharding on top of Accelerate's `DataLoaderDispatcher` behavior.
+13. For the current Whisper ACAVCAPS route, use the private flat manifest
+    `data/audio_swift/acavcaps/acavcaps_flat_global_tar_shuffle_seed20260723.json`: one global permutation across all
+    `1071` tars from stage1/2/3, with no stage training boundaries, plus runtime buffer shuffle `512` within each tar.
+    Stage labels are provenance only. Historical LoSATok stage/quarter manifests are separate and must not be mixed into
+    this route. Never modify the shared public dataset root or add manual rank sharding on top of Accelerate's
+    `DataLoaderDispatcher` behavior.
 14. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
 
 ---
@@ -2511,22 +2632,26 @@ Any new chat should assume the following:
   dynamic continuation. The old `20260723-054928` checkpoints still have `66` / `0` and remain permanently excluded from
   evaluation or continuation.
 
-### Current immediate next-step expectation (updated 2026-08-03)
+### Current immediate next-step expectation (updated 2026-08-05)
 
 For a new Huginn Whisper request, first determine whether it targets the current formal route or a historical branch.
 For the current formal route:
 
 1. Use the dynamic-30s contract: one mono 16-kHz chunk, cap at 30 seconds, 240ms/token, local-longest-prefix padding,
    response-only shifted NTP, Whisper + aligner + Huginn-only LoRA trainable, native Huginn frozen.
-2. Keep the two schedules separate: hierarchical AAC/ASR no-replacement multitask versus finite globally shuffled
-   multiplier pool. Do not substitute one registry, plugin, statistics file, or checkpoint audit for the other.
-3. Use four-card FSDP4 with the validated coarse units and current acceleration switches. A 4-to-8-card continuation is
-   unvalidated and requires a dedicated smoke before any resume.
-4. Before a long run, verify the metadata/real-decode/sampler prerequisites and the four-card save/resume smoke. For a
-   resume, require the embedded plan, checkpoint statistics, exact next global position, optimizer/scheduler/RNG state,
-   and matching registry identity.
-5. Treat a formal job as complete only after its terminal success banner, retained checkpoint audit, and cumulative
-   statistics report. A high step count or an intermediate loss line is not completion evidence.
+2. Keep the two current schedules separate: hierarchical AAC/ASR no-replacement multitask versus the finite globally
+   shuffled multiplier pool. Do not substitute one registry, plugin, statistics file, or checkpoint audit for the other.
+3. The multiplier run is still the active four-card remote job. Wait for `checkpoint-46050`, then require its final
+   terminal success banner, retained-checkpoint audit, and cumulative statistics audit before using it.
+4. The next ACAVCAPS run is a new eight-card FSDP2 training. Load only Whisper/aligner/Huginn-LoRA model weights from
+   `checkpoint-46050`; initialize optimizer, scheduler, global step, RNG, and ACAVCAPS position from scratch.
+5. Use the completed flat ACAVCAPS manifest: one global permutation over all `1071` tars across stage1/2/3, no stage
+   boundaries, and per-tar buffer `512`. Leave `ACAVCAPS_FLAT_MAX_TARS` unset for formal training.
+6. Before formal ACAVCAPS training, run the bounded eight-card smoke with real tar decode, forward/backward, checkpoint
+   save, process exit, and a separate same-world-size resume. Require the warm-start tensor-copy and fresh-state audits
+   to pass before submitting the full run.
+7. Treat any formal result as complete only after terminal success, final checkpoint audit, and cumulative statistics
+   report. A high step count or an intermediate loss line is not completion evidence.
 
 ### Historical LoSATok immediate-next-step expectation (updated 2026-07-27)
 
@@ -2561,7 +2686,7 @@ Before any long remote run:
   - checkpoint audit/save-reload validation
   - retrieval / generation / benchmark evaluation
 
-### Huginn Whisper dynamic-30s current status (2026-08-04; supersedes all dynamic-90s execution guidance below)
+### Huginn Whisper dynamic-30s current status (2026-08-05; supersedes all dynamic-90s execution guidance below)
 
 The active Huginn route now uses exactly one dynamic Whisper chunk per sample. Existing `dynamic90s` filenames,
 environment variables, model type, and model directory are retained only for Swift/checkpoint tooling compatibility;
@@ -2704,6 +2829,23 @@ bash code/huginn_lora/run_train_huginn_audio_whisper_dynamic90s_multitask_fsdp4_
 
 The full Torch Profiler route is paused after a Kineto/native `SIGSEGV` on the old recurrent dynamic-90s workload and is
 not part of the current launch sequence.
+
+### Latest 2026-08-05 handoff for the next ACAVCAPS phase
+
+The finite multiplier run remains active on four GPUs. The project is waiting for the real final
+`checkpoint-46050`; the existence of a checkpoint directory or an intermediate checkpoint is not enough to declare
+that run complete. The already-audited `checkpoint-25000` is useful as checkpoint-contract evidence only and is not the
+planned ACAVCAPS initialization source.
+
+The ACAVCAPS preparation work is complete. The private manifest and strict preflight establish one global tar order over
+all `1071` tars from stage1/2/3, totaling `4,664,169` JSON/FLAC pairs. This route is intentionally not a three-stage
+training schedule: the stage fields are provenance, while the training permutation is global. The preparation wrapper
+and checkpoint-25000 audit wrapper were submitted to `pdgpu-4090`; their `_5090` filenames are compatibility names.
+
+After `checkpoint-46050` is formally accepted, the next action is the eight-card model-only DCP warm-start smoke. It is
+a fresh training state: only Whisper, aligner, and Huginn-only LoRA weights are loaded; optimizer, scheduler, global
+step, RNG, and ACAVCAPS position are newly initialized. The smoke must perform real tar decoding, forward/backward,
+save, process exit, and a separate eight-card resume before the formal all-tar ACAVCAPS run is submitted.
 
 ### Historical Huginn Whisper dynamic-90s status update (2026-07-29; superseded)
 

@@ -1,0 +1,2464 @@
+{
+  "schema_version": "xares_zenodo_public_dataset_manifest_v1",
+  "status": "complete",
+  "generated_at_utc": "2026-08-05T14:38:59.415735+00:00",
+  "source": "https://github.com/jimbozhang/xares/blob/main/tools/download_manually.sh",
+  "zenodo_api": "https://zenodo.org/api/records/{record_id}",
+  "dataset_count": 22,
+  "file_count": 372,
+  "tar_bytes_sum": 215052625920,
+  "datasets": [
+    {
+      "dataset": "asvspoof2015",
+      "record_id": "14718430",
+      "title": "asvspoof2015 in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14718430/files-archive",
+      "files": [
+        {
+          "name": "asvspoof_eval_0000005.tar",
+          "size_bytes": 1049722880,
+          "checksum": "md5:4f6f6e8e068598e9c8d5dd36ba7ad805",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000005.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000017.tar",
+          "size_bytes": 1051514880,
+          "checksum": "md5:9d3d26c63d2a6fc080c1e9b40872621b",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000017.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000000.tar",
+          "size_bytes": 1052887040,
+          "checksum": "md5:c9c8ad65655c21ea7b61d484bf315394",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000000.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000006.tar",
+          "size_bytes": 1046159360,
+          "checksum": "md5:abcdce339d7b9b2edbff72958a88fd0a",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000006.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000008.tar",
+          "size_bytes": 1049681920,
+          "checksum": "md5:889f49f13c322c7c1f00baa3f8be6105",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000008.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000009.tar",
+          "size_bytes": 1053163520,
+          "checksum": "md5:5709fec774a82db6c030eecc50247d27",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000009.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000003.tar",
+          "size_bytes": 1048627200,
+          "checksum": "md5:fe7eff90f85e2af7d66cdfface3f7605",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000003.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000001.tar",
+          "size_bytes": 1054412800,
+          "checksum": "md5:6790be8b2a072ef4bbf165a880a5df68",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000001.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000007.tar",
+          "size_bytes": 1047306240,
+          "checksum": "md5:c2b90e2260f212273e9a4c6ad58b93ad",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000007.tar/content"
+        },
+        {
+          "name": "asvspoof_valid_0000000.tar",
+          "size_bytes": 1061785600,
+          "checksum": "md5:71784e8081c94c7a91f81db97f9750e8",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_valid_0000000.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000002.tar",
+          "size_bytes": 1049886720,
+          "checksum": "md5:b0165e9983cd1fd13ec554a651cd85c9",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000002.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000010.tar",
+          "size_bytes": 1048852480,
+          "checksum": "md5:4992f1d88d337072d9b697ac37dbe48a",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000010.tar/content"
+        },
+        {
+          "name": "asvspoof_valid_0000004.tar",
+          "size_bytes": 1084805120,
+          "checksum": "md5:6fbe10624e6fa91412f03fb0003ef5e7",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_valid_0000004.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000004.tar",
+          "size_bytes": 1050644480,
+          "checksum": "md5:ca30271352b7d7225f12986255dc291b",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000004.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000016.tar",
+          "size_bytes": 1049384960,
+          "checksum": "md5:1ca894a0ce5c656ca9fc294519b9f3ad",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000016.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000019.tar",
+          "size_bytes": 101713920,
+          "checksum": "md5:c2f9d74274cea1b1bd7d6372d0753cd4",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000019.tar/content"
+        },
+        {
+          "name": "asvspoof_valid_0000005.tar",
+          "size_bytes": 370841600,
+          "checksum": "md5:59c6aecb0a3bbfae848807acb555420f",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_valid_0000005.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000018.tar",
+          "size_bytes": 1051279360,
+          "checksum": "md5:db70048a845233088399279a4b8b5b54",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000018.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000013.tar",
+          "size_bytes": 1050726400,
+          "checksum": "md5:bc131fa19957deef3c8b73c22269182d",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000013.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000011.tar",
+          "size_bytes": 1052293120,
+          "checksum": "md5:5cd1b39174bfddc57dc9a478766b8a7c",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000011.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000012.tar",
+          "size_bytes": 1047633920,
+          "checksum": "md5:570cba907e5fb5262efe022d6c4fc53e",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000012.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000015.tar",
+          "size_bytes": 1048176640,
+          "checksum": "md5:c7dfe15f5d2356b7c4c38f9b0e44814c",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000015.tar/content"
+        },
+        {
+          "name": "asvspoof_train_0000000.tar",
+          "size_bytes": 1128632320,
+          "checksum": "md5:42403d230a5aa8aa0981b486619d9a0d",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_train_0000000.tar/content"
+        },
+        {
+          "name": "asvspoof_valid_0000001.tar",
+          "size_bytes": 1036339200,
+          "checksum": "md5:374c93f1dd754a13c63c3b5c055d6a40",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_valid_0000001.tar/content"
+        },
+        {
+          "name": "asvspoof_train_0000001.tar",
+          "size_bytes": 660838400,
+          "checksum": "md5:8a4faa78b08e488eb58fc2a23c97f185",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_train_0000001.tar/content"
+        },
+        {
+          "name": "asvspoof_valid_0000003.tar",
+          "size_bytes": 1040875520,
+          "checksum": "md5:446ab2cd9ba1d945cec19fc018be5674",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_valid_0000003.tar/content"
+        },
+        {
+          "name": "asvspoof_eval_0000014.tar",
+          "size_bytes": 1045125120,
+          "checksum": "md5:f715df9416358536b82b7d6923048362",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_eval_0000014.tar/content"
+        },
+        {
+          "name": "asvspoof_valid_0000002.tar",
+          "size_bytes": 1087078400,
+          "checksum": "md5:a50975b27a7a717f4fa595786eb234b0",
+          "download_url": "https://zenodo.org/api/records/14718430/files/asvspoof_valid_0000002.tar/content"
+        }
+      ],
+      "file_count": 28,
+      "tar_bytes_sum": 27520389120
+    },
+    {
+      "dataset": "clotho",
+      "record_id": "14856454",
+      "title": "Clotho dataset in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14856454/files-archive",
+      "files": [
+        {
+          "name": "clotho_validation_0000000.tar",
+          "size_bytes": 2088847360,
+          "checksum": "md5:75dd84ed3f28103869152c091821153e",
+          "download_url": "https://zenodo.org/api/records/14856454/files/clotho_validation_0000000.tar/content"
+        },
+        {
+          "name": "clotho_development_0000000.tar",
+          "size_bytes": 7623495680,
+          "checksum": "md5:c8b8de0cf891f8fdbd98fedc9206fbec",
+          "download_url": "https://zenodo.org/api/records/14856454/files/clotho_development_0000000.tar/content"
+        },
+        {
+          "name": "clotho_evaluation_0000000.tar",
+          "size_bytes": 2069432320,
+          "checksum": "md5:d8338a96e25da0d0569434774e7c80dc",
+          "download_url": "https://zenodo.org/api/records/14856454/files/clotho_evaluation_0000000.tar/content"
+        }
+      ],
+      "file_count": 3,
+      "tar_bytes_sum": 11781775360
+    },
+    {
+      "dataset": "cremad",
+      "record_id": "14646870",
+      "title": "CREMA_D in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14646870/files-archive",
+      "files": [
+        {
+          "name": "wds-audio-test-000012.tar",
+          "size_bytes": 4741120,
+          "checksum": "md5:cf1a0e9603e3e5b6fc44f85356535471",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000012.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000009.tar",
+          "size_bytes": 22671360,
+          "checksum": "md5:0586f53226f5230c58aac764f976b81f",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000009.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000000.tar",
+          "size_bytes": 4761600,
+          "checksum": "md5:de1417e159d86859bb992fb876d4636c",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000005.tar",
+          "size_bytes": 4689920,
+          "checksum": "md5:01ce759ffc227291182a809e4f016990",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000005.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000010.tar",
+          "size_bytes": 4956160,
+          "checksum": "md5:2616a6b13833a6185d0aa9fe2a75ca2c",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000010.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000007.tar",
+          "size_bytes": 4884480,
+          "checksum": "md5:13c29b6297974e22851286189160c01a",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000007.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000000.tar",
+          "size_bytes": 4915200,
+          "checksum": "md5:8771d3e9dfdbd1aeb2dfa67f1e0b75b1",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000014.tar",
+          "size_bytes": 21862400,
+          "checksum": "md5:59396cc39ae231c46fa5ed59d2a67f05",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000014.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000002.tar",
+          "size_bytes": 4720640,
+          "checksum": "md5:2583c762c802287dd63204660eb2af52",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000014.tar",
+          "size_bytes": 4710400,
+          "checksum": "md5:12696a46293fe4c5c2c1f88da8dc11aa",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000014.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000003.tar",
+          "size_bytes": 22384640,
+          "checksum": "md5:8a6857ec0a1100cb3f158b394d72360f",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000018.tar",
+          "size_bytes": 4710400,
+          "checksum": "md5:bc3b999237c171e54330b629068f527e",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000018.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000019.tar",
+          "size_bytes": 4485120,
+          "checksum": "md5:7fd9405be19a0756e6b8ee5e03ad1fba",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000019.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000008.tar",
+          "size_bytes": 22497280,
+          "checksum": "md5:09ecd060ac09b5e118659d220571f0a3",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000008.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000017.tar",
+          "size_bytes": 22231040,
+          "checksum": "md5:700aaaa247e54f2a977671dee4e7a133",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000017.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000006.tar",
+          "size_bytes": 4689920,
+          "checksum": "md5:080f3a09ccb033cd5b0df72dc71fe1e2",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000006.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000016.tar",
+          "size_bytes": 4782080,
+          "checksum": "md5:7503156d0c1fa97df5e9360b92b34e1f",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000016.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000008.tar",
+          "size_bytes": 4812800,
+          "checksum": "md5:9ccb23b574eebebd40d7e0ecd7b2eb7c",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000008.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000009.tar",
+          "size_bytes": 4648960,
+          "checksum": "md5:47f44121f4c03e15b304845b91aee519",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000009.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000001.tar",
+          "size_bytes": 4782080,
+          "checksum": "md5:cd77acbf10b33d89e0f0a7d371a61090",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000008.tar",
+          "size_bytes": 4608000,
+          "checksum": "md5:672998bad135560bc8f3bcb6db98599f",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000008.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000000.tar",
+          "size_bytes": 22056960,
+          "checksum": "md5:3ed6a42322e9384ee5dfe9d54afbf640",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000018.tar",
+          "size_bytes": 22364160,
+          "checksum": "md5:675cf10ca923d728038e64562795b2f2",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000018.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000005.tar",
+          "size_bytes": 4976640,
+          "checksum": "md5:5f4eedcbc36ca67ca9dd081203fd3399",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000005.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000004.tar",
+          "size_bytes": 4894720,
+          "checksum": "md5:f1b9d105c17166b7c1f6cb1fe27d3627",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000004.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000019.tar",
+          "size_bytes": 20899840,
+          "checksum": "md5:b8d65ab2466cfa251b28bb7151ab9532",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000019.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000003.tar",
+          "size_bytes": 4782080,
+          "checksum": "md5:d296623cc57b0268a70faa21d1b3ed69",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000011.tar",
+          "size_bytes": 4659200,
+          "checksum": "md5:5cea098ef6cdadd2e2f1151dcbb9b5b9",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000011.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000004.tar",
+          "size_bytes": 4741120,
+          "checksum": "md5:49b26e14f74316c5c173cf1577165115",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000004.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000013.tar",
+          "size_bytes": 4648960,
+          "checksum": "md5:16d0fb285ec2a0da4f78f843b4b9a3c9",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000013.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000017.tar",
+          "size_bytes": 4935680,
+          "checksum": "md5:5648a59d9fd0bf4c754abb049ffc6aa3",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000017.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000001.tar",
+          "size_bytes": 22548480,
+          "checksum": "md5:bb5139ca8b65d796a01bda6e6e85fabb",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000006.tar",
+          "size_bytes": 22435840,
+          "checksum": "md5:a53b97902d7bd38b63ccba4c99ec6034",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000006.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000013.tar",
+          "size_bytes": 22476800,
+          "checksum": "md5:0537e76b7014a680e248514dceb75394",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000013.tar/content"
+        },
+        {
+          "name": "wds-audio-test-000015.tar",
+          "size_bytes": 4884480,
+          "checksum": "md5:0a4d7903fe16b5d648062eb4a193450a",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-test-000015.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000002.tar",
+          "size_bytes": 21862400,
+          "checksum": "md5:74fed7ff1cab2f428c6c548a4ccd79c3",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000004.tar",
+          "size_bytes": 22384640,
+          "checksum": "md5:2bbf32e16242ba9a3041e87b61a091f3",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000004.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000005.tar",
+          "size_bytes": 22353920,
+          "checksum": "md5:341464cc00fedbc655c7e6639d6ac458",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000005.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000007.tar",
+          "size_bytes": 22128640,
+          "checksum": "md5:6d54276e0c48b564cc0256415b00f269",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000007.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000012.tar",
+          "size_bytes": 22333440,
+          "checksum": "md5:e364e4f3f48d6e502e339f05e73f2feb",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000012.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000010.tar",
+          "size_bytes": 22251520,
+          "checksum": "md5:210f33897e32f2e3cd75774daed081a2",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000010.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000016.tar",
+          "size_bytes": 22312960,
+          "checksum": "md5:839a6cde76c4e04617643796cb799b56",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000016.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000011.tar",
+          "size_bytes": 22005760,
+          "checksum": "md5:fc2c1d1bbed2500f613c1b9e0f146834",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000011.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000001.tar",
+          "size_bytes": 4782080,
+          "checksum": "md5:1ec84b07c4811af855382a2316624ae5",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000012.tar",
+          "size_bytes": 4710400,
+          "checksum": "md5:f787c500b9802f4704a87a67f87b7ed1",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000012.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000015.tar",
+          "size_bytes": 22405120,
+          "checksum": "md5:7c8e5f0f8c4f1fc8824a772dbeb9639b",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-train-000015.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000013.tar",
+          "size_bytes": 4945920,
+          "checksum": "md5:df6291434e3dd50c56c3f2fd67860f26",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000013.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000003.tar",
+          "size_bytes": 4648960,
+          "checksum": "md5:28f77878b355098217368ad5a6b59e78",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000002.tar",
+          "size_bytes": 4782080,
+          "checksum": "md5:ffbd389e0c97c1a9f5216a8053f515d8",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000014.tar",
+          "size_bytes": 4812800,
+          "checksum": "md5:6795eea067cff12a02c686e1d52e7b63",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000014.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000015.tar",
+          "size_bytes": 4751360,
+          "checksum": "md5:88b12d98c92c58384598938474a2f3f7",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000015.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000007.tar",
+          "size_bytes": 4771840,
+          "checksum": "md5:d08a08fde1cfdb5f2b45033dd92d06b3",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000007.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000006.tar",
+          "size_bytes": 4853760,
+          "checksum": "md5:43547dbc9787ac622acf03a945ef66e8",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000006.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000009.tar",
+          "size_bytes": 4730880,
+          "checksum": "md5:f787c0c0b13b7bf0ce6bf315b06b87f8",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000009.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000011.tar",
+          "size_bytes": 4638720,
+          "checksum": "md5:5240108462bcc39b1f1bdd9020062856",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000011.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000010.tar",
+          "size_bytes": 4700160,
+          "checksum": "md5:cbb786bc66aa49ad89d38bf61abe3102",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000010.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000016.tar",
+          "size_bytes": 4925440,
+          "checksum": "md5:b26c2ce063e98bbc5d80667b06055033",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000016.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000019.tar",
+          "size_bytes": 4147200,
+          "checksum": "md5:87a243394fc40f64f31b1825bbc3c488",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000019.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000017.tar",
+          "size_bytes": 4761600,
+          "checksum": "md5:3334b614e5dcec1e26134d7d75e48e77",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000017.tar/content"
+        },
+        {
+          "name": "wds-audio-valid-000018.tar",
+          "size_bytes": 5007360,
+          "checksum": "md5:a68995e75f755e3cc4761eb9a0755ebc",
+          "download_url": "https://zenodo.org/api/records/14646870/files/wds-audio-valid-000018.tar/content"
+        }
+      ],
+      "file_count": 60,
+      "tar_bytes_sum": 634859520
+    },
+    {
+      "dataset": "desed",
+      "record_id": "14808180",
+      "title": "DESED in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14808180/files-archive",
+      "files": [
+        {
+          "name": "wds-audio-eval-000019.tar",
+          "size_bytes": 16424960,
+          "checksum": "md5:c6e746088657c0e08a0a635bcbc7af30",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000019.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000014.tar",
+          "size_bytes": 18452480,
+          "checksum": "md5:344aea544c52561930c33c160c50a487",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000014.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000015.tar",
+          "size_bytes": 18657280,
+          "checksum": "md5:82d5816795d8c256e3aaa570e9846116",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000015.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000000.tar",
+          "size_bytes": 18698240,
+          "checksum": "md5:678073388b34e792cab8ada311a69907",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000018.tar",
+          "size_bytes": 18718720,
+          "checksum": "md5:2ba7b71dd46db3bcaab93f96f00bffb5",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000018.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000007.tar",
+          "size_bytes": 18636800,
+          "checksum": "md5:004fd95bc73419acfa8aec5d95446396",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000007.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000003.tar",
+          "size_bytes": 25180160,
+          "checksum": "md5:545e52b792a1555594e4bcf52b406776",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000009.tar",
+          "size_bytes": 18647040,
+          "checksum": "md5:e3066f0294400e112e6e3c8c34597d56",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000009.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000011.tar",
+          "size_bytes": 18534400,
+          "checksum": "md5:3ececac0aaad1feaf5c18f43c9761e81",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000011.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000001.tar",
+          "size_bytes": 18800640,
+          "checksum": "md5:b5052916f138298dc8ccf13d8bb31ecf",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000013.tar",
+          "size_bytes": 18739200,
+          "checksum": "md5:1436eaa24fd5a8d785d01cf33cf89004",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000013.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000016.tar",
+          "size_bytes": 25487360,
+          "checksum": "md5:5e17d1d0d8b467184d9140e5c290ea04",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000016.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000017.tar",
+          "size_bytes": 18708480,
+          "checksum": "md5:ded0149fd5c0efbe06b45d5d61265eaf",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000017.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000007.tar",
+          "size_bytes": 25436160,
+          "checksum": "md5:f832fa8f65c932c906f0182e8b33705b",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000007.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000012.tar",
+          "size_bytes": 18626560,
+          "checksum": "md5:e74611b2bb866ae2ffb72fd32d44da22",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000012.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000018.tar",
+          "size_bytes": 25589760,
+          "checksum": "md5:7bb1207462641517a30333b5d7f15d07",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000018.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000000.tar",
+          "size_bytes": 24463360,
+          "checksum": "md5:ecd6ea0d962b5875e612f94210ad0a4b",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000017.tar",
+          "size_bytes": 25395200,
+          "checksum": "md5:5dc4bc8793ca2dd48b37c189b1fa086d",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000017.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000011.tar",
+          "size_bytes": 25610240,
+          "checksum": "md5:e7f2786c629c1e8e5a71fd4489767c67",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000011.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000009.tar",
+          "size_bytes": 25169920,
+          "checksum": "md5:945ebec1ebaa7687be33a4cbe3713d23",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000009.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000005.tar",
+          "size_bytes": 18688000,
+          "checksum": "md5:3d6f89d8cda21a9619c53a9c80b1a789",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000005.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000002.tar",
+          "size_bytes": 18800640,
+          "checksum": "md5:cf3a5570e7890e470166c9b49e7bb492",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000001.tar",
+          "size_bytes": 25047040,
+          "checksum": "md5:8d3e8b0e6b72ab4ec854ca8192c26be2",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000002.tar",
+          "size_bytes": 24750080,
+          "checksum": "md5:1d940eba4332349ede370a53929febe8",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000010.tar",
+          "size_bytes": 18636800,
+          "checksum": "md5:9064c619d43d3dd0adc404bf046b40cf",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000010.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000008.tar",
+          "size_bytes": 18595840,
+          "checksum": "md5:a365649339b7a3c96580b3f0405905ca",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000008.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000004.tar",
+          "size_bytes": 24975360,
+          "checksum": "md5:6e34d1b2b5c0c0c81de009b5228f132e",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000004.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000012.tar",
+          "size_bytes": 25589760,
+          "checksum": "md5:814ccb75a1ea5a8cdcf594ef8fd64733",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000012.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000005.tar",
+          "size_bytes": 25384960,
+          "checksum": "md5:d6483ff9e12f4748627a8133da729eff",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000005.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000006.tar",
+          "size_bytes": 25569280,
+          "checksum": "md5:aef2ba51a09aa88c43c84452d6082370",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000006.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000013.tar",
+          "size_bytes": 25313280,
+          "checksum": "md5:bbaedb23901e95411e030e7b16829ed4",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000013.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000008.tar",
+          "size_bytes": 25374720,
+          "checksum": "md5:4ae58587ab499ea25a1f4f4592b0b6bb",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000008.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000010.tar",
+          "size_bytes": 25610240,
+          "checksum": "md5:731d0c9fbb0e93179e44cc303869a1df",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000010.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000003.tar",
+          "size_bytes": 18554880,
+          "checksum": "md5:5d639f5bd1d40b54c63fd957dc103a92",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000004.tar",
+          "size_bytes": 18483200,
+          "checksum": "md5:88cd03d0a366a319535d39cb99fabf7d",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000004.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000019.tar",
+          "size_bytes": 24821760,
+          "checksum": "md5:9ed47b594cc8c50cdcb499099c6f67f7",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000019.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000015.tar",
+          "size_bytes": 25528320,
+          "checksum": "md5:6d537c54d8d205d639da88ec796ed2b9",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000015.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000016.tar",
+          "size_bytes": 18688000,
+          "checksum": "md5:ae44dbf8a1ba4848558e98c3d775ae9c",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000016.tar/content"
+        },
+        {
+          "name": "wds-audio-eval-000006.tar",
+          "size_bytes": 18401280,
+          "checksum": "md5:17ceca2024a6ec5aaf50b658bf4277bb",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-eval-000006.tar/content"
+        },
+        {
+          "name": "wds-audio-train-000014.tar",
+          "size_bytes": 25436160,
+          "checksum": "md5:18ea1b23bf6783def8f2b8c4fd8aac54",
+          "download_url": "https://zenodo.org/api/records/14808180/files/wds-audio-train-000014.tar/content"
+        }
+      ],
+      "file_count": 40,
+      "tar_bytes_sum": 876226560
+    },
+    {
+      "dataset": "esc50",
+      "record_id": "14614287",
+      "title": "ESC-50 in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14614287/files-archive",
+      "files": [
+        {
+          "name": "wds-audio-fold-1-000002.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:8b3635c708ce51b7511197fcfaeea35a",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-1-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-1-000003.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:abf9f46ea45a79318f16fa22695346de",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-1-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-5-000000.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:9031fd3ab0ba29c8426404963659a977",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-5-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-2-000002.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:ba9d2966a9cfbb94af1daa03a442460f",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-2-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-4-000000.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:faae6c3e2a0cd30bd082eeb2d5bb900d",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-4-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-2-000001.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:71b65e053d174da655192d4c4784b12b",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-2-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-1-000001.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:a10410cdc1644061ca6778889daab46f",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-1-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-2-000003.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:29fdbe89c581639803be75986e790695",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-2-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-3-000001.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:1f093da9f68b3431be3627a578f4e4ff",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-3-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-5-000002.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:454ba2c4474c9f39129ece8e85cc7608",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-5-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-2-000000.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:876711173397547e7bc111c7a467e984",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-2-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-5-000001.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:11acca3360294a7f041d04effeedae75",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-5-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-3-000003.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:fe98050aed8d1a317f0cae38f3cdc85a",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-3-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-1-000000.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:832e9a6670fd46ee00baebb7c274a9e2",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-1-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-3-000000.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:496bdc44ed6228a56e68344a27d1d347",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-3-000000.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-3-000002.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:1c331ddbd4f289a5804fd2e51cabd340",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-3-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-4-000001.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:6d98365016fa6751917a7b73f6e882da",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-4-000001.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-4-000003.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:6898673dc2394c0e7af77a64999d08bb",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-4-000003.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-4-000002.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:69e9bf18b72ca807cb2dc1554482703e",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-4-000002.tar/content"
+        },
+        {
+          "name": "wds-audio-fold-5-000003.tar",
+          "size_bytes": 44503040,
+          "checksum": "md5:5af9a601cc899e1b32793883a563be73",
+          "download_url": "https://zenodo.org/api/records/14614287/files/wds-audio-fold-5-000003.tar/content"
+        }
+      ],
+      "file_count": 20,
+      "tar_bytes_sum": 890060800
+    },
+    {
+      "dataset": "fluentspeechcommands",
+      "record_id": "14722453",
+      "title": "fluentspeechcommands in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14722453/files-archive",
+      "files": [
+        {
+          "name": "fluentspeechcommands_valid_0000000.tar",
+          "size_bytes": 236800000,
+          "checksum": "md5:7f50b2c8933158811e95ad09781607bc",
+          "download_url": "https://zenodo.org/api/records/14722453/files/fluentspeechcommands_valid_0000000.tar/content"
+        },
+        {
+          "name": "fluentspeechcommands_train_0000000.tar",
+          "size_bytes": 746608640,
+          "checksum": "md5:ba7231b49f2da899d3c8b20aac737067",
+          "download_url": "https://zenodo.org/api/records/14722453/files/fluentspeechcommands_train_0000000.tar/content"
+        },
+        {
+          "name": "fluentspeechcommands_train_0000001.tar",
+          "size_bytes": 780902400,
+          "checksum": "md5:5337a90fc956b24ffb7ff346ea0c7937",
+          "download_url": "https://zenodo.org/api/records/14722453/files/fluentspeechcommands_train_0000001.tar/content"
+        },
+        {
+          "name": "fluentspeechcommands_train_0000002.tar",
+          "size_bytes": 258211840,
+          "checksum": "md5:77fb922d10fa0adbee29a2c52baa4da7",
+          "download_url": "https://zenodo.org/api/records/14722453/files/fluentspeechcommands_train_0000002.tar/content"
+        },
+        {
+          "name": "fluentspeechcommands_test_0000000.tar",
+          "size_bytes": 311664640,
+          "checksum": "md5:8b8501c06a38e9ca1598011b665e43d5",
+          "download_url": "https://zenodo.org/api/records/14722453/files/fluentspeechcommands_test_0000000.tar/content"
+        }
+      ],
+      "file_count": 5,
+      "tar_bytes_sum": 2334187520
+    },
+    {
+      "dataset": "freemusicarchive",
+      "record_id": "14725056",
+      "title": "freemusicarchive in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14725056/files-archive",
+      "files": [
+        {
+          "name": "fma_small_valid_0000000.tar",
+          "size_bytes": 771010560,
+          "checksum": "md5:e054fa149565432be7c17e4ffb85e92d",
+          "download_url": "https://zenodo.org/api/records/14725056/files/fma_small_valid_0000000.tar/content"
+        },
+        {
+          "name": "fma_small_train_0000000.tar",
+          "size_bytes": 6424442880,
+          "checksum": "md5:ad1eb37a7ae587b23b3f7c7d9afb86bc",
+          "download_url": "https://zenodo.org/api/records/14725056/files/fma_small_train_0000000.tar/content"
+        },
+        {
+          "name": "fma_small_test_0000000.tar",
+          "size_bytes": 771010560,
+          "checksum": "md5:75d0159d0d66e38527615040b0fa218c",
+          "download_url": "https://zenodo.org/api/records/14725056/files/fma_small_test_0000000.tar/content"
+        }
+      ],
+      "file_count": 3,
+      "tar_bytes_sum": 7966464000
+    },
+    {
+      "dataset": "fsd50k",
+      "record_id": "14868441",
+      "title": "FSD50k in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14868441/files-archive",
+      "files": [
+        {
+          "name": "fsd50k_eval_0000000.tar",
+          "size_bytes": 8657510400,
+          "checksum": "md5:6e4d0f79d1bc09f2fbe5a524ff0d30a0",
+          "download_url": "https://zenodo.org/api/records/14868441/files/fsd50k_eval_0000000.tar/content"
+        },
+        {
+          "name": "fsd50k_train_0000000.tar",
+          "size_bytes": 5081856000,
+          "checksum": "md5:3cd86e95945deaeca867ca4d41dad73e",
+          "download_url": "https://zenodo.org/api/records/14868441/files/fsd50k_train_0000000.tar/content"
+        },
+        {
+          "name": "fsd50k_train_0000003.tar",
+          "size_bytes": 5284034560,
+          "checksum": "md5:5c58aad5ef582a29db9ece05c1a6917a",
+          "download_url": "https://zenodo.org/api/records/14868441/files/fsd50k_train_0000003.tar/content"
+        },
+        {
+          "name": "fsd50k_train_0000002.tar",
+          "size_bytes": 5779189760,
+          "checksum": "md5:7fd9f80925148a069d25acda97a8ba9a",
+          "download_url": "https://zenodo.org/api/records/14868441/files/fsd50k_train_0000002.tar/content"
+        },
+        {
+          "name": "fsd50k_validation_0000000.tar",
+          "size_bytes": 3303567360,
+          "checksum": "md5:e1d6ff1c42b91131bc81cf23cd9ab304",
+          "download_url": "https://zenodo.org/api/records/14868441/files/fsd50k_validation_0000000.tar/content"
+        },
+        {
+          "name": "fsd50k_train_0000001.tar",
+          "size_bytes": 6350796800,
+          "checksum": "md5:227fb26e74c690e6e00c5f6550713149",
+          "download_url": "https://zenodo.org/api/records/14868441/files/fsd50k_train_0000001.tar/content"
+        },
+        {
+          "name": "fsd50k_eval_0000001.tar",
+          "size_bytes": 224389120,
+          "checksum": "md5:2792c69397435773684b43a9610237d1",
+          "download_url": "https://zenodo.org/api/records/14868441/files/fsd50k_eval_0000001.tar/content"
+        }
+      ],
+      "file_count": 7,
+      "tar_bytes_sum": 34681344000
+    },
+    {
+      "dataset": "fsdkaggle2018",
+      "record_id": "14725117",
+      "title": "fsdkaggle2018 in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14725117/files-archive",
+      "files": [
+        {
+          "name": "fsd18_test_0000000.tar",
+          "size_bytes": 740567040,
+          "checksum": "md5:bbc4dff676773977587a1b7322570a3e",
+          "download_url": "https://zenodo.org/api/records/14725117/files/fsd18_test_0000000.tar/content"
+        },
+        {
+          "name": "fsd18_train_0000000.tar",
+          "size_bytes": 5708298240,
+          "checksum": "md5:d4b205554dd44ffd4965c99fd5c83f21",
+          "download_url": "https://zenodo.org/api/records/14725117/files/fsd18_train_0000000.tar/content"
+        }
+      ],
+      "file_count": 2,
+      "tar_bytes_sum": 6448865280
+    },
+    {
+      "dataset": "gtzan_genre",
+      "record_id": "14722472",
+      "title": "gtzan_genre in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14722472/files-archive",
+      "files": [
+        {
+          "name": "gtzan_fold_8_0000000.tar",
+          "size_bytes": 132751360,
+          "checksum": "md5:822c786ed0df77bbcbbe2f2ce572e280",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_8_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_3_0000000.tar",
+          "size_bytes": 132935680,
+          "checksum": "md5:2b4ab313cbf4c507f3f00d9e915f124d",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_3_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_4_0000000.tar",
+          "size_bytes": 132945920,
+          "checksum": "md5:38395da37801ab78b9f1e6845c6384d2",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_4_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_7_0000000.tar",
+          "size_bytes": 132741120,
+          "checksum": "md5:224ff294832ffff7135310b5069930fe",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_7_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_2_0000000.tar",
+          "size_bytes": 132792320,
+          "checksum": "md5:5c2d959d437cb7dc63e49d29cb97b62b",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_2_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_0_0000000.tar",
+          "size_bytes": 132843520,
+          "checksum": "md5:bd22bf7c60d26e28188fa917e12ae2b9",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_0_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_1_0000000.tar",
+          "size_bytes": 132771840,
+          "checksum": "md5:675e04b7396af66105cdb22fd27a96ed",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_1_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_5_0000000.tar",
+          "size_bytes": 132843520,
+          "checksum": "md5:6af1017b0e593b8f41974fe1665b87fd",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_5_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_6_0000000.tar",
+          "size_bytes": 132782080,
+          "checksum": "md5:64182fd942d2b20688bb243296977bc6",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_6_0000000.tar/content"
+        },
+        {
+          "name": "gtzan_fold_9_0000000.tar",
+          "size_bytes": 131420160,
+          "checksum": "md5:0b14904dbcd7b7a82f93fd529c771274",
+          "download_url": "https://zenodo.org/api/records/14722472/files/gtzan_fold_9_0000000.tar/content"
+        }
+      ],
+      "file_count": 10,
+      "tar_bytes_sum": 1326827520
+    },
+    {
+      "dataset": "libricount",
+      "record_id": "14722478",
+      "title": "libricount  in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14722478/files-archive",
+      "files": [
+        {
+          "name": "libricount_fold01.tar",
+          "size_bytes": 187709440,
+          "checksum": "md5:8984fccf0db672c249cf3eda47a0ec9b",
+          "download_url": "https://zenodo.org/api/records/14722478/files/libricount_fold01.tar/content"
+        },
+        {
+          "name": "libricount_fold02.tar",
+          "size_bytes": 187709440,
+          "checksum": "md5:cd076f3e5cb738b85ae8c153683ba720",
+          "download_url": "https://zenodo.org/api/records/14722478/files/libricount_fold02.tar/content"
+        },
+        {
+          "name": "libricount_fold00.tar",
+          "size_bytes": 187699200,
+          "checksum": "md5:a5f3b93114b33b3224fc305295fd6e3f",
+          "download_url": "https://zenodo.org/api/records/14722478/files/libricount_fold00.tar/content"
+        },
+        {
+          "name": "libricount_fold03.tar",
+          "size_bytes": 187699200,
+          "checksum": "md5:ba47f26d6119c988b3cfa67600f49b9e",
+          "download_url": "https://zenodo.org/api/records/14722478/files/libricount_fold03.tar/content"
+        },
+        {
+          "name": "libricount_fold04.tar",
+          "size_bytes": 187719680,
+          "checksum": "md5:cf96e409100d88564dfa59ef3d03ec2c",
+          "download_url": "https://zenodo.org/api/records/14722478/files/libricount_fold04.tar/content"
+        }
+      ],
+      "file_count": 5,
+      "tar_bytes_sum": 938536960
+    },
+    {
+      "dataset": "librispeechmalefemale",
+      "record_id": "14716252",
+      "title": "LibrispeechMaleFemale in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14716252/files-archive",
+      "files": [
+        {
+          "name": "dev-clean-000004.tar",
+          "size_bytes": 18565120,
+          "checksum": "md5:38f5f63818e074004676016c759b6232",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000004.tar/content"
+        },
+        {
+          "name": "test-clean-000001.tar",
+          "size_bytes": 14428160,
+          "checksum": "md5:657e33946e363fe429b94fd6753c7d87",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000001.tar/content"
+        },
+        {
+          "name": "dev-clean-000010.tar",
+          "size_bytes": 16844800,
+          "checksum": "md5:4d96a8a15e52354cf3232a1bf758aca3",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000010.tar/content"
+        },
+        {
+          "name": "dev-clean-000007.tar",
+          "size_bytes": 21780480,
+          "checksum": "md5:be6bb847a36e43d651fd8a1fb76a1e16",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000007.tar/content"
+        },
+        {
+          "name": "test-clean-000003.tar",
+          "size_bytes": 21780480,
+          "checksum": "md5:08bb736062eca118daab961c276d6f23",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000003.tar/content"
+        },
+        {
+          "name": "test-clean-000007.tar",
+          "size_bytes": 20541440,
+          "checksum": "md5:3997a6e3b14ed9f51039040560077b8c",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000007.tar/content"
+        },
+        {
+          "name": "train-clean-100-000011.tar",
+          "size_bytes": 333711360,
+          "checksum": "md5:13df91ec77c349ac517ba86aef4159fd",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000011.tar/content"
+        },
+        {
+          "name": "dev-clean-000002.tar",
+          "size_bytes": 15656960,
+          "checksum": "md5:f434bbf2c00c4e052d79fd3bc1c61419",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000002.tar/content"
+        },
+        {
+          "name": "test-clean-000014.tar",
+          "size_bytes": 16957440,
+          "checksum": "md5:e707f056cf4aa21281b1715d4962f7e7",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000014.tar/content"
+        },
+        {
+          "name": "train-clean-100-000006.tar",
+          "size_bytes": 334643200,
+          "checksum": "md5:522e0e78ca332930faca8c7a34ca95a7",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000006.tar/content"
+        },
+        {
+          "name": "test-clean-000009.tar",
+          "size_bytes": 25221120,
+          "checksum": "md5:1577d36869a6e4e6d08d4725faf479d1",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000009.tar/content"
+        },
+        {
+          "name": "test-clean-000006.tar",
+          "size_bytes": 15073280,
+          "checksum": "md5:86b1ca355c89c30e855b862661187011",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000006.tar/content"
+        },
+        {
+          "name": "test-clean-000000.tar",
+          "size_bytes": 19527680,
+          "checksum": "md5:d21410b4a0d3a4926f5601bb79c75c12",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000000.tar/content"
+        },
+        {
+          "name": "test-clean-000013.tar",
+          "size_bytes": 18749440,
+          "checksum": "md5:6ecb749c6fcc562af68e3bb4d42a72f9",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000013.tar/content"
+        },
+        {
+          "name": "test-clean-000017.tar",
+          "size_bytes": 15841280,
+          "checksum": "md5:4a68f895fa539d3720f328fdf9cf6dea",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000017.tar/content"
+        },
+        {
+          "name": "test-clean-000008.tar",
+          "size_bytes": 20951040,
+          "checksum": "md5:3adc4652b3c8f3dfe6e6b4c76c707c08",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000008.tar/content"
+        },
+        {
+          "name": "test-clean-000015.tar",
+          "size_bytes": 19066880,
+          "checksum": "md5:79147ee0208791e460738159cfb52fc0",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000015.tar/content"
+        },
+        {
+          "name": "dev-clean-000001.tar",
+          "size_bytes": 16844800,
+          "checksum": "md5:036d605e67ddde6ab97a6abfd7ab2a2e",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000001.tar/content"
+        },
+        {
+          "name": "test-clean-000018.tar",
+          "size_bytes": 18268160,
+          "checksum": "md5:bd092b5354a91e2b25448ab30874dfc4",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000018.tar/content"
+        },
+        {
+          "name": "train-clean-100-000018.tar",
+          "size_bytes": 338339840,
+          "checksum": "md5:9f18f2dbe02aa34fa5c3ddad929f4ce5",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000018.tar/content"
+        },
+        {
+          "name": "dev-clean-000003.tar",
+          "size_bytes": 15493120,
+          "checksum": "md5:5f93170523d1de06554a2950593005be",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000003.tar/content"
+        },
+        {
+          "name": "dev-clean-000006.tar",
+          "size_bytes": 15411200,
+          "checksum": "md5:d79d0cde84d2022825c6813ddf138af5",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000006.tar/content"
+        },
+        {
+          "name": "train-clean-100-000012.tar",
+          "size_bytes": 336875520,
+          "checksum": "md5:2aac9a2d1058b69fd7bfc3ed05942cc6",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000012.tar/content"
+        },
+        {
+          "name": "train-clean-100-000004.tar",
+          "size_bytes": 346388480,
+          "checksum": "md5:8a4e070f021b29fc935e56dbae91e9d1",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000004.tar/content"
+        },
+        {
+          "name": "dev-clean-000012.tar",
+          "size_bytes": 13875200,
+          "checksum": "md5:a580fe0b4d7b8a3c4537fba9dc2c781a",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000012.tar/content"
+        },
+        {
+          "name": "dev-clean-000018.tar",
+          "size_bytes": 26071040,
+          "checksum": "md5:893f4e66b5be29b98a15564e83fc4fbb",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000018.tar/content"
+        },
+        {
+          "name": "dev-clean-000009.tar",
+          "size_bytes": 25579520,
+          "checksum": "md5:b7b65e222df9770e8cb25a9d7615921d",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000009.tar/content"
+        },
+        {
+          "name": "dev-clean-000011.tar",
+          "size_bytes": 18165760,
+          "checksum": "md5:dcdf3e703225543c87bea7e3c6f5fe1a",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000011.tar/content"
+        },
+        {
+          "name": "dev-clean-000013.tar",
+          "size_bytes": 19722240,
+          "checksum": "md5:726c9d0b50e74deb4083a89dd6b0f04f",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000013.tar/content"
+        },
+        {
+          "name": "dev-clean-000019.tar",
+          "size_bytes": 22138880,
+          "checksum": "md5:ba2e1eec71f04716e5e3c24a97adb5c1",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000019.tar/content"
+        },
+        {
+          "name": "dev-clean-000014.tar",
+          "size_bytes": 16168960,
+          "checksum": "md5:3581087acae62644d77fe131959f4681",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000014.tar/content"
+        },
+        {
+          "name": "test-clean-000019.tar",
+          "size_bytes": 24350720,
+          "checksum": "md5:12bc66f78c4cce64856847be6da77f5c",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000019.tar/content"
+        },
+        {
+          "name": "test-clean-000011.tar",
+          "size_bytes": 15104000,
+          "checksum": "md5:8402e8b513f86697553a16d343bacb60",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000011.tar/content"
+        },
+        {
+          "name": "test-clean-000010.tar",
+          "size_bytes": 19732480,
+          "checksum": "md5:cb0360cddbe8a6133e454d37d6d49276",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000010.tar/content"
+        },
+        {
+          "name": "test-clean-000012.tar",
+          "size_bytes": 15073280,
+          "checksum": "md5:b9748112097f5dd861ff394ba0241559",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000012.tar/content"
+        },
+        {
+          "name": "dev-clean-000015.tar",
+          "size_bytes": 17909760,
+          "checksum": "md5:507240ff64ef585e98acec8a2f3517b6",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000015.tar/content"
+        },
+        {
+          "name": "train-clean-100-000005.tar",
+          "size_bytes": 333404160,
+          "checksum": "md5:d0ac90e372c451cf8f459603fff9dff4",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000005.tar/content"
+        },
+        {
+          "name": "dev-clean-000016.tar",
+          "size_bytes": 16998400,
+          "checksum": "md5:ce3950d920935e989a51a9e375c16eba",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000016.tar/content"
+        },
+        {
+          "name": "dev-clean-000017.tar",
+          "size_bytes": 15851520,
+          "checksum": "md5:e79ba040c84487845700254927c1f5f8",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000017.tar/content"
+        },
+        {
+          "name": "train-clean-100-000016.tar",
+          "size_bytes": 349696000,
+          "checksum": "md5:c6632130ade05d042ed249d1257c29b2",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000016.tar/content"
+        },
+        {
+          "name": "test-clean-000016.tar",
+          "size_bytes": 22947840,
+          "checksum": "md5:ccfa1c5fa304a6e6e8f8b0dfc916b759",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000016.tar/content"
+        },
+        {
+          "name": "test-clean-000002.tar",
+          "size_bytes": 16158720,
+          "checksum": "md5:d1400b2c343f405380640a1a13984e5d",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000002.tar/content"
+        },
+        {
+          "name": "dev-clean-000008.tar",
+          "size_bytes": 21944320,
+          "checksum": "md5:52e5c97cbd0058a6e14d54be3ad36ec5",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000008.tar/content"
+        },
+        {
+          "name": "test-clean-000004.tar",
+          "size_bytes": 21596160,
+          "checksum": "md5:378fa1dd25c9e94dfa07fb682451f670",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000004.tar/content"
+        },
+        {
+          "name": "test-clean-000005.tar",
+          "size_bytes": 15974400,
+          "checksum": "md5:36574db2ab53c7d1fec0a385299a1bfd",
+          "download_url": "https://zenodo.org/api/records/14716252/files/test-clean-000005.tar/content"
+        },
+        {
+          "name": "train-clean-100-000002.tar",
+          "size_bytes": 342312960,
+          "checksum": "md5:9efbfd560f1093b6d28ff406de22d8c4",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000002.tar/content"
+        },
+        {
+          "name": "train-clean-100-000000.tar",
+          "size_bytes": 334592000,
+          "checksum": "md5:0103c445165757c357c1d2d4e734af35",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000000.tar/content"
+        },
+        {
+          "name": "train-clean-100-000017.tar",
+          "size_bytes": 323747840,
+          "checksum": "md5:249803d3c824e5c4525be080556fc1e1",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000017.tar/content"
+        },
+        {
+          "name": "train-clean-100-000003.tar",
+          "size_bytes": 331806720,
+          "checksum": "md5:e0a38db2a4bbf2e577c9e265b2f82a21",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000003.tar/content"
+        },
+        {
+          "name": "train-clean-100-000008.tar",
+          "size_bytes": 322222080,
+          "checksum": "md5:1da52909d27aabf794742ed25a7c4b2c",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000008.tar/content"
+        },
+        {
+          "name": "train-clean-100-000013.tar",
+          "size_bytes": 336209920,
+          "checksum": "md5:7738ba26238bbdfbc6e0db8941e913fa",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000013.tar/content"
+        },
+        {
+          "name": "train-clean-100-000014.tar",
+          "size_bytes": 333434880,
+          "checksum": "md5:3157d0e58cae43f30f39447d0fc2b762",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000014.tar/content"
+        },
+        {
+          "name": "train-clean-100-000019.tar",
+          "size_bytes": 363438080,
+          "checksum": "md5:4579bdfc84d4da0e6b9e55570861c8ec",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000019.tar/content"
+        },
+        {
+          "name": "dev-clean-000000.tar",
+          "size_bytes": 17561600,
+          "checksum": "md5:13f83136ddfa090e7b5833e95e33a6e6",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000000.tar/content"
+        },
+        {
+          "name": "train-clean-100-000010.tar",
+          "size_bytes": 334110720,
+          "checksum": "md5:61d8119ed8c186696227ae7b35f7dde6",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000010.tar/content"
+        },
+        {
+          "name": "train-clean-100-000007.tar",
+          "size_bytes": 343674880,
+          "checksum": "md5:6550fa651213f1da86c4118ce5445d04",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000007.tar/content"
+        },
+        {
+          "name": "train-clean-100-000015.tar",
+          "size_bytes": 331325440,
+          "checksum": "md5:0d36bf060c188e0b55f8893028b01a1e",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000015.tar/content"
+        },
+        {
+          "name": "dev-clean-000005.tar",
+          "size_bytes": 16957440,
+          "checksum": "md5:1e49d6d1e332558993d1df53afbd7e1e",
+          "download_url": "https://zenodo.org/api/records/14716252/files/dev-clean-000005.tar/content"
+        },
+        {
+          "name": "train-clean-100-000009.tar",
+          "size_bytes": 307445760,
+          "checksum": "md5:b5a2240a88e6d8ac9a71d80206e2b3fb",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000009.tar/content"
+        },
+        {
+          "name": "train-clean-100-000001.tar",
+          "size_bytes": 344094720,
+          "checksum": "md5:00cecf1cd3c2ee030abc7bb48cd38bce",
+          "download_url": "https://zenodo.org/api/records/14716252/files/train-clean-100-000001.tar/content"
+        }
+      ],
+      "file_count": 60,
+      "tar_bytes_sum": 7468359680
+    },
+    {
+      "dataset": "maestro",
+      "record_id": "14858022",
+      "title": "maestro in WebDataset Format Creators",
+      "archive_url": "https://zenodo.org/api/records/14858022/files-archive",
+      "files": [
+        {
+          "name": "maestro_test_000000.tar",
+          "size_bytes": 3243530240,
+          "checksum": "md5:7890feb9097ce68d85efd33810417cb1",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_test_000000.tar/content"
+        },
+        {
+          "name": "maestro_train_000002.tar",
+          "size_bytes": 3026585600,
+          "checksum": "md5:e9a1980d49352a551387730386bd8b69",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_train_000002.tar/content"
+        },
+        {
+          "name": "maestro_train_000001.tar",
+          "size_bytes": 3294771200,
+          "checksum": "md5:60f744159e2241dfd1f7dd61c031ff75",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_train_000001.tar/content"
+        },
+        {
+          "name": "maestro_valid_000000.tar",
+          "size_bytes": 3059599360,
+          "checksum": "md5:4342d107f0b51a3fe2c0f48a9e481943",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_valid_000000.tar/content"
+        },
+        {
+          "name": "maestro_train_000004.tar",
+          "size_bytes": 212520960,
+          "checksum": "md5:8fb1f1780eb72291b7dd5a54bc1b7de4",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_train_000004.tar/content"
+        },
+        {
+          "name": "maestro_valid_000001.tar",
+          "size_bytes": 2115911680,
+          "checksum": "md5:cf45978813ffdf516c529a31ef1347d8",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_valid_000001.tar/content"
+        },
+        {
+          "name": "maestro_train_000003.tar",
+          "size_bytes": 3118725120,
+          "checksum": "md5:c5bb7e4a7fd12b8957673957c8c99d19",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_train_000003.tar/content"
+        },
+        {
+          "name": "maestro_train_000000.tar",
+          "size_bytes": 3018516480,
+          "checksum": "md5:912c91263974c7ebb5e03b959d722148",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_train_000000.tar/content"
+        },
+        {
+          "name": "maestro_test_000001.tar",
+          "size_bytes": 1780602880,
+          "checksum": "md5:74aa0d4a2819980deaac8e51bbfc4190",
+          "download_url": "https://zenodo.org/api/records/14858022/files/maestro_test_000001.tar/content"
+        }
+      ],
+      "file_count": 9,
+      "tar_bytes_sum": 22870763520
+    },
+    {
+      "dataset": "nsynthinstument",
+      "record_id": "14725174",
+      "title": "nsynthinstument in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14725174/files-archive",
+      "files": [
+        {
+          "name": "nsynth_valid_0000001.tar",
+          "size_bytes": 353761280,
+          "checksum": "md5:e603e5c1cd3f6a47681235e5462da0fc",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_valid_0000001.tar/content"
+        },
+        {
+          "name": "nsynth_train_sub55k_0000000.tar",
+          "size_bytes": 1320970240,
+          "checksum": "md5:7a3bf186cef93881ee3a4377bb53b15f",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_train_sub55k_0000000.tar/content"
+        },
+        {
+          "name": "nsynth_train_sub55k_0000004.tar",
+          "size_bytes": 1320970240,
+          "checksum": "md5:c5ce8a79be26571736c2a55252bd0a71",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_train_sub55k_0000004.tar/content"
+        },
+        {
+          "name": "nsynth_train_sub55k_0000001.tar",
+          "size_bytes": 1320970240,
+          "checksum": "md5:5f277ff0cd438c470095453ca2d0b40d",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_train_sub55k_0000001.tar/content"
+        },
+        {
+          "name": "nsynth_train_sub55k_0000003.tar",
+          "size_bytes": 1320970240,
+          "checksum": "md5:2ff1b14adf5275eee342dffd47f22510",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_train_sub55k_0000003.tar/content"
+        },
+        {
+          "name": "nsynth_valid_0000000.tar",
+          "size_bytes": 1320970240,
+          "checksum": "md5:18b7e76e5b9f7ead8e801a51e534b5ed",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_valid_0000000.tar/content"
+        },
+        {
+          "name": "nsynth_test_0000000.tar",
+          "size_bytes": 541071360,
+          "checksum": "md5:4bb9864530db868eb124ae327e408c83",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_test_0000000.tar/content"
+        },
+        {
+          "name": "nsynth_train_sub55k_0000002.tar",
+          "size_bytes": 1320970240,
+          "checksum": "md5:3e928b3ba54d656f7c489848c8e662ad",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_train_sub55k_0000002.tar/content"
+        },
+        {
+          "name": "nsynth_train_sub55k_0000005.tar",
+          "size_bytes": 660490240,
+          "checksum": "md5:87eddad8a0113b6edcd5ebe10838a69a",
+          "download_url": "https://zenodo.org/api/records/14725174/files/nsynth_train_sub55k_0000005.tar/content"
+        }
+      ],
+      "file_count": 9,
+      "tar_bytes_sum": 9481144320
+    },
+    {
+      "dataset": "ravdess",
+      "record_id": "14722524",
+      "title": "ravdess in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14722524/files-archive",
+      "files": [
+        {
+          "name": "ravdess_fold_2_0000000.tar",
+          "size_bytes": 148684800,
+          "checksum": "md5:47f50788889145fe3461af953f31b856",
+          "download_url": "https://zenodo.org/api/records/14722524/files/ravdess_fold_2_0000000.tar/content"
+        },
+        {
+          "name": "ravdess_fold_3_0000000.tar",
+          "size_bytes": 151326720,
+          "checksum": "md5:51909b20a0c6925a8e467ac38ba34955",
+          "download_url": "https://zenodo.org/api/records/14722524/files/ravdess_fold_3_0000000.tar/content"
+        },
+        {
+          "name": "ravdess_fold_1_0000000.tar",
+          "size_bytes": 145602560,
+          "checksum": "md5:979ee2199995f533832b5e765579f0c0",
+          "download_url": "https://zenodo.org/api/records/14722524/files/ravdess_fold_1_0000000.tar/content"
+        },
+        {
+          "name": "ravdess_fold_0_0000000.tar",
+          "size_bytes": 150292480,
+          "checksum": "md5:3b62051f75138355710c0f8f257c9484",
+          "download_url": "https://zenodo.org/api/records/14722524/files/ravdess_fold_0_0000000.tar/content"
+        }
+      ],
+      "file_count": 4,
+      "tar_bytes_sum": 595906560
+    },
+    {
+      "dataset": "speechcommandsv1",
+      "record_id": "14722647",
+      "title": "SpeechCommands in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14722647/files-archive",
+      "files": [
+        {
+          "name": "wds-audio-train_0000003.tar",
+          "size_bytes": 352747520,
+          "checksum": "md5:586a6a4bbb5fb459e8ca3478af7d269e",
+          "download_url": "https://zenodo.org/api/records/14722647/files/wds-audio-train_0000003.tar/content"
+        },
+        {
+          "name": "wds-audio-valid_0000000.tar",
+          "size_bytes": 240558080,
+          "checksum": "md5:cda6b3d9954ab5a30fd7b4f3416f4a04",
+          "download_url": "https://zenodo.org/api/records/14722647/files/wds-audio-valid_0000000.tar/content"
+        },
+        {
+          "name": "wds-audio-train_0000002.tar",
+          "size_bytes": 353802240,
+          "checksum": "md5:73a38056a1a6b87b5f9863fc375093f7",
+          "download_url": "https://zenodo.org/api/records/14722647/files/wds-audio-train_0000002.tar/content"
+        },
+        {
+          "name": "wds-audio-test_0000000.tar",
+          "size_bytes": 242196480,
+          "checksum": "md5:e1f560380aa333843a2eee7c6a4d4d30",
+          "download_url": "https://zenodo.org/api/records/14722647/files/wds-audio-test_0000000.tar/content"
+        },
+        {
+          "name": "wds-audio-train_0000000.tar",
+          "size_bytes": 353628160,
+          "checksum": "md5:db449a5a029cf5b27abb049075be5ce4",
+          "download_url": "https://zenodo.org/api/records/14722647/files/wds-audio-train_0000000.tar/content"
+        },
+        {
+          "name": "wds-audio-train_0000004.tar",
+          "size_bytes": 353300480,
+          "checksum": "md5:40303af22f0c0088cd8e5ab419c66b17",
+          "download_url": "https://zenodo.org/api/records/14722647/files/wds-audio-train_0000004.tar/content"
+        },
+        {
+          "name": "wds-audio-train_0000001.tar",
+          "size_bytes": 353669120,
+          "checksum": "md5:2e0910ca917aeadf3e6980967b27ef3f",
+          "download_url": "https://zenodo.org/api/records/14722647/files/wds-audio-train_0000001.tar/content"
+        },
+        {
+          "name": "wds-audio-train_0000005.tar",
+          "size_bytes": 38461440,
+          "checksum": "md5:fbfc8ce722a37e98e1fe2add98a4fc3c",
+          "download_url": "https://zenodo.org/api/records/14722647/files/wds-audio-train_0000005.tar/content"
+        }
+      ],
+      "file_count": 8,
+      "tar_bytes_sum": 2288363520
+    },
+    {
+      "dataset": "speechocean762",
+      "record_id": "14725291",
+      "title": "speechocean762 in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14725291/files-archive",
+      "files": [
+        {
+          "name": "speechocean762_test.tar",
+          "size_bytes": 321464320,
+          "checksum": "md5:07c37fb373df638bd7aeb5a832d04276",
+          "download_url": "https://zenodo.org/api/records/14725291/files/speechocean762_test.tar/content"
+        },
+        {
+          "name": "speechocean762_train.tar",
+          "size_bytes": 342743040,
+          "checksum": "md5:39242cbeb664ff92be323f85478e35e3",
+          "download_url": "https://zenodo.org/api/records/14725291/files/speechocean762_train.tar/content"
+        }
+      ],
+      "file_count": 2,
+      "tar_bytes_sum": 664207360
+    },
+    {
+      "dataset": "urbansound8k",
+      "record_id": "14722683",
+      "title": "urbansound8k in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14722683/files-archive",
+      "files": [
+        {
+          "name": "urbansound_fold5_0000000.tar",
+          "size_bytes": 718213120,
+          "checksum": "md5:7923498ab2ee0549289081d19749d370",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold5_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold4_0000000.tar",
+          "size_bytes": 809431040,
+          "checksum": "md5:7d1da503adb6f76056ae6ff10ef2e4bf",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold4_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold3_0000000.tar",
+          "size_bytes": 666357760,
+          "checksum": "md5:a37e38e312c90221f0d249191d7e6aff",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold3_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold6_0000000.tar",
+          "size_bytes": 580556800,
+          "checksum": "md5:dad09d21fda4689d2123fe12ab8e187a",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold6_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold9_0000000.tar",
+          "size_bytes": 702187520,
+          "checksum": "md5:f0ef34b53cfa58ca31a2f6802dc3522b",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold9_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold7_0000000.tar",
+          "size_bytes": 679147520,
+          "checksum": "md5:0601a0b8ad7028628e92c6ae61263fe1",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold7_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold8_0000000.tar",
+          "size_bytes": 718417920,
+          "checksum": "md5:fb6f7b8b9da58314d4b7e1e4d421e60a",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold8_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold10_0000000.tar",
+          "size_bytes": 701788160,
+          "checksum": "md5:0a940010596451b9e8a4f6c89de6b7f7",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold10_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold2_0000000.tar",
+          "size_bytes": 736634880,
+          "checksum": "md5:7f8285591c13bc93fd074550899663b4",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold2_0000000.tar/content"
+        },
+        {
+          "name": "urbansound_fold1_0000000.tar",
+          "size_bytes": 810629120,
+          "checksum": "md5:a3638335cf01787bf3bc8f076506aa48",
+          "download_url": "https://zenodo.org/api/records/14722683/files/urbansound_fold1_0000000.tar/content"
+        }
+      ],
+      "file_count": 10,
+      "tar_bytes_sum": 7123363840
+    },
+    {
+      "dataset": "vocalsound",
+      "record_id": "14722710",
+      "title": "vocalsound in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14722710/files-archive",
+      "files": [
+        {
+          "name": "test-000004.tar",
+          "size_bytes": 24944640,
+          "checksum": "md5:0257a9cdd96e17c51afb193eb5a5f289",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000004.tar/content"
+        },
+        {
+          "name": "train-000006.tar",
+          "size_bytes": 107786240,
+          "checksum": "md5:36c721ff87a3423f908407198e9bc40c",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000006.tar/content"
+        },
+        {
+          "name": "test-000002.tar",
+          "size_bytes": 23255040,
+          "checksum": "md5:5216725b266ab75d3d085f86e7064423",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000002.tar/content"
+        },
+        {
+          "name": "train-000018.tar",
+          "size_bytes": 109465600,
+          "checksum": "md5:ad8c4ec807f2bcbe726b41292707eb3f",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000018.tar/content"
+        },
+        {
+          "name": "valid-000007.tar",
+          "size_bytes": 13230080,
+          "checksum": "md5:da96ced16d561338ac6ec2ebfa2fd028",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000007.tar/content"
+        },
+        {
+          "name": "train-000011.tar",
+          "size_bytes": 106024960,
+          "checksum": "md5:b568f6bd24ced0cb32b8d86cb6f19370",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000011.tar/content"
+        },
+        {
+          "name": "train-000013.tar",
+          "size_bytes": 107397120,
+          "checksum": "md5:33daf8a2816ddbc321df94b1405f461f",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000013.tar/content"
+        },
+        {
+          "name": "train-000004.tar",
+          "size_bytes": 108062720,
+          "checksum": "md5:07f72d1a745fbbba6ed8f7b14881d8aa",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000004.tar/content"
+        },
+        {
+          "name": "valid-000000.tar",
+          "size_bytes": 12943360,
+          "checksum": "md5:6d4a44e249a7f7ecaa6b2455ab126825",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000000.tar/content"
+        },
+        {
+          "name": "valid-000005.tar",
+          "size_bytes": 13137920,
+          "checksum": "md5:237dda900aaa966959ce885a82e9cb9f",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000005.tar/content"
+        },
+        {
+          "name": "valid-000008.tar",
+          "size_bytes": 13117440,
+          "checksum": "md5:cc3e9cf9ace8f71897103d3377b56661",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000008.tar/content"
+        },
+        {
+          "name": "valid-000002.tar",
+          "size_bytes": 12759040,
+          "checksum": "md5:6b5bcea0ae4fb7dae7f7e35647c7ceab",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000002.tar/content"
+        },
+        {
+          "name": "valid-000003.tar",
+          "size_bytes": 12451840,
+          "checksum": "md5:e299aaab01a67b8f2a5674085c7d6131",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000003.tar/content"
+        },
+        {
+          "name": "valid-000011.tar",
+          "size_bytes": 12687360,
+          "checksum": "md5:51590f304921916ab5dfafb53c6458d9",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000011.tar/content"
+        },
+        {
+          "name": "train-000005.tar",
+          "size_bytes": 107847680,
+          "checksum": "md5:64e4f08535baec5dc4a0bd956bae5f1d",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000005.tar/content"
+        },
+        {
+          "name": "train-000019.tar",
+          "size_bytes": 106536960,
+          "checksum": "md5:a8a169150969665daabaaffd45b6bee5",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000019.tar/content"
+        },
+        {
+          "name": "train-000008.tar",
+          "size_bytes": 102000640,
+          "checksum": "md5:80d5790068a5b629be117a8f977b363b",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000008.tar/content"
+        },
+        {
+          "name": "test-000000.tar",
+          "size_bytes": 26531840,
+          "checksum": "md5:fa5b3c7cd175ecd2da8aec79851792a4",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000000.tar/content"
+        },
+        {
+          "name": "test-000005.tar",
+          "size_bytes": 24074240,
+          "checksum": "md5:2d0039fc488b7aeab0620b62d288feb7",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000005.tar/content"
+        },
+        {
+          "name": "train-000002.tar",
+          "size_bytes": 108328960,
+          "checksum": "md5:9eb77a781c260217e87a5b5631940a33",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000002.tar/content"
+        },
+        {
+          "name": "test-000003.tar",
+          "size_bytes": 25108480,
+          "checksum": "md5:5eb0459bab0517c24278c1e0524ad1b0",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000003.tar/content"
+        },
+        {
+          "name": "test-000011.tar",
+          "size_bytes": 25272320,
+          "checksum": "md5:5cb74aae75aea374d4a348eb46cc5251",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000011.tar/content"
+        },
+        {
+          "name": "test-000001.tar",
+          "size_bytes": 23265280,
+          "checksum": "md5:0a90752203f5895fde83352f94572e89",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000001.tar/content"
+        },
+        {
+          "name": "test-000017.tar",
+          "size_bytes": 24729600,
+          "checksum": "md5:a0516671ef643126af14df7863f271f0",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000017.tar/content"
+        },
+        {
+          "name": "test-000015.tar",
+          "size_bytes": 23910400,
+          "checksum": "md5:83a97e7e4b8c904da1b2b43351608ee4",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000015.tar/content"
+        },
+        {
+          "name": "valid-000013.tar",
+          "size_bytes": 12503040,
+          "checksum": "md5:c51e8890150d937a97a245aad14dd65f",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000013.tar/content"
+        },
+        {
+          "name": "test-000019.tar",
+          "size_bytes": 23695360,
+          "checksum": "md5:32cadf1bc7355ec128c7077c86d91743",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000019.tar/content"
+        },
+        {
+          "name": "valid-000012.tar",
+          "size_bytes": 12769280,
+          "checksum": "md5:6faa52b7edb4cf393e30fbc05bd5eb83",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000012.tar/content"
+        },
+        {
+          "name": "valid-000016.tar",
+          "size_bytes": 14202880,
+          "checksum": "md5:aee8a2b0e2cd38f1db6d7b42e6393bcf",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000016.tar/content"
+        },
+        {
+          "name": "test-000012.tar",
+          "size_bytes": 23521280,
+          "checksum": "md5:4f4f7a0e2f4c5fe281833f4d2522af03",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000012.tar/content"
+        },
+        {
+          "name": "train-000003.tar",
+          "size_bytes": 108277760,
+          "checksum": "md5:6893f13329169ca7c6ff58c4b868bdb5",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000003.tar/content"
+        },
+        {
+          "name": "valid-000014.tar",
+          "size_bytes": 13045760,
+          "checksum": "md5:eb9022cb5b9f6f0bcaf46791bb555ed9",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000014.tar/content"
+        },
+        {
+          "name": "test-000014.tar",
+          "size_bytes": 24688640,
+          "checksum": "md5:71e31ab8bd79ea48a81f13a4e972874c",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000014.tar/content"
+        },
+        {
+          "name": "train-000014.tar",
+          "size_bytes": 106434560,
+          "checksum": "md5:29b9a09f16b5a858aaee4356020a3925",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000014.tar/content"
+        },
+        {
+          "name": "test-000018.tar",
+          "size_bytes": 23879680,
+          "checksum": "md5:bb1b23551923e4c5d963b1c8d34edfe1",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000018.tar/content"
+        },
+        {
+          "name": "valid-000015.tar",
+          "size_bytes": 11909120,
+          "checksum": "md5:f72475b37fd42776d7fe0454bf290be9",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000015.tar/content"
+        },
+        {
+          "name": "valid-000018.tar",
+          "size_bytes": 13496320,
+          "checksum": "md5:4a05e1bf902cab7411f37335e8726da7",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000018.tar/content"
+        },
+        {
+          "name": "test-000010.tar",
+          "size_bytes": 24842240,
+          "checksum": "md5:12296fe4cc84e3592e40690fb1c124f7",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000010.tar/content"
+        },
+        {
+          "name": "valid-000017.tar",
+          "size_bytes": 14295040,
+          "checksum": "md5:e63b6755886ff41b7c40d37c243ac83d",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000017.tar/content"
+        },
+        {
+          "name": "test-000008.tar",
+          "size_bytes": 26142720,
+          "checksum": "md5:e3a8ff57da89880339aba20f166ca30a",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000008.tar/content"
+        },
+        {
+          "name": "test-000006.tar",
+          "size_bytes": 24002560,
+          "checksum": "md5:9cb07ccf956007068dcc3de78232fb45",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000006.tar/content"
+        },
+        {
+          "name": "train-000016.tar",
+          "size_bytes": 107417600,
+          "checksum": "md5:26af37941f960f9189e83b6f576919f7",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000016.tar/content"
+        },
+        {
+          "name": "test-000007.tar",
+          "size_bytes": 25169920,
+          "checksum": "md5:9872e41c871a8b04aadf8ca74dad64e5",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000007.tar/content"
+        },
+        {
+          "name": "test-000009.tar",
+          "size_bytes": 24104960,
+          "checksum": "md5:9eeb682c07684a7227dcec3d712dbc2a",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000009.tar/content"
+        },
+        {
+          "name": "valid-000009.tar",
+          "size_bytes": 12175360,
+          "checksum": "md5:1062c3c13b83271d51a75cf4136a93e0",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000009.tar/content"
+        },
+        {
+          "name": "test-000013.tar",
+          "size_bytes": 26152960,
+          "checksum": "md5:315f3be5916bde7f68beccbd6de7487b",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000013.tar/content"
+        },
+        {
+          "name": "test-000016.tar",
+          "size_bytes": 24811520,
+          "checksum": "md5:8790c671c1c6c46e12c2511525d1c1f0",
+          "download_url": "https://zenodo.org/api/records/14722710/files/test-000016.tar/content"
+        },
+        {
+          "name": "train-000000.tar",
+          "size_bytes": 107939840,
+          "checksum": "md5:003d0a4cb29afa422042043aaec01c41",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000000.tar/content"
+        },
+        {
+          "name": "train-000001.tar",
+          "size_bytes": 106956800,
+          "checksum": "md5:cf5fe8a315b9da62c5377ccaa286f25e",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000001.tar/content"
+        },
+        {
+          "name": "train-000007.tar",
+          "size_bytes": 108953600,
+          "checksum": "md5:5439db96f77fa5066ff28b971ab788da",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000007.tar/content"
+        },
+        {
+          "name": "train-000009.tar",
+          "size_bytes": 105830400,
+          "checksum": "md5:016bdb0dd6a7c609fedd68d17a068cb8",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000009.tar/content"
+        },
+        {
+          "name": "valid-000001.tar",
+          "size_bytes": 12195840,
+          "checksum": "md5:d1e90180dbd03e8aa23fa6965c9fc6ca",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000001.tar/content"
+        },
+        {
+          "name": "train-000017.tar",
+          "size_bytes": 105574400,
+          "checksum": "md5:28905d4de99591752d9a7a10e7fb58d2",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000017.tar/content"
+        },
+        {
+          "name": "train-000010.tar",
+          "size_bytes": 105953280,
+          "checksum": "md5:5f3664e93407db7d70fcc70ecab662ac",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000010.tar/content"
+        },
+        {
+          "name": "train-000012.tar",
+          "size_bytes": 107632640,
+          "checksum": "md5:185dd9391b08ae4b92f6397b6405cbc8",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000012.tar/content"
+        },
+        {
+          "name": "valid-000004.tar",
+          "size_bytes": 13424640,
+          "checksum": "md5:ebe283587c1f2a8601fcdacf4bc90e6a",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000004.tar/content"
+        },
+        {
+          "name": "valid-000010.tar",
+          "size_bytes": 12810240,
+          "checksum": "md5:635662fe1247964736f60207f274e088",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000010.tar/content"
+        },
+        {
+          "name": "valid-000006.tar",
+          "size_bytes": 11530240,
+          "checksum": "md5:dba870beee5dc2e3aa9ea37289484248",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000006.tar/content"
+        },
+        {
+          "name": "train-000015.tar",
+          "size_bytes": 106045440,
+          "checksum": "md5:5958099e740274e7da121c2986c0f149",
+          "download_url": "https://zenodo.org/api/records/14722710/files/train-000015.tar/content"
+        },
+        {
+          "name": "valid-000019.tar",
+          "size_bytes": 13352960,
+          "checksum": "md5:5e6bd98ce29b833f3f19e18c199aafa6",
+          "download_url": "https://zenodo.org/api/records/14722710/files/valid-000019.tar/content"
+        }
+      ],
+      "file_count": 60,
+      "tar_bytes_sum": 2890608640
+    },
+    {
+      "dataset": "voxceleb1",
+      "record_id": "14811963",
+      "title": "voxceleb1 in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14811963/files-archive",
+      "files": [
+        {
+          "name": "voxceleb1_train_0000004.tar",
+          "size_bytes": 2671912960,
+          "checksum": "md5:9106e061856afc213d1e434cb1fc1002",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000004.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000003.tar",
+          "size_bytes": 2659133440,
+          "checksum": "md5:513eaf8bdc30b70eb0d3c418943c5e02",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000003.tar/content"
+        },
+        {
+          "name": "voxceleb1_test_0000000.tar",
+          "size_bytes": 2107033600,
+          "checksum": "md5:aa9c726093963eca67691a02dc94b0c6",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_test_0000000.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000005.tar",
+          "size_bytes": 2662666240,
+          "checksum": "md5:2ae5fce517756f3c3827be6e73723faa",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000005.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000002.tar",
+          "size_bytes": 2637639680,
+          "checksum": "md5:8f0b1241ccc83a6ceecad57e68e6005c",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000002.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000009.tar",
+          "size_bytes": 2722273280,
+          "checksum": "md5:b68786d2da8e3ca0d3d93ef9ffc6181b",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000009.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000007.tar",
+          "size_bytes": 2647521280,
+          "checksum": "md5:a34fbfafabb432273beae97e518e2697",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000007.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000006.tar",
+          "size_bytes": 2684385280,
+          "checksum": "md5:aa0d19ac47981876e3fdb962efe39afa",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000006.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000010.tar",
+          "size_bytes": 2737960960,
+          "checksum": "md5:095e5b9387f9815c77380d4993fe52e9",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000010.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000008.tar",
+          "size_bytes": 2695874560,
+          "checksum": "md5:37b266ffa8cea22a5031d9480f585e31",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000008.tar/content"
+        },
+        {
+          "name": "voxceleb1_valid_0000000.tar",
+          "size_bytes": 1776302080,
+          "checksum": "md5:f88ce959987c0e3a14fa83c8ac30611c",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_valid_0000000.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000013.tar",
+          "size_bytes": 2302709760,
+          "checksum": "md5:f7ec5fa8bb0eac9502d93320b5e7f4ac",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000013.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000000.tar",
+          "size_bytes": 2646312960,
+          "checksum": "md5:8c1f9538e9d72cbcfc9a52062476ed09",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000000.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000011.tar",
+          "size_bytes": 2754324480,
+          "checksum": "md5:9431049e0006237d0102afc8ca5288d0",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000011.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000012.tar",
+          "size_bytes": 2756823040,
+          "checksum": "md5:fc5230f02525390f5bd765b56782c74b",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000012.tar/content"
+        },
+        {
+          "name": "voxceleb1_train_0000001.tar",
+          "size_bytes": 2650296320,
+          "checksum": "md5:893e48a46ecbdbb36c5db58ee7ded1db",
+          "download_url": "https://zenodo.org/api/records/14811963/files/voxceleb1_train_0000001.tar/content"
+        }
+      ],
+      "file_count": 16,
+      "tar_bytes_sum": 41113169920
+    },
+    {
+      "dataset": "voxlingua33",
+      "record_id": "14812245",
+      "title": "voxlingua33 in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14812245/files-archive",
+      "files": [
+        {
+          "name": "train_subset_2k_0000003.tar",
+          "size_bytes": 3216588800,
+          "checksum": "md5:301b414aa0e2a2ea3349e60f3995102c",
+          "download_url": "https://zenodo.org/api/records/14812245/files/train_subset_2k_0000003.tar/content"
+        },
+        {
+          "name": "train_subset_2k_0000000.tar",
+          "size_bytes": 3228436480,
+          "checksum": "md5:d605496d3c462da1d4bbf3b0f793266b",
+          "download_url": "https://zenodo.org/api/records/14812245/files/train_subset_2k_0000000.tar/content"
+        },
+        {
+          "name": "train_subset_2k_0000004.tar",
+          "size_bytes": 3212984320,
+          "checksum": "md5:452c93ca4cc0d3eb757a4e0b449f65fa",
+          "download_url": "https://zenodo.org/api/records/14812245/files/train_subset_2k_0000004.tar/content"
+        },
+        {
+          "name": "train_subset_2k_0000006.tar",
+          "size_bytes": 1931540480,
+          "checksum": "md5:c277fabe6b4f968799c08439f5806c99",
+          "download_url": "https://zenodo.org/api/records/14812245/files/train_subset_2k_0000006.tar/content"
+        },
+        {
+          "name": "dev_0000000.tar",
+          "size_bytes": 522270720,
+          "checksum": "md5:8e3e51f13f1bc41eca20f3bffa9aa5f3",
+          "download_url": "https://zenodo.org/api/records/14812245/files/dev_0000000.tar/content"
+        },
+        {
+          "name": "train_subset_2k_0000005.tar",
+          "size_bytes": 3222487040,
+          "checksum": "md5:df80f051147ff5393d1384421d1ba2ac",
+          "download_url": "https://zenodo.org/api/records/14812245/files/train_subset_2k_0000005.tar/content"
+        },
+        {
+          "name": "train_subset_2k_0000002.tar",
+          "size_bytes": 3213168640,
+          "checksum": "md5:1eefba7e5eb2574b4251234521737259",
+          "download_url": "https://zenodo.org/api/records/14812245/files/train_subset_2k_0000002.tar/content"
+        },
+        {
+          "name": "train_subset_2k_0000001.tar",
+          "size_bytes": 3211028480,
+          "checksum": "md5:8d0dc925b098b526c54af9375a9b668f",
+          "download_url": "https://zenodo.org/api/records/14812245/files/train_subset_2k_0000001.tar/content"
+        }
+      ],
+      "file_count": 8,
+      "tar_bytes_sum": 21758504960
+    },
+    {
+      "dataset": "vocalimitations",
+      "record_id": "14862060",
+      "title": "vocalimitationset in WebDataset Format",
+      "archive_url": "https://zenodo.org/api/records/14862060/files-archive",
+      "files": [
+        {
+          "name": "vocal_imitations_fold00_0000000.tar",
+          "size_bytes": 1142394880,
+          "checksum": "md5:fa3c6c7a312e69cea1b09cc7082de80c",
+          "download_url": "https://zenodo.org/api/records/14862060/files/vocal_imitations_fold00_0000000.tar/content"
+        },
+        {
+          "name": "vocal_imitations_fold01_0000000.tar",
+          "size_bytes": 1119959040,
+          "checksum": "md5:a460679e32ede60b3f4c8821b4ef705a",
+          "download_url": "https://zenodo.org/api/records/14862060/files/vocal_imitations_fold01_0000000.tar/content"
+        },
+        {
+          "name": "vocal_imitations_fold02_0000000.tar",
+          "size_bytes": 1136343040,
+          "checksum": "md5:4bfbe1d6f28fdb540b8aa02625b86aa9",
+          "download_url": "https://zenodo.org/api/records/14862060/files/vocal_imitations_fold02_0000000.tar/content"
+        }
+      ],
+      "file_count": 3,
+      "tar_bytes_sum": 3398696960
+    }
+  ]
+}
