@@ -103,6 +103,9 @@ MODEL_ONLY_WARMSTART_EXPECTED_WORLD_SIZE_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ON
 MODEL_ONLY_WARMSTART_PHASE_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_PHASE"
 MODEL_ONLY_WARMSTART_AUDIT_MODE_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_AUDIT_MODE"
 MODEL_ONLY_WARMSTART_EXPECTED_START_STEP_ENV = "HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_EXPECTED_START_STEP"
+EXPECTED_AUDIO_ENCODER_LR_ENV = "HUGINN_AUDIO_DYNAMIC30S_EXPECTED_AUDIO_ENCODER_LR"
+EXPECTED_ALIGNER_LR_ENV = "HUGINN_AUDIO_DYNAMIC30S_EXPECTED_ALIGNER_LR"
+EXPECTED_LORA_LR_ENV = "HUGINN_AUDIO_DYNAMIC30S_EXPECTED_LORA_LR"
 TRAINING_STATS_DIR_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR"
 TRAINING_STATS_RESUME_STATE_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_RESUME_STATE"
 TRAINING_STATS_LOG_STEPS_ENV = "HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_LOG_STEPS"
@@ -2698,6 +2701,34 @@ def _training_parameter_group(name: str) -> str:
     return "other"
 
 
+def _configured_optimizer_learning_rates() -> dict[str, float]:
+    defaults = {
+        "audio_encoder": 1e-4,
+        "aligner": 1e-4,
+        "lora": 1e-4,
+        "huginn_base": 1e-4,
+        "other": 1e-4,
+    }
+    environment_names = {
+        "audio_encoder": EXPECTED_AUDIO_ENCODER_LR_ENV,
+        "aligner": EXPECTED_ALIGNER_LR_ENV,
+        "lora": EXPECTED_LORA_LR_ENV,
+    }
+    configured = dict(defaults)
+    for group, environment_name in environment_names.items():
+        value = os.environ.get(environment_name, "").strip()
+        if not value:
+            continue
+        try:
+            learning_rate = float(value)
+        except ValueError as exc:
+            raise ValueError(f"{environment_name} must be a positive finite float, got {value!r}") from exc
+        if not math.isfinite(learning_rate) or learning_rate <= 0:
+            raise ValueError(f"{environment_name} must be a positive finite float, got {value!r}")
+        configured[group] = learning_rate
+    return configured
+
+
 def _audit_local_trainable_gradients(model: torch.nn.Module, *, context: str) -> dict[str, dict[str, int]]:
     scalar_flags: dict[str, dict[str, list[torch.Tensor]]] = {
         name: {"finite": [], "nonzero": []}
@@ -2819,11 +2850,12 @@ def _audit_optimizer_parameter_groups(
     optimizer: Any,
     *,
     context: str,
-    expected_learning_rate: float = 1e-4,
+    expected_learning_rate: float | None = None,
     allow_scheduled_learning_rate: bool = False,
 ) -> list[dict[str, Any]]:
     if optimizer is None:
         raise RuntimeError(f"{context} received no optimizer")
+    expected_learning_rates = _configured_optimizer_learning_rates()
     parameter_groups_by_id = {
         id(parameter): _training_parameter_group(name)
         for name, parameter in model.named_parameters()
@@ -2849,15 +2881,27 @@ def _audit_optimizer_parameter_groups(
                     observed_boundary_parameter_ids[boundary_name].add(parameter_id)
         learning_rate = float(optimizer_group["lr"])
         configured_learning_rate = float(optimizer_group.get("initial_lr", learning_rate))
-        learning_rate_valid = abs(configured_learning_rate - expected_learning_rate) <= 1e-12
-        if allow_scheduled_learning_rate:
-            learning_rate_valid = learning_rate_valid and 0.0 <= learning_rate <= expected_learning_rate + 1e-12
+        active_groups = [name for name, count in counts.items() if count > 0]
+        if expected_learning_rate is not None:
+            group_expected_rates = [expected_learning_rate for _ in active_groups] or [expected_learning_rate]
         else:
-            learning_rate_valid = learning_rate_valid and abs(learning_rate - expected_learning_rate) <= 1e-12
+            group_expected_rates = [expected_learning_rates[name] for name in active_groups] or [1e-4]
+        if len({float(value) for value in group_expected_rates}) != 1:
+            raise RuntimeError(
+                f"{context} optimizer group {index} mixes parameters with different expected LRs: "
+                f"groups={active_groups} expected_rates={group_expected_rates}"
+            )
+        group_expected_learning_rate = float(group_expected_rates[0])
+        learning_rate_valid = abs(configured_learning_rate - group_expected_learning_rate) <= 1e-12
+        if allow_scheduled_learning_rate:
+            learning_rate_valid = learning_rate_valid and 0.0 <= learning_rate <= group_expected_learning_rate + 1e-12
+        else:
+            learning_rate_valid = learning_rate_valid and abs(learning_rate - group_expected_learning_rate) <= 1e-12
         if not learning_rate_valid:
             raise RuntimeError(
                 f"{context} optimizer group {index} has current/configured LR "
-                f"{learning_rate}/{configured_learning_rate}, expected base {expected_learning_rate}: counts={counts}"
+                f"{learning_rate}/{configured_learning_rate}, expected base {group_expected_learning_rate}: "
+                f"counts={counts}"
             )
         if unknown_parameters:
             raise RuntimeError(
@@ -3011,6 +3055,7 @@ def _build_dynamic30s_training_runtime_contract(
     lora_runtime_audit: dict[str, Any],
     formal_training: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    configured_learning_rates = _configured_optimizer_learning_rates()
     contract = {
         "gate": "huginn_whisper_dynamic30s_240ms_training_runtime_contract_v2",
         "phase": phase,
@@ -3033,9 +3078,9 @@ def _build_dynamic30s_training_runtime_contract(
             "huginn_native_backbone": False,
         },
         "learning_rates": {
-            "whisper_encoder": 1e-4,
-            "audio_aligner": 1e-4,
-            "huginn_lora": 1e-4,
+            "whisper_encoder": configured_learning_rates["audio_encoder"],
+            "audio_aligner": configured_learning_rates["aligner"],
+            "huginn_lora": configured_learning_rates["lora"],
         },
         "lora": {
             "rank": int(lora_runtime_audit["rank"]),

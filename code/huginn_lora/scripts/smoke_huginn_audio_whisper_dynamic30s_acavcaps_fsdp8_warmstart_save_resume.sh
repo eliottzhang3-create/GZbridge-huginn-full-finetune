@@ -23,6 +23,9 @@ SAVE_STEP=2
 RESUME_STEP=3
 SEED="${ACAVCAPS_FLAT_SEED:-20260723}"
 MAX_TARS="${ACAVCAPS_FLAT_MAX_TARS:-2}"
+AUDIO_ENCODER_LR="${HUGINN_AUDIO_DYNAMIC30S_AUDIO_ENCODER_LR:-1e-5}"
+ALIGNER_LR="${HUGINN_AUDIO_DYNAMIC30S_ALIGNER_LR:-5e-5}"
+LORA_LR="${HUGINN_AUDIO_DYNAMIC30S_LORA_LR:-5e-5}"
 INIT_CHECKPOINT="${HUGINN_AUDIO_DYNAMIC30S_ACAV_WARMSTART_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_whisper_dynamic30s_multiplier_single_epoch_fsdp4/run-20260731_084946/swift_output/v0-20260731-085036/checkpoint-46050}"
 MANIFEST="${ACAVCAPS_FLAT_MANIFEST:-$REPO_ROOT/data/audio_swift/acavcaps/acavcaps_flat_global_tar_shuffle_seed20260723.json}"
 RUN_ROOT="${HUGINN_AUDIO_DYNAMIC30S_ACAV_SMOKE_ROOT:-outputs/huginn_audio_whisper_dynamic30s_acavcaps_fsdp8_warmstart_save_resume/run-$(date +%Y%m%d_%H%M%S)}"
@@ -85,6 +88,9 @@ export HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_AUDIT_MODE=fresh
 export HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_EXPECTED_START_STEP=0
 export HUGINN_AUDIO_DYNAMIC90S_MODEL_ONLY_WARMSTART_PHASE=acavcaps_warmstart
 export HUGINN_AUDIO_DYNAMIC90S_INIT_FSDP_DCP_CHECKPOINT="$INIT_CHECKPOINT"
+export HUGINN_AUDIO_DYNAMIC30S_EXPECTED_AUDIO_ENCODER_LR="$AUDIO_ENCODER_LR"
+export HUGINN_AUDIO_DYNAMIC30S_EXPECTED_ALIGNER_LR="$ALIGNER_LR"
+export HUGINN_AUDIO_DYNAMIC30S_EXPECTED_LORA_LR="$LORA_LR"
 unset HUGINN_AUDIO_DYNAMIC90S_INIT_ALIGNER_CHECKPOINT
 unset HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_AUDIT_DIR
 
@@ -101,6 +107,7 @@ echo "input_checkpoint=$INIT_CHECKPOINT"
 echo "manifest=$MANIFEST"
 echo "manifest_scope=all_1071_tars_flat_global_order smoke_max_tars=$MAX_TARS"
 echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH gradient_accumulation=$GRADIENT_ACCUMULATION_STEPS"
+echo "learning_rates=audio_encoder:$AUDIO_ENCODER_LR aligner:$ALIGNER_LR lora:$LORA_LR"
 echo "phase1=model_weights_only_new_optimizer_scheduler_global_step_rng_data_position"
 
 swift sft \
@@ -120,9 +127,9 @@ swift sft \
   --freeze_vit false \
   --freeze_aligner false \
   --modules_to_save "${MODULES_TO_SAVE[@]}" \
-  --learning_rate 1e-4 \
-  --aligner_lr 1e-4 \
-  --vit_lr 1e-4 \
+  --learning_rate "$LORA_LR" \
+  --aligner_lr "$ALIGNER_LR" \
+  --vit_lr "$AUDIO_ENCODER_LR" \
   --lr_scheduler_type constant \
   --lora_rank 8 \
   --lora_alpha 16 \
@@ -192,9 +199,9 @@ swift sft \
   --freeze_vit false \
   --freeze_aligner false \
   --modules_to_save "${MODULES_TO_SAVE[@]}" \
-  --learning_rate 1e-4 \
-  --aligner_lr 1e-4 \
-  --vit_lr 1e-4 \
+  --learning_rate "$LORA_LR" \
+  --aligner_lr "$ALIGNER_LR" \
+  --vit_lr "$AUDIO_ENCODER_LR" \
   --lr_scheduler_type constant \
   --lora_rank 8 \
   --lora_alpha 16 \

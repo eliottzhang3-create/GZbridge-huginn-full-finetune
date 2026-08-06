@@ -387,6 +387,10 @@ semantics are:
    8-card process and resume from that newly-created smoke checkpoint. The second phase tests ordinary same-world-size
    checkpoint resume inside the new ACAVCAPS run; it is not a resume of the old 4-card multiplier run.
 
+The ACAVCAPS warm-start learning-rate contract is intentionally different from the preceding multiplier run: audio
+encoder `1e-5`, aligner `5e-5`, and Huginn LoRA `5e-5`. The multiplier source training remains on its existing
+`1e-4` configuration; only the fresh ACAVCAPS optimizer uses this lower, per-group schedule.
+
 The implementation and gates are:
 
 - model-only DCP loader/audit in `code/huginn_lora/plugins/huginn_audio_whisper_dynamic90s_swift.py`;
@@ -396,10 +400,11 @@ The implementation and gates are:
 - strict save/resume inspector:
   `code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic30s_acavcaps_warmstart_resume.py`.
 
-The smoke is pending only on the final source checkpoint and remote execution. It must verify restored Whisper,
+The smoke is pending on remote execution and final source-checkpoint replacement. It must verify restored Whisper,
 aligner, and LoRA tensors, exact source-to-target tensor copy verification, empty fresh optimizer state in phase 1,
 optimizer ownership limited to current trainables, restored optimizer/scheduler state in phase 2, and frozen Huginn
-backbone equality across the smoke save/resume boundary.
+backbone equality across the smoke save/resume boundary. Its optimizer audit must also report the per-group rates
+`audio_encoder=1e-5`, `aligner=5e-5`, and `lora=5e-5`.
 
 #### Current architecture and training contract
 
