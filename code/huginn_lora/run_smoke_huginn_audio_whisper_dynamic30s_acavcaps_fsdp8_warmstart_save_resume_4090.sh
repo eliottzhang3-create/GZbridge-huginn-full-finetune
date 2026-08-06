@@ -1,6 +1,8 @@
 #!/bin/bash
 set -euo pipefail
 
+# Auxiliary scheduling probe only. The active ACAVCAPS continuation route uses
+# the sibling _5090 wrapper and eight RTX 5090 GPUs.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 mkdir -p log
