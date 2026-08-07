@@ -139,6 +139,7 @@ def inspect_checkpoint(
     expected_step: int,
     world_size: int,
     expected_phase: str,
+    expected_learning_rates: dict[str, float] | None = None,
 ) -> dict[str, Any]:
     from torch.distributed.checkpoint import FileSystemReader
 
@@ -209,6 +210,7 @@ def inspect_checkpoint(
         )
     optimizer_dcp_dirs = []
     optimizer_metadata_counts: dict[str, dict[str, int]] = {}
+    optimizer_other_state_counts: dict[str, int] = {}
     for candidate in checkpoint.iterdir():
         if candidate == model_dir or not candidate.is_dir() or not (candidate / ".metadata").is_file():
             continue
@@ -223,11 +225,16 @@ def inspect_checkpoint(
             optimizer_metadata_counts[candidate.name] = {
                 name: len(keys) for name, keys in optimizer_groups.items()
             }
+            optimizer_other_state_counts[candidate.name] = sum(
+                key.startswith("optimizer.state.") for key in optimizer_groups["other"]
+            )
             print(
                 f"[optimizer-metadata] checkpoint={checkpoint.name} dir={candidate.name} "
                 f"counts={optimizer_metadata_counts[candidate.name]} "
+                f"other_state_count={optimizer_other_state_counts[candidate.name]} "
                 f"aligner_preview={optimizer_groups['aligner'][:4]} "
-                f"audio_encoder_preview={optimizer_groups['audio_encoder'][:4]}"
+                f"audio_encoder_preview={optimizer_groups['audio_encoder'][:4]} "
+                f"other_preview={optimizer_groups['other'][:4]}"
             )
     if not optimizer_dcp_dirs:
         raise RuntimeError(f"No optimizer DCP state directory was found at {checkpoint}")
@@ -255,11 +262,11 @@ def inspect_checkpoint(
             "huginn_native_backbone": False,
         }
         or runtime_contract.get("learning_rates")
-        != {
+        != (expected_learning_rates or {
             "whisper_encoder": 1e-4,
             "audio_aligner": 1e-4,
             "huginn_lora": 1e-4,
-        }
+        })
         or runtime_contract.get("lora")
         != {
             "rank": 8,
@@ -315,6 +322,7 @@ def inspect_checkpoint(
         "rng_files": [str(path) for path in rng_files],
         "optimizer_dcp_dirs": [str(path) for path in optimizer_dcp_dirs],
         "optimizer_metadata_counts": optimizer_metadata_counts,
+        "optimizer_other_state_counts": optimizer_other_state_counts,
         "training_runtime_contract": runtime_contract,
     }
 

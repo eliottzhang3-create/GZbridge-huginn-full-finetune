@@ -16,6 +16,11 @@ from inspect_huginn_whisper_dynamic90s_fsdp_checkpoints import (
 
 
 TRAINABLE_GROUPS = ("lora", "aligner", "audio_encoder")
+EXPECTED_LEARNING_RATES = {
+    "whisper_encoder": 1e-5,
+    "audio_aligner": 5e-5,
+    "huginn_lora": 5e-5,
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -52,10 +57,15 @@ def strict_optimizer_coverage(checkpoint: dict[str, Any]) -> dict[str, int]:
         for group in TRAINABLE_GROUPS
         if int(counts.get(group, 0)) <= 0
     }
-    if missing or int(counts.get("huginn_base", -1)) != 0 or int(counts.get("other", -1)) != 0:
+    other_state_count = next(
+        iter(checkpoint.get("optimizer_other_state_counts", {}).values()),
+        0,
+    )
+    if missing or int(counts.get("huginn_base", -1)) != 0 or other_state_count != 0:
         raise RuntimeError(
             "ACAVCAPS smoke optimizer ownership mismatch: "
-            f"checkpoint={checkpoint['path']} missing={missing} counts={counts}"
+            f"checkpoint={checkpoint['path']} missing={missing} counts={counts} "
+            f"other_state_count={other_state_count}"
         )
     return {name: int(value) for name, value in counts.items()}
 
@@ -81,6 +91,32 @@ def audit_warmstart_report(save_checkpoint: Path) -> dict[str, Any]:
     optimizer_groups = report.get("optimizer_group_audit")
     if not isinstance(optimizer_groups, list) or not optimizer_groups:
         raise RuntimeError(f"Warm-start optimizer-group audit is missing: {report_path}")
+    expected_rates = {
+        "lora": 5e-5,
+        "aligner": 5e-5,
+        "audio_encoder": 1e-5,
+    }
+    observed_groups: set[str] = set()
+    for group_audit in optimizer_groups:
+        if not isinstance(group_audit, dict):
+            raise RuntimeError(f"Warm-start optimizer-group audit entry is invalid: {group_audit}")
+        counts = group_audit.get("parameter_counts")
+        if not isinstance(counts, dict):
+            raise RuntimeError(f"Warm-start optimizer-group parameter counts are missing: {group_audit}")
+        active = [name for name, count in counts.items() if int(count) > 0]
+        if len(active) != 1 or active[0] not in expected_rates:
+            raise RuntimeError(f"Warm-start optimizer group mixes/contains invalid parameters: {group_audit}")
+        observed_groups.add(active[0])
+        expected_rate = expected_rates[active[0]]
+        if abs(float(group_audit.get("learning_rate", -1.0)) - expected_rate) > 1e-12:
+            raise RuntimeError(f"Warm-start optimizer LR mismatch: {group_audit}")
+        if abs(float(group_audit.get("configured_learning_rate", -1.0)) - expected_rate) > 1e-12:
+            raise RuntimeError(f"Warm-start configured optimizer LR mismatch: {group_audit}")
+    if observed_groups != set(expected_rates):
+        raise RuntimeError(
+            f"Warm-start optimizer groups are incomplete: observed={sorted(observed_groups)} "
+            f"expected={sorted(expected_rates)}"
+        )
     return report
 
 
@@ -88,8 +124,20 @@ def main() -> None:
     args = parse_args()
     if args.world_size != 8 or not (0 < args.save_step < args.resume_step):
         raise ValueError("Expected world_size=8 and 0 < save_step < resume_step")
-    saved = inspect_checkpoint(args.save_checkpoint, args.save_step, args.world_size, args.save_phase)
-    resumed = inspect_checkpoint(args.resume_checkpoint, args.resume_step, args.world_size, args.resume_phase)
+    saved = inspect_checkpoint(
+        args.save_checkpoint,
+        args.save_step,
+        args.world_size,
+        args.save_phase,
+        expected_learning_rates=EXPECTED_LEARNING_RATES,
+    )
+    resumed = inspect_checkpoint(
+        args.resume_checkpoint,
+        args.resume_step,
+        args.world_size,
+        args.resume_phase,
+        expected_learning_rates=EXPECTED_LEARNING_RATES,
+    )
     warmstart_report = audit_warmstart_report(args.save_checkpoint.resolve())
     save_optimizer_counts = strict_optimizer_coverage(saved)
     resume_optimizer_counts = strict_optimizer_coverage(resumed)
