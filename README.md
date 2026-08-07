@@ -389,7 +389,9 @@ semantics are:
 
 The ACAVCAPS warm-start learning-rate contract is intentionally different from the preceding multiplier run: audio
 encoder `1e-5`, aligner `5e-5`, and Huginn LoRA `5e-5`. The multiplier source training remains on its existing
-`1e-4` configuration; only the fresh ACAVCAPS optimizer uses this lower, per-group schedule.
+`1e-4` configuration; only the fresh ACAVCAPS optimizer uses this lower, per-group schedule. The current bounded
+8-card smoke uses per-device batch `4`, gradient accumulation `4`, and global batch `128`; this smoke setting is not
+itself a declaration of the eventual full-training schedule.
 
 The implementation and gates are:
 

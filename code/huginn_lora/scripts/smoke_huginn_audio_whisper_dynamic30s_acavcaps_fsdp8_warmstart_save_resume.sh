@@ -17,8 +17,13 @@ export OMP_NUM_THREADS=4
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 WORLD_SIZE=8
-PER_DEVICE_BATCH=1
-GRADIENT_ACCUMULATION_STEPS=1
+PER_DEVICE_BATCH=4
+GRADIENT_ACCUMULATION_STEPS=4
+GLOBAL_BATCH_SIZE=$((WORLD_SIZE * PER_DEVICE_BATCH * GRADIENT_ACCUMULATION_STEPS))
+if [ "$GLOBAL_BATCH_SIZE" -ne 128 ]; then
+  echo "ACAVCAPS FSDP8 smoke global batch mismatch: expected=128 actual=$GLOBAL_BATCH_SIZE" >&2
+  exit 1
+fi
 SAVE_STEP=2
 RESUME_STEP=3
 SEED="${ACAVCAPS_FLAT_SEED:-20260723}"
@@ -106,7 +111,7 @@ echo "========== ACAVCAPS FSDP8 MODEL-ONLY WARM-START SAVE SMOKE =========="
 echo "input_checkpoint=$INIT_CHECKPOINT"
 echo "manifest=$MANIFEST"
 echo "manifest_scope=all_1071_tars_flat_global_order smoke_max_tars=$MAX_TARS"
-echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH gradient_accumulation=$GRADIENT_ACCUMULATION_STEPS"
+echo "world_size=$WORLD_SIZE per_device_batch=$PER_DEVICE_BATCH gradient_accumulation=$GRADIENT_ACCUMULATION_STEPS global_batch=$GLOBAL_BATCH_SIZE"
 echo "learning_rates=audio_encoder:$AUDIO_ENCODER_LR aligner:$ALIGNER_LR lora:$LORA_LR"
 echo "phase1=model_weights_only_new_optimizer_scheduler_global_step_rng_data_position"
 
