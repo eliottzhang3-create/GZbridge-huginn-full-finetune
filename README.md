@@ -401,7 +401,7 @@ The implementation and gates are:
   `code/huginn_lora/scripts/smoke_huginn_audio_whisper_dynamic30s_acavcaps_fsdp8_warmstart_save_resume.sh`;
 - canonical 8-card submission wrapper:
   `code/huginn_lora/run_smoke_huginn_audio_whisper_dynamic30s_acavcaps_fsdp8_warmstart_save_resume_5090.sh`,
-  using `pdgpu-5090`, eight RTX 5090 GPUs, `-c32 -m128G -g8`. The previously prepared 4090 wrapper was only a
+  using `pdgpu-5090`, eight RTX 5090 GPUs, `-c32 -m256G -g8`. The previously prepared 4090 wrapper was only a
   temporary scheduling probe and is not part of the active route;
 - strict save/resume inspector:
   `code/huginn_lora/scripts/inspect_huginn_audio_whisper_dynamic30s_acavcaps_warmstart_resume.py`.

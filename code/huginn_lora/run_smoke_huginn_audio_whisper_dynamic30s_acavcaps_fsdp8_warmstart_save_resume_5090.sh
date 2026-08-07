@@ -21,7 +21,7 @@ done
 vc submit \
   -p pdgpu-5090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
-  -c 32 -m 128G -g 8 \
+  -c 32 -m 256G -g 8 \
   -n 1 \
   -j smoke-acav-flat-whisper-warmstart-fsdp8-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
