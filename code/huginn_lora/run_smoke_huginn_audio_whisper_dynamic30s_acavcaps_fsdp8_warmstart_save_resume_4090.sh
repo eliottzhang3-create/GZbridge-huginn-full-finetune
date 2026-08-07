@@ -7,7 +7,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 mkdir -p log
 
-: "${HUGINN_AUDIO_DYNAMIC30S_ACAV_WARMSTART_CHECKPOINT:=/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_whisper_dynamic30s_multiplier_single_epoch_fsdp4/run-20260731_084946/swift_output/v0-20260731-085036/checkpoint-35000}"
+: "${HUGINN_AUDIO_DYNAMIC30S_ACAV_WARMSTART_CHECKPOINT:=/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_whisper_dynamic30s_multiplier_single_epoch_fsdp4/run-20260731_084946/swift_output/v0-20260731-085036/checkpoint-46050}"
 : "${ACAVCAPS_FLAT_MAX_TARS:=2}"
 export HUGINN_AUDIO_DYNAMIC30S_ACAV_WARMSTART_CHECKPOINT
 export ACAVCAPS_FLAT_MAX_TARS
