@@ -1,10 +1,11 @@
-"""Current Whisper dynamic-30s ACAVCAPS flat-tar dataset route.
+"""Current Whisper dynamic-30s ACAVCAPS private-manifest dataset route.
 
-The model/template registration comes from the current Whisper plugin.  This
-module adds only a private-manifest WebDataset loader whose top-level tar list
-has already been globally shuffled across all ACAVCAPS source stages.  FLAC
-bytes are not materialized into dataset rows: the current Whisper template
-reopens the public tar and decodes the referenced member at training time.
+The model/template registration comes from the current Whisper plugin. This
+module accepts either the full flat global-tar manifest or the validated
+per-category quarter stage-schedule manifest; the latter is normalized to one
+ordered tar list at load time. FLAC bytes are not materialized into dataset
+rows: the current Whisper template reopens the public tar and decodes the
+referenced member at training time.
 """
 
 from __future__ import annotations
@@ -28,10 +29,12 @@ BUFFER_ENV = "ACAVCAPS_FLAT_SAMPLE_SHUFFLE_BUFFER"
 MAX_TARS_ENV = "ACAVCAPS_FLAT_MAX_TARS"
 DATASET_NAME = "huginn_audio_whisper_dynamic30s_acavcaps"
 EXPECTED_POLICY = "global_tar_order_shuffle_all_stages_v1_per_tar_buffer_shuffle"
+EXPECTED_QUARTER_POLICY = "stage_order_fixed_tar_order_shuffled_per_stage_sample_buffered_per_tar"
 EXPECTED_DATASET_ROOT = Path("/hpc_stor03/public/shared/data/raa/ACAVCAPS")
 EXPECTED_SOURCE_STAGE_ORDER = ("stage1", "stage2", "stage3")
 EXPECTED_TAR_COUNT = 1071
 EXPECTED_SAMPLE_COUNT = 4_664_169
+EXPECTED_QUARTER_TAR_COUNT = 271
 DEFAULT_BUFFER_SIZE = 512
 
 
@@ -69,35 +72,74 @@ def _manifest_path(dataset_meta: Any | None = None) -> Path:
 
 def _load_manifest(path: Path) -> dict[str, Any]:
     if not path.is_file():
-        raise FileNotFoundError(f"ACAVCAPS flat manifest does not exist: {path}")
+        raise FileNotFoundError(f"ACAVCAPS manifest does not exist: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, dict):
-        raise ValueError(f"ACAVCAPS flat manifest root is not an object: {path}")
-    if payload.get("schedule_policy") != EXPECTED_POLICY:
-        raise ValueError(
-            "ACAVCAPS flat manifest schedule policy mismatch: "
-            f"{payload.get('schedule_policy')!r}"
-        )
+        raise ValueError(f"ACAVCAPS manifest root is not an object: {path}")
     if Path(str(payload.get("dataset_root", ""))).resolve() != EXPECTED_DATASET_ROOT.resolve():
         raise ValueError(f"Unexpected ACAVCAPS dataset root: {payload.get('dataset_root')!r}")
     if payload.get("public_root_mutation") != "forbidden" or payload.get("scan_mode") != "derived_from_full":
-        raise ValueError("ACAVCAPS flat manifest is not a read-only derivation from the full scan")
-    if tuple(payload.get("source_stage_order", [])) != EXPECTED_SOURCE_STAGE_ORDER:
-        raise ValueError(f"Unexpected ACAVCAPS source stage order: {payload.get('source_stage_order')!r}")
+        raise ValueError("ACAVCAPS manifest is not a read-only derivation from the full scan")
+
+    policy = payload.get("schedule_policy")
+    if policy == EXPECTED_QUARTER_POLICY:
+        stages = payload.get("stages")
+        if not isinstance(stages, list) or tuple(stage.get("name") for stage in stages) != EXPECTED_SOURCE_STAGE_ORDER:
+            raise ValueError(f"Unexpected ACAVCAPS quarter stage order: {payload.get('stages')!r}")
+        flattened: list[dict[str, Any]] = []
+        sample_count = 0
+        for stage in stages:
+            stage_name = str(stage["name"])
+            stage_tars = stage.get("tars")
+            if not isinstance(stage_tars, list) or not stage_tars:
+                raise ValueError(f"ACAVCAPS quarter manifest has no tars for {stage_name}")
+            for entry in stage_tars:
+                if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+                    raise ValueError(f"Invalid ACAVCAPS quarter tar entry in {stage_name}: {entry!r}")
+                if int(entry.get("json_count", 0)) <= 0 or entry.get("json_count") != entry.get("flac_count"):
+                    raise ValueError(f"Invalid ACAVCAPS quarter JSON/FLAC count in {stage_name}: {entry!r}")
+                normalized_entry = dict(entry)
+                normalized_entry["order_index"] = len(flattened)
+                normalized_entry["source_stage"] = stage_name
+                flattened.append(normalized_entry)
+                sample_count += int(entry["json_count"])
+        if len(flattened) != EXPECTED_QUARTER_TAR_COUNT:
+            raise ValueError(
+                f"ACAVCAPS quarter manifest must contain {EXPECTED_QUARTER_TAR_COUNT} tars, "
+                f"got {len(flattened)}"
+            )
+        payload = dict(payload)
+        payload.pop("stages", None)
+        payload["source_stage_order"] = list(EXPECTED_SOURCE_STAGE_ORDER)
+        payload["tars"] = flattened
+        payload["tar_count"] = len(flattened)
+        payload["sample_count"] = sample_count
+        payload["_schedule_mode"] = "quarter_stage_schedule"
+    elif policy == EXPECTED_POLICY:
+        if tuple(payload.get("source_stage_order", [])) != EXPECTED_SOURCE_STAGE_ORDER:
+            raise ValueError(f"Unexpected ACAVCAPS source stage order: {payload.get('source_stage_order')!r}")
+        if "stages" in payload:
+            raise ValueError("ACAVCAPS flat manifest must not expose stages as training boundaries")
+        if int(payload.get("tar_count", -1)) != EXPECTED_TAR_COUNT:
+            raise ValueError(f"ACAVCAPS flat manifest must contain all {EXPECTED_TAR_COUNT} tars")
+        if int(payload.get("sample_count", -1)) != EXPECTED_SAMPLE_COUNT:
+            raise ValueError(
+                f"ACAVCAPS flat manifest sample_count mismatch: expected={EXPECTED_SAMPLE_COUNT} "
+                f"actual={payload.get('sample_count')!r}"
+            )
+        payload = dict(payload)
+        payload["_schedule_mode"] = "flat_global_schedule"
+    else:
+        raise ValueError(
+            "ACAVCAPS manifest schedule policy mismatch: "
+            f"{policy!r}; expected full={EXPECTED_POLICY!r} or quarter={EXPECTED_QUARTER_POLICY!r}"
+        )
+
     tars = payload.get("tars")
     if not isinstance(tars, list) or not tars:
-        raise ValueError("ACAVCAPS flat manifest must contain a non-empty top-level tars list")
-    if "stages" in payload:
-        raise ValueError("ACAVCAPS flat manifest must not expose stages as training boundaries")
+        raise ValueError("ACAVCAPS manifest must contain a non-empty top-level tars list")
     if int(payload.get("tar_count", -1)) != len(tars):
-        raise ValueError("ACAVCAPS flat manifest tar_count does not match tars length")
-    if len(tars) != EXPECTED_TAR_COUNT:
-        raise ValueError(f"ACAVCAPS flat manifest must contain all {EXPECTED_TAR_COUNT} tars, got {len(tars)}")
-    if int(payload.get("sample_count", -1)) != EXPECTED_SAMPLE_COUNT:
-        raise ValueError(
-            f"ACAVCAPS flat manifest sample_count mismatch: expected={EXPECTED_SAMPLE_COUNT} "
-            f"actual={payload.get('sample_count')!r}"
-        )
+        raise ValueError("ACAVCAPS manifest tar_count does not match tars length")
     return payload
 
 
@@ -253,6 +295,7 @@ def _register_dataset() -> None:
                 "[HuginnAudioDynamic30sACAVCAPS] loaded flat IterableDataset "
                 f"manifest={path} tar_count={loaded['tar_count']} "
                 f"sample_count={loaded.get('sample_count')} "
+                f"schedule={loaded.get('_schedule_mode')} "
                 f"buffer={_buffer_size(loaded)} max_tars={_max_tars() or 'all'}",
                 flush=True,
             )

@@ -32,14 +32,14 @@ LORA_LR="${HUGINN_AUDIO_DYNAMIC30S_LORA_LR:-5e-5}"
 CHECKPOINT_INTERVAL="${HUGINN_AUDIO_DYNAMIC30S_ACAV_FORMAL_SAVE_STEPS:-5000}"
 LOGGING_STEPS="${HUGINN_AUDIO_DYNAMIC30S_ACAV_FORMAL_LOGGING_STEPS:-10}"
 REPORT_TO="${HUGINN_AUDIO_DYNAMIC30S_ACAV_FORMAL_REPORT_TO:-tensorboard}"
-MANIFEST="${ACAVCAPS_FLAT_MANIFEST:-$REPO_ROOT/data/audio_swift/acavcaps/acavcaps_flat_global_tar_shuffle_seed20260723.json}"
+MANIFEST="${ACAVCAPS_WDS_QUARTER_MANIFEST:-$REPO_ROOT/data/audio_swift/acavcaps_wds/acavcaps_wds_stage_schedule_quarter_ceil_seed20260723.json}"
 INIT_CHECKPOINT="${HUGINN_AUDIO_DYNAMIC30S_ACAV_FORMAL_INIT_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_whisper_dynamic30s_multiplier_single_epoch_fsdp4/run-20260731_084946/swift_output/v0-20260731-085036/checkpoint-46050}"
 WARMSTART_GATE="${HUGINN_AUDIO_DYNAMIC30S_ACAV_WARMSTART_GATE:-}"
 RUN_ROOT="${HUGINN_AUDIO_DYNAMIC30S_ACAV_FORMAL_RUN_ROOT:-$REPO_ROOT/outputs/huginn_audio_whisper_dynamic30s_acavcaps_formal_fsdp8/run-$(date +%Y%m%d_%H%M%S)}"
 
 MODEL_PATH="$REPO_ROOT/models/huginn-audio-whisper-dynamic90s-v1"
 PLUGIN_PATH="$REPO_ROOT/code/huginn_lora/plugins/huginn_audio_whisper_dynamic30s_acavcaps_swift.py"
-MANIFEST_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_acavcaps_flat_global_tar_manifest.py"
+MANIFEST_INSPECTOR="$REPO_ROOT/code/huginn_lora/scripts/inspect_acavcaps_wds_quarter_manifest.py"
 MODULES_TO_SAVE=(temporal_compressor audio_projector audio_boundary_embeddings)
 
 if [ -e "$RUN_ROOT" ]; then
@@ -47,11 +47,11 @@ if [ -e "$RUN_ROOT" ]; then
   exit 1
 fi
 if [ ! -s "$MANIFEST" ]; then
-  echo "ACAVCAPS flat manifest is missing or empty: $MANIFEST" >&2
+  echo "ACAVCAPS quarter manifest is missing or empty: $MANIFEST" >&2
   exit 1
 fi
 if [ ! -s "${MANIFEST%.json}.stats.json" ]; then
-  echo "ACAVCAPS flat manifest stats are missing or empty: ${MANIFEST%.json}.stats.json" >&2
+  echo "ACAVCAPS quarter manifest stats are missing or empty: ${MANIFEST%.json}.stats.json" >&2
   exit 1
 fi
 if [ ! -d "$INIT_CHECKPOINT/pytorch_model_fsdp_0" ]; then
@@ -104,13 +104,14 @@ import json
 import sys
 from pathlib import Path
 
-payload = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
-print(int(payload["sample_count"]), int(payload["tar_count"]))
+manifest = Path(sys.argv[1]).expanduser().resolve()
+stats = json.loads(manifest.with_suffix(".stats.json").read_text(encoding="utf-8"))
+print(int(stats["sample_count"]), int(stats["tar_count"]))
 PY
 )
 MAX_STEPS=$(((TOTAL_SAMPLES + GLOBAL_BATCH_SIZE - 1) / GLOBAL_BATCH_SIZE))
-if [ "$TOTAL_SAMPLES" -ne 4664169 ] || [ "$TAR_COUNT" -ne 1071 ]; then
-  echo "Unexpected full ACAVCAPS manifest size: samples=$TOTAL_SAMPLES tars=$TAR_COUNT" >&2
+if [ "$TOTAL_SAMPLES" -le 0 ] || [ "$TAR_COUNT" -ne 271 ]; then
+  echo "Unexpected quarter ACAVCAPS manifest size: samples=$TOTAL_SAMPLES tars=$TAR_COUNT" >&2
   exit 1
 fi
 if [ "$CHECKPOINT_INTERVAL" -le 0 ] || [ "$LOGGING_STEPS" -le 0 ]; then
@@ -159,15 +160,16 @@ from pathlib import Path
 manifest = Path(manifest_value).expanduser().resolve()
 digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
 plan = {
-    "plan_version": "huginn_audio_whisper_dynamic30s_acavcaps_flat_global_fsdp8_v1",
+    "plan_version": "huginn_audio_whisper_dynamic30s_acavcaps_quarter_stage_fsdp8_v1",
     "dataset": {
         "manifest": str(manifest),
         "manifest_sha256": digest,
-        "schedule_policy": "global_tar_order_shuffle_all_stages_v1_per_tar_buffer_shuffle",
+        "schedule_policy": "stage_order_fixed_tar_order_shuffled_per_stage_sample_buffered_per_tar",
         "source_stage_order": ["stage1", "stage2", "stage3"],
         "tar_count": int(tar_count),
         "sample_count": int(total_samples),
         "sample_shuffle_buffer": 512,
+        "selection_policy": "ceil(N/4) per category, preserve stage order",
         "max_tars": None,
         "public_root_mutation": "forbidden",
     },
@@ -236,17 +238,16 @@ unset HUGINN_AUDIO_DYNAMIC90S_CHECKPOINT_AUDIT_DIR
 unset HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_DIR
 unset HUGINN_AUDIO_DYNAMIC90S_TRAINING_STATS_PHASE
 
-echo "========== ACAVCAPS FLAT GLOBAL MANIFEST FORMAL PREFLIGHT =========="
+echo "========== ACAVCAPS QUARTER MANIFEST FORMAL PREFLIGHT =========="
 python -u "$MANIFEST_INSPECTOR" \
   --manifest "$MANIFEST" \
   --world_size "$WORLD_SIZE" \
   --per_device_batch_size "$PER_DEVICE_BATCH" \
-  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS" \
-  --check_tar_files
+  --gradient_accumulation_steps "$GRADIENT_ACCUMULATION_STEPS"
 
 echo "========== HUGINN WHISPER DYNAMIC30S ACAVCAPS FORMAL FSDP8 START =========="
 echo "dataset=$MANIFEST"
-echo "dataset_scope=all_1071_tars_one_global_stage_flattened_per_tar_shuffle_buffer_512"
+echo "dataset_scope=ceil_quarter_per_category_stage1_stage2_stage3_preserved_per_tar_shuffle_buffer_512"
 echo "dataset_samples=$TOTAL_SAMPLES nominal_full_pass_updates=$MAX_STEPS"
 echo "warmstart_checkpoint=$INIT_CHECKPOINT"
 echo "warmstart=model_weights_only restored=whisper+aligner+66_lora fresh=optimizer+scheduler+global_step+rng+data_position"
@@ -256,7 +257,7 @@ echo "lr_scheduler_type=constant lora_rank=8 lora_alpha=16 lora_dropout=0.05"
 echo "trainable=whisper+aligner+huginn_lora frozen=huginn_native_backbone"
 echo "fsdp=version2_full_shard_state_dict=SHARDED_STATE_DICT activation_checkpointing=true recurrent_core_reshard_after_forward=false"
 echo "checkpoints=$CHECKPOINT_STEPS_CSV save_total_limit=2"
-echo "acavcaps_flat_max_tars=<unset>"
+echo "acavcaps_flat_max_tars=<unset> quarter_manifest=true"
 echo "formal_plan=$PLAN_PATH"
 
 swift sft \

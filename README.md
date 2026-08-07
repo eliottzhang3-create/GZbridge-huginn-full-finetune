@@ -347,10 +347,11 @@ The supplied 2026-08-03 logs showed approximately `13 s/step` for the multiplier
 multitask route. These are runtime observations only; a run is complete only after its final success banner and formal
 checkpoint/statistics audit.
 
-#### Current ACAVCAPS flat global-tar route
+#### Prepared full ACAVCAPS flat global-tar alternative
 
-This is the next dataset route for the **current Whisper-large dynamic-30s mainline**. It must not be confused with the
-historical LoSATok ACAVCAPS-quarter routes documented later in this README.
+This is the prepared full-data alternative for the **current Whisper-large dynamic-30s mainline**. The currently selected
+formal run uses the validated quarter manifest described in the formal-entry subsection below. Neither route should be
+confused with the historical LoSATok ACAVCAPS-quarter routes documented later in this README.
 
 - The source full preflight manifest is:
   `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/data/audio_swift/acavcaps_wds/acavcaps_wds_stage_schedule_full_seed20260723.json`.
@@ -372,8 +373,8 @@ historical LoSATok ACAVCAPS-quarter routes documented later in this README.
   the per-tar buffer shuffle, validates JSON/FLAC pairs and the non-empty `long` caption, and passes
   `tar_path + audio_member` metadata to the current Whisper template for lazy decoding. It deliberately does not add
   manual rank sharding because Accelerate's `DataLoaderDispatcher` owns rank-level batch dispatch for this route.
-- For formal ACAVCAPS training, `ACAVCAPS_FLAT_MAX_TARS` must be unset so all `1071` tars are consumed. A positive
-  `ACAVCAPS_FLAT_MAX_TARS` is allowed only for the bounded smoke test and is not a formal data configuration.
+- For the full flat alternative, `ACAVCAPS_FLAT_MAX_TARS` must be unset so all `1071` tars are consumed. The selected
+  quarter formal route instead uses the validated `271`-tar quarter manifest and does not use `MAX_TARS` truncation.
 
 #### Current 4-card-to-8-card model-only warm-start plan
 
@@ -431,12 +432,13 @@ The current formal entry has now been prepared separately from the historical Ra
   `/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune/outputs/huginn_whisper_dynamic30s_multiplier_single_epoch_fsdp4/run-20260731_084946/swift_output/v0-20260731-085036/checkpoint-46050`.
   It is passed as `--adapters` with `--load_args false` and through the model-only DCP environment. No old optimizer,
   scheduler, Trainer step, RNG state, or multiplier data position is resumed.
-- Dataset: `data/audio_swift/acavcaps/acavcaps_flat_global_tar_shuffle_seed20260723.json`, with its `.stats.json`
-  companion. `ACAVCAPS_FLAT_MAX_TARS` is explicitly unset, so all `1071` tars and all `4,664,169` JSON/FLAC pairs
-  are used. The three source stages are one global tar permutation; there are no stage boundaries; runtime per-tar
-  sample shuffle buffer is `512`.
-- Batch and nominal coverage: per-device batch `4`, gradient accumulation `4`, global batch `128`, nominal full-pass
-  length `36439` optimizer updates (`ceil(4,664,169 / 128)`).
+- Dataset: `data/audio_swift/acavcaps_wds/acavcaps_wds_stage_schedule_quarter_ceil_seed20260723.json`, with its
+  `.stats.json` companion. It contains `271` validated tars selected by `ceil(N/4)` per category: `00A=4`, `0M0=40`,
+  `S00=120`, `S0A=25`, `SM0=74`, `0MA=2`, `SMA=6`. Stage1 -> stage2 -> stage3 order is preserved and runtime per-tar
+  sample shuffle buffer remains `512`. The formal script derives the exact quarter sample count and nominal optimizer
+  step count from the stats sidecar at submission time.
+- Batch and nominal coverage: per-device batch `4`, gradient accumulation `4`, global batch `128`; the quarter formal
+  step count is `ceil(quarter_sample_count / 128)`.
 - Fresh optimizer LR contract: Whisper/audio encoder `1e-5`, aligner `5e-5`, Huginn LoRA `5e-5`; scheduler is
   `constant`. Huginn native backbone and LM-head base parameters are frozen and must not enter the optimizer. LoRA is
   rank `8`, alpha `16`, dropout `0.05`; aligner modules saved are `temporal_compressor`, `audio_projector`, and
@@ -453,7 +455,7 @@ The current formal entry has now been prepared separately from the historical Ra
   `HUGINN_AUDIO_DYNAMIC30S_ACAV_ALLOW_UNGATED_FORMAL=1` is available only for a deliberate bypass.
 
 The older `code/huginn_lora/run_train_acavcaps_huginn_audio_swift_formal_5090.sh` remains a historical route using
-`huginn_audio_raven`, `huginn_audio_text`, and a curriculum master manifest. It is not the current Whisper flat-global
+`huginn_audio_raven`, `huginn_audio_text`, and a curriculum master manifest. It is not the current Whisper quarter
 ACAVCAPS formal entry and must not be used for this continuation.
 
 #### Current architecture and training contract
@@ -2645,12 +2647,12 @@ Any new chat should assume the following:
 12. The latest checkpoint-retention requirement is at most two retained checkpoints. The multiplier formal launcher is
     synchronized to `save_total_limit=2`; the multitask formal source currently still passes `4`, so reconcile that
     source/configuration before launching a new multitask formal run.
-13. For the current Whisper ACAVCAPS route, use the private flat manifest
-    `data/audio_swift/acavcaps/acavcaps_flat_global_tar_shuffle_seed20260723.json`: one global permutation across all
-    `1071` tars from stage1/2/3, with no stage training boundaries, plus runtime buffer shuffle `512` within each tar.
-    Stage labels are provenance only. Historical LoSATok stage/quarter manifests are separate and must not be mixed into
-    this route. Never modify the shared public dataset root or add manual rank sharding on top of Accelerate's
-    `DataLoaderDispatcher` behavior.
+13. For the current Whisper ACAVCAPS formal route, use the already validated private quarter manifest
+    `data/audio_swift/acavcaps_wds/acavcaps_wds_stage_schedule_quarter_ceil_seed20260723.json`: `ceil(N/4)` tar
+    selection per category, `271` tars total, stage1→stage2→stage3 order preserved, and runtime buffer shuffle `512`
+    within each tar. The full flat-global manifest remains available as a separate prepared alternative, but is not the
+    selected formal data schedule. Never modify the shared public dataset root or add manual rank sharding on top of
+    Accelerate's `DataLoaderDispatcher` behavior.
 14. For audio generation and MMAU scoring, do not call generic Hugging Face `generate()` on the multimodal wrapper; use the repository's manual audio-prefill/cache path so RoPE positions include the audio prefix.
 
 ---
