@@ -224,61 +224,30 @@ def select_update_probes(model: torch.nn.Module) -> dict[str, dict[str, Any]]:
     return probes
 
 
-def install_runtime_audits(model: torch.nn.Module) -> tuple[dict[str, Any], list[Any]]:
+def install_runtime_audits(model: torch.nn.Module, trace: dict[str, Any]) -> list[Any]:
     ouro_model = find_unique_module(model, "OuroModel")
-    causal_model = find_unique_module(model, "OuroForCausalLM")
-    trace: dict[str, Any] = {
-        "trainer_forward_calls": 0,
-        "first_layer_calls": 0,
-        "gate_calls": 0,
-        "batch": None,
-        "logits": None,
-        "native_loss": None,
-        "output_shape": None,
-        "past_key_values_present": None,
-        "gradient_records": {},
-    }
     handles: list[Any] = []
-
-    def pre_hook(_module: torch.nn.Module, _args: tuple[Any, ...], kwargs: dict[str, Any]) -> None:
-        trace["trainer_forward_calls"] += 1
-        if trace["batch"] is not None:
-            return
-        input_ids = kwargs.get("input_ids")
-        labels = kwargs.get("labels")
-        attention_mask = kwargs.get("attention_mask")
-        if not all(torch.is_tensor(value) for value in (input_ids, labels, attention_mask)):
-            raise RuntimeError(
-                "Swift trainer did not pass the expected causal-LM tensors: "
-                f"keys={sorted(kwargs)}"
-            )
-        trace["batch"] = {
-            "input_ids": input_ids.detach().cpu(),
-            "labels": labels.detach().cpu(),
-            "attention_mask": attention_mask.detach().cpu(),
-            "use_cache": kwargs.get("use_cache"),
-            "logits_to_keep": kwargs.get("logits_to_keep"),
-        }
-
-    def output_hook(_module: torch.nn.Module, _args: tuple[Any, ...], output: Any) -> None:
-        if trace["logits"] is not None:
-            return
-        logits = getattr(output, "logits", None)
-        if logits is None and isinstance(output, (tuple, list)) and output:
-            logits = output[0]
-        if not torch.is_tensor(logits):
-            raise RuntimeError(f"Ouro forward did not expose logits; output_type={type(output)}")
-        trace["logits"] = logits.detach().float().cpu()
-        loss = getattr(output, "loss", None)
-        trace["native_loss"] = None if loss is None else float(loss.detach().float().cpu().item())
-        trace["output_shape"] = list(logits.shape)
-        trace["past_key_values_present"] = getattr(output, "past_key_values", None) is not None
+    trace["gradient_model"] = model
 
     def first_layer_hook(_module: torch.nn.Module, _args: tuple[Any, ...], _output: Any) -> None:
         trace["first_layer_calls"] += 1
 
     def gate_hook(_module: torch.nn.Module, _args: tuple[Any, ...], _output: Any) -> None:
         trace["gate_calls"] += 1
+
+    def first_layer_backward_hook(
+        _module: torch.nn.Module,
+        _grad_input: tuple[Any, ...],
+        _grad_output: tuple[Any, ...],
+    ) -> None:
+        trace["first_layer_backward_calls"] += 1
+
+    def gate_backward_hook(
+        _module: torch.nn.Module,
+        _grad_input: tuple[Any, ...],
+        _grad_output: tuple[Any, ...],
+    ) -> None:
+        trace["gate_backward_calls"] += 1
 
     def make_gradient_hook(parameter_name: str):
         def gradient_hook(gradient: torch.Tensor) -> torch.Tensor:
@@ -292,14 +261,15 @@ def install_runtime_audits(model: torch.nn.Module) -> tuple[dict[str, Any], list
 
         return gradient_hook
 
-    handles.append(model.register_forward_pre_hook(pre_hook, with_kwargs=True))
-    handles.append(causal_model.register_forward_hook(output_hook))
     handles.append(ouro_model.layers[0].register_forward_hook(first_layer_hook))
     handles.append(ouro_model.early_exit_gate.register_forward_hook(gate_hook))
+    handles.append(ouro_model.layers[0].register_full_backward_hook(first_layer_backward_hook))
+    handles.append(ouro_model.early_exit_gate.register_full_backward_hook(gate_backward_hook))
     for name, parameter in model.named_parameters():
         if parameter.requires_grad:
             handles.append(parameter.register_hook(make_gradient_hook(name)))
-    return trace, handles
+    trace["audit_model_class"] = f"{model.__class__.__module__}.{model.__class__.__name__}"
+    return handles
 
 
 def remove_handles(handles: list[Any]) -> None:
@@ -317,37 +287,76 @@ def validate_batch_and_loss(trace: dict[str, Any]) -> dict[str, Any]:
     attention_mask = batch["attention_mask"]
     if tuple(input_ids.shape) != (EXPECTED_BATCH_SIZE, input_ids.shape[1]):
         raise RuntimeError(f"Unexpected training batch size: shape={tuple(input_ids.shape)}")
-    if labels.shape != input_ids.shape or attention_mask.shape != input_ids.shape:
+    if attention_mask.shape != input_ids.shape:
         raise RuntimeError(
-            "This smoke requires full-sequence causal labels without compact logits: "
+            "Swift attention mask is not aligned with full input_ids: "
             f"input={tuple(input_ids.shape)} labels={tuple(labels.shape)} attention={tuple(attention_mask.shape)}"
         )
-    if logits.shape[:2] != input_ids.shape:
+    if logits.shape[:2] != labels.shape:
         raise RuntimeError(
-            "Ouro logits and labels are not aligned before shifting: "
-            f"logits={tuple(logits.shape)} input={tuple(input_ids.shape)}"
+            "Swift compact logits and labels are not aligned: "
+            f"logits={tuple(logits.shape)} labels={tuple(labels.shape)}"
         )
-    expected_targets = input_ids[:, 1:]
-    actual_targets = labels[:, 1:]
-    target_mask = attention_mask[:, 1:].bool()
-    if not torch.equal(actual_targets[target_mask], expected_targets[target_mask]):
-        raise RuntimeError("Swift labels are not the expected next-token targets")
-    if bool((actual_targets[~target_mask] != -100).any().item()):
-        raise RuntimeError("Padded next-token labels are not masked with -100")
-    shifted_logits = logits[:, :-1, :].contiguous()
-    shifted_labels = labels[:, 1:].contiguous()
+    logits_to_keep = trace["batch"].get("logits_to_keep")
+    if torch.is_tensor(logits_to_keep):
+        if logits_to_keep.numel() != 1:
+            raise RuntimeError(
+                "This batch-size-3 smoke expects Swift's scalar compact logits_to_keep, "
+                f"got shape={tuple(logits_to_keep.shape)}"
+            )
+        logits_to_keep = int(logits_to_keep.item())
+    elif logits_to_keep is not None:
+        logits_to_keep = int(logits_to_keep)
+    else:
+        logits_to_keep = int(labels.shape[1])
+    compact_start = int(input_ids.shape[1] - labels.shape[1])
+    if compact_start < 0:
+        raise RuntimeError(
+            f"Compact labels are longer than input_ids: input={input_ids.shape[1]} labels={labels.shape[1]}"
+        )
+    if logits_to_keep != labels.shape[1]:
+        raise RuntimeError(
+            f"Swift logits_to_keep does not match compact labels: logits_to_keep={logits_to_keep} "
+            f"labels_width={labels.shape[1]}"
+        )
+    shifted_labels = torch.roll(labels, shifts=-1, dims=-1).contiguous()
+    valid_target_mask = shifted_labels != -100
+    for row_index in range(input_ids.shape[0]):
+        for compact_position in torch.where(valid_target_mask[row_index])[0].tolist():
+            full_prediction_position = compact_start + int(compact_position)
+            full_target_position = full_prediction_position + 1
+            if full_target_position >= input_ids.shape[1] or not bool(
+                attention_mask[row_index, full_target_position].item()
+            ):
+                raise RuntimeError(
+                    "Swift shifted target points outside the valid input sequence: "
+                    f"row={row_index} compact_position={compact_position} "
+                    f"full_prediction_position={full_prediction_position}"
+                )
+            expected_target = input_ids[row_index, full_target_position]
+            actual_target = shifted_labels[row_index, compact_position]
+            if int(expected_target) != int(actual_target):
+                raise RuntimeError(
+                    "Swift label shift mismatch: "
+                    f"row={row_index} compact_position={compact_position} "
+                    f"expected_input_target={int(expected_target)} actual_label={int(actual_target)}"
+                )
+    if bool((shifted_labels[~valid_target_mask] != -100).any().item()):
+        raise RuntimeError("Invalid shifted labels were not masked with -100")
     manual_loss = torch.nn.functional.cross_entropy(
-        shifted_logits.reshape(-1, shifted_logits.shape[-1]),
+        logits.reshape(-1, logits.shape[-1]),
         shifted_labels.reshape(-1),
         ignore_index=-100,
     )
-    native_loss = trace.get("native_loss")
-    if native_loss is None or not math.isfinite(native_loss):
-        raise RuntimeError(f"Ouro native CE loss is missing or non-finite: {native_loss}")
+    trainer_loss = trace.get("trainer_loss")
+    if trainer_loss is None or not math.isfinite(trainer_loss):
+        raise RuntimeError(f"Swift trainer CE loss is missing or non-finite: {trainer_loss}")
     manual_value = float(manual_loss.item())
-    if not math.isclose(manual_value, native_loss, rel_tol=2e-3, abs_tol=2e-3):
-        raise RuntimeError(f"Native CE does not match explicit shifted CE: native={native_loss} manual={manual_value}")
-    valid_targets = int((shifted_labels != -100).sum().item())
+    if not math.isclose(manual_value, trainer_loss, rel_tol=2e-3, abs_tol=2e-3):
+        raise RuntimeError(
+            f"Swift trainer CE does not match explicit shifted CE: trainer={trainer_loss} manual={manual_value}"
+        )
+    valid_targets = int(valid_target_mask.sum().item())
     if valid_targets <= 0:
         raise RuntimeError("The captured batch has no valid next-token targets")
     return {
@@ -355,12 +364,14 @@ def validate_batch_and_loss(trace: dict[str, Any]) -> dict[str, Any]:
         "labels_shape": list(labels.shape),
         "attention_shape": list(attention_mask.shape),
         "logits_shape": list(logits.shape),
+        "compact_start": compact_start,
+        "compact_width": int(labels.shape[1]),
         "valid_next_token_targets": valid_targets,
         "manual_shifted_ce": manual_value,
-        "native_forward_loss": native_loss,
+        "swift_trainer_loss": trainer_loss,
         "shift_verified": True,
         "use_cache_argument": batch.get("use_cache"),
-        "logits_to_keep": batch.get("logits_to_keep"),
+        "logits_to_keep": logits_to_keep,
         "past_key_values_present": trace.get("past_key_values_present"),
     }
 
@@ -400,10 +411,16 @@ def gradient_report(model: torch.nn.Module, gradient_records: dict[str, dict[str
     trainable_names = [name for name, parameter in model.named_parameters() if parameter.requires_grad]
     missing = [name for name in trainable_names if name not in gradient_records]
     nonfinite = [name for name, item in gradient_records.items() if not item["finite"]]
+    frozen_with_gradients = [
+        name for name, parameter in model.named_parameters()
+        if not parameter.requires_grad and parameter.grad is not None
+    ]
     if missing:
         raise RuntimeError(f"Trainable parameters without autograd-hook gradients: {missing[:40]}")
     if nonfinite:
         raise RuntimeError(f"Non-finite trainable gradients: {nonfinite[:40]}")
+    if frozen_with_gradients:
+        raise RuntimeError(f"Frozen parameters unexpectedly received gradients: {frozen_with_gradients[:40]}")
     trainable = [
         {"name": name, **gradient_records[name]}
         for name in trainable_names
@@ -413,7 +430,7 @@ def gradient_report(model: torch.nn.Module, gradient_records: dict[str, dict[str
         "trainable_gradients": trainable[:80],
         "trainable_gradients_truncated": len(trainable) > 80,
         "missing_trainable_gradients": missing,
-        "frozen_parameters_with_gradients": [],
+        "frozen_parameters_with_gradients": frozen_with_gradients,
         "capture_method": "autograd_parameter_hook_before_trainer_zero_grad",
     }
 
@@ -547,7 +564,76 @@ def main() -> None:
             gate_names = gate_trainable_names(model)
             lora_report = lora_module_report(model)
             probes = select_update_probes(model)
-            trace, handles = install_runtime_audits(model)
+            trace: dict[str, Any] = {
+                "trainer_forward_calls": 0,
+                "backward_calls": 0,
+                "first_layer_calls": 0,
+                "gate_calls": 0,
+                "first_layer_backward_calls": 0,
+                "gate_backward_calls": 0,
+                "batch": None,
+                "logits": None,
+                "trainer_loss": None,
+                "output_shape": None,
+                "past_key_values_present": None,
+                "gradient_records": {},
+                "audit_model_class": None,
+            }
+            handles: list[Any] = []
+            original_compute_loss = trainer.compute_loss
+            original_backward = trainer.accelerator.backward
+
+            def audited_backward(loss: torch.Tensor, **kwargs: Any):
+                trace["backward_calls"] += 1
+                return original_backward(loss, **kwargs)
+
+            def audited_compute_loss(
+                actual_model: torch.nn.Module,
+                inputs: dict[str, Any],
+                return_outputs: bool = False,
+                num_items_in_batch: Any = None,
+            ):
+                trace["trainer_forward_calls"] += 1
+                if trace["batch"] is None:
+                    required = ("input_ids", "labels", "attention_mask")
+                    missing = [name for name in required if not torch.is_tensor(inputs.get(name))]
+                    if missing:
+                        raise RuntimeError(
+                            f"Swift compute_loss did not receive required tensors: {missing}; "
+                            f"keys={sorted(inputs)}"
+                        )
+                    logits_to_keep = inputs.get("logits_to_keep")
+                    if torch.is_tensor(logits_to_keep):
+                        logits_to_keep = logits_to_keep.detach().cpu().clone()
+                    trace["batch"] = {
+                        "input_ids": inputs["input_ids"].detach().cpu().clone(),
+                        "labels": inputs["labels"].detach().cpu().clone(),
+                        "attention_mask": inputs["attention_mask"].detach().cpu().clone(),
+                        "use_cache": inputs.get("use_cache"),
+                        "logits_to_keep": logits_to_keep,
+                    }
+                    handles.extend(install_runtime_audits(actual_model, trace))
+                result = original_compute_loss(
+                    actual_model,
+                    inputs,
+                    return_outputs=True,
+                    num_items_in_batch=num_items_in_batch,
+                )
+                loss, outputs = result
+                if trace["logits"] is None:
+                    logits = getattr(outputs, "logits", None)
+                    if logits is None and isinstance(outputs, (tuple, list)) and outputs:
+                        logits = outputs[0]
+                    if not torch.is_tensor(logits):
+                        raise RuntimeError(f"Swift compute_loss returned no logits; output_type={type(outputs)}")
+                    trace["logits"] = logits.detach().float().cpu()
+                    trace["trainer_loss"] = float(loss.detach().float().cpu().item())
+                    trace["output_shape"] = list(logits.shape)
+                    trace["past_key_values_present"] = getattr(outputs, "past_key_values", None) is not None
+                return result if return_outputs else loss
+
+            trainer.compute_loss = audited_compute_loss
+            trainer.accelerator.backward = audited_backward
             print("========== OURO SWIFT LORA PRE-TRAIN AUDIT ==========")
             print(f"[trainer] {trainer.__class__.__module__}.{trainer.__class__.__name__}", flush=True)
             print(f"[config] total_ut_steps={ouro_model.total_ut_steps} use_cache={causal_model.config.use_cache}", flush=True)
@@ -560,11 +646,15 @@ def main() -> None:
                 train_result = super().train(trainer)
             finally:
                 remove_handles(handles)
+                trainer.compute_loss = original_compute_loss
+                trainer.accelerator.backward = original_backward
             torch.cuda.synchronize()
             elapsed_seconds = time.perf_counter() - started
 
             if int(trainer.state.global_step) != 1:
                 raise RuntimeError(f"Expected exactly one optimizer step, got {trainer.state.global_step}")
+            if trace["backward_calls"] != 1:
+                raise RuntimeError(f"Expected exactly one trainer backward call, got {trace['backward_calls']}")
             if trace["trainer_forward_calls"] != 1:
                 raise RuntimeError(
                     f"Expected exactly one real trainer forward, got {trace['trainer_forward_calls']}"
@@ -578,12 +668,23 @@ def main() -> None:
                 raise RuntimeError(
                     f"Expected early_exit_gate to run {EXPECTED_STEPS} times, got {trace['gate_calls']}"
                 )
+            if trace["first_layer_backward_calls"] != EXPECTED_STEPS:
+                raise RuntimeError(
+                    f"Expected shared decoder layer backward to run {EXPECTED_STEPS} times, "
+                    f"got {trace['first_layer_backward_calls']}"
+                )
+            if trace["gate_backward_calls"] != EXPECTED_STEPS:
+                raise RuntimeError(
+                    f"Expected early_exit_gate backward to run {EXPECTED_STEPS} times, "
+                    f"got {trace['gate_backward_calls']}"
+                )
             if trace["past_key_values_present"]:
                 raise RuntimeError("Training forward unexpectedly returned a KV cache")
 
             loss_report = validate_batch_and_loss(trace)
             optimizer_report = inspect_optimizer(trainer, model)
-            gradient_report_value = gradient_report(model, trace["gradient_records"])
+            gradient_model = trace.get("gradient_model", model)
+            gradient_report_value = gradient_report(gradient_model, trace["gradient_records"])
 
             update_report: dict[str, Any] = {}
             for category, probe in probes.items():
@@ -617,7 +718,7 @@ def main() -> None:
                     "entropy_or_kl": False,
                     "total_ut_steps": EXPECTED_STEPS,
                     "use_cache": False,
-                    "backward_calls": 1,
+                    "backward_calls": trace["backward_calls"],
                     "optimizer_steps": 1,
                 },
                 "packages": {
@@ -644,8 +745,11 @@ def main() -> None:
                 "lora": lora_report,
                 "forward_audit": {
                     "trainer_forward_calls": trace["trainer_forward_calls"],
+                    "backward_calls": trace["backward_calls"],
                     "first_shared_decoder_layer_calls": trace["first_layer_calls"],
                     "early_exit_gate_calls": trace["gate_calls"],
+                    "first_shared_decoder_layer_backward_calls": trace["first_layer_backward_calls"],
+                    "early_exit_gate_backward_calls": trace["gate_backward_calls"],
                     **loss_report,
                 },
                 "optimizer": optimizer_report,
