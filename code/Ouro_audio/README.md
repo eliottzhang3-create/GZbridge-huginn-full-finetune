@@ -38,10 +38,14 @@ code/Ouro_audio/run_smoke_ouro_swift_lora_4090.sh
 
 It uses `pdgpu-4090` and writes a checkpoint plus a JSON audit report. The
 audit checks the actual Swift trainer batch, ms-swift's compact-suffix
-next-token label alignment, four forward and backward calls through a shared
-decoder layer and the early-exit gate, one optimizer step, optimizer
-membership, gradient capture before `zero_grad`, frozen-parameter gradients
-and update probes, and checkpoint contents. This smoke does
+next-token label alignment, four forward and backward calls through the
+shared decoder layer, four gate forward calls and three gate backward calls,
+one optimizer step, optimizer membership, gradient capture before
+`zero_grad`, frozen-parameter gradients and update probes, and checkpoint
+contents. Ouro's last gate output is intentionally not differentiated: with
+the default `early_exit_threshold=1.0`, the final exit probability is the
+remaining probability mass, so the fourth gate is a forced-exit branch. This
+smoke does
 not implement the paper's entropy/KL regularizer; that will be a separate
 controlled experiment after the ordinary-CE path is stable.
 

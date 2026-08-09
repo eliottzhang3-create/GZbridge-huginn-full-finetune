@@ -25,6 +25,7 @@ import torch
 MODEL_TYPE = "ouro_text_native"
 TEMPLATE_TYPE = "ouro_text_direct"
 EXPECTED_STEPS = 4
+EXPECTED_GATE_BACKWARD_STEPS = EXPECTED_STEPS - 1
 EXPECTED_BATCH_SIZE = 3
 LORA_RANK = 8
 LORA_ALPHA = 32
@@ -553,6 +554,12 @@ def main() -> None:
                 )
             if int(getattr(ouro_model, "total_ut_steps", -1)) != EXPECTED_STEPS:
                 raise RuntimeError(f"Unexpected Ouro runtime total_ut_steps: {ouro_model.total_ut_steps}")
+            exit_threshold = getattr(causal_model, "early_exit_threshold", None)
+            if exit_threshold is None or float(exit_threshold) != 1.0:
+                raise RuntimeError(
+                    "This smoke expects Ouro's default forced-final-step exit threshold=1.0, "
+                    f"got {exit_threshold}"
+                )
             causal_model.config.use_cache = False
             ouro_model.config.use_cache = False
             if hasattr(model, "gradient_checkpointing_disable"):
@@ -636,7 +643,13 @@ def main() -> None:
             trainer.accelerator.backward = audited_backward
             print("========== OURO SWIFT LORA PRE-TRAIN AUDIT ==========")
             print(f"[trainer] {trainer.__class__.__module__}.{trainer.__class__.__name__}", flush=True)
-            print(f"[config] total_ut_steps={ouro_model.total_ut_steps} use_cache={causal_model.config.use_cache}", flush=True)
+            print(
+                f"[config] total_ut_steps={ouro_model.total_ut_steps} "
+                f"early_exit_threshold={exit_threshold} "
+                f"use_cache={causal_model.config.use_cache} "
+                f"gate_backward_expected={EXPECTED_GATE_BACKWARD_STEPS}",
+                flush=True,
+            )
             print(f"[parameters] {json.dumps(parameters_before, ensure_ascii=False)}", flush=True)
             print(f"[gate] trainable_names={gate_names}", flush=True)
             print(f"[lora] {json.dumps(lora_report, ensure_ascii=False)}", flush=True)
@@ -673,9 +686,9 @@ def main() -> None:
                     f"Expected shared decoder layer backward to run {EXPECTED_STEPS} times, "
                     f"got {trace['first_layer_backward_calls']}"
                 )
-            if trace["gate_backward_calls"] != EXPECTED_STEPS:
+            if trace["gate_backward_calls"] != EXPECTED_GATE_BACKWARD_STEPS:
                 raise RuntimeError(
-                    f"Expected early_exit_gate backward to run {EXPECTED_STEPS} times, "
+                    f"Expected early_exit_gate backward to run {EXPECTED_GATE_BACKWARD_STEPS} times, "
                     f"got {trace['gate_backward_calls']}"
                 )
             if trace["past_key_values_present"]:
@@ -717,6 +730,9 @@ def main() -> None:
                     "loss": "ordinary_causal_lm_cross_entropy",
                     "entropy_or_kl": False,
                     "total_ut_steps": EXPECTED_STEPS,
+                    "early_exit_threshold": 1.0,
+                    "gate_backward_calls_expected": EXPECTED_GATE_BACKWARD_STEPS,
+                    "gate_final_step_gradient": False,
                     "use_cache": False,
                     "backward_calls": trace["backward_calls"],
                     "optimizer_steps": 1,
@@ -750,6 +766,7 @@ def main() -> None:
                     "early_exit_gate_calls": trace["gate_calls"],
                     "first_shared_decoder_layer_backward_calls": trace["first_layer_backward_calls"],
                     "early_exit_gate_backward_calls": trace["gate_backward_calls"],
+                    "early_exit_gate_last_step_backward_expected": False,
                     **loss_report,
                 },
                 "optimizer": optimizer_report,
