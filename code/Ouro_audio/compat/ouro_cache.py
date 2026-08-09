@@ -1,10 +1,18 @@
 """Compatibility patch for Ouro's UniversalTransformerCache.
 
-The pinned Ouro remote code assigns to ``Cache.key_cache`` and
-``Cache.value_cache``. In Transformers 4.54.1 those names are read-only
-properties, so construction fails before the first forward. This module keeps
-Ouro's cache layout but stores the lists behind private attributes and
-overrides the read-only properties locally.
+Ouro is a Universal Transformer: its 24 physical layers are reused for four
+recurrent steps. Its cache therefore has ``4 * 24 = 96`` logical slots rather
+than the usual one slot per physical layer. The model's published cache class
+also predates the layered-cache API used by Transformers 4.54.1:
+
+* ``Cache.key_cache`` and ``Cache.value_cache`` are read-only properties in
+  the pinned Transformers version; and
+* causal-mask construction calls
+  ``past_key_values.layers[layer_idx].get_mask_sizes(cache_position)``.
+
+This module preserves Ouro's cache indexing while providing those two
+compatibility surfaces. It intentionally does not modify the downloaded
+Hugging Face model files.
 """
 
 from __future__ import annotations
@@ -17,6 +25,26 @@ import torch
 from transformers.cache_utils import Cache
 
 
+class _OuroCacheLayer:
+    """Small adapter for Transformers' layered-cache mask interface.
+
+    Transformers 4.54.1 asks a cache layer for the KV length before Ouro has
+    entered the current recurrent step. The corresponding Ouro slot contains
+    the previous sequence for that physical layer, so the correct mask length
+    is ``past_length + query_length``. The actual tensors remain owned by the
+    parent cache and are still updated through Ouro's global slot index.
+    """
+
+    def __init__(self, owner: "OuroUniversalTransformerCache", layer_idx: int):
+        self.owner = owner
+        self.layer_idx = layer_idx
+
+    def get_mask_sizes(self, cache_position: torch.Tensor) -> tuple[int, int]:
+        query_length = int(cache_position.shape[0])
+        past_length = self.owner.get_seq_length(self.layer_idx)
+        return past_length + query_length, 0
+
+
 class OuroUniversalTransformerCache(Cache):
     """Transformers-4.54-compatible implementation of Ouro's cache contract."""
 
@@ -24,13 +52,24 @@ class OuroUniversalTransformerCache(Cache):
 
     def __init__(self, max_cache_size: Optional[int] = None):
         # Do not call Cache.__init__: the upstream Ouro implementation also
-        # intentionally avoids it because the parent assumes static cache
-        # layers. ``layers`` is retained for HF Cache utility compatibility.
+        # intentionally avoids it because this cache owns a non-standard
+        # recurrent-step layout.
         self._ouro_key_cache: list[Optional[Any]] = []
         self._ouro_value_cache: list[Optional[Any]] = []
-        self.layers: list[Any] = []
+        # Ouro passes max_cache_size=total_ut_steps*num_hidden_layers (96 for
+        # Ouro-1.4B). Keep one adapter per logical cache slot. A default is
+        # useful for callers that instantiate the cache manually, while update
+        # still grows the list for a larger explicitly configured model.
+        layer_count = max_cache_size if max_cache_size is not None else 96
+        self.layers: list[_OuroCacheLayer] = [
+            _OuroCacheLayer(self, layer_idx) for layer_idx in range(layer_count)
+        ]
         self._seen_tokens = 0
         self.max_cache_size = max_cache_size
+
+    def _ensure_layer_capacity(self, layer_idx: int) -> None:
+        while len(self.layers) <= layer_idx:
+            self.layers.append(_OuroCacheLayer(self, len(self.layers)))
 
     @property
     def key_cache(self) -> list[Optional[Any]]:
@@ -63,6 +102,7 @@ class OuroUniversalTransformerCache(Cache):
                 "Check total_ut_steps and num_hidden_layers."
             )
 
+        self._ensure_layer_capacity(layer_idx)
         while len(self.key_cache) <= layer_idx:
             self.key_cache.append(None)
             self.value_cache.append(None)

@@ -31,3 +31,13 @@ The model loader uses the pinned Hugging Face revision:
 ```text
 574fa66cb8bf5abdc979642d01cf2b79b16bfab1
 ```
+
+## KV-cache compatibility
+
+Ouro-1.4B reuses 24 physical layers for 4 recurrent steps, so its native
+cache uses 96 logical slots. The pinned Transformers 4.54.1 mask path also
+expects `past_key_values.layers[layer_idx].get_mask_sizes(...)`, while the
+published Ouro cache leaves `layers` empty. `compat/ouro_cache.py` supplies
+the missing layered-cache adapters and preserves the original 96-slot update
+layout. It is patched at runtime after loading the remote model code; the
+downloaded model snapshot is not edited.
