@@ -15,6 +15,9 @@ from typing import Any
 
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from compat.ouro_cache import patch_ouro_cache
+
 
 MODEL_TYPE = "ouro_text_native"
 TEMPLATE_TYPE = "ouro_text_direct"
@@ -129,6 +132,8 @@ def main() -> None:
     model.eval()
     torch.cuda.synchronize(device_index)
     load_seconds = time.perf_counter() - load_started
+    cache_patch = patch_ouro_cache(model)
+    print(f"[cache] patch={json.dumps(cache_patch, ensure_ascii=False)}", flush=True)
 
     if model.__class__.__name__ != "OuroForCausalLM":
         raise RuntimeError(f"Unexpected Swift model class: {model.__class__.__module__}.{model.__class__.__name__}")
@@ -208,6 +213,7 @@ def main() -> None:
         "model_type": MODEL_TYPE,
         "template_type": TEMPLATE_TYPE,
         "model_class": f"{model.__class__.__module__}.{model.__class__.__name__}",
+        "cache_patch": cache_patch,
         "parameter_count": count_parameters(model),
         "config": config_summary,
         "prompt": args.question.strip(),

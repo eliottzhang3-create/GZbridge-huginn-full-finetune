@@ -14,6 +14,9 @@ from typing import Any
 
 import torch
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from compat.ouro_cache import patch_ouro_cache
+
 
 EXPECTED_REVISION = "574fa66cb8bf5abdc979642d01cf2b79b16bfab1"
 REQUIRED_FILES = (
@@ -138,6 +141,9 @@ def main() -> None:
     load_seconds = time.perf_counter() - load_started
     print(f"[load] class={model.__class__.__module__}.{model.__class__.__name__} seconds={load_seconds:.3f}", flush=True)
 
+    cache_patch = patch_ouro_cache(model)
+    print(f"[cache] patch={json.dumps(cache_patch, ensure_ascii=False)}", flush=True)
+
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     if parameter_count < 1_000_000_000 or parameter_count > 2_000_000_000:
         raise RuntimeError(f"Unexpected Ouro-1.4B parameter count: {parameter_count}")
@@ -189,6 +195,7 @@ def main() -> None:
         },
         "config": config_summary,
         "model_class": f"{model.__class__.__module__}.{model.__class__.__name__}",
+        "cache_patch": cache_patch,
         "parameter_count": parameter_count,
         "prompt": prompt,
         "prompt_length": prompt_length,
