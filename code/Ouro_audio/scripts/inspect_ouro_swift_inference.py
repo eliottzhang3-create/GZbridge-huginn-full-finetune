@@ -125,7 +125,11 @@ def main() -> None:
         load_model=True,
         download_model=False,
         attn_impl="sdpa",
-        model_kwargs={"local_files_only": True, "low_cpu_mem_usage": True, "trust_remote_code": True},
+        # ms-swift 4.4.2 passes trust_remote_code=True itself from
+        # ModelLoader.default_trust_remote_code. Supplying it again here
+        # reaches Transformers' from_pretrained twice and raises:
+        # "got multiple values for keyword argument 'trust_remote_code'".
+        model_kwargs={"local_files_only": True, "low_cpu_mem_usage": True},
     )
     if model is None:
         raise RuntimeError("ms-swift get_model_processor returned model=None")

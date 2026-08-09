@@ -8,11 +8,13 @@ introduced.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
+from typing import Any
 
 import torch
 
-from swift.model import Model, ModelGroup, ModelMeta, register_model
+from swift.model import Model, ModelGroup, ModelLoader, ModelMeta, register_model
 from swift.template import TemplateMeta, register_template
 
 
@@ -20,6 +22,27 @@ MODEL_TYPE = "ouro_text_native"
 TEMPLATE_TYPE = "ouro_text_direct"
 DEFAULT_MODEL_DIR = Path("/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B")
 MODEL_DIR = Path(os.environ.get("OURO_MODEL_PATH", str(DEFAULT_MODEL_DIR))).expanduser()
+PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+if str(PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(PLUGIN_ROOT))
+
+
+class OuroTextLoader(ModelLoader):
+    """Load Ouro through ms-swift and install its cache compatibility patch.
+
+    The patch must be installed immediately after ``from_pretrained`` and
+    before any Swift inference/evaluation path calls the model with
+    ``use_cache=True``. Keeping it in the loader also makes the normal
+    ``swift infer`` and future ``swift sft`` entry points consistent with the
+    dedicated audit scripts.
+    """
+
+    def get_model(self, model_dir: str, config: Any, processor: Any, model_kwargs: dict):
+        model = super().get_model(model_dir, config, processor, model_kwargs)
+        from compat.ouro_cache import patch_ouro_cache
+
+        patch_ouro_cache(model)
+        return model
 
 
 def _register_template() -> None:
@@ -42,6 +65,7 @@ def _register_model() -> None:
         ModelMeta(
             model_type=MODEL_TYPE,
             model_groups=[ModelGroup(models=[Model(model_path=str(MODEL_DIR))])],
+            loader=OuroTextLoader,
             template=TEMPLATE_TYPE,
             architectures=["OuroForCausalLM"],
             torch_dtype=torch.bfloat16,

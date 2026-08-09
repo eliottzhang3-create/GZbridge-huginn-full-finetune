@@ -32,6 +32,11 @@ The model loader uses the pinned Hugging Face revision:
 574fa66cb8bf5abdc979642d01cf2b79b16bfab1
 ```
 
+The Swift registration uses a custom `OuroTextLoader`. It installs the same
+cache patch immediately after ms-swift loads the model, so normal Swift
+inference and later SFT/LoRA entry points do not depend on an audit script
+performing a second manual patch.
+
 ## KV-cache compatibility
 
 Ouro-1.4B reuses 24 physical layers for 4 recurrent steps, so its native
