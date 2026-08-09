@@ -15,6 +15,35 @@ The first milestone is a submitted, text-only native Ouro smoke test and a
 text-only ms-swift registration. Whisper and the audio aligner are deliberately
 not part of this first milestone.
 
+## Text-only LoRA + gate smoke
+
+The first training experiment is intentionally minimal: three assistant-only
+records in one batch, one optimizer update, ordinary causal next-token cross
+entropy, Ouro's configured four recurrent steps, and no KV cache. It trains
+only explicit LoRA adapters and `early_exit_gate`; the embedding, decoder
+backbone, norms, and `lm_head` remain frozen. The MLP `gate_proj` is an LoRA
+target, but it is not the separate Ouro early-exit gate.
+
+The tiny dataset is:
+
+```text
+code/Ouro_audio/data/ouro_lora_tiny.jsonl
+```
+
+The submitted smoke entry point is:
+
+```text
+code/Ouro_audio/run_smoke_ouro_swift_lora_4090.sh
+```
+
+It uses `pdgpu-4090` and writes a checkpoint plus a JSON audit report. The
+audit checks the actual Swift trainer batch, full-sequence next-token label
+alignment, four calls to a shared decoder layer and the early-exit gate, one
+backward/optimizer step, optimizer membership, gradient capture before
+`zero_grad`, frozen-parameter probes, and checkpoint contents. This smoke does
+not implement the paper's entropy/KL regularizer; that will be a separate
+controlled experiment after the ordinary-CE path is stable.
+
 ## Remote execution
 
 All GPU work must go through the `vc submit` launcher. Login-node commands are
