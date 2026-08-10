@@ -477,6 +477,22 @@ def checkpoint_report(checkpoint_dir: Path) -> dict[str, Any]:
     }
 
 
+def find_saved_checkpoint(output_dir: Path, step: int = 1) -> Path:
+    """Resolve Swift's versioned run directory to the actual checkpoint path."""
+    if not output_dir.is_dir():
+        raise FileNotFoundError(f"Swift output directory does not exist: {output_dir}")
+    candidates = sorted(
+        path for path in output_dir.rglob(f"checkpoint-{step}")
+        if path.is_dir()
+    )
+    if len(candidates) != 1:
+        raise RuntimeError(
+            f"Expected exactly one Swift checkpoint-{step} below {output_dir}, "
+            f"found {len(candidates)}: {[str(path) for path in candidates]}"
+        )
+    return candidates[0]
+
+
 def main() -> None:
     args = parse_args()
     require_environment()
@@ -713,7 +729,7 @@ def main() -> None:
                 if category == "frozen" and max_abs_change != 0:
                     raise RuntimeError(f"Frozen probe changed: {probe['name']} delta={max_abs_change}")
 
-            checkpoint_dir = output_dir / "checkpoint-1"
+            checkpoint_dir = find_saved_checkpoint(output_dir, step=1)
             checkpoint = checkpoint_report(checkpoint_dir)
             log_history = trainer.state.log_history
             finite_losses = [
