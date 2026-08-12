@@ -14,6 +14,44 @@ The branch follows OWL's downstream training design:
 - keep `total_ut_steps=4`, `early_exit_threshold=1.0`, and `use_cache=false` during training;
 - execute OWL Stage 1 and Stage 2 only.
 
+## Phase 1 deep asset audit
+
+After the initial metadata audit, submit the read-only deep audit through the
+GPU job system:
+
+```bash
+bash code/Ouro_audio/owl/run_inspect_phase1_deep_assets_4090.sh
+```
+
+The job uses `pdgpu-4090`, streams `reverb.tar.gz` without extracting it, and
+writes `phase1_deep_asset_audit.json`.  Optional environment variables are:
+
+```bash
+OWL_AUDIO_ROOT=/path/to/anechoic/root
+OWL_SOURCE_ROOT=/path/to/official/OWL/checkout
+OWL_PHASE1_DEEP_SHA256=1
+```
+
+The report intentionally marks audio references as unresolved when no audio
+root is supplied; this is an audit finding, not an assumption that the audio
+is present in `reverb.tar.gz`.
+
+## Phase 1 SAGE native audit
+
+The SAGE audit imports the official OWL SAGE implementation, tries an exact
+checkpoint load, runs a synthetic two-channel 32 kHz waveform, and optionally
+runs representative real BiDepth audio samples:
+
+```bash
+bash code/Ouro_audio/owl/run_inspect_sage_native_4090.sh
+```
+
+Before submission, `OWL_SOURCE_ROOT` must point to an official OWL checkout
+whose `src/slam_llm/models/SAGE/` directory is present. If the source audio
+is available, set `OWL_AUDIO_ROOT` to one or more colon-separated roots. The
+job still runs a synthetic forward when no audio root is configured, but the
+report remains `incomplete` until real audio references can be resolved.
+
 The first multimodal smoke uses one RTX 4090 with batch size 8. The later
 formal target is eight RTX 5090 cards with one sample per card and global batch
 size 8.
