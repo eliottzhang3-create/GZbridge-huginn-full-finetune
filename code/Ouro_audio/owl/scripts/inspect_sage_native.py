@@ -98,6 +98,13 @@ def _forward_sample(model: nn.Module, waveform: torch.Tensor, label: str) -> dic
     return {"label": label, "input": _tensor_stats(waveform), "output": _tensor_stats(output)}
 
 
+def _write_report(path: Path, report: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, ensure_ascii=False)
+        handle.write("\n")
+
+
 def _load_audio(path: Path) -> tuple[torch.Tensor, int]:
     if path.suffix.lower() == ".npy":
         import numpy as np
@@ -242,7 +249,37 @@ def main() -> None:
     device = torch.device(args.device)
     checkpoint = _load_checkpoint(args.sage_path)
     state = checkpoint["model"]
-    model = _build_sage(args.owl_source_root)
+    try:
+        model = _build_sage(args.owl_source_root)
+    except Exception as exc:  # noqa: BLE001 - dependency/import audit result
+        report = {
+            "status": "incomplete",
+            "python": {"version": sys.version, "executable": sys.executable},
+            "torch": {
+                "version": torch.__version__,
+                "cuda_available": torch.cuda.is_available(),
+            },
+            "checkpoint": {
+                "path": str(args.sage_path),
+                "size_bytes": args.sage_path.stat().st_size,
+                "sha256": _sha256_file(args.sage_path),
+                "container_keys": [str(key) for key in checkpoint.keys()],
+                "state_dict_key_count": len(state),
+            },
+            "official_source": {"root": str(args.owl_source_root)},
+            "model_import": {
+                "status": "failed",
+                "error_type": type(exc).__name__,
+                "error": repr(exc),
+                "forward_skipped": True,
+            },
+            "issues": ["sage_model_import_or_dependency_failed"],
+        }
+        _write_report(args.output, report)
+        print(f"[model] import failed; report={args.output}")
+        print(f"[model] error={exc!r}")
+        print("[status] incomplete")
+        return
     parameter_count = sum(parameter.numel() for parameter in model.parameters())
     trainable_count = sum(
         parameter.numel() for parameter in model.parameters() if parameter.requires_grad
@@ -272,10 +309,7 @@ def main() -> None:
             },
             "issues": ["sage_strict_checkpoint_load_failed"],
         }
-        args.output.parent.mkdir(parents=True, exist_ok=True)
-        with args.output.open("w", encoding="utf-8") as handle:
-            json.dump(report, handle, indent=2, ensure_ascii=False)
-            handle.write("\n")
+        _write_report(args.output, report)
         print(f"[load] strict checkpoint load failed; report={args.output}")
         print("[status] incomplete")
         return
@@ -342,10 +376,7 @@ def main() -> None:
     elif unresolved:
         report.setdefault("issues", []).append("some_audio_references_unresolved")
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8") as handle:
-        json.dump(report, handle, indent=2, ensure_ascii=False)
-        handle.write("\n")
+    _write_report(args.output, report)
     print(f"[synthetic] output_shape={synthetic['output']['shape']}")
     print(f"[real] successful={sum(sample.get('status') == 'ok' for sample in real_samples)} unresolved={len(unresolved)}")
     print(f"[report] {args.output}")
