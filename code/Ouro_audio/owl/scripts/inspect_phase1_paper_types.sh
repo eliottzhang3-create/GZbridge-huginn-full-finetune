@@ -15,9 +15,7 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
 BIDEPTH_ROOT="${OWL_BIDEPTH_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BiDepth}"
-REVERB_ROOT="${OWL_REVERB_ROOT:-$BIDEPTH_ROOT/reverb_extracted}"
-OWL_SOURCE_ROOT="${OWL_SOURCE_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/OWL}"
-OUTPUT="${OWL_PHASE1_DECOMPRESSED_OUTPUT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/owl/phase1_decompressed_asset_audit.json}"
+OUTPUT="${OWL_PHASE1_PAPER_TYPE_OUTPUT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/owl/phase1_paper_type_audit.json}"
 
 case "$OUTPUT" in
   /hpc_stor03/public|/hpc_stor03/public/*)
@@ -26,19 +24,6 @@ case "$OUTPUT" in
     ;;
 esac
 
-ARGS=(
-  --bidepth-root "$BIDEPTH_ROOT"
-  --reverb-root "$REVERB_ROOT"
-  --owl-source-root "$OWL_SOURCE_ROOT"
+python -u code/Ouro_audio/owl/scripts/audit_bidepth_paper_types.py \
+  --bidepth-root "$BIDEPTH_ROOT" \
   --output "$OUTPUT"
-  --sample-npy-count "${OWL_SAMPLE_NPY_COUNT:-24}"
-)
-
-if [[ -n "${OWL_AUDIO_ROOT:-}" ]]; then
-  IFS=':' read -r -a AUDIO_ROOTS <<< "$OWL_AUDIO_ROOT"
-  for root in "${AUDIO_ROOTS[@]}"; do
-    ARGS+=(--audio-root "$root")
-  done
-fi
-
-python -u code/Ouro_audio/owl/scripts/audit_bidepth_decompressed.py "${ARGS[@]}"

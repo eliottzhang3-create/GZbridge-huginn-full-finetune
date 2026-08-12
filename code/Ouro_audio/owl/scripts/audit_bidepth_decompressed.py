@@ -36,6 +36,7 @@ from audit_bidepth_deep import (
     _norm_path,
     _present,
 )
+from output_safety import assert_private_output
 
 
 DEFAULT_REVERB_ROOT = DEFAULT_BIDEPTH / "reverb_extracted"
@@ -627,6 +628,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    assert_private_output(args.output)
     print("========== OWL PHASE 1 DECOMPRESSED ASSET + LOADER AUDIT ==========")
     print(f"[python] version={sys.version.split()[0]} executable={sys.executable}")
     print(f"[bidepth] root={args.bidepth_root}")

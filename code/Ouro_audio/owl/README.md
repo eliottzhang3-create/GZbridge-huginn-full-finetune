@@ -114,6 +114,12 @@ length behavior found in the official loader and the official training
 launcher. The intended current evaluation policy is `train` for optimization,
 `val` for validation, and no use of `test`.
 
+The current train audit shows that `stage1-clsdoa/train.json` is entirely
+single-source, while `stage2-single/train.json` contains the Stage 1
+single-source records plus an additional dual-source portion. The audit uses
+the source ID fields, rather than the filename alone, to determine this
+composition.
+
 The laboratory AudioSet tree is an external read-only asset. Because the JSON
 references already contain prefixes such as
 `balanced_train/audio/YOOj8XfZGR8c`, pass the AudioSet root itself:

@@ -19,6 +19,13 @@ SAGE_PATH="${OWL_SAGE_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/OWL/SAGE/f
 BIDEPTH_ROOT="${OWL_BIDEPTH_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BiDepth}"
 OUTPUT="${OWL_PHASE1_AUDIT_OUTPUT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/owl/phase1_asset_audit.json}"
 
+case "$OUTPUT" in
+  /hpc_stor03/public|/hpc_stor03/public/*)
+    echo "Refusing public output path: $OUTPUT" >&2
+    exit 2
+    ;;
+esac
+
 ARGS=(
   --sage-path "$SAGE_PATH"
   --bidepth-root "$BIDEPTH_ROOT"

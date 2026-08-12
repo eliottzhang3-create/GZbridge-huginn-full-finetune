@@ -15,6 +15,8 @@ import os
 import sys
 from collections import Counter
 from pathlib import Path
+
+from output_safety import assert_private_output
 from typing import Any, Iterable
 
 
@@ -243,6 +245,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    assert_private_output(args.output)
     print("========== OWL PHASE 1 REMOTE ASSET AUDIT ==========")
     print(f"[python] version={sys.version.split()[0]} executable={sys.executable}")
     print(f"[sage] path={args.sage_path}")

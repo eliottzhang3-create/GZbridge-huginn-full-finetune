@@ -18,6 +18,13 @@ BIDEPTH_ROOT="${OWL_BIDEPTH_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BiDept
 ARCHIVE="${OWL_REVERB_ARCHIVE:-$BIDEPTH_ROOT/reverb.tar.gz}"
 OUTPUT="${OWL_PHASE1_DEEP_OUTPUT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/owl/phase1_deep_asset_audit.json}"
 
+case "$OUTPUT" in
+  /hpc_stor03/public|/hpc_stor03/public/*)
+    echo "Refusing public output path: $OUTPUT" >&2
+    exit 2
+    ;;
+esac
+
 ARGS=(
   --bidepth-root "$BIDEPTH_ROOT"
   --reverb-archive "$ARCHIVE"

@@ -15,10 +15,17 @@ export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 
 BIDEPTH_ROOT="${OWL_BIDEPTH_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BiDepth}"
-REVERB_ROOT="${OWL_REVERB_ROOT:-$BIDEPTH_ROOT/reverb_extracted}"
+REVERB_ROOT="${OWL_REVERB_ROOT:-$BIDEPTH_ROOT/reverb_extracted/mp3d_reverb}"
 OWL_SOURCE_ROOT="${OWL_SOURCE_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/OWL}"
 OUTPUT="${OWL_PHASE1_TRAIN_CONTRACT_OUTPUT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/owl/phase1_train_contract_audit.json}"
 AUDIO_ROOT="${OWL_AUDIO_ROOT:-/hpc_stor03/public/shared/data/raa/AudioSet}"
+
+case "$OUTPUT" in
+  /hpc_stor03/public|/hpc_stor03/public/*)
+    echo "Refusing public output path: $OUTPUT" >&2
+    exit 2
+    ;;
+esac
 
 ARGS=(
   --bidepth-root "$BIDEPTH_ROOT"

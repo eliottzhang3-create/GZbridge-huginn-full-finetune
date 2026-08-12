@@ -41,6 +41,7 @@ from audit_bidepth_decompressed import (
     _load_npy,
     _resolve_reverb,
 )
+from output_safety import assert_private_output
 
 
 DEFAULT_OUTPUT = Path(
@@ -274,6 +275,100 @@ def _record_summary(records: list[dict[str, Any]], stage: str) -> dict[str, Any]
     }
 
 
+def _composition_summary(records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Break down source cardinality by question type and source shape."""
+
+    counts: Counter[tuple[str, str]] = Counter()
+    second_audio_ids: set[str] = set()
+    second_reverb_ids: set[str] = set()
+    primary_audio_ids: set[str] = set()
+    primary_reverb_ids: set[str] = set()
+    dual_examples: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            continue
+        source = _source_tuple(record)
+        shape = "dual" if source[2] and source[3] else "single"
+        question_type = str(record.get("question_type", "<missing>"))
+        counts[(shape, question_type)] += 1
+        if source[0]:
+            primary_audio_ids.add(source[0])
+        if source[1]:
+            primary_reverb_ids.add(source[1])
+        if source[2]:
+            second_audio_ids.add(source[2])
+        if source[3]:
+            second_reverb_ids.add(source[3])
+        if shape == "dual" and len(dual_examples) < 5:
+            dual_examples.append(
+                {
+                    "record_index": index,
+                    "question_id": record.get("question_id"),
+                    "question_type": question_type,
+                    "audio_id": record.get("audio_id"),
+                    "reverb_id": record.get("reverb_id"),
+                    "audio_id2": record.get("audio_id2"),
+                    "reverb_id2": record.get("reverb_id2"),
+                    "question": record.get("question"),
+                    "answer": record.get("answer"),
+                }
+            )
+    return {
+        "counts_by_source_shape_and_question_type": {
+            f"{shape}/{question_type}": count
+            for (shape, question_type), count in sorted(counts.items())
+        },
+        "primary_audio_id_count": len(primary_audio_ids),
+        "second_audio_id_count": len(second_audio_ids),
+        "primary_reverb_id_count": len(primary_reverb_ids),
+        "second_reverb_id_count": len(second_reverb_ids),
+        "primary_second_audio_intersection_count": len(
+            primary_audio_ids & second_audio_ids
+        ),
+        "primary_second_reverb_intersection_count": len(
+            primary_reverb_ids & second_reverb_ids
+        ),
+        "dual_examples": dual_examples,
+    }
+
+
+def _canonical_record(record: dict[str, Any]) -> str:
+    return json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _stage_composition_comparison(
+    stage1_records: list[dict[str, Any]], stage2_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Check whether Stage 2 includes Stage 1 as a record multiset."""
+
+    stage1_keys = Counter(
+        _canonical_record(record)
+        for record in stage1_records
+        if isinstance(record, dict)
+    )
+    stage2_keys = Counter(
+        _canonical_record(record)
+        for record in stage2_records
+        if isinstance(record, dict)
+    )
+    missing_from_stage2 = stage1_keys - stage2_keys
+    stage2_extra = stage2_keys - stage1_keys
+    return {
+        "stage1_record_count": sum(stage1_keys.values()),
+        "stage2_record_count": sum(stage2_keys.values()),
+        "stage1_unique_record_count": len(stage1_keys),
+        "stage1_records_missing_from_stage2_count": sum(missing_from_stage2.values()),
+        "stage2_records_not_in_stage1_count": sum(stage2_extra.values()),
+        "stage2_contains_stage1_as_multiset": not missing_from_stage2,
+        "stage2_additional_unique_record_count": len(stage2_extra),
+    }
+
+
 def _collect_refs(records: list[dict[str, Any]], fields: tuple[str, ...]) -> set[str]:
     refs: set[str] = set()
     for record in records:
@@ -359,6 +454,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    assert_private_output(args.output)
     print("========== OWL STAGE 1/2 TRAIN CONTRACT AUDIT ==========")
     print(f"[python] version={sys.version.split()[0]} executable={sys.executable}")
     print(f"[bidepth] root={args.bidepth_root}")
@@ -367,6 +463,7 @@ def main() -> None:
 
     question_root = args.bidepth_root / "owl-questions"
     stages: dict[str, Any] = {}
+    loaded_records: dict[str, list[dict[str, Any]]] = {}
     issues: list[str] = []
     for stage in TRAIN_STAGES:
         path = question_root / stage / "train.json"
@@ -375,10 +472,12 @@ def main() -> None:
             issues.append(f"{stage}_train_missing")
             continue
         records, container = _load_records(path)
+        loaded_records[stage] = records
         stages[stage] = {
             "path": str(path),
             "container": container,
             "record_summary": _record_summary(records, stage),
+            "composition": _composition_summary(records),
             "assets": _inspect_stage_assets(
                 stage,
                 records,
@@ -411,6 +510,13 @@ def main() -> None:
         },
         "source_inventory": source_inventory,
         "stages": stages,
+        "stage_composition_comparison": (
+            _stage_composition_comparison(
+                loaded_records["stage1-clsdoa"], loaded_records["stage2-single"]
+            )
+            if all(stage in loaded_records for stage in TRAIN_STAGES)
+            else {"status": "unavailable"}
+        ),
         "official_loader_contract": _inspect_loader_contract(args.owl_source_root),
         "official_component_summary": _inspect_official_components(args.owl_source_root),
         "interpretation": {
@@ -458,6 +564,19 @@ def main() -> None:
             f"audio_missing={audio.get('missing_count', 'n/a')} "
             f"rir_refs={assets['unique_reverb_reference_count']} "
             f"rir_missing={assets['reverb_reference_missing_count']}"
+        )
+        composition = item.get("composition", {})
+        print(
+            f"[summary] {stage} composition="
+            f"{composition.get('counts_by_source_shape_and_question_type', {})}"
+        )
+    comparison = report.get("stage_composition_comparison", {})
+    if comparison.get("status") != "unavailable":
+        print(
+            "[summary] stage2_contains_stage1_as_multiset="
+            f"{comparison.get('stage2_contains_stage1_as_multiset')} "
+            "stage2_additional_unique_records="
+            f"{comparison.get('stage2_additional_unique_record_count')}"
         )
     print(
         "[summary] audio_root="

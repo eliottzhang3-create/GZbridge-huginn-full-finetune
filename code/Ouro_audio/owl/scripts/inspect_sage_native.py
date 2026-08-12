@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 import torch
+
+from output_safety import assert_private_output
 import torch.nn as nn
 
 
@@ -238,6 +240,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    assert_private_output(args.output)
     print("========== OWL PHASE 1 SAGE NATIVE AUDIT ==========")
     print(f"[python] version={sys.version.split()[0]} executable={sys.executable}")
     print(f"[torch] version={torch.__version__} cuda={torch.cuda.is_available()}")

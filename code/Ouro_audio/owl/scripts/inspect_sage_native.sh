@@ -19,6 +19,13 @@ BIDEPTH_ROOT="${OWL_BIDEPTH_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BiDept
 SOURCE_ROOT="${OWL_SOURCE_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/OWL}"
 OUTPUT="${OWL_SAGE_NATIVE_OUTPUT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/owl/phase1_sage_native_audit.json}"
 
+case "$OUTPUT" in
+  /hpc_stor03/public|/hpc_stor03/public/*)
+    echo "Refusing public output path: $OUTPUT" >&2
+    exit 2
+    ;;
+esac
+
 ARGS=(
   --sage-path "$SAGE_PATH"
   --owl-source-root "$SOURCE_ROOT"
