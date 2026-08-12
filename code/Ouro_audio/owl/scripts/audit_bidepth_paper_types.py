@@ -1,14 +1,16 @@
-"""Audit BiDepth against the paper's semantic Type I-IV taxonomy.
+"""Audit BiDepth's released partitions against the paper's Type I-IV taxonomy.
 
 The released OWL loader does not implement Type I-IV filtering.  It loads one
 whole ``<qa_data_root>/<stage>/<split>.json`` file, so this script classifies
-the records by their question/answer semantics and compares that result with
-the directory name and the coarse ``question_type`` field.
+the records by their partition and coarse fields.  It also records lexical
+signals from questions/answers, but those signals are *not* treated as a
+paper-Type classifier.
 
-This is deliberately a conservative audit, not a training-time filter.  Each
-record receives a primary heuristic label plus evidence flags and examples.
-The report makes it possible to decide whether the downloaded JSON files are
-paper stages, cumulative stage files, or a different/revised release.
+This distinction is important: the released ``stage3-mixup`` partition is the
+paper's CoT/mixup partition, so every record in that partition must be counted
+as Type IV for the curriculum audit even if its answer happens to contain
+words such as ``left`` or ``front``.  Keyword matches are retained only as
+diagnostic evidence.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ import hashlib
 import json
 import re
 import sys
+import unicodedata
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -35,7 +38,7 @@ SOURCE_FIELDS = ("audio_id", "reverb_id", "audio_id2", "reverb_id2")
 STAGES = ("stage1-clsdoa", "stage2-single", "stage3-mixup")
 SPLITS = ("train", "val", "test")
 
-YES_NO_RE = re.compile(r"^\s*(yes|no)\s*[.!]?\s*$", re.IGNORECASE)
+YES_NO_RE = re.compile(r"^(yes|no)$", re.IGNORECASE)
 POSITION_RE = re.compile(
     r"\b(?:one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s*o'?clock\b"
     r"|\b(?:up|down)\b.*\b\d+(?:\.\d+)?\b",
@@ -70,40 +73,92 @@ def _source_shape(record: dict[str, Any]) -> str:
     return "single"
 
 
+def _normalized_answer(answer: Any) -> str:
+    """Normalize harmless formatting while preserving answer semantics."""
+    text = unicodedata.normalize("NFKC", str(answer or "")).strip().lower()
+    text = text.strip(" \t\r\n\"'`([{<")
+    text = text.strip(" \t\r\n\"'`.。!?！？;；:,，)]}>")
+    return text
+
+
+def _binary_answer_label(answer: Any) -> str | None:
+    normalized = _normalized_answer(answer)
+    if YES_NO_RE.fullmatch(normalized):
+        return normalized.capitalize()
+    return None
+
+
+def _coarse_field_type(record: dict[str, Any]) -> str:
+    return str(record.get("question_type", "<missing>")).strip().upper()
+
+
+def _stable_field_mapping(field_type: str) -> str | None:
+    """Map the released coarse task field to paper Type I/II."""
+    return {
+        "CLASSIFICATION": "Type_I",
+        "DOA": "Type_II",
+    }.get(field_type)
+
+
+def _paper_assignment(stage: str, record: dict[str, Any]) -> tuple[str | None, str]:
+    """Assign curriculum type using explicit release rules.
+
+    Type III is identified by an exact Yes/No answer *and* two source IDs.
+    Remaining Type I/II records use the stable released ``question_type``
+    mapping.  Stage 3 is authoritative Type IV by partition contract.
+    """
+    shape = _source_shape(record)
+    binary_label = _binary_answer_label(record.get("answer"))
+    field_type = _coarse_field_type(record)
+    if stage == "stage3-mixup":
+        return "Type_IV", "stage3_partition_contract"
+    if binary_label is not None and shape == "dual":
+        return "Type_III", "dual_exact_yes_no_answer"
+    mapped = _stable_field_mapping(field_type)
+    if mapped is not None:
+        if binary_label is not None and shape != "dual":
+            return mapped, "single_source_yes_no_field_mapping_anomaly"
+        return mapped, "stable_question_type_mapping"
+    return None, "unknown_question_type"
+
+
 def _type_evidence(record: dict[str, Any]) -> dict[str, Any]:
     question = str(record.get("question", ""))
     answer = str(record.get("answer", ""))
     question_lower = question.lower()
     answer_lower = answer.lower()
     source_shape = _source_shape(record)
-    answer_yes_no = bool(YES_NO_RE.match(answer))
+    binary_label = _binary_answer_label(answer)
+    answer_yes_no = binary_label is not None
     has_position = bool(POSITION_RE.search(answer))
     has_cot = bool(COT_RE.search(answer))
     has_relation_question = bool(RELATIONAL_RE.search(question))
     has_doa_question = bool(DOA_QUESTION_RE.search(question))
     has_classification_question = bool(CLASSIFICATION_QUESTION_RE.search(question))
 
-    # Type III is the strongest lexical case: dual source, relational query,
-    # and a binary answer. Type IV is dual-source relational reasoning with an
-    # explanatory answer rather than a bare Yes/No. Type I/II are separated by
-    # event-label versus position/DoA answer patterns.
+    # These are diagnostic signals only.  They are intentionally not promoted
+    # to the paper's Type I-IV labels: Type IV CoT answers routinely contain
+    # direction/event words, which makes keyword classification unreliable.
     if source_shape == "dual" and answer_yes_no and (
         has_relation_question or not has_position
     ):
-        inferred = "Type_III"
+        heuristic_type = "Type_III_candidate"
     elif source_shape == "dual" and (has_cot or (has_relation_question and has_position)):
-        inferred = "Type_IV"
+        heuristic_type = "Type_IV_candidate"
     elif has_position or (has_doa_question and not has_classification_question):
-        inferred = "Type_II"
+        heuristic_type = "Type_II_candidate"
     elif has_classification_question or not has_position:
-        inferred = "Type_I"
+        heuristic_type = "Type_I_candidate"
     else:
-        inferred = "Uncertain"
+        heuristic_type = "Uncertain_candidate"
 
     return {
-        "inferred_type": inferred,
+        "heuristic_type_candidate": heuristic_type,
         "source_shape": source_shape,
         "question_type_field": record.get("question_type"),
+        "stable_field_type": _coarse_field_type(record),
+        "stable_field_mapping": _stable_field_mapping(_coarse_field_type(record)),
+        "binary_answer_label": binary_label,
         "answer_is_bare_yes_no": answer_yes_no,
         "answer_has_position_pattern": has_position,
         "answer_has_cot_marker": has_cot,
@@ -124,7 +179,7 @@ def _record_example(record: dict[str, Any], evidence: dict[str, Any], index: int
         "record_index": index,
         "question_id": record.get("question_id"),
         "question_type_field": record.get("question_type"),
-        "inferred_type": evidence["inferred_type"],
+        "heuristic_type_candidate": evidence["heuristic_type_candidate"],
         "source_shape": evidence["source_shape"],
         "audio_id": record.get("audio_id"),
         "reverb_id": record.get("reverb_id"),
@@ -138,30 +193,52 @@ def _record_example(record: dict[str, Any], evidence: dict[str, Any], index: int
 
 def _audit_file(path: Path, stage: str, split: str) -> dict[str, Any]:
     records, container = _load_records(path)
-    inferred_counts: Counter[str] = Counter()
+    heuristic_counts: Counter[str] = Counter()
     matrix: Counter[tuple[str, str, str]] = Counter()
+    authoritative_counts: Counter[str] = Counter()
+    assignment_reasons: Counter[str] = Counter()
     shape_counts: Counter[str] = Counter()
+    assignment_by_shape: Counter[tuple[str, str]] = Counter()
+    assignment_by_field: Counter[tuple[str, str]] = Counter()
+    binary_by_shape: Counter[tuple[str, str]] = Counter()
+    binary_by_field: Counter[tuple[str, str]] = Counter()
+    unknown_fields: Counter[str] = Counter()
+    binary_single_source_count = 0
     source_ids: dict[str, set[str]] = {field: set() for field in SOURCE_FIELDS}
     examples: dict[str, list[dict[str, Any]]] = defaultdict(list)
     uncertain_examples: list[dict[str, Any]] = []
 
     for index, record in enumerate(records):
         if not isinstance(record, dict):
-            inferred_counts["Invalid_record"] += 1
+            heuristic_counts["Invalid_record"] += 1
             continue
         evidence = _type_evidence(record)
-        inferred = evidence["inferred_type"]
+        heuristic_type = evidence["heuristic_type_candidate"]
         source_shape = evidence["source_shape"]
-        field_type = str(record.get("question_type", "<missing>"))
-        inferred_counts[inferred] += 1
+        field_type = _coarse_field_type(record)
+        heuristic_counts[heuristic_type] += 1
+        authoritative_type, assignment_reason = _paper_assignment(stage, record)
+        if authoritative_type is not None:
+            authoritative_counts[authoritative_type] += 1
+            assignment_by_shape[(authoritative_type, source_shape)] += 1
+            assignment_by_field[(authoritative_type, field_type)] += 1
+        assignment_reasons[assignment_reason] += 1
+        binary_label = _binary_answer_label(record.get("answer"))
+        if binary_label is not None:
+            binary_by_shape[(binary_label, source_shape)] += 1
+            binary_by_field[(binary_label, field_type)] += 1
+            if source_shape != "dual":
+                binary_single_source_count += 1
+        if _stable_field_mapping(field_type) is None:
+            unknown_fields[field_type] += 1
         shape_counts[source_shape] += 1
-        matrix[(inferred, field_type, source_shape)] += 1
+        matrix[(heuristic_type, field_type, source_shape)] += 1
         for field in SOURCE_FIELDS:
             if _present(record.get(field)):
                 source_ids[field].add(_norm_path(str(record[field])))
-        if len(examples[inferred]) < 5:
-            examples[inferred].append(_record_example(record, evidence, index))
-        if inferred == "Uncertain" and len(uncertain_examples) < 20:
+        if len(examples[heuristic_type]) < 5:
+            examples[heuristic_type].append(_record_example(record, evidence, index))
+        if heuristic_type == "Uncertain_candidate" and len(uncertain_examples) < 20:
             uncertain_examples.append(_record_example(record, evidence, index))
 
     return {
@@ -170,16 +247,91 @@ def _audit_file(path: Path, stage: str, split: str) -> dict[str, Any]:
         "split": split,
         "container": container,
         "record_count": len(records),
-        "inferred_type_counts": dict(inferred_counts),
+        "partition_contract": _partition_contract(stage),
+        "authoritative_paper_type_counts": dict(authoritative_counts),
+        "assignment_reason_counts": dict(assignment_reasons),
+        "assignment_by_source_shape": {
+            f"{paper_type}/{shape}": count
+            for (paper_type, shape), count in sorted(assignment_by_shape.items())
+        },
+        "assignment_by_question_type_field": {
+            f"{paper_type}/{field_type}": count
+            for (paper_type, field_type), count in sorted(assignment_by_field.items())
+        },
+        "binary_yes_no_counts": {
+            "total": sum(binary_by_shape.values()),
+            "by_label_and_source_shape": {
+                f"{label}/{shape}": count
+                for (label, shape), count in sorted(binary_by_shape.items())
+            },
+            "by_label_and_question_type_field": {
+                f"{label}/{field_type}": count
+                for (label, field_type), count in sorted(binary_by_field.items())
+            },
+            "single_source_binary_count": binary_single_source_count,
+            "dual_source_binary_count": sum(
+                count for (label, shape), count in binary_by_shape.items() if shape == "dual"
+            ),
+        },
+        "stable_field_mapping_validation": {
+            "mapping": {
+                "CLASSIFICATION": "Type_I",
+                "DOA": "Type_II",
+            },
+            "unknown_question_type_field_counts": dict(unknown_fields),
+            "known_question_type_field_total": sum(
+                count for field_type, count in Counter(
+                    _coarse_field_type(record)
+                    for record in records
+                    if isinstance(record, dict)
+                ).items()
+                if _stable_field_mapping(field_type) is not None
+            ),
+        },
+        "heuristic_signal_counts_not_for_training": dict(heuristic_counts),
         "source_shape_counts": dict(shape_counts),
         "field_type_counts": dict(Counter(str(record.get("question_type", "<missing>")) for record in records if isinstance(record, dict))),
-        "inferred_type_field_type_source_matrix": {
+        "heuristic_signal_field_type_source_matrix": {
             f"{inferred}/{field_type}/{shape}": count
             for (inferred, field_type, shape), count in sorted(matrix.items())
         },
         "unique_source_id_counts": {field: len(values) for field, values in source_ids.items()},
-        "examples_by_inferred_type": dict(examples),
+        "examples_by_heuristic_signal": dict(examples),
         "uncertain_examples": uncertain_examples,
+    }
+
+
+def _authoritative_type(stage: str, record: dict[str, Any]) -> str | None:
+    """Return only labels justified by the released partition contract.
+
+    Stage 3 is a curriculum partition, not a bag of keyword-matched answers:
+    its complete released split is the COT/mixup Type-IV data.  For the
+    single-source cls/doa warmup, the coarse field has the stable mapping
+    CLASSIFICATION -> Type I and DOA -> Type II.  The current stage2 file is
+    mixed/cumulative (it contains both source shapes and both coarse fields),
+    so the script deliberately refuses to assign one paper Type to it.
+    """
+    return _paper_assignment(stage, record)[0]
+
+
+def _partition_contract(stage: str) -> dict[str, Any]:
+    if stage == "stage1-clsdoa":
+        return {
+            "status": "authoritative_for_coarse_field_mapping",
+            "paper_types": ["Type_I", "Type_II"],
+            "mapping": {"CLASSIFICATION": "Type_I", "DOA": "Type_II"},
+        }
+    if stage == "stage3-mixup":
+        return {
+            "status": "authoritative_partition_label",
+            "paper_types": ["Type_IV"],
+            "mapping": "all records are treated as Type_IV for curriculum accounting",
+        }
+    return {
+        "status": "mixed_release_partition_not_assigned",
+        "paper_types": [],
+        "mapping": None,
+        "reason": "stage2-single contains multiple source shapes and coarse task fields; lexical guesses are diagnostic only",
     }
 
 
@@ -193,7 +345,173 @@ def _stage_file_summary(root: Path) -> dict[str, Any]:
             if path.is_file():
                 stage_result["files"][split] = _audit_file(path, stage, split)
         result[stage] = stage_result
+    stage1_path = root / "owl-questions" / "stage1-clsdoa" / "train.json"
+    stage2_path = root / "owl-questions" / "stage2-single" / "train.json"
+    if stage1_path.is_file() and stage2_path.is_file():
+        stage1_records, _ = _load_records(stage1_path)
+        stage2_records, _ = _load_records(stage2_path)
+        result["stage2-single"]["train_delta_after_stage1"] = _stage2_delta_summary(
+            stage1_records, stage2_records
+        )
+        result["stage12_train_composition"] = _stage12_composition_summary(
+            stage1_records, stage2_records
+        )
     return result
+
+
+def _stage2_delta_summary(
+    stage1_records: list[dict[str, Any]], stage2_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Describe records newly appearing in stage2 relative to stage1.
+
+    This is the useful audit for a cumulative release: it avoids assigning
+    the whole 599,831-record stage2 file to paper Stage 2 when 330,714 records
+    are already present in stage1.
+    """
+    stage1_counter = Counter(
+        _canonical_record(record) for record in stage1_records if isinstance(record, dict)
+    )
+    stage2_counter = Counter(
+        _canonical_record(record) for record in stage2_records if isinstance(record, dict)
+    )
+    delta_counter = stage2_counter - stage1_counter
+    field_counts: Counter[str] = Counter()
+    shape_counts: Counter[str] = Counter()
+    paper_type_counts: Counter[str] = Counter()
+    paper_type_shape_counts: Counter[tuple[str, str]] = Counter()
+    yes_no_count = 0
+    cot_signal_count = 0
+    examples: list[dict[str, Any]] = []
+    for encoded, count in delta_counter.items():
+        record = json.loads(encoded)
+        evidence = _type_evidence(record)
+        field_counts[str(record.get("question_type", "<missing>"))] += count
+        shape_counts[evidence["source_shape"]] += count
+        paper_type, _ = _paper_assignment("stage2-single", record)
+        if paper_type is not None:
+            paper_type_counts[paper_type] += count
+            paper_type_shape_counts[(paper_type, evidence["source_shape"])] += count
+        yes_no_count += int(evidence["answer_is_bare_yes_no"]) * count
+        cot_signal_count += int(evidence["answer_has_cot_marker"]) * count
+        if len(examples) < 10:
+            examples.append(_record_example(record, evidence, -1))
+    return {
+        "stage1_record_count": len(stage1_records),
+        "stage2_record_count": len(stage2_records),
+        "stage2_delta_record_count": sum(delta_counter.values()),
+        "stage2_contains_stage1_as_multiset": not (Counter(
+            _canonical_record(record) for record in stage1_records if isinstance(record, dict)
+        ) - Counter(
+            _canonical_record(record) for record in stage2_records if isinstance(record, dict)
+        )),
+        "delta_field_type_counts": dict(field_counts),
+        "delta_source_shape_counts": dict(shape_counts),
+        "delta_paper_type_counts": dict(paper_type_counts),
+        "delta_paper_type_source_shape_counts": {
+            f"{paper_type}/{shape}": count
+            for (paper_type, shape), count in sorted(paper_type_shape_counts.items())
+        },
+        "delta_bare_yes_no_count": yes_no_count,
+        "delta_cot_lexical_signal_count_not_authoritative": cot_signal_count,
+        "delta_examples": examples,
+        "interpretation": "The delta is the candidate new curriculum material; its paper Type still requires semantic/manual confirmation, not keyword inference.",
+    }
+
+
+def _source_tuple_key(record: dict[str, Any]) -> tuple[str, str, str, str]:
+    return tuple(
+        _norm_path(str(record.get(field))) if _present(record.get(field)) else "<none>"
+        for field in SOURCE_FIELDS
+    )
+
+
+def _composition_for_records(records: list[dict[str, Any]], stage: str) -> dict[str, Any]:
+    record_counter: Counter[str] = Counter()
+    tuple_counter: Counter[tuple[str, str, str, str]] = Counter()
+    record_type_counts: Counter[str] = Counter()
+    record_shape_counts: Counter[str] = Counter()
+    tuple_shape_counts: Counter[str] = Counter()
+    tuple_type_counts: Counter[str] = Counter()
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        record_counter[_canonical_record(record)] += 1
+        tuple_key = _source_tuple_key(record)
+        tuple_counter[tuple_key] += 1
+        shape = _source_shape(record)
+        record_shape_counts[shape] += 1
+        tuple_shape_counts[shape] += 0
+        paper_type, _ = _paper_assignment(stage, record)
+        if paper_type is not None:
+            record_type_counts[paper_type] += 1
+            tuple_type_counts[paper_type] += 0
+    # A source tuple can generate multiple questions.  For tuple-level counts,
+    # assign a type only when all records sharing that tuple agree.
+    tuple_records: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    for record in records:
+        if isinstance(record, dict):
+            tuple_records[_source_tuple_key(record)].append(record)
+    tuple_type_conflicts = 0
+    for tuple_key, tuple_items in tuple_records.items():
+        shapes = {_source_shape(item) for item in tuple_items}
+        tuple_shape_counts[next(iter(shapes)) if len(shapes) == 1 else "mixed"] += 1
+        types = {_paper_assignment(stage, item)[0] for item in tuple_items}
+        types.discard(None)
+        if len(types) == 1:
+            tuple_type_counts[next(iter(types))] += 1
+        elif len(types) > 1:
+            tuple_type_conflicts += 1
+    return {
+        "record_count": len([record for record in records if isinstance(record, dict)]),
+        "unique_record_count": len(record_counter),
+        "source_tuple_count": len(tuple_counter),
+        "source_tuple_reuse_histogram": dict(Counter(tuple_counter.values())),
+        "record_source_shape_counts": dict(record_shape_counts),
+        "source_tuple_shape_counts": dict(tuple_shape_counts),
+        "record_paper_type_counts": dict(record_type_counts),
+        "source_tuple_paper_type_counts": dict(tuple_type_counts),
+        "source_tuple_paper_type_conflict_count": tuple_type_conflicts,
+    }
+
+
+def _stage12_composition_summary(
+    stage1_records: list[dict[str, Any]], stage2_records: list[dict[str, Any]]
+) -> dict[str, Any]:
+    stage1_counter = Counter(
+        _canonical_record(record) for record in stage1_records if isinstance(record, dict)
+    )
+    stage2_counter = Counter(
+        _canonical_record(record) for record in stage2_records if isinstance(record, dict)
+    )
+    delta_records: list[dict[str, Any]] = []
+    for encoded, count in (stage2_counter - stage1_counter).items():
+        delta_records.extend([json.loads(encoded)] * count)
+    union_records: list[dict[str, Any]] = []
+    for encoded, count in (stage1_counter | stage2_counter).items():
+        union_records.extend([json.loads(encoded)] * count)
+    return {
+        "units_note": "record_count is JSON QA records; source_tuple_count is unique audio/reverb source tuple count. Both are reported because paper dataset sizes may use different units.",
+        "stage1_file": _composition_for_records(stage1_records, "stage1-clsdoa"),
+        "stage2_file": _composition_for_records(stage2_records, "stage2-single"),
+        "stage2_delta_after_stage1": _composition_for_records(delta_records, "stage2-single"),
+        "stage1_union_stage2": _composition_for_records(union_records, "stage2-single"),
+        "paper_target_reference": {
+            "stage1": {
+                "single_source_about": 270000,
+                "dual_source_about": 270000,
+                "types": ["Type_I", "Type_II"],
+            },
+            "stage2": {
+                "new_dual_source_about": 300000,
+                "type": "Type_III",
+            },
+            "cumulative_stage1_plus_stage2": {
+                "single_source_about": 270000,
+                "dual_source_about": 570000,
+            },
+            "comparison_warning": "Compare both JSON record counts and unique source-tuple counts; do not silently equate them.",
+        },
+    }
 
 
 def _semantic_expectations() -> dict[str, Any]:
@@ -202,6 +520,25 @@ def _semantic_expectations() -> dict[str, Any]:
             "paper_meaning": "event detection",
             "expected_answers": "event/category labels",
             "expected_source_conditions": "single and dual",
+        },
+        "released_partition_contract": {
+            "stage1-clsdoa": {
+                "paper_role": "single-source Type I/II warmup partition",
+                "authoritative_mapping": {
+                    "CLASSIFICATION": "Type_I",
+                    "DOA": "Type_II",
+                },
+            },
+            "stage2-single": {
+                "paper_role": "mixed/cumulative release partition; do not map the whole file to paper Stage 2",
+                "authoritative_mapping": None,
+                "reason": "the observed file contains both single and dual source records and both CLASSIFICATION and DOA records",
+            },
+            "stage3-mixup": {
+                "paper_role": "paper Stage 3 CoT/mixup partition",
+                "authoritative_mapping": "Type_IV",
+                "reason": "partition semantics override lexical answer-word heuristics",
+            },
         },
         "Type_II": {
             "paper_meaning": "absolute direction/azimuth/elevation/distance estimation",
@@ -236,6 +573,7 @@ def main() -> None:
     print(f"[python] version={sys.version.split()[0]} executable={sys.executable}")
     print(f"[bidepth] root={args.bidepth_root}")
     print(f"[scope] stages={args.stages} splits={SPLITS}")
+    all_file_reports = _stage_file_summary(args.bidepth_root)
     report: dict[str, Any] = {
         "status": "ok",
         "python": {"version": sys.version, "executable": sys.executable},
@@ -245,8 +583,10 @@ def main() -> None:
             "whole_json_loaded": True,
             "question_type_used_for_filtering": False,
             "question_type_used_for_inference_key": True,
+            "paper_type_filter_in_official_loader": False,
         },
-        "files": _stage_file_summary(args.bidepth_root),
+        "files": all_file_reports,
+        "stage12_train_composition": all_file_reports.get("stage12_train_composition"),
         "audit_contract": {
             "read_only": True,
             "gpu_model_loaded": False,
@@ -267,9 +607,28 @@ def main() -> None:
         for split, item in stage_report.get("files", {}).items():
             print(
                 f"[summary] {stage}/{split} records={item['record_count']} "
-                f"types={item['inferred_type_counts']} "
+                f"paper_types={item['authoritative_paper_type_counts']} "
+                f"heuristic_signals={item['heuristic_signal_counts_not_for_training']} "
                 f"shapes={item['source_shape_counts']}"
             )
+    composition = report.get("stage12_train_composition")
+    if composition:
+        print(
+            "[composition] stage1="
+            f"{composition['stage1_file']['record_source_shape_counts']} "
+            "stage2="
+            f"{composition['stage2_file']['record_source_shape_counts']} "
+            "stage2_delta="
+            f"{composition['stage2_delta_after_stage1']['record_source_shape_counts']}"
+        )
+        print(
+            "[composition] paper_types stage1="
+            f"{composition['stage1_file']['record_paper_type_counts']} "
+            "stage2="
+            f"{composition['stage2_file']['record_paper_type_counts']} "
+            "stage2_delta="
+            f"{composition['stage2_delta_after_stage1']['record_paper_type_counts']}"
+        )
     print(f"[status] {report['status']}")
 
 
