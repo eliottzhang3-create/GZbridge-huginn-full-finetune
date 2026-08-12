@@ -75,7 +75,20 @@ mkdir -p /hpc_stor03/sjtu_home/jinwei.zhang/models/OWL/SAGE
 mkdir -p /hpc_stor03/sjtu_home/jinwei.zhang/data/BiDepth
 ```
 
-## 4. Assets not to download yet
+## 4. Submit the Phase 1 audit
+
+The audit is CPU-only internally, but its supported entry point is a submitted
+job so it follows the project's remote execution policy:
+
+```bash
+bash code/Ouro_audio/owl/run_inspect_phase1_remote_assets_4090.sh
+```
+
+This submits to `pdgpu-4090` and runs
+`scripts/inspect_phase1_remote_assets.sh`. It does not instantiate SAGE on a
+GPU; it only audits the checkpoint container and BiDepth JSON metadata.
+
+## 5. Assets not to download yet
 
 Do not download AudioSet-20K or another large anechoic-audio collection yet.
 The released OWL launcher has an `anechoic_data_root` argument, but the public

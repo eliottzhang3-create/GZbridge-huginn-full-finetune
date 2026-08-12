@@ -22,6 +22,11 @@ The authoritative Phase 0 contract is `configs/phase0_contract.json`.
 Weights, datasets, and generated checkpoints remain on the remote Linux
 server; they are not committed to this repository.
 
+The existing native Ouro inspection also profiles one complete no-cache
+forward. Its report distinguishes unique active physical parameters from the
+four-step parameter-use count, reports linear-projection FLOPs and supported
+PyTorch-profiler FLOPs, and records the peak CUDA allocation increment.
+
 The downloaded Ouro model directory must retain its remote-code files,
 including `configuration_ouro.py` and `modeling_ouro.py`. The local branch
 loads them with Transformers `trust_remote_code=True`; copying a second copy
