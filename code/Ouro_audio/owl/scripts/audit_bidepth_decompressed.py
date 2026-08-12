@@ -163,14 +163,25 @@ def _overlap_report(
     locations: dict[str, dict[Any, set[str]]] = {
         name: defaultdict(set) for name in key_builders
     }
+    exact_record_locations: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for split_name, records in records_by_split.items():
-        for record in records:
+        for record_index, record in enumerate(records):
             if not isinstance(record, dict):
                 continue
             for name, builder in key_builders.items():
                 key = builder(record)
                 if key not in ("", ("", "", "", "")):
                     locations[name][key].add(split_name)
+            exact_key = key_builders["exact_record"](record)
+            exact_record_locations[exact_key].append(
+                {
+                    "split": split_name,
+                    "record_index": record_index,
+                    "question_id": record.get("question_id"),
+                    "question_type": record.get("question_type"),
+                    "source_tuple": list(_source_key(record)),
+                }
+            )
 
     same_stage: dict[str, Any] = {}
     cross_stage: dict[str, Any] = {}
@@ -191,9 +202,35 @@ def _overlap_report(
         same_stage[key_name] = same_stage_count
         cross_stage[key_name] = cross_stage_count
         same_stage.setdefault("examples", {})[key_name] = examples
+    exact_pair_counts: Counter[str] = Counter()
+    exact_duplicate_examples: list[dict[str, Any]] = []
+    for fingerprint, items in exact_record_locations.items():
+        split_names = sorted({item["split"] for item in items})
+        if len(split_names) < 2:
+            continue
+        for index, left in enumerate(split_names):
+            for right in split_names[index + 1 :]:
+                left_stage = left.split("/", 1)[0]
+                right_stage = right.split("/", 1)[0]
+                if left_stage == right_stage:
+                    exact_pair_counts[f"{left} <-> {right}"] += 1
+        stages = {split_name.split("/", 1)[0] for split_name in split_names}
+        if len(stages) == 1 and len(exact_duplicate_examples) < 50:
+            exact_duplicate_examples.append(
+                {
+                    "fingerprint": hashlib.sha1(fingerprint.encode("utf-8")).hexdigest(),
+                    "locations": [
+                        item for item in items
+                        if item["split"].split("/", 1)[0] in stages
+                    ],
+                }
+            )
+
     return {
         "same_stage_split_overlap_key_counts": same_stage,
         "cross_stage_overlap_key_counts": cross_stage,
+        "same_stage_exact_record_duplicate_pair_counts": dict(exact_pair_counts),
+        "same_stage_exact_record_duplicate_examples": exact_duplicate_examples,
         "interpretation": (
             "Exact record overlap within train/val/test is a hard leakage finding. "
             "Source tuple overlap across curriculum stages can be intentional, "
