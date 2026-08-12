@@ -1,0 +1,63 @@
+{
+  "phase": "phase1",
+  "status": "awaiting_user_asset_upload",
+  "queue": "pdgpu-5090",
+  "required_downloads": [
+    {
+      "name": "SAGE pretrained checkpoint",
+      "source": "https://huggingface.co/BASH-Lab/OWL",
+      "hf_repo": "BASH-Lab/OWL",
+      "hf_repo_type": "model",
+      "hf_revision": "main",
+      "hf_files": [
+        "SAGE/finetuned.pth"
+      ],
+      "approx_size": "1.04 GB",
+      "local_expected_path": "OWL-assets/SAGE/finetuned.pth",
+      "remote_expected_path": "/hpc_stor03/sjtu_home/jinwei.zhang/models/OWL/SAGE/finetuned.pth",
+      "required": true
+    },
+    {
+      "name": "BiDepth dataset",
+      "source": "https://huggingface.co/datasets/BASH-Lab/BiDepth",
+      "hf_repo": "BASH-Lab/BiDepth",
+      "hf_repo_type": "dataset",
+      "hf_revision": "main",
+      "hf_files": [
+        "owl-questions/",
+        "reverb.tar.gz",
+        "README.md",
+        ".gitattributes"
+      ],
+      "approx_size": "5.63 GB",
+      "local_expected_path": "BiDepth/",
+      "remote_expected_path": "/hpc_stor03/sjtu_home/jinwei.zhang/data/BiDepth/",
+      "required": true,
+      "upload_archive_intact": true
+    }
+  ],
+  "already_available_remotely": [
+    {
+      "name": "Ouro-1.4B",
+      "path": "/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B",
+      "required_remote_code": [
+        "configuration_ouro.py",
+        "modeling_ouro.py"
+      ]
+    }
+  ],
+  "not_downloaded_yet": [
+    {
+      "name": "AudioSet original/anechoic audio",
+      "reason": "official train.sh references anechoic_data_root, but the released BiDepth archive contents and official dataset loader must be inspected first"
+    },
+    {
+      "name": "OWL full model zoo",
+      "reason": "we only need SAGE/finetuned.pth; the original LLM checkpoints are not used"
+    },
+    {
+      "name": "OWL full source repository as a data asset",
+      "reason": "the needed source will be synchronized through the code branch or pinned as a remote third_party checkout"
+    }
+  ]
+}

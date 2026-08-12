@@ -1,0 +1,212 @@
+{
+  "contract_version": "ouro-owl-phase0-2026-08-11",
+  "branch": {
+    "name": "ouro_owl_sage",
+    "parent": "Ouro_audio",
+    "isolate_from": [
+      "ouro_text_native",
+      "huginn",
+      "hrm_text"
+    ],
+    "phase0_status": "frozen"
+  },
+  "scope": {
+    "included": [
+      "OWL downstream Stage 1",
+      "OWL downstream Stage 2",
+      "SAGE frozen audio encoder",
+      "official OWL Q-Former",
+      "Ouro-1.4B Q/K/V LoRA"
+    ],
+    "excluded": [
+      "OWL Stage 3 Type IV CoT training",
+      "SAGE pretraining or finetuning",
+      "Whisper audio encoder",
+      "depth or RIR auxiliary inputs",
+      "Ouro gate training",
+      "Ouro gate regularization",
+      "KV cache during training"
+    ]
+  },
+  "remote_assets": {
+    "ouro": {
+      "model_id": "ByteDance/Ouro-1.4B",
+      "path": "/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B",
+      "revision": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1",
+      "required_files": [
+        "config.json",
+        "configuration_ouro.py",
+        "modeling_ouro.py",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+        "merges.txt"
+      ],
+      "loading_mode": "transformers_trust_remote_code_local_files_only"
+    },
+    "sage": {
+      "model_id": "BASH-Lab/OWL",
+      "checkpoint_relative_path": "SAGE/finetuned.pth",
+      "remote_path": "/hpc_stor03/sjtu_home/jinwei.zhang/models/OWL/SAGE/finetuned.pth",
+      "loading_mode": "official_owl_sage_torch_checkpoint"
+    },
+    "owl_source": {
+      "repository": "https://github.com/BASHLab/OWL",
+      "source_role": "architecture_and_dataset_reference"
+    },
+    "bidpth": {
+      "dataset_id": "BASH-Lab/BiDepth",
+      "remote_root": "/hpc_stor03/sjtu_home/jinwei.zhang/data/BiDepth",
+      "source_role": "OWL QA/audio data"
+    }
+  },
+  "model": {
+    "ouro_model_type": "ouro",
+    "total_ut_steps": 4,
+    "early_exit_threshold": 1.0,
+    "train_gate": false,
+    "train_backbone": false,
+    "use_cache": false,
+    "train_sage": false
+  },
+  "trainable_components": {
+    "sage": false,
+    "qformer": true,
+    "ouro_backbone": false,
+    "ouro_lm_head": false,
+    "ouro_embeddings": false,
+    "ouro_norms": false,
+    "ouro_mlp": false,
+    "ouro_o_proj": false,
+    "ouro_early_exit_gate": false,
+    "lora": true
+  },
+  "sage": {
+    "input": "raw_binaural_waveform",
+    "expected_input_shape": "[batch, 2, time]",
+    "sample_rate_hz": 32000,
+    "stft_n_fft": 1024,
+    "stft_hop_length": 320,
+    "mel_bins": 128,
+    "embed_dim": 768,
+    "depth": 12,
+    "num_heads": 12,
+    "num_cls_tokens": 3,
+    "expected_output_shape": "[batch, 515, 768]"
+  },
+  "qformer": {
+    "implementation": "official_owl_encoder_projector_qformer",
+    "encoder_hidden_size": 768,
+    "num_hidden_layers": 8,
+    "query_len": 64,
+    "output_hidden_size": 2048,
+    "initialization": "from_scratch",
+    "train_all_parameters": true
+  },
+  "lora": {
+    "rank": 8,
+    "alpha": 32,
+    "dropout": 0.05,
+    "target_modules": [
+      "q_proj",
+      "k_proj",
+      "v_proj"
+    ],
+    "target_scope": "all_24_physical_ouro_layers",
+    "train_o_proj": false,
+    "train_mlp_projections": false
+  },
+  "loss": {
+    "language_loss": "standard_autoregressive_cross_entropy",
+    "next_token_shift": true,
+    "audio_placeholder_labels": -100,
+    "prompt_labels": -100,
+    "answer_labels": "active",
+    "gate_regularization": {
+      "enabled": false,
+      "reason": "early_exit_gate_is_frozen_by_experiment_contract"
+    }
+  },
+  "data_curriculum": {
+    "normalization": "loudness",
+    "augmentation": false,
+    "weighted_sampling": false,
+    "stage1": {
+      "task_types": [
+        "I",
+        "II"
+      ],
+      "single_source": {
+        "expected_samples": "approximately_270K"
+      },
+      "dual_source": {
+        "expected_samples": "approximately_270K"
+      },
+      "expected_total_samples": "approximately_540K",
+      "curriculum_order": "single_source_then_dual_source",
+      "epochs": 2
+    },
+    "stage2": {
+      "task_types": [
+        "III"
+      ],
+      "source_count": "dual_source",
+      "expected_total_samples": "approximately_300K",
+      "epochs": 2
+    },
+    "stage3": {
+      "status": "not_run"
+    }
+  },
+  "optimization": {
+    "optimizer": "AdamW",
+    "learning_rate": 0.0001,
+    "weight_decay": 0.01,
+    "gradient_clip_norm": 1.0,
+    "mixed_precision": "fp16",
+    "scheduler": "owl_stage1_specific_cosine_warmup_to_be_verified",
+    "stage1_warmup_steps": 5000
+  },
+  "hardware": {
+    "temporary_smoke": {
+      "gpu_type": "NVIDIA RTX 4090",
+      "num_gpus": 1,
+      "per_device_train_batch_size": 8,
+      "gradient_accumulation_steps": 1,
+      "global_batch_size": 8,
+      "gpu_submission_required": true,
+      "queue": "pdgpu-4090",
+      "purpose": "single-card multimodal forward/backward and checkpoint smoke"
+    },
+    "formal_target": {
+      "gpu_type": "NVIDIA RTX 5090",
+      "num_gpus": 8,
+      "per_device_train_batch_size": 1,
+      "gradient_accumulation_steps": 1,
+      "global_batch_size": 8,
+      "gpu_submission_required": true,
+      "queue": "pdgpu-5090",
+      "purpose": "later distributed Stage 1/Stage 2 training"
+    }
+  },
+  "audit_requirements": [
+    "SAGE parameters remain frozen and receive no gradients",
+    "Ouro native parameters remain frozen and receive no gradients",
+    "Ouro early_exit_gate remains frozen and receives no gradients",
+    "only Q-Former and Q/K/V LoRA parameters are trainable",
+    "Ouro executes all four recurrent steps",
+    "training uses use_cache=false",
+    "labels use exact next-token shift",
+    "audio positions and prompt positions are masked with -100",
+    "Stage 2 starts from the Stage 1 trainable checkpoint",
+    "checkpoint can be reloaded in a fresh process"
+  ],
+  "open_verifications_before_phase1": [
+    "confirm the actual remote SAGE checkpoint path",
+    "confirm the actual BiDepth remote directory layout",
+    "resolve OWL paper batch-size wording against released code",
+    "resolve linear-versus-half-cycle-cosine warmup wording",
+    "confirm cluster queue spelling for the eight-RTX-5090 allocation"
+  ]
+}
