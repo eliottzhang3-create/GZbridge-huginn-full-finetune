@@ -36,6 +36,32 @@ The report intentionally marks audio references as unresolved when no audio
 root is supplied; this is an audit finding, not an assumption that the audio
 is present in `reverb.tar.gz`.
 
+## Phase 1 decompressed RIR and official-loader audit
+
+Once the remote archive has been extracted to
+`/hpc_stor03/sjtu_home/jinwei.zhang/data/BiDepth/reverb_extracted`, use the
+direct-lookup audit:
+
+```bash
+bash code/Ouro_audio/owl/run_inspect_phase1_decompressed_assets_4090.sh
+```
+
+This job does not rescan the gzip archive. It checks every `reverb_id` and
+`reverb_id2` reference against the extracted tree, loads representative NPY
+files with `allow_pickle=false`, records shape/dtype/finite-value statistics,
+and reports split-level coverage. It also reads the official remote OWL
+checkout and statically audits the dataset loader plus the SAGE, Q-Former,
+multimodal wrapper, and official training launcher. The report distinguishes
+hard integrity issues from source reuse that may be intentional across the
+curriculum stages.
+
+The official OWL checkout is therefore not a model asset and should not be
+copied into `models`. The submitted audit reads it from
+`OWL_SOURCE_ROOT` (default:
+`/hpc_stor03/sjtu_home/jinwei.zhang/code/OWL`). If an offline local copy is
+needed for interactive source reading, place it under a code-only path such
+as `code/Ouro_audio/owl/vendor/official_owl/`, not under `models/`.
+
 ## Phase 1 SAGE native audit
 
 The SAGE audit imports the official OWL SAGE implementation, tries an exact

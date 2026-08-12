@@ -16,6 +16,7 @@ import json
 import math
 import sys
 import tarfile
+import time
 from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
@@ -226,6 +227,14 @@ def _inspect_questions(root: Path) -> tuple[dict[str, Any], dict[str, list[dict[
         for fingerprint, locations in all_fingerprints.items()
         if len(set(locations)) > 1
     }
+    same_stage_split_duplicates: dict[str, list[str]] = {}
+    cross_stage_duplicates: dict[str, list[str]] = {}
+    for fingerprint, locations in cross_split_duplicates.items():
+        stage_names = {location.split("/", 1)[0] for location in locations}
+        if len(stage_names) == 1:
+            same_stage_split_duplicates[fingerprint] = locations
+        else:
+            cross_stage_duplicates[fingerprint] = locations
     invariants: dict[str, Any] = {}
     for stage, splits in stages.items():
         train = splits.get("train", {})
@@ -246,6 +255,14 @@ def _inspect_questions(root: Path) -> tuple[dict[str, Any], dict[str, list[dict[
         "train_union_summary": _record_summary(all_records, questions_root / "<train-union>"),
         "cross_split_exact_duplicate_fingerprint_count": len(cross_split_duplicates),
         "cross_split_exact_duplicate_examples": dict(list(cross_split_duplicates.items())[:20]),
+        "same_stage_split_duplicate_fingerprint_count": len(same_stage_split_duplicates),
+        "same_stage_split_duplicate_examples": dict(
+            list(same_stage_split_duplicates.items())[:20]
+        ),
+        "cross_stage_duplicate_fingerprint_count": len(cross_stage_duplicates),
+        "cross_stage_duplicate_examples": dict(
+            list(cross_stage_duplicates.items())[:20]
+        ),
         "partition_invariants": invariants,
     }, records_by_split
 
@@ -305,6 +322,8 @@ def _inspect_reverb_archive(
         for candidate in _reverb_candidates(ref):
             candidate_to_ref.setdefault(candidate, ref)
 
+    started = time.monotonic()
+    last_progress = started
     print(f"[reverb] streaming archive index: {archive_path}", flush=True)
     with tarfile.open(archive_path, mode="r:gz") as archive:
         for member in archive:
@@ -327,10 +346,28 @@ def _inspect_reverb_archive(
                 else:
                     raw = extracted.read()
                     sample_payloads[target_ref] = _inspect_npy_bytes(raw, name)
+            now = time.monotonic()
+            if now - last_progress >= 30.0:
+                print(
+                    f"[reverb] progress members={member_count} files={file_count} "
+                    f"matched_refs={len(matched_refs)}/{len(reverb_refs)} "
+                    f"elapsed_seconds={now - started:.1f}",
+                    flush=True,
+                )
+                last_progress = now
 
     missing = sorted(reverb_refs - set(matched_refs))
+    elapsed_seconds = time.monotonic() - started
+    print(
+        f"[reverb] completed members={member_count} files={file_count} "
+        f"matched_refs={len(matched_refs)}/{len(reverb_refs)} "
+        f"elapsed_seconds={elapsed_seconds:.1f}",
+        flush=True,
+    )
     return {
         "status": "ok",
+        "scan_completed": True,
+        "scan_seconds": elapsed_seconds,
         "path": str(archive_path),
         "size_bytes": archive_path.stat().st_size,
         "member_count": member_count,
@@ -504,8 +541,12 @@ def main() -> None:
         issues.append("reverb_reference_missing")
     if report["audio_roots"].get("status") != "ok":
         issues.append("audio_references_unresolved")
-    if questions["cross_split_exact_duplicate_fingerprint_count"]:
-        issues.append("cross_split_exact_duplicates_present")
+    if questions["same_stage_split_duplicate_fingerprint_count"]:
+        issues.append("same_stage_split_duplicates_present")
+    if questions["cross_stage_duplicate_fingerprint_count"]:
+        report.setdefault("findings", []).append(
+            "cross_stage_duplicates_present; these may be intentional curriculum reuse"
+        )
     report["issues"] = issues
     report["status"] = "incomplete" if issues else "ok"
 
