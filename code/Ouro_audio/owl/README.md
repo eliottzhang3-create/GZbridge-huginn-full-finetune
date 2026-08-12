@@ -95,3 +95,21 @@ The downloaded Ouro model directory must retain its remote-code files,
 including `configuration_ouro.py` and `modeling_ouro.py`. The local branch
 loads them with Transformers `trust_remote_code=True`; copying a second copy
 into the local `models` directory is intentionally not part of Phase 0.
+
+## Stage 1/2 train-contract audit
+
+For the current training decision, use the focused audit instead of the
+val/test overlap report:
+
+```bash
+bash code/Ouro_audio/owl/run_inspect_phase1_train_contract_4090.sh
+```
+
+It only analyzes `stage1-clsdoa/train.json` and `stage2-single/train.json`.
+For each stage it reports the single/dual source shape inferred from
+`audio_id2` and `reverb_id2`, unique anechoic and RIR references, RIR coverage,
+representative NPY payloads, and whether an external `--audio-root` resolves
+the `audio_id` references. It also records the exact path/convolution/fixed
+length behavior found in the official loader and the official training
+launcher. The intended current evaluation policy is `train` for optimization,
+`val` for validation, and no use of `test`.

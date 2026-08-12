@@ -136,6 +136,76 @@ def _source_key(record: dict[str, Any]) -> tuple[str, ...]:
     )
 
 
+def _canonical_record(record: dict[str, Any]) -> str:
+    return json.dumps(
+        record,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _digest_strings(values: Iterable[str], *, sort_values: bool) -> str:
+    import hashlib as _hashlib
+
+    ordered = sorted(values) if sort_values else list(values)
+    digest = _hashlib.sha256()
+    for value in ordered:
+        digest.update(value.encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _split_equality_report(
+    records_by_split: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Compare val/test as ordered sequences and as record multisets."""
+
+    result: dict[str, Any] = {}
+    for stage in sorted({name.split("/", 1)[0] for name in records_by_split}):
+        val_name = f"{stage}/val"
+        test_name = f"{stage}/test"
+        if val_name not in records_by_split or test_name not in records_by_split:
+            continue
+        val_records = [
+            record for record in records_by_split[val_name] if isinstance(record, dict)
+        ]
+        test_records = [
+            record for record in records_by_split[test_name] if isinstance(record, dict)
+        ]
+        val_keys = [_canonical_record(record) for record in val_records]
+        test_keys = [_canonical_record(record) for record in test_records]
+        val_counter = Counter(val_keys)
+        test_counter = Counter(test_keys)
+        intersection_counter = val_counter & test_counter
+        only_val_counter = val_counter - test_counter
+        only_test_counter = test_counter - val_counter
+        result[stage] = {
+            "val_count": len(val_records),
+            "test_count": len(test_records),
+            "val_unique_count": len(val_counter),
+            "test_unique_count": len(test_counter),
+            "val_internal_duplicate_extra_count": sum(
+                count - 1 for count in val_counter.values() if count > 1
+            ),
+            "test_internal_duplicate_extra_count": sum(
+                count - 1 for count in test_counter.values() if count > 1
+            ),
+            "multiset_intersection_count": sum(intersection_counter.values()),
+            "unique_record_intersection_count": len(intersection_counter),
+            "records_only_in_val_count": sum(only_val_counter.values()),
+            "records_only_in_test_count": sum(only_test_counter.values()),
+            "ordered_sequence_equal": val_keys == test_keys,
+            "record_multiset_equal": val_counter == test_counter,
+            "record_set_equal": set(val_keys) == set(test_keys),
+            "val_ordered_sha256": _digest_strings(val_keys, sort_values=False),
+            "test_ordered_sha256": _digest_strings(test_keys, sort_values=False),
+            "val_canonical_set_sha256": _digest_strings(val_counter.keys(), sort_values=True),
+            "test_canonical_set_sha256": _digest_strings(test_counter.keys(), sort_values=True),
+        }
+    return result
+
+
 def _primary_key(record: dict[str, Any], field: str) -> str:
     value = record.get(field)
     return _norm_path(str(value)) if _present(value) else ""
@@ -589,6 +659,7 @@ def main() -> None:
             "reference_count": len(audio_refs),
         },
         "overlap": _overlap_report(records_by_split),
+        "split_equality": _split_equality_report(records_by_split),
         "official_loader": loader,
         "official_components": _inspect_official_components(args.owl_source_root),
         "audit_contract": {
@@ -623,6 +694,9 @@ def main() -> None:
         issues.append("official_component_source_incomplete")
     if questions["same_stage_split_duplicate_fingerprint_count"]:
         issues.append("same_stage_exact_record_duplicates_present")
+    for stage, equality in report["split_equality"].items():
+        if equality.get("record_multiset_equal"):
+            findings.append(f"{stage}_val_test_are_exactly_the_same_record_multiset")
     if report["overlap"]["same_stage_split_overlap_key_counts"]["source_tuple"]:
         findings.append("same_stage_source_tuple_reuse_present")
     if report["overlap"]["cross_stage_overlap_key_counts"]["source_tuple"]:
