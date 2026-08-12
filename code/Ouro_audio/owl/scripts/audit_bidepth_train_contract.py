@@ -440,6 +440,29 @@ def main() -> None:
         json.dump(report, handle, indent=2, ensure_ascii=False)
         handle.write("\n")
     print(f"[report] {args.output}")
+    for stage, item in stages.items():
+        if item.get("status") == "missing":
+            print(f"[summary] {stage} train=missing")
+            continue
+        record_summary = item["record_summary"]
+        assets = item["assets"]
+        audio = assets["audio"]
+        print(
+            f"[summary] {stage} records={record_summary['count']} "
+            f"types={record_summary['question_type_counts']} "
+            f"source_shapes={record_summary['source_shape_counts']}"
+        )
+        print(
+            f"[summary] {stage} audio_refs={assets['unique_audio_reference_count']} "
+            f"audio_matched={audio.get('matched_count', 'n/a')} "
+            f"audio_missing={audio.get('missing_count', 'n/a')} "
+            f"rir_refs={assets['unique_reverb_reference_count']} "
+            f"rir_missing={assets['reverb_reference_missing_count']}"
+        )
+    print(
+        "[summary] audio_root="
+        f"{args.audio_root if args.audio_root else '<not configured>'}"
+    )
     print(f"[status] {report['status']} issues={issues}")
 
 

@@ -113,3 +113,17 @@ the `audio_id` references. It also records the exact path/convolution/fixed
 length behavior found in the official loader and the official training
 launcher. The intended current evaluation policy is `train` for optimization,
 `val` for validation, and no use of `test`.
+
+The laboratory AudioSet tree is an external read-only asset. Because the JSON
+references already contain prefixes such as
+`balanced_train/audio/YOOj8XfZGR8c`, pass the AudioSet root itself:
+
+```bash
+OWL_AUDIO_ROOT=/hpc_stor03/public/shared/data/raa/AudioSet \
+bash code/Ouro_audio/owl/run_inspect_phase1_train_contract_4090.sh
+```
+
+Do not pass `.../AudioSet/balanced_train` as the root; that would duplicate the
+`balanced_train/audio/` prefix during resolution. The expected waveform for a
+reference such as `balanced_train/audio/YOOj8XfZGR8c` is
+`.../AudioSet/balanced_train/audio/YOOj8XfZGR8c.wav`.
