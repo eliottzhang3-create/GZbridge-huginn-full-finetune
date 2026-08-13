@@ -324,6 +324,8 @@ def _attach_bat_audio_modules(model: nn.Module) -> dict[str, Any]:
         "spatial_ast_root": str(spatial_ast_root),
         "spatial_ast_checkpoint": str(spatial_ast_checkpoint),
         "qformer_source": str(qformer_source),
+        "qformer_initialization": "random",
+        "qformer_checkpoint_loaded": False,
         "audio_root_read_only": str(audio_root),
         "reverb_root": str(reverb_root),
         "audio_token_count": AUDIO_TOKEN_COUNT,

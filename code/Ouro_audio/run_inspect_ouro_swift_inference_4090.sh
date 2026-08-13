@@ -15,11 +15,11 @@ for name in OURO_MODEL_PATH OURO_TEXT_PLUGIN_PATH OURO_SWIFT_OUTPUT_REPORT OURO_
 done
 
 vc submit \
-  -p pdgpu-4090 \
+  -p pdgpu-5090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 8 -m 32G -g 1 \
   -n 1 \
-  -j inspect-ouro-swift-text-4090-$(date +%m%d%H%M) \
+  -j inspect-ouro-swift-text-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
-  JOB=1:1 "$SCRIPT_DIR/log/inspect_ouro_swift_inference_4090.JOB.log" \
+  JOB=1:1 "$SCRIPT_DIR/log/inspect_ouro_swift_inference_5090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/inspect_ouro_swift_inference.sh"

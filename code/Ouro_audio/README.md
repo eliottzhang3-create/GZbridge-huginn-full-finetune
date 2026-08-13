@@ -36,7 +36,7 @@ The submitted smoke entry point is:
 code/Ouro_audio/run_smoke_ouro_swift_lora_4090.sh
 ```
 
-It uses `pdgpu-4090` and writes a checkpoint plus a JSON audit report. The
+It uses `pdgpu-5090` and writes a checkpoint plus a JSON audit report. The
 audit checks the actual Swift trainer batch, ms-swift's compact-suffix
 next-token label alignment, four forward and backward calls through the
 shared decoder layer, four gate forward calls and three gate backward calls,
@@ -147,7 +147,7 @@ The active multimodal line is now BAT, not OWL/SAGE. The intended model is:
 ```text
 language model: Ouro-1.4B
 audio encoder: pretrained BAT Spatial-AST, frozen
-audio projector: BAT/SLAM-LLM 8-layer Q-Former, 64 queries, trainable
+audio projector: BAT/SLAM-LLM 8-layer Q-Former, 64 queries, randomly initialized and trainable
 Ouro backbone: frozen
 Ouro LoRA: trainable
 Ouro early-exit gate: frozen
@@ -253,12 +253,19 @@ training use_cache: false
 
 The implementation is split into `bat/models/spatial_ast_audio.py`, the
 ms-swift registration plugin, and the submitted GPU audit
-`bat/run_inspect_bat_ouro_multimodal_4090.sh`. That audit is the gate before
-LoRA training: it checks real AudioSet/RIR input, 64-position replacement,
-input/label/mask alignment, four recurrent forward calls, shared-layer
-backward calls, finite shifted CE, Q-Former gradients, and frozen
-Spatial-AST/Ouro/gate parameters. After it passes, rank-8 Ouro LoRA will be
-added and audited as a separate trainability/checkpoint step.
+`bat/run_inspect_bat_ouro_multimodal_4090.sh`. That audit checks real
+AudioSet/RIR input, 64-position replacement, input/label/mask alignment, four
+recurrent forward calls, shared-layer backward calls, finite shifted CE,
+Q-Former gradients, and frozen Spatial-AST/Ouro/gate parameters. The separate
+rank-8 LoRA smoke trains the randomly initialized Q-Former together with
+Ouro q_proj/v_proj LoRA and verifies that no other parameter group is
+trainable.
+
+`BAT/model.pt` is not loaded by this branch. It is a packaged BAT checkpoint
+from a different LLM configuration and is retained only as an external
+reference. The active experiment deliberately uses the BAT Q-Former
+architecture with fresh random initialization, because the target study is
+to train that Q-Former for Ouro-1.4B rather than transfer projector weights.
 
 ### OWL/SAGE branch contract (historical; superseded by BAT)
 
@@ -385,7 +392,7 @@ keyword-based classification.
 
 ### Next steps
 
-1. Rerun the corrected paper-type audit through the submitted `pdgpu-4090`
+1. Rerun the corrected paper-type audit through the submitted `pdgpu-5090`
    entry point.
 2. Inspect normalized Stage 2 answer forms, including possible alternatives
    such as `true/false`, before concluding that Type III is absent.
@@ -397,7 +404,6 @@ keyword-based classification.
    token insertion, freeze audit, one-batch multimodal smoke, and Stage 1/2
    launchers.
 
-All GPU execution must continue to use submitted jobs. The temporary
-single-card smoke queue is `pdgpu-4090`; the later formal eight-card target is
-`pdgpu-5090`. CPU-only inspection and upload commands may run on the login
-node.
+All GPU execution must continue to use submitted jobs. Active BAT smoke,
+inspection, manifest, and training launchers use the `pdgpu-5090` queue. CPU-only
+inspection and upload commands may run on the login node.

@@ -15,11 +15,11 @@ for name in OURO_MODEL_PATH OURO_NATIVE_OUTPUT_REPORT OURO_NATIVE_MAX_NEW_TOKENS
 done
 
 vc submit \
-  -p pdgpu-4090 \
+  -p pdgpu-5090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 8 -m 32G -g 1 \
   -n 1 \
-  -j inspect-ouro-native-4090-$(date +%m%d%H%M) \
+  -j inspect-ouro-native-5090-$(date +%m%d%H%M) \
   -d "$SCRIPT_DIR" \
-  JOB=1:1 "$SCRIPT_DIR/log/inspect_ouro_native_4090.JOB.log" \
+  JOB=1:1 "$SCRIPT_DIR/log/inspect_ouro_native_5090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/inspect_ouro_native.sh"

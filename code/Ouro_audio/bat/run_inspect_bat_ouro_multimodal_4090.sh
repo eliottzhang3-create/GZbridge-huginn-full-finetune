@@ -16,11 +16,11 @@ for name in OURO_MODEL_PATH OURO_BAT_PLUGIN_PATH BAT_SPATIAL_AST_CODE_ROOT \
 done
 
 vc submit \
-  -p pdgpu-4090 \
+  -p pdgpu-5090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 8 -m 32G -g 1 \
   -n 1 \
-  -j "inspect-bat-ouro-multimodal-4090-$(date +%m%d%H%M)" \
+  -j "inspect-bat-ouro-multimodal-5090-$(date +%m%d%H%M)" \
   -d "$SCRIPT_DIR" \
-  JOB=1:1 "$SCRIPT_DIR/log/inspect_bat_ouro_multimodal_4090.JOB.log" \
+  JOB=1:1 "$SCRIPT_DIR/log/inspect_bat_ouro_multimodal_5090.JOB.log" \
   --cmd "${CMD_PREFIX}bash scripts/run_bat_ouro_multimodal_audit_remote.sh"

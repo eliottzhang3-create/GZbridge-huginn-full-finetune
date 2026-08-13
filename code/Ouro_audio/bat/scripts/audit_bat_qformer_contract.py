@@ -129,6 +129,7 @@ def main() -> None:
             "spatial_ast_loaded": False,
             "ouro_loaded": False,
             "checkpoint_loaded": False,
+            "qformer_initialization": "random",
             "encoder_training": False,
         },
         "config": {

@@ -136,6 +136,8 @@ def main() -> None:
         raise RuntimeError("Ouro BAT loader did not attach its audio contract")
     if contract.get("audio_token_count") != EXPECTED_AUDIO_TOKENS:
         raise RuntimeError(f"Unexpected audio token count: {contract}")
+    if contract.get("qformer_initialization") != "random" or contract.get("qformer_checkpoint_loaded") is not False:
+        raise RuntimeError(f"Q-Former must be randomly initialized without checkpoint loading: {contract}")
     if contract.get("total_ut_steps") != EXPECTED_STEPS or contract.get("early_exit_threshold") != 1.0:
         raise RuntimeError(f"Unexpected Ouro loop contract: {contract}")
 
