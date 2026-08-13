@@ -307,9 +307,9 @@ def _authoritative_type(stage: str, record: dict[str, Any]) -> str | None:
     Stage 3 is a curriculum partition, not a bag of keyword-matched answers:
     its complete released split is the COT/mixup Type-IV data.  For the
     single-source cls/doa warmup, the coarse field has the stable mapping
-    CLASSIFICATION -> Type I and DOA -> Type II.  The current stage2 file is
-    mixed/cumulative (it contains both source shapes and both coarse fields),
-    so the script deliberately refuses to assign one paper Type to it.
+    CLASSIFICATION -> Type I and DOA -> Type II.  For the current stage2 file,
+    this mapping is applied record-by-record; the partition itself is not
+    called "paper Stage 2" because it contains both single and dual records.
     """
     return _paper_assignment(stage, record)[0]
 
@@ -328,10 +328,14 @@ def _partition_contract(stage: str) -> dict[str, Any]:
             "mapping": "all records are treated as Type_IV for curriculum accounting",
         }
     return {
-        "status": "mixed_release_partition_not_assigned",
-        "paper_types": [],
-        "mapping": None,
-        "reason": "stage2-single contains multiple source shapes and coarse task fields; lexical guesses are diagnostic only",
+        "status": "mixed_release_partition_recordwise_mapping",
+        "paper_types": ["Type_I", "Type_II", "Type_III_candidate_if_dual_exact_yes_no"],
+        "mapping": {
+            "dual_exact_yes_no_answer": "Type_III",
+            "CLASSIFICATION": "Type_I",
+            "DOA": "Type_II",
+        },
+        "reason": "stage2-single contains both single and dual records; its directory name is not treated as paper Stage 2",
     }
 
 
@@ -374,7 +378,18 @@ def _stage2_delta_summary(
     stage2_counter = Counter(
         _canonical_record(record) for record in stage2_records if isinstance(record, dict)
     )
-    delta_counter = stage2_counter - stage1_counter
+    exact_record_delta_counter = stage2_counter - stage1_counter
+    stage1_source_tuples = {
+        _source_tuple_key(record)
+        for record in stage1_records
+        if isinstance(record, dict)
+    }
+    source_tuple_delta_records = [
+        record
+        for record in stage2_records
+        if isinstance(record, dict)
+        and _source_tuple_key(record) not in stage1_source_tuples
+    ]
     field_counts: Counter[str] = Counter()
     shape_counts: Counter[str] = Counter()
     paper_type_counts: Counter[str] = Counter()
@@ -382,7 +397,7 @@ def _stage2_delta_summary(
     yes_no_count = 0
     cot_signal_count = 0
     examples: list[dict[str, Any]] = []
-    for encoded, count in delta_counter.items():
+    for encoded, count in exact_record_delta_counter.items():
         record = json.loads(encoded)
         evidence = _type_evidence(record)
         field_counts[str(record.get("question_type", "<missing>"))] += count
@@ -398,23 +413,31 @@ def _stage2_delta_summary(
     return {
         "stage1_record_count": len(stage1_records),
         "stage2_record_count": len(stage2_records),
-        "stage2_delta_record_count": sum(delta_counter.values()),
-        "stage2_contains_stage1_as_multiset": not (Counter(
+        "exact_record_delta_count": sum(exact_record_delta_counter.values()),
+        "stage2_contains_stage1_as_exact_record_multiset": not (Counter(
             _canonical_record(record) for record in stage1_records if isinstance(record, dict)
         ) - Counter(
             _canonical_record(record) for record in stage2_records if isinstance(record, dict)
         )),
-        "delta_field_type_counts": dict(field_counts),
-        "delta_source_shape_counts": dict(shape_counts),
-        "delta_paper_type_counts": dict(paper_type_counts),
-        "delta_paper_type_source_shape_counts": {
+        "stage1_source_tuple_count": len(stage1_source_tuples),
+        "stage2_source_tuple_delta_record_count": len(source_tuple_delta_records),
+        "stage2_source_tuple_delta_source_tuple_count": len({
+            _source_tuple_key(record) for record in source_tuple_delta_records
+        }),
+        "stage2_source_tuple_delta_composition": _composition_for_records(
+            source_tuple_delta_records, "stage2-single"
+        ),
+        "exact_record_delta_field_type_counts": dict(field_counts),
+        "exact_record_delta_source_shape_counts": dict(shape_counts),
+        "exact_record_delta_paper_type_counts": dict(paper_type_counts),
+        "exact_record_delta_paper_type_source_shape_counts": {
             f"{paper_type}/{shape}": count
             for (paper_type, shape), count in sorted(paper_type_shape_counts.items())
         },
         "delta_bare_yes_no_count": yes_no_count,
         "delta_cot_lexical_signal_count_not_authoritative": cot_signal_count,
         "delta_examples": examples,
-        "interpretation": "The delta is the candidate new curriculum material; its paper Type still requires semantic/manual confirmation, not keyword inference.",
+        "interpretation": "exact_record_delta and source_tuple_delta are different units. The source_tuple_delta is the relevant measure for detecting new acoustic source configurations.",
     }
 
 
@@ -432,6 +455,8 @@ def _composition_for_records(records: list[dict[str, Any]], stage: str) -> dict[
     record_shape_counts: Counter[str] = Counter()
     tuple_shape_counts: Counter[str] = Counter()
     tuple_type_counts: Counter[str] = Counter()
+    answer_by_shape: dict[str, Counter[str]] = defaultdict(Counter)
+    answer_by_shape_and_field: dict[tuple[str, str], Counter[str]] = defaultdict(Counter)
     for record in records:
         if not isinstance(record, dict):
             continue
@@ -441,6 +466,9 @@ def _composition_for_records(records: list[dict[str, Any]], stage: str) -> dict[
         shape = _source_shape(record)
         record_shape_counts[shape] += 1
         tuple_shape_counts[shape] += 0
+        answer = _normalized_answer(record.get("answer"))
+        answer_by_shape[shape][answer] += 1
+        answer_by_shape_and_field[(shape, _coarse_field_type(record))][answer] += 1
         paper_type, _ = _paper_assignment(stage, record)
         if paper_type is not None:
             record_type_counts[paper_type] += 1
@@ -471,6 +499,14 @@ def _composition_for_records(records: list[dict[str, Any]], stage: str) -> dict[
         "record_paper_type_counts": dict(record_type_counts),
         "source_tuple_paper_type_counts": dict(tuple_type_counts),
         "source_tuple_paper_type_conflict_count": tuple_type_conflicts,
+        "answer_form_counts_by_source_shape": {
+            shape: dict(counter.most_common(50))
+            for shape, counter in sorted(answer_by_shape.items())
+        },
+        "answer_form_counts_by_source_shape_and_question_type": {
+            f"{shape}/{field_type}": dict(counter.most_common(50))
+            for (shape, field_type), counter in sorted(answer_by_shape_and_field.items())
+        },
     }
 
 
@@ -628,6 +664,24 @@ def main() -> None:
             f"{composition['stage2_file']['record_paper_type_counts']} "
             "stage2_delta="
             f"{composition['stage2_delta_after_stage1']['record_paper_type_counts']}"
+        )
+    stage2_delta = report.get("files", {}).get("stage2-single", {}).get(
+        "train_delta_after_stage1", {}
+    )
+    if stage2_delta:
+        print(
+            "[delta] exact_record_delta="
+            f"{stage2_delta.get('exact_record_delta_count')} "
+            "source_tuple_delta_records="
+            f"{stage2_delta.get('stage2_source_tuple_delta_record_count')} "
+            "source_tuple_delta_unique="
+            f"{stage2_delta.get('stage2_source_tuple_delta_source_tuple_count')}"
+        )
+        print(
+            "[delta] source_tuple_delta_types="
+            f"{stage2_delta.get('stage2_source_tuple_delta_composition', {}).get('record_paper_type_counts', {})} "
+            "shapes="
+            f"{stage2_delta.get('stage2_source_tuple_delta_composition', {}).get('record_source_shape_counts', {})}"
         )
     print(f"[status] {report['status']}")
 
