@@ -104,12 +104,21 @@ def infer_bat_type(record: dict[str, Any]) -> tuple[str | None, str]:
         # BAT Type E contains binary and non-binary reasoning families.  Check
         # these markers before CLASSIFICATION/DIRECTION because names such as
         # MIXUP_NONBINARY_CLASSIFICATION contain those substrings too.
+        explicit_reasoning_types = {
+            "MIXUP_DISTANCE_BOTH",
+            "MIXUP_DIRECTION",
+            "MIXUP_NONBINARY_DISTANCE",
+            "MIXUP_NONBINARY_SOURCE",
+            "MIXUP_NONBINARY_DIRECTION",
+        }
+        if compact in explicit_reasoning_types:
+            return "E", "two-source BAT reasoning question_type"
         reasoning_markers = ("BINARY", "NONBINARY", "REASON", "REASONING")
         if any(marker in compact for marker in reasoning_markers):
             return "E", "two-source reasoning family"
-        if compact in {"CLASSIFICATION", "CLS", "DETECTION", "MIXUP_CLASSIFICATION", "MIXUP_CLS", "MIXUP_DETECTION"} or "CLASSIFICATION" in compact:
+        if compact in {"MIXUP_SINGLE_CLASSIFICATION", "CLASSIFICATION", "CLS", "DETECTION", "MIXUP_CLASSIFICATION", "MIXUP_CLS", "MIXUP_DETECTION"}:
             return "C", "two-source target classification"
-        if compact in {"DOA", "DIRECTION", "DISTANCE_DIRECTION", "DOA_DP", "MIXUP_DOA", "MIXUP_DIRECTION", "MIXUP_DISTANCE_DIRECTION", "MIXUP_DOA_DP"} or "DOA" in compact:
+        if compact in {"MIXUP_SINGLE_DOA", "DOA", "DIRECTION", "DISTANCE_DIRECTION", "DOA_DP", "MIXUP_DOA", "MIXUP_DISTANCE_DIRECTION", "MIXUP_DOA_DP"}:
             return "D", "two-source target DoA/distance"
 
     return None, f"unmapped raw question_type={raw!r}, source_shape={shape!r}"
