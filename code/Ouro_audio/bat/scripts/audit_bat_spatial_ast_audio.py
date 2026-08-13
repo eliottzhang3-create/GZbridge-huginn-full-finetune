@@ -102,6 +102,105 @@ def install_spatial_ast_compat(source_root: Path) -> dict[str, Any]:
     }
 
 
+def install_librosa_compat(source_root: Path) -> dict[str, Any]:
+    """Provide the librosa filter-bank API needed by official ``utils/stft.py``.
+
+    The official Spatial-AST STFT helper imports ``librosa`` only to build
+    ``librosa.filters.mel``.  Installing an old librosa into the shared
+    Torch-2.11 environment is unnecessary and can introduce NumPy/numba
+    compatibility problems, so use a small NumPy implementation of the
+    librosa Slaney mel filter bank when librosa is unavailable.
+    """
+    try:
+        import librosa  # noqa: F401
+
+        return {
+            "mode": "installed_librosa",
+            "source_root": str(source_root),
+            "installed_librosa_package": True,
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback is deliberate
+        import types
+
+        def hz_to_mel(frequencies: np.ndarray) -> np.ndarray:
+            frequencies = np.asarray(frequencies, dtype=np.float64)
+            f_sp = 200.0 / 3.0
+            mels = (frequencies - 0.0) / f_sp
+            min_log_hz = 1000.0
+            min_log_mel = (min_log_hz - 0.0) / f_sp
+            logstep = math.log(6.4) / 27.0
+            log_t = frequencies >= min_log_hz
+            mels = mels.copy()
+            mels[log_t] = min_log_mel + np.log(frequencies[log_t] / min_log_hz) / logstep
+            return mels
+
+        def mel_to_hz(mels: np.ndarray) -> np.ndarray:
+            mels = np.asarray(mels, dtype=np.float64)
+            f_sp = 200.0 / 3.0
+            freqs = 0.0 + f_sp * mels
+            min_log_hz = 1000.0
+            min_log_mel = (min_log_hz - 0.0) / f_sp
+            logstep = math.log(6.4) / 27.0
+            log_t = mels >= min_log_mel
+            freqs = freqs.copy()
+            freqs[log_t] = min_log_hz * np.exp(logstep * (mels[log_t] - min_log_mel))
+            return freqs
+
+        def mel_filter_bank(
+            *,
+            sr: int,
+            n_fft: int,
+            n_mels: int = 128,
+            fmin: float = 0.0,
+            fmax: float | None = None,
+            htk: bool = False,
+            norm: str | float | None = "slaney",
+            dtype: Any = np.float32,
+        ) -> np.ndarray:
+            if htk:
+                hz_to_mel_fn = lambda value: 2595.0 * np.log10(1.0 + value / 700.0)
+                mel_to_hz_fn = lambda value: 700.0 * (10.0 ** (value / 2595.0) - 1.0)
+            else:
+                hz_to_mel_fn = hz_to_mel
+                mel_to_hz_fn = mel_to_hz
+            if fmax is None:
+                fmax = float(sr) / 2.0
+            if not 0.0 <= fmin <= fmax <= float(sr) / 2.0:
+                raise ValueError(f"Invalid mel frequency range: fmin={fmin}, fmax={fmax}, sr={sr}")
+            fft_freqs = np.linspace(0.0, float(sr) / 2.0, int(1 + n_fft // 2))
+            mel_frequencies = mel_to_hz_fn(
+                np.linspace(hz_to_mel_fn(np.asarray([fmin]))[0], hz_to_mel_fn(np.asarray([fmax]))[0], n_mels + 2)
+            )
+            fdiff = np.diff(mel_frequencies)
+            ramps = np.subtract.outer(mel_frequencies, fft_freqs)
+            weights = np.zeros((n_mels, int(1 + n_fft // 2)), dtype=np.float64)
+            for index in range(n_mels):
+                lower = -ramps[index] / fdiff[index]
+                upper = ramps[index + 2] / fdiff[index + 1]
+                weights[index] = np.maximum(0.0, np.minimum(lower, upper))
+            if norm == "slaney":
+                enorm = 2.0 / (mel_frequencies[2 : n_mels + 2] - mel_frequencies[:n_mels])
+                weights *= enorm[:, None]
+            elif norm not in (None, "slaney"):
+                raise ValueError(f"Fallback mel filter only supports norm=None/'slaney', got {norm!r}")
+            return weights.astype(dtype, copy=False)
+
+        librosa_module = types.ModuleType("librosa")
+        filters_module = types.ModuleType("librosa.filters")
+        filters_module.mel = mel_filter_bank
+        librosa_module.filters = filters_module
+        sys.modules.setdefault("librosa", librosa_module)
+        sys.modules.setdefault("librosa.filters", filters_module)
+        return {
+            "mode": "local_librosa_mel_compat",
+            "source_root": str(source_root),
+            "installed_librosa_package": False,
+            "import_error": repr(exc),
+            "api": "librosa.filters.mel",
+            "mel_contract": {"sr": 32000, "n_fft": 1024, "n_mels": 128, "fmin": 50, "fmax": 14000, "norm": "slaney", "htk": False},
+        }
+
+
 def private_output(path: Path) -> None:
     text = str(path).replace("\\", "/")
     if text.startswith("/hpc_stor03/public"):
@@ -328,9 +427,15 @@ def build_spatial_ast(source_root: Path) -> tuple[nn.Module, dict[str, Any]]:
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
     compat = install_spatial_ast_compat(source_root)
+    librosa_compat = install_librosa_compat(source_root)
     module = import_module_from_file("bat_official_spatial_ast", source_path)
     model = module.build_AST(num_classes=355, num_cls_tokens=3)
-    return model, {"path": str(source_path), "sha256": sha256_file(source_path), "dependency_compat": compat}
+    return model, {
+        "path": str(source_path),
+        "sha256": sha256_file(source_path),
+        "dependency_compat": compat,
+        "librosa_compat": librosa_compat,
+    }
 
 
 def checkpoint_state(path: Path) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:

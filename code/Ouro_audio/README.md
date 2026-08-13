@@ -212,6 +212,12 @@ module for the three legacy symbols actually imported by the official source:
 `to_2tuple`, `trunc_normal_`, and `DropPath`. It does not install or modify
 the old timm package, and it does not modify the remote Spatial-AST checkout.
 
+The official `utils/stft.py` also imports `librosa` only for
+`librosa.filters.mel`. If librosa is unavailable or incompatible with the
+current NumPy stack, the audio-link audit uses a local Slaney mel-filter
+compatibility implementation for that one API. This is audit-only and does
+not alter the official source or checkpoint.
+
 ### OWL/SAGE branch contract (historical; superseded by BAT)
 
 The current multimodal contract is:
