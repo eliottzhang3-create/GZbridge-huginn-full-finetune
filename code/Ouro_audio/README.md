@@ -87,8 +87,8 @@ This remains an isolated research branch, separate from the Huginn and
 HRM-text lines. Current work has two parts:
 
 1. a validated text-only Ouro-1.4B registration/LoRA path; and
-2. an OWL/SAGE multimodal investigation whose data contract is being audited
-   before multimodal training is implemented.
+2. a BAT/Spatial-AST multimodal investigation whose audio contract is being
+   audited before multimodal training is implemented.
 
 The branch uses `ByteDance/Ouro-1.4B`, not Ouro-2.6B. The complete model and
 Transformers remote-code snapshot remains on the remote server:
@@ -140,7 +140,72 @@ first three. This is expected native behavior, not evidence that only three
 recurrent steps executed. Entropy/KL regularization is not part of this
 ordinary-CE smoke.
 
-### OWL/SAGE branch contract
+### BAT/Spatial-AST current branch contract
+
+The active multimodal line is now BAT, not OWL/SAGE. The intended model is:
+
+```text
+language model: Ouro-1.4B
+audio encoder: pretrained BAT Spatial-AST, frozen
+audio projector: BAT/SLAM-LLM 8-layer Q-Former, 64 queries, trainable
+Ouro backbone: frozen
+Ouro LoRA: trainable
+Ouro early-exit gate: frozen
+total_ut_steps: 4
+early_exit_threshold: 1.0
+use_cache: false during training
+BAT language-model stages I/II/III: in scope
+Spatial-AST pretraining stages: out of scope
+```
+
+The remote BAT assets are:
+
+```text
+Spatial-AST source:
+/hpc_stor03/sjtu_home/jinwei.zhang/code/Spatial-AST
+
+Spatial-AST checkpoint:
+/hpc_stor03/sjtu_home/jinwei.zhang/models/BAT/SpatialAST/finetuned.pth
+
+SpatialSoundQA:
+/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/SpatialSoundQA
+
+AudioSet, read-only public source:
+/hpc_stor03/public/shared/data/raa/AudioSet
+```
+
+The BAT Phase 1 data/curriculum audit is complete with `status=ok`. The
+released JSON files are cumulative:
+
+```text
+Stage 1: 278,784 records = A+B
+Stage 2: 514,784 records = A+B+C+D
+Stage 3: 872,312 records = A+B+C+D+E
+```
+
+All unique AudioSet and binaural-RIR references resolved. The mapping used by
+the audit is `CLASSIFICATION -> A`, `DOA -> B`,
+`MIXUP_SINGLE_CLASSIFICATION -> C`, `MIXUP_SINGLE_DOA -> D`, and the explicit
+binary/non-binary reasoning families -> `E`. The exact report is written to
+the private remote path:
+
+```text
+/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/bat/phase1_data_contract_audit.json
+```
+
+The standalone BAT Q-Former audit also passed: Spatial-AST tokens are
+expected as `[B,515,768]`, and the projector output is `[B,64,2048]`.
+The next submitted GPU audit is
+`bat/run_inspect_bat_spatial_ast_audio_4090.sh`. It verifies the actual
+AudioSet waveform plus binaural RIR rendering, frozen Spatial-AST token
+extraction, and Q-Former output without loading Ouro or training parameters.
+
+The official Spatial-AST repository's public `forward()` returns four
+task-head tensors, while BAT's LLM path needs the internal 515-token sequence.
+The new audit checks both interfaces explicitly; a successful task-head
+forward alone is not considered sufficient.
+
+### OWL/SAGE branch contract (historical; superseded by BAT)
 
 The current multimodal contract is:
 
