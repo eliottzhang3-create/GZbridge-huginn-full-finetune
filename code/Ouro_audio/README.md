@@ -218,6 +218,48 @@ current NumPy stack, the audio-link audit uses a local Slaney mel-filter
 compatibility implementation for that one API. This is audit-only and does
 not alter the official source or checkpoint.
 
+#### BAT Spatial-AST -> Ouro integration (current implementation phase)
+
+The reusable audio path is now being integrated under the independent BAT
+plugin `plugins/ouro_bat_spatial_ast_swift.py`; the existing text-only
+registration `plugins/ouro_text_swift.py` is unchanged. The exact tensor
+contract is:
+
+```text
+AudioSet mono/first channel + binaural RIR
+  -> rendered waveform [B,2,320000]
+  -> frozen Spatial-AST tokens [B,515,768]
+  -> trainable BAT Q-Former [B,64,2048]
+  -> replace 64 fixed audio-prefix placeholder embeddings in Ouro
+  -> Ouro input embeddings [B,64+T,2048]
+```
+
+The 64 positions are fixed. They are not vocabulary tokens carrying learned
+meaning: the template inserts 64 harmless pad/eos ids so Swift can collate a
+normal integer sequence, and the Ouro forward wrapper replaces exactly those
+embedding positions with Q-Former output. The first 64 label positions are
+`-100`, so ordinary shifted causal CE supervises only the text response. This
+avoids extending the Ouro tokenizer before a dedicated placeholder-token audit.
+
+The current trainability boundary before LoRA injection is:
+
+```text
+trainable: BAT Q-Former
+frozen: Spatial-AST, Ouro native backbone, Ouro embeddings/lm_head, early_exit_gate
+Ouro total_ut_steps: 4
+Ouro early_exit_threshold: 1.0
+training use_cache: false
+```
+
+The implementation is split into `bat/models/spatial_ast_audio.py`, the
+ms-swift registration plugin, and the submitted GPU audit
+`bat/run_inspect_bat_ouro_multimodal_4090.sh`. That audit is the gate before
+LoRA training: it checks real AudioSet/RIR input, 64-position replacement,
+input/label/mask alignment, four recurrent forward calls, shared-layer
+backward calls, finite shifted CE, Q-Former gradients, and frozen
+Spatial-AST/Ouro/gate parameters. After it passes, rank-8 Ouro LoRA will be
+added and audited as a separate trainability/checkpoint step.
+
 ### OWL/SAGE branch contract (historical; superseded by BAT)
 
 The current multimodal contract is:
