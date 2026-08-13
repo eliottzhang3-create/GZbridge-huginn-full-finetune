@@ -54,59 +54,70 @@ def install_spatial_ast_compat(source_root: Path) -> dict[str, Any]:
     Keeping these tiny compatibility definitions local avoids installing an
     obsolete timm package into the Ouro environment.
     """
-    import types
+    try:
+        from timm.models.layers import DropPath, to_2tuple, trunc_normal_
 
-    timm_module = types.ModuleType("timm")
-    models_module = types.ModuleType("timm.models")
-    layers_module = types.ModuleType("timm.models.layers")
+        return {
+            "mode": "installed_timm",
+            "source_root": str(source_root),
+            "installed_timm_package": True,
+            "symbols": ["to_2tuple", "trunc_normal_", "DropPath"],
+        }
+    except Exception as exc:  # noqa: BLE001 - fallback is deliberate
+        import types
 
-    def to_2tuple(value: Any) -> tuple[Any, Any]:
-        if isinstance(value, (tuple, list)):
-            if len(value) != 2:
-                raise ValueError(f"Expected a 2-tuple value, got {value!r}")
-            return tuple(value)
-        return (value, value)
+        timm_module = types.ModuleType("timm")
+        models_module = types.ModuleType("timm.models")
+        layers_module = types.ModuleType("timm.models.layers")
 
-    def trunc_normal_(tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0, a: float = -2.0, b: float = 2.0) -> torch.Tensor:
-        # Use the current Torch implementation, which is the numerical
-        # equivalent needed by the old timm call sites.
-        return torch.nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
+        def to_2tuple(value: Any) -> tuple[Any, Any]:
+            if isinstance(value, (tuple, list)):
+                if len(value) != 2:
+                    raise ValueError(f"Expected a 2-tuple value, got {value!r}")
+                return tuple(value)
+            return (value, value)
 
-    class DropPath(nn.Module):
-        def __init__(self, drop_prob: float = 0.0) -> None:
-            super().__init__()
-            self.drop_prob = float(drop_prob)
+        def trunc_normal_(tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0, a: float = -2.0, b: float = 2.0) -> torch.Tensor:
+            # Use the current Torch implementation, which is the numerical
+            # equivalent needed by the old timm call sites.
+            return torch.nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
 
-        def forward(self, value: torch.Tensor) -> torch.Tensor:
-            if self.drop_prob == 0.0 or not self.training:
-                return value
-            keep_prob = 1.0 - self.drop_prob
-            shape = (value.shape[0],) + (1,) * (value.ndim - 1)
-            random_tensor = keep_prob + torch.rand(shape, dtype=value.dtype, device=value.device)
-            return value.div(keep_prob) * random_tensor.floor()
+        class DropPath(nn.Module):
+            def __init__(self, drop_prob: float = 0.0) -> None:
+                super().__init__()
+                self.drop_prob = float(drop_prob)
 
-    layers_module.to_2tuple = to_2tuple
-    layers_module.trunc_normal_ = trunc_normal_
-    layers_module.DropPath = DropPath
-    models_module.layers = layers_module
-    timm_module.models = models_module
-    sys.modules.setdefault("timm", timm_module)
-    sys.modules.setdefault("timm.models", models_module)
-    sys.modules.setdefault("timm.models.layers", layers_module)
-    return {
-        "mode": "local_legacy_timm_compat",
-        "source_root": str(source_root),
-        "symbols": ["to_2tuple", "trunc_normal_", "DropPath"],
-        "official_timm_requirement": "0.3.2",
-        "installed_timm_package": False,
-    }
+            def forward(self, value: torch.Tensor) -> torch.Tensor:
+                if self.drop_prob == 0.0 or not self.training:
+                    return value
+                keep_prob = 1.0 - self.drop_prob
+                shape = (value.shape[0],) + (1,) * (value.ndim - 1)
+                random_tensor = keep_prob + torch.rand(shape, dtype=value.dtype, device=value.device)
+                return value.div(keep_prob) * random_tensor.floor()
+
+        layers_module.to_2tuple = to_2tuple
+        layers_module.trunc_normal_ = trunc_normal_
+        layers_module.DropPath = DropPath
+        models_module.layers = layers_module
+        timm_module.models = models_module
+        sys.modules.setdefault("timm", timm_module)
+        sys.modules.setdefault("timm.models", models_module)
+        sys.modules.setdefault("timm.models.layers", layers_module)
+        return {
+            "mode": "local_legacy_timm_compat",
+            "source_root": str(source_root),
+            "symbols": ["to_2tuple", "trunc_normal_", "DropPath"],
+            "official_timm_requirement": "0.3.2",
+            "installed_timm_package": False,
+            "import_error": repr(exc),
+        }
 
 
 def install_librosa_compat(source_root: Path) -> dict[str, Any]:
     """Provide the librosa filter-bank API needed by official ``utils/stft.py``.
 
-    The official Spatial-AST STFT helper imports ``librosa`` only to build
-    ``librosa.filters.mel``.  Installing an old librosa into the shared
+    The official Spatial-AST STFT helper imports ``librosa`` to build the
+    Mel filter and FFT window.  Installing an old librosa into the shared
     Torch-2.11 environment is unnecessary and can introduce NumPy/numba
     compatibility problems, so use a small NumPy implementation of the
     librosa Slaney mel filter bank when librosa is unavailable.
@@ -187,7 +198,10 @@ def install_librosa_compat(source_root: Path) -> dict[str, Any]:
 
         librosa_module = types.ModuleType("librosa")
         filters_module = types.ModuleType("librosa.filters")
+        from scipy.signal import get_window as scipy_get_window
+
         filters_module.mel = mel_filter_bank
+        filters_module.get_window = scipy_get_window
         librosa_module.filters = filters_module
         sys.modules.setdefault("librosa", librosa_module)
         sys.modules.setdefault("librosa.filters", filters_module)
@@ -195,8 +209,9 @@ def install_librosa_compat(source_root: Path) -> dict[str, Any]:
             "mode": "local_librosa_mel_compat",
             "source_root": str(source_root),
             "installed_librosa_package": False,
+            "requires_formal_install": True,
             "import_error": repr(exc),
-            "api": "librosa.filters.mel",
+            "api": ["librosa.filters.mel", "librosa.filters.get_window"],
             "mel_contract": {"sr": 32000, "n_fft": 1024, "n_mels": 128, "fmin": 50, "fmax": 14000, "norm": "slaney", "htk": False},
         }
 
@@ -605,6 +620,12 @@ def main() -> None:
         parameter.requires_grad = True
 
     sample_reports: list[dict[str, Any]] = []
+    dependency_compat = source_contract.get("dependency_compat", {})
+    librosa_compat = source_contract.get("librosa_compat", {})
+    if dependency_compat.get("mode") != "installed_timm":
+        issues.append("timm_compatibility_fallback_used")
+    if librosa_compat.get("mode") != "installed_librosa":
+        issues.append("librosa_compatibility_fallback_used")
     token_inputs: list[torch.Tensor] = []
     for label, record in samples:
         waveform, source_info = render_record(record, args.audio_root, args.reverb_root)
