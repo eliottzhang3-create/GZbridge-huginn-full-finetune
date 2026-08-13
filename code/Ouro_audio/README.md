@@ -205,6 +205,13 @@ task-head tensors, while BAT's LLM path needs the internal 515-token sequence.
 The new audit checks both interfaces explicitly; a successful task-head
 forward alone is not considered sufficient.
 
+The official Spatial-AST environment pins `timm==0.3.2`, but the shared
+`swift_ouro` environment uses a newer Torch stack and initially has no timm.
+The audio-link audit therefore installs a local, audit-only compatibility
+module for the three legacy symbols actually imported by the official source:
+`to_2tuple`, `trunc_normal_`, and `DropPath`. It does not install or modify
+the old timm package, and it does not modify the remote Spatial-AST checkout.
+
 ### OWL/SAGE branch contract (historical; superseded by BAT)
 
 The current multimodal contract is:

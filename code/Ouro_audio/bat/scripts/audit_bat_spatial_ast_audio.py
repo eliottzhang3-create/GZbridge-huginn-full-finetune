@@ -43,6 +43,65 @@ EXPECTED_TOKEN_COUNT = 515
 EXPECTED_HIDDEN_SIZE = 768
 
 
+def install_spatial_ast_compat(source_root: Path) -> dict[str, Any]:
+    """Install only the legacy helper symbols Spatial-AST imports.
+
+    The official repository pins timm==0.3.2, but the shared swift_ouro
+    environment intentionally uses a newer Torch stack and does not have timm
+    installed.  Spatial-AST's source uses only ``to_2tuple`` and
+    ``trunc_normal_`` from timm in its top-level module; its local
+    ``utils/vision_transformer.py`` additionally imports ``DropPath``.
+    Keeping these tiny compatibility definitions local avoids installing an
+    obsolete timm package into the Ouro environment.
+    """
+    import types
+
+    timm_module = types.ModuleType("timm")
+    models_module = types.ModuleType("timm.models")
+    layers_module = types.ModuleType("timm.models.layers")
+
+    def to_2tuple(value: Any) -> tuple[Any, Any]:
+        if isinstance(value, (tuple, list)):
+            if len(value) != 2:
+                raise ValueError(f"Expected a 2-tuple value, got {value!r}")
+            return tuple(value)
+        return (value, value)
+
+    def trunc_normal_(tensor: torch.Tensor, mean: float = 0.0, std: float = 1.0, a: float = -2.0, b: float = 2.0) -> torch.Tensor:
+        # Use the current Torch implementation, which is the numerical
+        # equivalent needed by the old timm call sites.
+        return torch.nn.init.trunc_normal_(tensor, mean=mean, std=std, a=a, b=b)
+
+    class DropPath(nn.Module):
+        def __init__(self, drop_prob: float = 0.0) -> None:
+            super().__init__()
+            self.drop_prob = float(drop_prob)
+
+        def forward(self, value: torch.Tensor) -> torch.Tensor:
+            if self.drop_prob == 0.0 or not self.training:
+                return value
+            keep_prob = 1.0 - self.drop_prob
+            shape = (value.shape[0],) + (1,) * (value.ndim - 1)
+            random_tensor = keep_prob + torch.rand(shape, dtype=value.dtype, device=value.device)
+            return value.div(keep_prob) * random_tensor.floor()
+
+    layers_module.to_2tuple = to_2tuple
+    layers_module.trunc_normal_ = trunc_normal_
+    layers_module.DropPath = DropPath
+    models_module.layers = layers_module
+    timm_module.models = models_module
+    sys.modules.setdefault("timm", timm_module)
+    sys.modules.setdefault("timm.models", models_module)
+    sys.modules.setdefault("timm.models.layers", layers_module)
+    return {
+        "mode": "local_legacy_timm_compat",
+        "source_root": str(source_root),
+        "symbols": ["to_2tuple", "trunc_normal_", "DropPath"],
+        "official_timm_requirement": "0.3.2",
+        "installed_timm_package": False,
+    }
+
+
 def private_output(path: Path) -> None:
     text = str(path).replace("\\", "/")
     if text.startswith("/hpc_stor03/public"):
@@ -268,9 +327,10 @@ def build_spatial_ast(source_root: Path) -> tuple[nn.Module, dict[str, Any]]:
         raise FileNotFoundError(source_path)
     if str(source_root) not in sys.path:
         sys.path.insert(0, str(source_root))
+    compat = install_spatial_ast_compat(source_root)
     module = import_module_from_file("bat_official_spatial_ast", source_path)
     model = module.build_AST(num_classes=355, num_cls_tokens=3)
-    return model, {"path": str(source_path), "sha256": sha256_file(source_path)}
+    return model, {"path": str(source_path), "sha256": sha256_file(source_path), "dependency_compat": compat}
 
 
 def checkpoint_state(path: Path) -> tuple[dict[str, Any], dict[str, torch.Tensor]]:
