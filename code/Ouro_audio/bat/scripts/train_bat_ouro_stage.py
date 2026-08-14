@@ -95,7 +95,9 @@ def main() -> None:
         "--gradient_checkpointing", "false", "--logging_steps", "100", "--save_strategy", "steps",
         "--save_steps", str(max(1, int(schedule["steps_per_epoch"]))), "--save_total_limit", "2",
         "--save_only_model", "false", "--remove_unused_columns", "false", "--dataloader_num_workers", "4",
-        "--dataloader_pin_memory", "true", "--dataset_num_proc", "1", "--lazy_tokenize", "false",
+        # Render AudioSet/RIR lazily at batch collation time.  Eager mode
+        # would materialize every [2, 320000] waveform during Dataset.map.
+        "--dataloader_pin_memory", "true", "--dataset_num_proc", "1", "--lazy_tokenize", "true",
         "--load_from_cache_file", "false", "--loss_scale", "all", "--seed", "42", "--data_seed", "42",
         "--optim", "adamw_torch", "--adam_beta1", str(BAT_TRAINING.beta1), "--adam_beta2", str(BAT_TRAINING.beta2),
         "--weight_decay", str(BAT_TRAINING.weight_decay), "--attn_impl", "sdpa", "--bf16", "true",

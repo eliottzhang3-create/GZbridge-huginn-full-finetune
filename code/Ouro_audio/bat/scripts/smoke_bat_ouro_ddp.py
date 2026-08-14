@@ -281,8 +281,10 @@ def main() -> None:
         "--num_train_epochs", str(schedule["epochs"]), "--per_device_train_batch_size", str(EXPECTED_LOCAL_BATCH),
         "--gradient_accumulation_steps", "1", "--gradient_checkpointing", "false", "--logging_steps", "1",
         "--save_strategy", "steps", "--save_steps", str(save_steps), "--save_total_limit", "2", "--save_only_model", "false",
-        "--dataloader_num_workers", "0", "--dataloader_pin_memory", "false", "--dataset_num_proc", "1",
-        "--lazy_tokenize", "false", "--load_from_cache_file", "false", "--loss_scale", "all", "--seed", "42",
+        "--dataloader_num_workers", "4", "--dataloader_pin_memory", "true", "--dataset_num_proc", "1",
+        # Keep smoke/preflight on the same lazy multimodal path as formal
+        # training; eager mode renders the whole dataset inside Dataset.map.
+        "--lazy_tokenize", "true", "--load_from_cache_file", "false", "--loss_scale", "all", "--seed", "42",
         "--data_seed", "42", "--optim", "adamw_torch", "--adam_beta1", str(BAT_TRAINING.beta1),
         "--adam_beta2", str(BAT_TRAINING.beta2), "--weight_decay", str(BAT_TRAINING.weight_decay),
         "--attn_impl", "sdpa", "--bf16", "true", "--ddp_find_unused_parameters", "false",
