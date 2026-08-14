@@ -137,6 +137,10 @@ def main() -> None:
     print(f"[rank] rank={rank()} world_size={actual_world_size}")
     print(f"[curriculum] manifest={args.dataset} records={dataset_records}")
     print(f"[curriculum] boundaries={curriculum_report['boundary_steps']}")
+    print(
+        f"[curriculum] shuffle={curriculum_report['shuffle_policy']} "
+        f"runtime_shuffle={curriculum_report['runtime_shuffle']}"
+    )
     print(f"[schedule] {json.dumps({'total_steps': total_steps, 'warmup_steps': warmup_steps, 'scheduler': 'cosine', 'global_batch_size': global_batch_size}, ensure_ascii=False)}")
     if rank() == 0:
         print(f"[argv] {' '.join(argv)}")

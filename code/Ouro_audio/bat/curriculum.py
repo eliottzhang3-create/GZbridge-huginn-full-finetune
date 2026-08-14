@@ -9,6 +9,7 @@ drift between tools.
 from __future__ import annotations
 
 import json
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -64,6 +65,20 @@ def count_jsonl(path: Path) -> int:
         return sum(1 for line in handle if line.strip())
 
 
+def update_order_digest(digest: "hashlib._Hash", row: dict[str, Any], padding: bool) -> None:
+    """Add one curriculum row to the deterministic block-order digest."""
+    payload = {
+        "question_id": row.get("question_id"),
+        "bat_type": row.get("bat_type"),
+        "source_shape": row.get("source_shape"),
+        "padding": bool(padding),
+    }
+    digest.update(
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    )
+    digest.update(b"\n")
+
+
 def steps_for_records(record_count: int, global_batch_size: int) -> int:
     if record_count <= 0 or global_batch_size <= 0:
         raise ValueError("record_count and global_batch_size must be positive")
@@ -85,6 +100,13 @@ def load_report(path: Path) -> dict[str, Any]:
 
 
 def validate_curriculum_report(report: dict[str, Any], global_batch_size: int) -> None:
+    if report.get("shuffle_policy") != "deterministic_per_curriculum_block":
+        raise ValueError(
+            "Curriculum report must use deterministic per-block shuffling; "
+            f"got {report.get('shuffle_policy')!r}"
+        )
+    if report.get("runtime_shuffle") is not False:
+        raise ValueError("Curriculum report must explicitly disable runtime/global dataloader shuffle")
     if int(report.get("global_batch_size", -1)) != global_batch_size:
         raise ValueError(
             f"Curriculum global batch mismatch: report={report.get('global_batch_size')} "
@@ -101,7 +123,15 @@ def validate_curriculum_report(report: dict[str, Any], global_batch_size: int) -
     previous_record = 0
     previous_step = 0
     for item in blocks:
-        for key in ("start_record", "end_record", "start_step", "end_step", "written_records"):
+        for key in (
+            "start_record",
+            "end_record",
+            "start_step",
+            "end_step",
+            "written_records",
+            "shuffle_seed",
+            "order_sha256",
+        ):
             if key not in item:
                 raise ValueError(f"Curriculum block is missing {key}: {item}")
         if int(item["start_record"]) != previous_record or int(item["start_step"]) != previous_step:

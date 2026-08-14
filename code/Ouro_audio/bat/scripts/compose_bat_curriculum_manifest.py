@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import random
 from itertools import islice
 from pathlib import Path
 from typing import Any
@@ -15,6 +17,7 @@ from bat.curriculum import (
     STAGE_TYPES,
     count_jsonl,
     steps_for_records,
+    update_order_digest,
     validate_curriculum_report,
 )
 
@@ -31,6 +34,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--global-batch-size", type=int, default=16)
     parser.add_argument("--limit-per-stage", type=int, default=0, help="For a small integration smoke only")
+    parser.add_argument("--shuffle-seed", type=int, default=42)
     parser.add_argument("--allow-count-drift", action="store_true")
     return parser.parse_args()
 
@@ -105,8 +109,15 @@ def main() -> None:
     with temporary.open("w", encoding="utf-8", newline="\n") as handle:
         for stage in STAGE_ORDER:
             source_count = stage_counts[stage]
+            # Keep only one stage in memory.  This permits deterministic
+            # per-block shuffling without materializing the 4.2M-row global
+            # curriculum manifest itself.
+            source_rows = list(islice(iter_jsonl(stage_paths[stage]), source_count))
             for epoch in range(1, STAGE_EPOCHS[stage] + 1):
                 block_index += 1
+                block_seed = args.shuffle_seed + block_index - 1
+                block_rows = list(source_rows)
+                random.Random(block_seed).shuffle(block_rows)
                 padding_count = (-source_count) % args.global_batch_size if stage == "III" else 0
                 written_count = source_count + padding_count
                 if stage != "III" and written_count % args.global_batch_size:
@@ -117,12 +128,19 @@ def main() -> None:
                 start_record = record_cursor
                 start_step = step_cursor
                 padding_seed: list[dict[str, Any]] = []
-                for index, row in enumerate(islice(iter_jsonl(stage_paths[stage]), source_count)):
+                order_digest = hashlib.sha256()
+                for index, row in enumerate(block_rows):
                     if index < args.global_batch_size:
                         padding_seed.append(row)
-                    write_row(handle, row, stage, epoch, block_index, padding=False)
+                    item = dict(row)
+                    item["curriculum_shuffle_seed"] = block_seed
+                    update_order_digest(order_digest, item, padding=False)
+                    write_row(handle, item, stage, epoch, block_index, padding=False)
                 for index in range(padding_count):
-                    write_row(handle, padding_seed[index % len(padding_seed)], stage, epoch, block_index, padding=True)
+                    item = dict(padding_seed[index % len(padding_seed)])
+                    item["curriculum_shuffle_seed"] = block_seed
+                    update_order_digest(order_digest, item, padding=True)
+                    write_row(handle, item, stage, epoch, block_index, padding=True)
                 record_cursor += written_count
                 step_cursor += steps_for_records(written_count, args.global_batch_size)
                 blocks.append(
@@ -132,6 +150,8 @@ def main() -> None:
                         "epoch": epoch,
                         "source_records": source_count,
                         "padding_records": padding_count,
+                        "shuffle_seed": block_seed,
+                        "order_sha256": order_digest.hexdigest(),
                         "written_records": written_count,
                         "start_record": start_record,
                         "end_record": record_cursor,
@@ -160,6 +180,9 @@ def main() -> None:
         "lr_scheduler_type": "cosine",
         "padding_policy": "pad_stage_III_each_epoch_to_global_batch",
         "padding_records_total": sum(int(item["padding_records"]) for item in blocks),
+        "shuffle_policy": "deterministic_per_curriculum_block",
+        "shuffle_seed": args.shuffle_seed,
+        "runtime_shuffle": False,
     }
     validate_curriculum_report(report, args.global_batch_size)
     args.report.parent.mkdir(parents=True, exist_ok=True)

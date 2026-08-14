@@ -4,12 +4,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import Counter
 from pathlib import Path
 from typing import Any
 
-from bat.curriculum import STAGE_EPOCHS, STAGE_ORDER, load_report, validate_curriculum_report
+from bat.curriculum import STAGE_EPOCHS, STAGE_ORDER, load_report, update_order_digest, validate_curriculum_report
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,12 +27,20 @@ def main() -> None:
     curriculum = load_report(args.report)
     validate_curriculum_report(curriculum, args.global_batch_size)
     expected_blocks = [
-        (int(item["block"]), str(item["stage"]), int(item["epoch"]), int(item["written_records"]))
+        (
+            int(item["block"]),
+            str(item["stage"]),
+            int(item["epoch"]),
+            int(item["written_records"]),
+            int(item["shuffle_seed"]),
+            str(item["order_sha256"]),
+        )
         for item in curriculum["blocks"]
     ]
     issues: list[str] = []
     observed_blocks: Counter[tuple[int, str, int]] = Counter()
     observed_padding: Counter[tuple[int, str, int]] = Counter()
+    block_digests = {block: hashlib.sha256() for block, *_ in expected_blocks}
     record_count = 0
     current_block_index = 0
     with args.manifest.open("r", encoding="utf-8") as handle:
@@ -58,7 +67,7 @@ def main() -> None:
             if block < 1 or block > len(expected_blocks):
                 issues.append(f"invalid_block:{line_number}:{block}")
                 continue
-            expected_block, expected_stage, expected_epoch, _ = expected_blocks[block - 1]
+            expected_block, expected_stage, expected_epoch, _, expected_seed, _ = expected_blocks[block - 1]
             if (block, stage, epoch) != (expected_block, expected_stage, expected_epoch):
                 issues.append(
                     f"block_metadata_mismatch:{line_number}:observed={(block, stage, epoch)} "
@@ -72,9 +81,18 @@ def main() -> None:
                 observed_padding[(block, stage, epoch)] += 1
                 if stage != "III":
                     issues.append(f"non_stage3_padding:{line_number}:stage={stage}")
+            try:
+                observed_seed = int(row.get("curriculum_shuffle_seed", -1))
+            except (TypeError, ValueError):
+                observed_seed = -1
+            if observed_seed != expected_seed:
+                issues.append(
+                    f"shuffle_seed_mismatch:{line_number}:observed={observed_seed}:expected={expected_seed}"
+                )
+            update_order_digest(block_digests[block], row, padding)
             record_count += 1
 
-    for block, stage, epoch, written_records in expected_blocks:
+    for block, stage, epoch, written_records, _, expected_digest in expected_blocks:
         observed = observed_blocks[(block, stage, epoch)]
         if observed != written_records:
             issues.append(f"block_count_mismatch:block={block}:observed={observed}:expected={written_records}")
@@ -83,6 +101,11 @@ def main() -> None:
             issues.append(
                 f"block_padding_mismatch:block={block}:observed={observed_padding[(block, stage, epoch)]}:"
                 f"expected={expected_padding}"
+            )
+        observed_digest = block_digests[block].hexdigest()
+        if observed_digest != expected_digest:
+            issues.append(
+                f"block_order_digest_mismatch:block={block}:observed={observed_digest}:expected={expected_digest}"
             )
     if record_count != int(curriculum["total_records"]):
         issues.append(f"total_record_mismatch:observed={record_count}:expected={curriculum['total_records']}")
