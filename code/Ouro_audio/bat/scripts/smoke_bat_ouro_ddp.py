@@ -78,6 +78,114 @@ def count_jsonl(path: Path) -> int:
         return sum(1 for line in handle if line.strip())
 
 
+def audit_audio_batch(model: torch.nn.Module, inputs: dict[str, Any]) -> dict[str, Any]:
+    """Prove that the lazy batch contains the expected AudioSet/RIR renderings."""
+    waveforms = inputs.get("audio_waveforms")
+    records = inputs.get("bat_audio_records")
+    if not torch.is_tensor(waveforms):
+        raise RuntimeError("Lazy BAT batch has no tensor audio_waveforms")
+    if waveforms.ndim != 3 or tuple(waveforms.shape[1:]) != (2, 320000):
+        raise RuntimeError(f"Unexpected lazy waveform batch shape: {tuple(waveforms.shape)}")
+    if not bool(torch.isfinite(waveforms).all().item()):
+        raise RuntimeError("Lazy BAT waveform batch contains NaN or Inf")
+    if not isinstance(records, list) or len(records) != waveforms.shape[0]:
+        raise RuntimeError(
+            "Lazy BAT source metadata is missing or misaligned: "
+            f"records={type(records).__name__}/{len(records) if isinstance(records, list) else None} "
+            f"batch={waveforms.shape[0]}"
+        )
+
+    causal = find_module(model, "OuroForCausalLM")
+    renderer = getattr(causal, "audio_renderer", None)
+    if renderer is None:
+        raise RuntimeError("Ouro BAT model has no attached BATAudioRenderer")
+    # The renderer is intentionally CPU-side and owns the read-only input
+    # roots. Re-rendering only this first smoke batch gives an independent
+    # equality check without adding work to the real training loop.
+    actual = waveforms.detach().float().cpu()
+    details: list[dict[str, Any]] = []
+    for index, record in enumerate(records):
+        if not isinstance(record, dict):
+            raise RuntimeError(f"Lazy BAT record {index} is not a dictionary: {type(record).__name__}")
+        audio_id = str(record.get("audio_id", ""))
+        reverb_id = str(record.get("reverb_id", ""))
+        if not audio_id or not reverb_id:
+            raise RuntimeError(f"Lazy BAT record {index} lacks audio_id/reverb_id: {record}")
+        audio_path = renderer._resolve_audio(renderer.audio_root, audio_id)
+        reverb_path = renderer._resolve_reverb(renderer.reverb_root, reverb_id)
+        second_audio_id = record.get("audio_id2")
+        second_reverb_id = record.get("reverb_id2")
+        second_paths = None
+        if second_audio_id not in (None, "", "null") or second_reverb_id not in (None, "", "null"):
+            if second_audio_id in (None, "", "null") or second_reverb_id in (None, "", "null"):
+                raise RuntimeError(f"Lazy BAT record {index} has a partial second source: {record}")
+            second_paths = {
+                "audio": str(renderer._resolve_audio(renderer.audio_root, str(second_audio_id))),
+                "reverb": str(renderer._resolve_reverb(renderer.reverb_root, str(second_reverb_id))),
+            }
+        expected = renderer.render_record(record).float().cpu()
+        difference = (actual[index] - expected).abs()
+        max_abs_error = float(difference.max().item())
+        if max_abs_error > 1e-5:
+            raise RuntimeError(
+                f"Lazy BAT waveform does not match an independent AudioSet/RIR render: "
+                f"index={index} max_abs_error={max_abs_error}"
+            )
+        waveform_rms = float(torch.sqrt(torch.mean(actual[index] ** 2)).item())
+        if waveform_rms <= 0.0:
+            raise RuntimeError(f"Lazy BAT rendered waveform is silent: index={index}")
+        details.append({
+            "index": index,
+            "audio_id": audio_id,
+            "audio_path": str(audio_path),
+            "reverb_id": reverb_id,
+            "reverb_path": str(reverb_path),
+            "second_source": second_paths,
+            "waveform_shape": list(actual[index].shape),
+            "waveform_rms": waveform_rms,
+            "independent_render_max_abs_error": max_abs_error,
+        })
+    return {
+        "status": "ok",
+        "source_metadata_present": True,
+        "audio_root": str(renderer.audio_root),
+        "reverb_root": str(renderer.reverb_root),
+        "batch_shape": list(actual.shape),
+        "records": details,
+    }
+
+
+def gradient_audit(model: torch.nn.Module) -> dict[str, Any]:
+    """Audit the first real backward: only Q-Former and LoRA may receive grads."""
+    groups = {"qformer": 0, "lora": 0, "spatial_ast": 0, "gate": 0, "ouro_native": 0, "other": 0}
+    nonfinite: list[str] = []
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        if "lora_A" in name or "lora_B" in name:
+            group = "lora"
+        elif "audio_qformer" in name:
+            group = "qformer"
+        elif "spatial_ast_encoder" in name:
+            group = "spatial_ast"
+        elif "early_exit_gate" in name:
+            group = "gate"
+        elif ".model." in name or name.endswith("lm_head.weight"):
+            group = "ouro_native"
+        else:
+            group = "other"
+        groups[group] += 1
+        if not bool(torch.isfinite(parameter.grad).all().item()):
+            nonfinite.append(name)
+    if groups["qformer"] <= 0 or groups["lora"] <= 0:
+        raise RuntimeError(f"Expected finite Q-Former and LoRA gradients, got {groups}")
+    if any(groups[key] for key in ("spatial_ast", "gate", "ouro_native", "other")):
+        raise RuntimeError(f"Frozen BAT components unexpectedly received gradients: {groups}")
+    if nonfinite:
+        raise RuntimeError(f"Non-finite trainable gradients: {nonfinite[:10]}")
+    return {"finite_gradient_parameter_counts": groups, "nonfinite_names": nonfinite}
+
+
 def barrier() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -207,6 +315,9 @@ def read_checkpoint_step(path: Path) -> int:
 
 def main() -> None:
     args = parse_args()
+    # Enable provenance metadata and runtime prefix audits only for this
+    # smoke. Formal training keeps the batch free of audit-only dictionaries.
+    os.environ["BAT_AUDIO_AUDIT"] = "1"
     BAT_TRAINING.validate()
     require_environment()
 
@@ -318,19 +429,40 @@ def main() -> None:
                 "rank": current_rank, "local_rank": local_rank, "world_size": current_world,
                 "forward": 0, "backward": 0, "layer": 0, "gate": 0,
                 "layer_backward": 0, "gate_backward": 0, "loss": None, "batch": None,
+                "audio_encoder_forward": 0, "audio_encoder_input_shape": None,
+                "audio_encoder_output_shape": None, "qformer_forward": 0,
+                "qformer_input_shape": None, "qformer_output_shape": None,
+                "audio_batch": None, "prefix_audit": None, "gradient_audit": None,
             }
             handles: list[Any] = []
             first_layer = ouro.layers[0]
+            audio_encoder = find_module(model, "SpatialASTAudioEncoder")
+            qformer = find_module(model, "BATQFormer")
+
+            def audio_encoder_hook(_module, hook_inputs, hook_output):
+                trace["audio_encoder_forward"] += 1
+                trace["audio_encoder_input_shape"] = list(hook_inputs[0].shape)
+                trace["audio_encoder_output_shape"] = list(hook_output.shape)
+
+            def qformer_hook(_module, hook_inputs, hook_output):
+                trace["qformer_forward"] += 1
+                trace["qformer_input_shape"] = list(hook_inputs[0].shape)
+                trace["qformer_output_shape"] = list(hook_output.shape)
+
             handles.append(first_layer.register_forward_hook(lambda *_: trace.__setitem__("layer", trace["layer"] + 1)))
             handles.append(ouro.early_exit_gate.register_forward_hook(lambda *_: trace.__setitem__("gate", trace["gate"] + 1)))
             handles.append(first_layer.register_full_backward_hook(lambda *_: trace.__setitem__("layer_backward", trace["layer_backward"] + 1)))
             handles.append(ouro.early_exit_gate.register_full_backward_hook(lambda *_: trace.__setitem__("gate_backward", trace["gate_backward"] + 1)))
+            handles.append(audio_encoder.register_forward_hook(audio_encoder_hook))
+            handles.append(qformer.register_forward_hook(qformer_hook))
             original_compute_loss = trainer.compute_loss
             original_backward = trainer.accelerator.backward
 
             def compute_loss(actual_model, inputs, return_outputs=False, num_items_in_batch=None):
                 trace["forward"] += 1
                 labels_before = inputs["labels"].detach().clone()
+                audio_batch_before = inputs.get("audio_waveforms")
+                audio_records_before = inputs.get("bat_audio_records")
                 loss_scale_before = inputs.get("loss_scale")
                 if torch.is_tensor(loss_scale_before):
                     loss_scale_before = loss_scale_before.detach().clone()
@@ -400,6 +532,26 @@ def main() -> None:
                         raise RuntimeError(f"Rank {current_rank} local batch is not 2: {tuple(inputs['input_ids'].shape)}")
                     if not bool((labels[:, :BAT_TRAINING.audio_token_count] == -100).all().item()):
                         raise RuntimeError("Audio prefix labels are not fully masked")
+                    trace["audio_batch"] = audit_audio_batch(model, {
+                        "audio_waveforms": audio_batch_before,
+                        "bat_audio_records": audio_records_before,
+                    })
+                    if trace["audio_encoder_forward"] <= 0 or trace["qformer_forward"] <= 0:
+                        raise RuntimeError("Lazy audio encoder/Q-Former did not run in the real training forward")
+                    if trace["audio_encoder_input_shape"] != [EXPECTED_LOCAL_BATCH, 2, 320000]:
+                        raise RuntimeError(f"Unexpected Spatial-AST input shape: {trace['audio_encoder_input_shape']}")
+                    if trace["audio_encoder_output_shape"] != [EXPECTED_LOCAL_BATCH, 515, 768]:
+                        raise RuntimeError(f"Unexpected Spatial-AST output shape: {trace['audio_encoder_output_shape']}")
+                    if trace["qformer_input_shape"] != [EXPECTED_LOCAL_BATCH, 515, 768]:
+                        raise RuntimeError(f"Unexpected Q-Former input shape: {trace['qformer_input_shape']}")
+                    if trace["qformer_output_shape"] != [EXPECTED_LOCAL_BATCH, 64, 2048]:
+                        raise RuntimeError(f"Unexpected Q-Former output shape: {trace['qformer_output_shape']}")
+                    prefix_audit = getattr(causal, "_ouro_bat_last_audio_forward_audit", None)
+                    if not isinstance(prefix_audit, dict) or not prefix_audit.get("audio_prefix_replaced"):
+                        raise RuntimeError("Ouro audio prefix replacement audit was not captured")
+                    if prefix_audit.get("inputs_embeds_shape") != list(inputs["input_ids"].shape):
+                        raise RuntimeError(f"Audio/text embedding width mismatch: {prefix_audit}")
+                    trace["prefix_audit"] = prefix_audit
                     trace["batch"] = {
                         "input_ids_shape": list(inputs["input_ids"].shape),
                         "labels_shape": list(labels.shape),
@@ -420,7 +572,10 @@ def main() -> None:
 
             def backward(loss, **kwargs):
                 trace["backward"] += 1
-                return original_backward(loss, **kwargs)
+                result = original_backward(loss, **kwargs)
+                if trace["gradient_audit"] is None:
+                    trace["gradient_audit"] = gradient_audit(model)
+                return result
 
             trainer.compute_loss = compute_loss
             trainer.accelerator.backward = backward
@@ -443,6 +598,16 @@ def main() -> None:
                 raise RuntimeError(f"Rank {current_rank} unexpected recurrent forward counts: {trace}")
             if trace["layer_backward"] != EXPECTED_RECURRENT_STEPS * expected_optimizer_steps:
                 raise RuntimeError(f"Rank {current_rank} unexpected recurrent backward count: {trace}")
+            if trace["audio_encoder_forward"] != expected_optimizer_steps:
+                raise RuntimeError(f"Rank {current_rank} unexpected Spatial-AST calls: {trace}")
+            if trace["qformer_forward"] != expected_optimizer_steps:
+                raise RuntimeError(f"Rank {current_rank} unexpected Q-Former calls: {trace}")
+            if (
+                trace["audio_batch"] is None
+                or trace["prefix_audit"] is None
+                or trace["gradient_audit"] is None
+            ):
+                raise RuntimeError(f"Rank {current_rank} missing lazy audio provenance audit: {trace}")
             local_report = {
                 "rank": current_rank, "local_rank": local_rank, "world_size": current_world,
                 "parameters": parameters, "lora": lora, "optimizer": local_optimizer,

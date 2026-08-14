@@ -77,6 +77,7 @@ SPATIAL_AST_HIDDEN_SIZE = 768
 OURO_HIDDEN_SIZE = 2048
 EXPECTED_UT_STEPS = 4
 EXPECTED_EARLY_EXIT_THRESHOLD = 1.0
+AUDIO_AUDIT_ENABLED = os.environ.get("BAT_AUDIO_AUDIT", "0") == "1"
 
 
 def env_path(name: str, default: Path) -> Path:
@@ -167,8 +168,11 @@ def _install_audio_forward(model: nn.Module) -> None:
         inputs_embeds: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
         audio_waveforms: torch.Tensor | None = None,
+        bat_audio_records: list[dict[str, Any]] | None = None,
         **kwargs: Any,
     ):
+        if AUDIO_AUDIT_ENABLED and bat_audio_records is not None:
+            self._ouro_bat_last_audio_records = bat_audio_records
         if audio_waveforms is None:
             return original_forward(
                 input_ids=input_ids,
@@ -230,6 +234,15 @@ def _install_audio_forward(model: nn.Module) -> None:
                 "Audio prefix replacement changed sequence width: "
                 f"input_ids={tuple(input_ids.shape)} inputs_embeds={tuple(inputs_embeds.shape)}"
             )
+        if AUDIO_AUDIT_ENABLED:
+            self._ouro_bat_last_audio_forward_audit = {
+                "input_ids_shape": list(input_ids.shape),
+                "audio_embeddings_shape": list(audio_embeddings.shape),
+                "text_embeddings_shape": list(text_embeddings.shape),
+                "inputs_embeds_shape": list(inputs_embeds.shape),
+                "audio_prefix_replaced": True,
+                "audio_prefix_token_count": AUDIO_TOKEN_COUNT,
+            }
         call_kwargs = dict(kwargs)
         call_kwargs["inputs_embeds"] = inputs_embeds
         call_kwargs["input_ids"] = None
@@ -397,6 +410,10 @@ class OuroBATTemplate(Template):
         if labels is not None:
             encoded["labels"] = [-100] * self.audio_token_count + list(labels)
         encoded["audio_waveform"] = waveform
+        if AUDIO_AUDIT_ENABLED:
+            # Preserve only the source metadata needed by the smoke audit.
+            # The model forward consumes this field before calling Ouro.
+            encoded["bat_audio_record"] = dict(audios[0])
         return encoded
 
     def _data_collator_mm_data(self, batch: list[dict[str, Any]]) -> dict[str, Any]:
@@ -404,7 +421,13 @@ class OuroBATTemplate(Template):
         if any(value is None for value in waveforms):
             raise ValueError("Every Ouro BAT sample must contain audio_waveform")
         stacked = torch.stack([value if torch.is_tensor(value) else torch.as_tensor(value) for value in waveforms], dim=0)
-        return {"audio_waveforms": stacked.float()}
+        payload = {"audio_waveforms": stacked.float()}
+        if AUDIO_AUDIT_ENABLED:
+            records = [item.get("bat_audio_record") for item in batch]
+            if any(record is None for record in records):
+                raise RuntimeError("BAT audio audit metadata was lost before collation")
+            payload["bat_audio_records"] = records
+        return payload
 
 
 _register_architecture()
