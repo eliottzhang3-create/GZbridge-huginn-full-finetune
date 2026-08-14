@@ -182,6 +182,16 @@ def make_collator(template: Any, pad_token_id: int):
     return collate
 
 
+def source_summary(record: Any) -> dict[str, Any] | None:
+    """Keep only provenance fields needed to diagnose a slow audio batch."""
+    if not isinstance(record, dict):
+        return None
+    return {
+        key: str(record.get(key, ""))
+        for key in ("audio_id", "reverb_id", "audio_id2", "reverb_id2", "question_id", "question_type")
+    }
+
+
 class CudaRegionTimer:
     def __init__(self):
         self.start = torch.cuda.Event(enable_timing=True)
@@ -323,6 +333,10 @@ def main() -> None:
         start = step * block + current_rank * args.local_batch_size
         rank_rows.extend(all_rows[start : start + args.local_batch_size])
 
+    # Keep source provenance in the profiler batches.  This does not alter the
+    # model path; it only lets a later report identify a slow AudioSet/RIR
+    # lookup instead of exposing only an aggregate 80-second stall.
+    os.environ.setdefault("BAT_AUDIO_AUDIT", "1")
     plugin = import_plugin(args.plugin_path.resolve())
     if plugin.MODEL_TYPE != MODEL_TYPE or plugin.TEMPLATE_TYPE != TEMPLATE_TYPE:
         raise RuntimeError("BAT plugin registration constants do not match profiler")
@@ -416,6 +430,7 @@ def main() -> None:
     qformer_values: list[float] = []
     step_values: list[float] = []
     losses: list[float] = []
+    step_details: list[dict[str, Any]] = []
     iterator = iter(loader)
     torch.cuda.reset_peak_memory_stats(device)
     try:
@@ -458,6 +473,7 @@ def main() -> None:
             forward_ms = forward_timer.milliseconds()
             backward_ms = backward_timer.milliseconds()
             if step_index >= args.warmup_steps:
+                source_records = [source_summary(item) for item in batch.get("bat_audio_records", [])]
                 data_wait_values.append(data_wait)
                 h2d_values.append(h2d_seconds)
                 forward_values.append(forward_ms / 1000.0)
@@ -466,6 +482,20 @@ def main() -> None:
                 qformer_values.append(qformer_timer.milliseconds() / 1000.0)
                 step_values.append(time.perf_counter() - step_started)
                 losses.append(float(loss.detach().float().cpu().item()))
+                step_details.append(
+                    {
+                        "measured_step_index": step_index - args.warmup_steps,
+                        "data_wait_seconds": data_wait,
+                        "host_to_device_seconds": h2d_seconds,
+                        "spatial_ast_seconds": spatial_timer.milliseconds() / 1000.0,
+                        "qformer_seconds": qformer_timer.milliseconds() / 1000.0,
+                        "ouro_forward_seconds": forward_ms / 1000.0,
+                        "backward_plus_ddp_allreduce_seconds": backward_ms / 1000.0,
+                        "step_wall_seconds": time.perf_counter() - step_started,
+                        "loss": float(loss.detach().float().cpu().item()),
+                        "sources": source_records,
+                    }
+                )
 
             model.zero_grad(set_to_none=True)
             if current_world > 1:
@@ -491,6 +521,10 @@ def main() -> None:
             "step_wall_from_data_to_sync": summarize(step_values),
         },
         "loss": summarize(losses),
+        "slowest_steps": sorted(
+            step_details, key=lambda item: float(item["step_wall_seconds"]), reverse=True
+        )[:5],
+        "step_details": step_details,
         "memory": {
             "peak_allocated_bytes": int(torch.cuda.max_memory_allocated(device)),
             "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
@@ -547,6 +581,7 @@ def main() -> None:
         print(f"[report] {output}", flush=True)
         print(f"[ranks] {len(reports)}", flush=True)
         print(f"[rank0 timings] {json.dumps(local_report['timings_seconds'], ensure_ascii=False)}", flush=True)
+        print(f"[rank0 slowest_steps] {json.dumps(local_report['slowest_steps'], ensure_ascii=False)}", flush=True)
         print(f"[rank0 memory] {json.dumps(local_report['memory'], ensure_ascii=False)}", flush=True)
         print(f"[update_probe] {json.dumps(parameter_probe_report, ensure_ascii=False)}", flush=True)
         print("========== BAT OURO PURE PIPELINE PROFILING PASSED ==========", flush=True)
