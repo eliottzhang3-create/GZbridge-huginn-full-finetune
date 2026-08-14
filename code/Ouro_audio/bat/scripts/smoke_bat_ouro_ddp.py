@@ -47,6 +47,7 @@ EXPECTED_LOCAL_BATCH = BAT_TRAINING.per_device_batch_size
 EXPECTED_DATASET_RECORDS = 16
 EXPECTED_RECURRENT_STEPS = 4
 EXPECTED_OPTIMIZER_STEPS = 2
+EXPECTED_OURO_HIDDEN_SIZE = 2048
 
 
 def parse_args() -> argparse.Namespace:
@@ -624,20 +625,27 @@ def main() -> None:
                     prefix_audit = getattr(causal, "_ouro_bat_last_audio_forward_audit", None)
                     if not isinstance(prefix_audit, dict) or not prefix_audit.get("audio_prefix_replaced"):
                         raise RuntimeError("Ouro audio prefix replacement audit was not captured")
-                    # Normalize both sides before comparing.  The audit payload
-                    # is serialized as lists, while torch.Size/tuple values can
-                    # appear when this code runs through different DDP/PEFT
-                    # wrappers.  The previous direct list comparison produced a
-                    # false failure even though [B, T] was identical.
+                    # Compare the sequence dimensions separately from the
+                    # embedding width: input_ids is [B, T], while inputs_embeds
+                    # is [B, T, H].  Comparing the full shapes would always
+                    # report a false mismatch.
                     expected_sequence_shape = shape_tuple(input_ids)
-                    actual_sequence_shape = tuple(
+                    actual_embedding_shape = tuple(
                         int(value) for value in (prefix_audit.get("inputs_embeds_shape") or ())
                     )
+                    actual_sequence_shape = actual_embedding_shape[:2]
                     if actual_sequence_shape != expected_sequence_shape:
                         raise RuntimeError(
                             "Audio/text embedding sequence shape mismatch: "
-                            f"expected={expected_sequence_shape} actual={actual_sequence_shape} "
+                            f"expected_sequence={expected_sequence_shape} "
+                            f"actual_embedding={actual_embedding_shape} "
                             f"audit={prefix_audit}"
+                        )
+                    if actual_embedding_shape != (*expected_sequence_shape, EXPECTED_OURO_HIDDEN_SIZE):
+                        raise RuntimeError(
+                            "Audio embedding hidden-size mismatch: "
+                            f"expected={(*expected_sequence_shape, EXPECTED_OURO_HIDDEN_SIZE)} "
+                            f"actual={actual_embedding_shape} audit={prefix_audit}"
                         )
                     trace["prefix_audit"] = prefix_audit
                     trace["batch"] = {
