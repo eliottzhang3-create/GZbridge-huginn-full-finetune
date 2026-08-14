@@ -95,7 +95,9 @@ def main() -> None:
         "--dataloader_pin_memory", "true", "--dataset_num_proc", "1", "--lazy_tokenize", "false",
         "--load_from_cache_file", "false", "--loss_scale", "all", "--seed", "42", "--data_seed", "42",
         "--optim", "adamw_torch", "--adam_beta1", str(BAT_TRAINING.beta1), "--adam_beta2", str(BAT_TRAINING.beta2),
-        "--weight_decay", str(BAT_TRAINING.weight_decay), "--attn_impl", "sdpa", "--bf16", "true", "--report_to", "none",
+        "--weight_decay", str(BAT_TRAINING.weight_decay), "--attn_impl", "sdpa", "--bf16", "true",
+        "--ddp_find_unused_parameters", "false", "--average_tokens_across_devices", "false",
+        "--report_to", "none",
     ]
     if args.resume_from_checkpoint is not None:
         argv.extend(["--resume_from_checkpoint", str(args.resume_from_checkpoint)])

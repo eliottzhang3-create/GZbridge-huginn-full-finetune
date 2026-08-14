@@ -152,7 +152,9 @@ def main() -> None:
         "--lazy_tokenize", "false", "--load_from_cache_file", "false", "--loss_scale", "all", "--seed", "42",
         "--data_seed", "42", "--optim", "adamw_torch", "--adam_beta1", str(BAT_TRAINING.beta1),
         "--adam_beta2", str(BAT_TRAINING.beta2), "--weight_decay", str(BAT_TRAINING.weight_decay),
-        "--attn_impl", "sdpa", "--bf16", "true", "--report_to", "none",
+        "--attn_impl", "sdpa", "--bf16", "true", "--ddp_find_unused_parameters", "false",
+        "--average_tokens_across_devices", "false",
+        "--report_to", "none",
     ]
 
     class AuditedDistributedSwiftSft(SwiftSft):
@@ -191,23 +193,72 @@ def main() -> None:
 
             def compute_loss(actual_model, inputs, return_outputs=False, num_items_in_batch=None):
                 trace["forward"] += 1
+                labels_before = inputs["labels"].detach().clone()
+                loss_scale_before = inputs.get("loss_scale")
+                if torch.is_tensor(loss_scale_before):
+                    loss_scale_before = loss_scale_before.detach().clone()
                 result = original_compute_loss(actual_model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
                 loss, outputs = result
                 if trace["loss"] is None:
                     logits = outputs.logits
-                    labels = inputs["labels"]
+                    labels = labels_before
                     if logits.ndim != 3 or labels.ndim != 2 or tuple(logits.shape[:2]) != tuple(labels.shape):
                         raise RuntimeError(f"Cannot audit shifted CE: logits={tuple(logits.shape)} labels={tuple(labels.shape)}")
-                    shifted_logits = logits[:, :-1].contiguous()
+                    logits_float = logits.float()
+                    shifted_logits = logits_float[:, :-1].contiguous()
                     shifted_labels = labels[:, 1:].contiguous()
-                    manual_loss = F.cross_entropy(
+                    manual_token_loss = F.cross_entropy(
                         shifted_logits.reshape(-1, shifted_logits.shape[-1]),
-                        shifted_labels.reshape(-1), ignore_index=-100,
+                        shifted_labels.reshape(-1), ignore_index=-100, reduction="none",
                     )
+                    manual_valid = shifted_labels.reshape(-1) != -100
+                    manual_sum = manual_token_loss[manual_valid].sum()
+                    manual_count = int(manual_valid.sum().item())
+                    manual_value = float((manual_sum / manual_count).detach().cpu())
+
+                    # Reproduce ms-swift v4.4.2's per-token loss path:
+                    # roll labels left, optionally apply loss_scale, then
+                    # divide the token-loss sum by num_items_in_batch.
+                    swift_labels = torch.roll(labels, shifts=-1, dims=-1).reshape(-1)
+                    swift_token_loss = F.cross_entropy(
+                        logits_float.reshape(-1, logits_float.shape[-1]),
+                        swift_labels,
+                        ignore_index=-100,
+                        reduction="none",
+                    )
+                    swift_valid = swift_labels != -100
+                    if loss_scale_before is not None:
+                        if not torch.is_tensor(loss_scale_before):
+                            raise RuntimeError(f"Unexpected loss_scale type: {type(loss_scale_before).__name__}")
+                        swift_scale = torch.roll(loss_scale_before, shifts=-1, dims=-1).reshape(-1).to(swift_token_loss.dtype)
+                        swift_token_loss = swift_token_loss * swift_scale
+                        expected_scale = swift_valid.to(swift_scale.dtype)
+                        loss_scale_binary_equivalent = bool(torch.equal(swift_scale, expected_scale))
+                    else:
+                        swift_scale = None
+                        loss_scale_binary_equivalent = True
+                    swift_sum = swift_token_loss.sum()
+                    if num_items_in_batch is None:
+                        denominator = manual_count
+                    elif torch.is_tensor(num_items_in_batch):
+                        denominator = int(num_items_in_batch.detach().cpu().item())
+                    else:
+                        denominator = int(num_items_in_batch)
+                    if denominator <= 0:
+                        raise RuntimeError(f"Invalid Swift loss denominator: {denominator}")
+                    swift_formula_value = float((swift_sum / denominator).detach().cpu())
                     trainer_value = float(loss.detach().float().cpu())
-                    manual_value = float(manual_loss.detach().float().cpu())
-                    if not math.isclose(manual_value, trainer_value, rel_tol=2e-3, abs_tol=2e-3):
-                        raise RuntimeError(f"Trainer CE mismatch: trainer={trainer_value} manual={manual_value}")
+                    if not math.isclose(swift_formula_value, trainer_value, rel_tol=2e-3, abs_tol=2e-3):
+                        raise RuntimeError(
+                            "Swift loss formula mismatch: "
+                            f"trainer={trainer_value} reproduced={swift_formula_value} "
+                            f"manual_local_mean={manual_value} denominator={denominator}"
+                        )
+                    if not loss_scale_binary_equivalent:
+                        raise RuntimeError(
+                            "loss_scale is not equivalent to the labels -100 mask; "
+                            "ordinary CE contract is not verified"
+                        )
                     if int(inputs["input_ids"].shape[0]) != EXPECTED_LOCAL_BATCH:
                         raise RuntimeError(f"Rank {current_rank} local batch is not 2: {tuple(inputs['input_ids'].shape)}")
                     if not bool((labels[:, :BAT_TRAINING.audio_token_count] == -100).all().item()):
@@ -218,8 +269,12 @@ def main() -> None:
                         "attention_mask_shape": list(inputs["attention_mask"].shape),
                         "audio_waveforms_shape": list(inputs["audio_waveforms"].shape),
                         "audio_prefix_label_ignore_count": int((labels[:, :BAT_TRAINING.audio_token_count] == -100).sum().item()),
-                        "valid_shifted_target_count": int((shifted_labels != -100).sum().item()),
+                        "valid_shifted_target_count": manual_count,
+                        "manual_shifted_loss_sum": float(manual_sum.detach().cpu()),
                         "manual_shifted_ce": manual_value,
+                        "swift_loss_denominator": denominator,
+                        "swift_reproduced_ce": swift_formula_value,
+                        "loss_scale_binary_equivalent": loss_scale_binary_equivalent,
                         "trainer_ce": trainer_value,
                         "shift_verified": True,
                     }
@@ -267,6 +322,17 @@ def main() -> None:
                 local_batches = [item["forward_audit"]["batch"]["input_ids_shape"][0] for item in reports]
                 if local_batches != [EXPECTED_LOCAL_BATCH] * EXPECTED_WORLD_SIZE:
                     raise RuntimeError(f"Local batch audit failed: {local_batches}")
+                global_loss_sum = sum(
+                    float(item["forward_audit"]["batch"]["manual_shifted_loss_sum"])
+                    for item in reports
+                )
+                global_token_count = sum(
+                    int(item["forward_audit"]["batch"]["valid_shifted_target_count"])
+                    for item in reports
+                )
+                if global_token_count <= 0:
+                    raise RuntimeError("Global shifted-token count is zero")
+                global_ce = global_loss_sum / global_token_count
                 checkpoint = checkpoint_report(checkpoint_path(args.output_dir))
                 report = {
                     "status": "ok",
@@ -275,6 +341,8 @@ def main() -> None:
                         "per_device_batch_size": EXPECTED_LOCAL_BATCH,
                         "gradient_accumulation_steps": 1, "global_batch_size": 16,
                         "dataset_records": EXPECTED_DATASET_RECORDS, "optimizer_steps": EXPECTED_OPTIMIZER_STEPS,
+                        "global_valid_shifted_target_count": global_token_count,
+                        "global_manual_shifted_ce": global_ce,
                         "rank_reports": reports,
                     },
                     "paper_contract": {
