@@ -25,7 +25,6 @@ import torch.nn.functional as F
 from bat.configs.training import BAT_TRAINING
 from smoke_bat_ouro_lora import (
     TARGET_MODULES,
-    checkpoint_report,
     find_module,
     lora_report,
     optimizer_report,
@@ -51,6 +50,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
+    parser.add_argument("--expected-records", type=int, default=EXPECTED_DATASET_RECORDS)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--save-steps", type=int, default=None)
+    parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
     return parser.parse_args()
 
 
@@ -87,11 +90,74 @@ def gather_reports(report: dict[str, Any]) -> list[dict[str, Any]]:
     return [item for item in gathered if item is not None]
 
 
-def checkpoint_path(output_dir: Path) -> Path:
-    candidates = sorted(path for path in output_dir.rglob("checkpoint-2") if path.is_dir())
+def checkpoint_path(output_dir: Path, expected_step: int) -> Path:
+    candidates = sorted(path for path in output_dir.rglob(f"checkpoint-{expected_step}") if path.is_dir())
     if len(candidates) != 1:
-        raise RuntimeError(f"Expected one checkpoint-2 below {output_dir}, found {candidates}")
+        raise RuntimeError(f"Expected one checkpoint-{expected_step} below {output_dir}, found {candidates}")
     return candidates[0]
+
+
+def checkpoint_report_for_step(path: Path, expected_step: int) -> dict[str, Any]:
+    from safetensors import safe_open
+
+    adapter = path / "adapter_model.safetensors"
+    if not adapter.is_file():
+        raise RuntimeError(f"Missing adapter checkpoint: {adapter}")
+    with safe_open(str(adapter), framework="pt", device="cpu") as handle:
+        keys = sorted(handle.keys())
+    lora_keys = [key for key in keys if "lora_" in key]
+    qformer_keys = [key for key in keys if "audio_qformer" in key]
+    unexpected = [key for key in keys if key not in lora_keys and key not in qformer_keys]
+    if not lora_keys or not qformer_keys or unexpected:
+        raise RuntimeError(
+            f"Unexpected BAT checkpoint keys: lora={len(lora_keys)} "
+            f"qformer={len(qformer_keys)} unexpected={unexpected[:10]}"
+        )
+
+    state_path = path / "trainer_state.json"
+    if not state_path.is_file():
+        raise RuntimeError(f"Missing trainer_state.json: {state_path}")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    actual_step = int(state.get("global_step", -1))
+    if actual_step != expected_step:
+        raise RuntimeError(f"Expected checkpoint global_step={expected_step}, got {actual_step}")
+
+    alternatives = {
+        "optimizer": ("optimizer.pt", "optimizer.bin", "optimizer.safetensors"),
+        "scheduler": ("scheduler.pt", "scheduler.bin"),
+        "rng": ("rng_state.pth", "rng_state.pt"),
+    }
+    state_files: dict[str, str | None] = {}
+    missing_state: list[str] = []
+    for group, names in alternatives.items():
+        found = next((name for name in names if (path / name).is_file()), None)
+        state_files[group] = found
+        if found is None:
+            missing_state.append(f"{group}={names}")
+    adapter_config = path / "adapter_config.json"
+    if not adapter_config.is_file():
+        missing_state.append("adapter_config.json")
+    if missing_state:
+        raise RuntimeError(f"Incomplete resumable checkpoint {path}: missing {missing_state}")
+
+    return {
+        "path": str(path),
+        "tensor_count": len(keys),
+        "lora_tensor_count": len(lora_keys),
+        "qformer_tensor_count": len(qformer_keys),
+        "unexpected_tensor_count": len(unexpected),
+        "global_step": actual_step,
+        "state_files": state_files,
+        "adapter_config": str(adapter_config),
+    }
+
+
+def read_checkpoint_step(path: Path) -> int:
+    state_path = path / "trainer_state.json"
+    if not state_path.is_file():
+        raise RuntimeError(f"Resume checkpoint is missing trainer_state.json: {state_path}")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    return int(state.get("global_step", -1))
 
 
 def main() -> None:
@@ -111,10 +177,13 @@ def main() -> None:
     for path in (args.model_path, args.plugin_path, args.dataset):
         if not path.expanduser().resolve().exists():
             raise FileNotFoundError(path)
+    expected_records = int(args.expected_records)
+    if expected_records <= 0:
+        raise ValueError(f"--expected-records must be positive, got {expected_records}")
     dataset_records = count_jsonl(args.dataset)
-    if dataset_records != EXPECTED_DATASET_RECORDS:
+    if dataset_records != expected_records:
         raise RuntimeError(
-            f"DDP smoke requires exactly {EXPECTED_DATASET_RECORDS} JSONL records; "
+            f"DDP smoke requires exactly {expected_records} JSONL records; "
             f"got {dataset_records} from {args.dataset}"
         )
     if args.output_dir.exists() and current_rank == 0:
@@ -125,13 +194,32 @@ def main() -> None:
     from swift.pipelines.train.sft import SwiftSft
 
     schedule = BAT_TRAINING.schedule(
-        dataset_size=EXPECTED_DATASET_RECORDS,
+        dataset_size=expected_records,
         world_size=EXPECTED_WORLD_SIZE,
         gradient_accumulation_steps=1,
         stage_name="I",
     )
-    if int(schedule["effective_batch_size"]) != 16 or int(schedule["total_steps"]) != EXPECTED_OPTIMIZER_STEPS:
+    target_steps = int(args.max_steps) if args.max_steps is not None else int(schedule["total_steps"])
+    if target_steps <= 0:
+        raise ValueError(f"--max-steps must be positive, got {target_steps}")
+    initial_step = 0
+    resume_checkpoint = None
+    if args.resume_from_checkpoint is not None:
+        resume_checkpoint = args.resume_from_checkpoint.expanduser().resolve()
+        if not resume_checkpoint.is_dir():
+            raise FileNotFoundError(resume_checkpoint)
+        initial_step = read_checkpoint_step(resume_checkpoint)
+        if initial_step < 0 or initial_step >= target_steps:
+            raise RuntimeError(
+                f"Invalid resume step={initial_step} for target_steps={target_steps}: {resume_checkpoint}"
+            )
+    expected_optimizer_steps = target_steps - initial_step
+    if int(schedule["effective_batch_size"]) != 16 or expected_optimizer_steps <= 0:
         raise RuntimeError(f"Unexpected DDP smoke schedule: {schedule}")
+    warmup_steps = min(int(schedule["warmup_steps"]), target_steps)
+    save_steps = int(args.save_steps) if args.save_steps is not None else target_steps
+    if save_steps <= 0:
+        raise ValueError(f"--save-steps must be positive, got {save_steps}")
 
     argv = [
         "--model", str(args.model_path), "--model_type", MODEL_TYPE, "--template", TEMPLATE_TYPE,
@@ -144,10 +232,10 @@ def main() -> None:
         "--freeze_aligner", "false", "--lora_rank", str(BAT_TRAINING.lora_rank),
         "--lora_alpha", str(BAT_TRAINING.lora_alpha), "--lora_dropout", str(BAT_TRAINING.lora_dropout),
         "--learning_rate", str(BAT_TRAINING.learning_rate), "--lr_scheduler_type", "cosine",
-        "--warmup_steps", str(schedule["warmup_steps"]), "--max_steps", str(schedule["total_steps"]),
+        "--warmup_steps", str(warmup_steps), "--max_steps", str(target_steps),
         "--num_train_epochs", str(schedule["epochs"]), "--per_device_train_batch_size", str(EXPECTED_LOCAL_BATCH),
         "--gradient_accumulation_steps", "1", "--gradient_checkpointing", "false", "--logging_steps", "1",
-        "--save_strategy", "steps", "--save_steps", "2", "--save_total_limit", "1", "--save_only_model", "false",
+        "--save_strategy", "steps", "--save_steps", str(save_steps), "--save_total_limit", "2", "--save_only_model", "false",
         "--dataloader_num_workers", "0", "--dataloader_pin_memory", "false", "--dataset_num_proc", "1",
         "--lazy_tokenize", "false", "--load_from_cache_file", "false", "--loss_scale", "all", "--seed", "42",
         "--data_seed", "42", "--optim", "adamw_torch", "--adam_beta1", str(BAT_TRAINING.beta1),
@@ -156,6 +244,8 @@ def main() -> None:
         "--average_tokens_across_devices", "false",
         "--report_to", "none",
     ]
+    if resume_checkpoint is not None:
+        argv.extend(["--resume_from_checkpoint", str(resume_checkpoint)])
 
     class AuditedDistributedSwiftSft(SwiftSft):
         def train(self, trainer):
@@ -287,6 +377,7 @@ def main() -> None:
 
             trainer.compute_loss = compute_loss
             trainer.accelerator.backward = backward
+            torch.cuda.reset_peak_memory_stats()
             started = time.perf_counter()
             try:
                 result = super().train(trainer)
@@ -297,13 +388,13 @@ def main() -> None:
                     handle.remove()
 
             local_optimizer = optimizer_report(trainer, model)
-            if int(trainer.state.global_step) != EXPECTED_OPTIMIZER_STEPS:
-                raise RuntimeError(f"Rank {current_rank} expected global_step=2, got {trainer.state.global_step}")
-            if trace["forward"] != EXPECTED_OPTIMIZER_STEPS or trace["backward"] != EXPECTED_OPTIMIZER_STEPS:
+            if int(trainer.state.global_step) != target_steps:
+                raise RuntimeError(f"Rank {current_rank} expected global_step={target_steps}, got {trainer.state.global_step}")
+            if trace["forward"] != expected_optimizer_steps or trace["backward"] != expected_optimizer_steps:
                 raise RuntimeError(f"Rank {current_rank} unexpected trainer counts: {trace}")
-            if trace["layer"] != EXPECTED_RECURRENT_STEPS * EXPECTED_OPTIMIZER_STEPS or trace["gate"] != EXPECTED_RECURRENT_STEPS * EXPECTED_OPTIMIZER_STEPS:
+            if trace["layer"] != EXPECTED_RECURRENT_STEPS * expected_optimizer_steps or trace["gate"] != EXPECTED_RECURRENT_STEPS * expected_optimizer_steps:
                 raise RuntimeError(f"Rank {current_rank} unexpected recurrent forward counts: {trace}")
-            if trace["layer_backward"] != EXPECTED_RECURRENT_STEPS * EXPECTED_OPTIMIZER_STEPS:
+            if trace["layer_backward"] != EXPECTED_RECURRENT_STEPS * expected_optimizer_steps:
                 raise RuntimeError(f"Rank {current_rank} unexpected recurrent backward count: {trace}")
             local_report = {
                 "rank": current_rank, "local_rank": local_rank, "world_size": current_world,
@@ -311,6 +402,12 @@ def main() -> None:
                 "forward_audit": {**trace, "expected_recurrent_steps": EXPECTED_RECURRENT_STEPS, "use_cache": False},
                 "elapsed_seconds": time.perf_counter() - started,
                 "global_step": int(trainer.state.global_step),
+                "memory": {
+                    "peak_allocated_bytes": int(torch.cuda.max_memory_allocated()),
+                    "peak_reserved_bytes": int(torch.cuda.max_memory_reserved()),
+                    "current_allocated_bytes": int(torch.cuda.memory_allocated()),
+                    "current_reserved_bytes": int(torch.cuda.memory_reserved()),
+                },
             }
             reports = gather_reports(local_report)
             if len(reports) != EXPECTED_WORLD_SIZE:
@@ -333,16 +430,26 @@ def main() -> None:
                 if global_token_count <= 0:
                     raise RuntimeError("Global shifted-token count is zero")
                 global_ce = global_loss_sum / global_token_count
-                checkpoint = checkpoint_report(checkpoint_path(args.output_dir))
+                checkpoint = checkpoint_report_for_step(
+                    checkpoint_path(args.output_dir, target_steps), target_steps
+                )
                 report = {
                     "status": "ok",
                     "distributed": {
                         "backend": dist.get_backend(), "world_size": EXPECTED_WORLD_SIZE,
                         "per_device_batch_size": EXPECTED_LOCAL_BATCH,
                         "gradient_accumulation_steps": 1, "global_batch_size": 16,
-                        "dataset_records": EXPECTED_DATASET_RECORDS, "optimizer_steps": EXPECTED_OPTIMIZER_STEPS,
+                        "dataset_records": expected_records, "optimizer_steps": expected_optimizer_steps,
+                        "target_global_step": target_steps, "initial_global_step": initial_step,
+                        "resumed_from_checkpoint": None if resume_checkpoint is None else str(resume_checkpoint),
                         "global_valid_shifted_target_count": global_token_count,
                         "global_manual_shifted_ce": global_ce,
+                        "rank_peak_allocated_bytes": [
+                            int(item["memory"]["peak_allocated_bytes"]) for item in reports
+                        ],
+                        "rank_peak_reserved_bytes": [
+                            int(item["memory"]["peak_reserved_bytes"]) for item in reports
+                        ],
                         "rank_reports": reports,
                     },
                     "paper_contract": {
@@ -361,6 +468,11 @@ def main() -> None:
                 }
                 write_json(args.output_report, report)
                 print(f"[ddp] backend={dist.get_backend()} world_size={EXPECTED_WORLD_SIZE} global_batch=16", flush=True)
+                print(
+                    f"[memory] peak_allocated_max={max(report['distributed']['rank_peak_allocated_bytes'])} "
+                    f"peak_reserved_max={max(report['distributed']['rank_peak_reserved_bytes'])}",
+                    flush=True,
+                )
                 print(f"[checkpoint] {json.dumps(checkpoint, ensure_ascii=False)}", flush=True)
                 print(f"[report] {args.output_report}", flush=True)
                 print("[status] ok", flush=True)
