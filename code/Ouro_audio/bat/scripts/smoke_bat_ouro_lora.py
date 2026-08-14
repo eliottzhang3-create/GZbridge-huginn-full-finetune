@@ -68,6 +68,11 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
+def count_jsonl(path: Path) -> int:
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for line in handle if line.strip())
+
+
 def find_module(model: torch.nn.Module, class_name: str) -> torch.nn.Module:
     matches = [module for module in model.modules() if module.__class__.__name__ == class_name]
     if len(matches) != 1:
@@ -217,6 +222,13 @@ def main() -> None:
     for path in (args.model_path, args.plugin_path, args.dataset):
         if not path.expanduser().resolve().exists():
             raise FileNotFoundError(path)
+    dataset_records = count_jsonl(args.dataset)
+    if dataset_records != 2:
+        raise RuntimeError(
+            "BAT LoRA smoke requires exactly 2 JSONL records; "
+            f"got {dataset_records} from {args.dataset}. "
+            "Generate it with BAT_MANIFEST_LIMIT=2."
+        )
     if args.output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite {args.output_dir}")
     if str(args.output_report).replace("\\", "/").startswith("/hpc_stor03/public"):
@@ -348,7 +360,7 @@ def main() -> None:
                     "epoch_partitioning_factor": BAT_TRAINING.epoch_partitioning_factor, "stage": "I",
                     "stage_epochs": 2, "batch_size": BAT_TRAINING.per_device_batch_size,
                 },
-                "schedule": dict(schedule), "argv": argv,
+                "schedule": dict(schedule), "dataset_records": dataset_records, "argv": argv,
                 "parameters": parameters, "lora": lora, "optimizer": opt,
                 "forward_audit": {**trace, "expected_recurrent_steps": EXPECTED_STEPS, "use_cache": False},
                 "checkpoint": checkpoint, "elapsed_seconds": time.perf_counter() - started,

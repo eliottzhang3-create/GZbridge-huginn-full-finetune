@@ -95,6 +95,8 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+    if args.limit < 0:
+        raise ValueError(f"--limit must be non-negative, got {args.limit}")
     if str(args.output).replace("\\", "/").startswith("/hpc_stor03/public"):
         raise SystemExit(f"Refusing public output path: {args.output}")
     stage_name, expected_types = STAGES[args.stage]
@@ -102,14 +104,20 @@ def main() -> None:
     random.Random(args.seed).shuffle(records)
     if args.limit > 0:
         records = records[:args.limit]
+        if len(records) != args.limit:
+            raise RuntimeError(
+                f"Requested --limit={args.limit}, but source contains only {len(records)} records: {args.qa_json}"
+            )
     converted = [convert(row, args.stage) for row in records]
     observed = {row["bat_type"] for row in converted}
     if not observed or not observed <= expected_types:
         raise RuntimeError(f"{stage_name} manifest has invalid types: observed={sorted(observed)} expected={sorted(expected_types)}")
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", encoding="utf-8", newline="\n") as handle:
+    temporary = args.output.with_name(args.output.name + ".tmp")
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
         for row in converted:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
+    temporary.replace(args.output)
     print(f"[manifest] stage={args.stage} source={args.qa_json} records={len(converted)} output={args.output}")
     print(f"[manifest] bat_types={sorted(observed)}")
 
