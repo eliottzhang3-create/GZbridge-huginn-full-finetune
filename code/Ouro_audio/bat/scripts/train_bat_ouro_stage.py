@@ -89,7 +89,10 @@ def main() -> None:
         "--max_steps", str(schedule["total_steps"]), "--num_train_epochs", str(schedule["epochs"]),
         "--per_device_train_batch_size", str(BAT_TRAINING.per_device_batch_size),
         "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
-        "--gradient_checkpointing", "true", "--logging_steps", "100", "--save_strategy", "steps",
+        # The validated 8x5090 BAT path uses ordinary autograd.  The memory
+        # preflight peaked at only ~6.9 GiB/GPU, so enabling checkpointing
+        # would add an untested recomputation path without a memory benefit.
+        "--gradient_checkpointing", "false", "--logging_steps", "100", "--save_strategy", "steps",
         "--save_steps", str(max(1, int(schedule["steps_per_epoch"]))), "--save_total_limit", "2",
         "--save_only_model", "false", "--remove_unused_columns", "false", "--dataloader_num_workers", "4",
         "--dataloader_pin_memory", "true", "--dataset_num_proc", "1", "--lazy_tokenize", "false",
