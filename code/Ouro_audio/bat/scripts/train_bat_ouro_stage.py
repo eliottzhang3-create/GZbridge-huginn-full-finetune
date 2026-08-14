@@ -108,20 +108,21 @@ def main() -> None:
     print("========== BAT OURO STAGE TRAINING ==========")
     print(f"[rank] rank={process_rank} world_size={actual_world_size}")
     print(f"[stage] {args.stage} dataset={args.dataset} records={dataset_size}")
-    print(f"[paper] {json.dumps({
-        'sound_source': BAT_TRAINING.sound_source,
-        'audio_normalization': BAT_TRAINING.audio_normalization,
-        'augmentation': BAT_TRAINING.augmentation,
-        'weighted_sampling': BAT_TRAINING.weighted_sampling,
-        'optimizer': BAT_TRAINING.optimizer,
-        'betas': [BAT_TRAINING.beta1, BAT_TRAINING.beta2],
-        'weight_decay': BAT_TRAINING.weight_decay,
-        'learning_rate': BAT_TRAINING.learning_rate,
-        'scheduler': BAT_TRAINING.scheduler,
-        'warmup_epochs': BAT_TRAINING.warmup_epochs,
-        'epoch_partitioning_factor': BAT_TRAINING.epoch_partitioning_factor,
-        'batch_size': BAT_TRAINING.per_device_batch_size,
-    }, ensure_ascii=False)}")
+    paper_contract = {
+        "sound_source": BAT_TRAINING.sound_source,
+        "audio_normalization": BAT_TRAINING.audio_normalization,
+        "augmentation": BAT_TRAINING.augmentation,
+        "weighted_sampling": BAT_TRAINING.weighted_sampling,
+        "optimizer": BAT_TRAINING.optimizer,
+        "betas": [BAT_TRAINING.beta1, BAT_TRAINING.beta2],
+        "weight_decay": BAT_TRAINING.weight_decay,
+        "learning_rate": BAT_TRAINING.learning_rate,
+        "scheduler": BAT_TRAINING.scheduler,
+        "warmup_epochs": BAT_TRAINING.warmup_epochs,
+        "epoch_partitioning_factor": BAT_TRAINING.epoch_partitioning_factor,
+        "batch_size": BAT_TRAINING.per_device_batch_size,
+    }
+    print(f"[paper] {json.dumps(paper_contract, ensure_ascii=False)}")
     print(f"[schedule] {json.dumps(dict(schedule), ensure_ascii=False)}")
     if process_rank == 0:
         print(f"[argv] {' '.join(argv)}")
