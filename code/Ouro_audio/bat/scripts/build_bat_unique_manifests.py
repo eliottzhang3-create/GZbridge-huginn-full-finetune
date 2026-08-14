@@ -431,8 +431,11 @@ def main() -> None:
         for question_id, fingerprints in question_id_to_fingerprints.items()
         if len(fingerprints) > 1
     }
-    if conflicts:
-        issues.append("question_id_content_conflicts")
+    # BAT question_id values are local/reused identifiers rather than a
+    # globally unique primary key.  The same id can legitimately identify a
+    # classification, a DoA question, and several mixup reasoning questions.
+    # Keep this as an audit statistic, but do not reject the manifest.
+    question_id_reuse_warning = bool(conflicts)
 
     unique_qa_rows = [unique_rows[fingerprint] for fingerprint in first_seen_order]
     for row in unique_qa_rows:
@@ -456,6 +459,11 @@ def main() -> None:
         warnings.append(
             f"unique_qa_count_outside_expected_range:{len(unique_qa_rows)} "
             f"not in [{args.expected_qa_min},{args.expected_qa_max}]"
+        )
+    if question_id_reuse_warning:
+        warnings.append(
+            f"question_id_reused_as_local_identifier:{len(conflicts)}_ids; "
+            "not treated as a deduplication error"
         )
 
     containment: dict[str, Any] = {}
@@ -547,8 +555,10 @@ def main() -> None:
             "source_tuple_reuse_extra_qa_records": sum(
                 max(0, int(row["qa_record_count"]) - 1) for row in unique_source_rows
             ),
-            "question_id_conflict_count": len(conflicts),
-            "question_id_conflict_examples": dict(list(conflicts.items())[:20]),
+            "question_id_scope": "local_or_reused; not globally unique",
+            "unique_question_id_count": len(question_id_to_fingerprints),
+            "question_id_reuse_count": len(conflicts),
+            "question_id_reuse_examples": dict(list(conflicts.items())[:20]),
             "invalid_record_count": len(invalid_rows),
             "invalid_record_examples": invalid_rows[:20],
         },
@@ -561,7 +571,7 @@ def main() -> None:
             "within_range": args.expected_qa_min <= len(unique_qa_rows) <= args.expected_qa_max,
         },
         "contract": {
-            "qa_dedup_key": "question_id + normalized question_type + bat_type + question + answer + ordered source tuple",
+            "qa_dedup_key": "question_id + normalized question_type + bat_type + question + answer + ordered source tuple; question_id reuse is allowed",
             "source_dedup_key": "sha256(ordered audio_id,reverb_id,audio_id2,reverb_id2)",
             "source_tuple_order_preserved": True,
             "audio_processing_performed": False,
