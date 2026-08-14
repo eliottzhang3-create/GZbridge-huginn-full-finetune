@@ -63,11 +63,13 @@ def main() -> None:
     elif rank() == 0:
         checkpoint = args.resume_from_checkpoint.resolve()
         output_root = args.output_dir.resolve()
-        if checkpoint.parent != output_root:
+        try:
+            checkpoint.relative_to(output_root)
+        except ValueError as exc:
             raise ValueError(
-                "Resume checkpoint must be directly inside --output-dir so subsequent curriculum "
-                f"boundary checkpoints remain in one run directory: checkpoint={checkpoint} output={output_root}"
-            )
+                "Resume checkpoint must be inside --output-dir so it belongs to this curriculum run: "
+                f"checkpoint={checkpoint} output={output_root}"
+            ) from exc
 
     global_batch_size = BAT_TRAINING.per_device_batch_size * args.world_size * args.gradient_accumulation_steps
     curriculum_report = load_report(args.curriculum_report)
@@ -84,19 +86,29 @@ def main() -> None:
 
     class ContinuousCurriculumSwiftSft(SwiftSft):
         def train(self, trainer):
+            # Swift may materialize a run-specific directory such as
+            # ``output_dir/v0-<timestamp>``.  TrainerArguments contains that
+            # effective directory; the outer CLI path is only the requested
+            # parent directory and must not be used for checkpoint inspection.
+            effective_output_dir = Path(trainer.args.output_dir).resolve()
             callback = CurriculumBoundaryCheckpointCallback(
                 args.curriculum_report,
                 global_batch_size,
-                checkpoint_root=args.output_dir,
+                checkpoint_root=effective_output_dir,
+                resume_checkpoint=args.resume_from_checkpoint,
             )
             trainer.add_callback(callback)
             result = super().train(trainer)
+            # Re-read after Swift returns as an additional guard against a
+            # pipeline that finalizes or rewrites its versioned run directory
+            # during setup/training.
+            effective_output_dir = Path(trainer.args.output_dir).resolve()
             missing = callback.missing_boundary_steps()
             if missing:
                 raise RuntimeError(f"Missing curriculum boundary checkpoints: {missing}")
             if rank() == 0:
                 for step, stage in sorted(callback.step_to_stage.items()):
-                    checkpoint_dir = args.output_dir / f"checkpoint-{step}"
+                    checkpoint_dir = effective_output_dir / f"checkpoint-{step}"
                     marker = checkpoint_dir / "curriculum_stage.json"
                     if not marker.is_file():
                         raise RuntimeError(f"Missing curriculum marker for Stage-{stage}: {marker}")

@@ -29,6 +29,7 @@ class CurriculumBoundaryCheckpointCallback(TrainerCallback):
         curriculum_report: Path,
         global_batch_size: int,
         checkpoint_root: Path | None = None,
+        resume_checkpoint: Path | None = None,
     ):
         super().__init__()
         self.curriculum_report = curriculum_report.resolve()
@@ -38,8 +39,10 @@ class CurriculumBoundaryCheckpointCallback(TrainerCallback):
         self.step_to_stage = {int(value): str(stage) for stage, value in boundary_steps.items()}
         self.boundary_steps = frozenset(self.step_to_stage)
         self.checkpoint_root = checkpoint_root.resolve() if checkpoint_root is not None else None
+        self.resume_checkpoint = resume_checkpoint.resolve() if resume_checkpoint is not None else None
         self.saved_steps: set[int] = set()
         self._load_existing_boundary_markers()
+        self._load_resume_marker()
 
     def _load_existing_boundary_markers(self) -> None:
         """Treat previously completed boundary saves as already satisfied.
@@ -60,6 +63,21 @@ class CurriculumBoundaryCheckpointCallback(TrainerCallback):
                 continue
             if marker.get("status") == "ok" and marker.get("stage") == stage and int(marker.get("global_step", -1)) == step:
                 self.saved_steps.add(step)
+
+    def _load_resume_marker(self) -> None:
+        """Count the source checkpoint's boundary as already completed."""
+        if self.resume_checkpoint is None:
+            return
+        marker_path = self.resume_checkpoint / "curriculum_stage.json"
+        if not marker_path.is_file():
+            return
+        try:
+            marker = json.loads(marker_path.read_text(encoding="utf-8"))
+            step = int(marker.get("global_step", -1))
+        except (OSError, json.JSONDecodeError, TypeError, ValueError):
+            return
+        if marker.get("status") == "ok" and step in self.boundary_steps and marker.get("stage") == self.step_to_stage[step]:
+            self.saved_steps.add(step)
 
     def on_step_end(
         self,
