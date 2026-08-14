@@ -261,6 +261,19 @@ rank-8 LoRA smoke trains the randomly initialized Q-Former together with
 Ouro q_proj/v_proj LoRA and verifies that no other parameter group is
 trainable.
 
+#### BAT pure pipeline profiling
+
+`bat/run_profile_bat_ouro_pipeline_5090.sh` is a read-only performance
+profiler for the production audio path. It uses the real BAT template and
+DataLoader, injects the same rank-8 q_proj/v_proj LoRA, measures data wait,
+host-to-device transfer, Spatial-AST, Q-Former, Ouro forward, and
+backward-plus-DDP all-reduce time, and never creates an optimizer or calls
+`optimizer.step`. It writes only a private JSON report. The default profile
+uses 8 `pdgpu-5090` ranks, local batch 2, 3 warm-up steps, and 20 measured
+steps. `BAT_PROFILE_START_INDEX` can select another region of the curriculum
+manifest, for example a Stage-II/III region, without changing the training
+manifest.
+
 `BAT/model.pt` is not loaded by this branch. It is a packaged BAT checkpoint
 from a different LLM configuration and is retained only as an external
 reference. The active experiment deliberately uses the BAT Q-Former
