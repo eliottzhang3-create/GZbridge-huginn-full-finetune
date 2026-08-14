@@ -14,6 +14,7 @@ import argparse
 import json
 import math
 import os
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -97,7 +98,11 @@ def checkpoint_path(output_dir: Path, expected_step: int) -> Path:
     return candidates[0]
 
 
-def checkpoint_report_for_step(path: Path, expected_step: int) -> dict[str, Any]:
+def checkpoint_report_for_step(
+    path: Path,
+    expected_step: int,
+    expected_world_size: int = EXPECTED_WORLD_SIZE,
+) -> dict[str, Any]:
     from safetensors import safe_open
 
     adapter = path / "adapter_model.safetensors"
@@ -125,20 +130,57 @@ def checkpoint_report_for_step(path: Path, expected_step: int) -> dict[str, Any]
     alternatives = {
         "optimizer": ("optimizer.pt", "optimizer.bin", "optimizer.safetensors"),
         "scheduler": ("scheduler.pt", "scheduler.bin"),
-        "rng": ("rng_state.pth", "rng_state.pt"),
     }
-    state_files: dict[str, str | None] = {}
+    state_files: dict[str, str | list[str] | None] = {}
     missing_state: list[str] = []
     for group, names in alternatives.items():
         found = next((name for name in names if (path / name).is_file()), None)
         state_files[group] = found
         if found is None:
             missing_state.append(f"{group}={names}")
+
+    # Transformers saves one RNG file per process for distributed training:
+    # rng_state_0.pth, rng_state_1.pth, ... .  The single-process fallback is
+    # rng_state.pth.  The old audit only checked the fallback name and thus
+    # falsely rejected an otherwise valid DDP checkpoint.
+    rng_rank_files: list[str] = []
+    for pattern in ("rng_state_*.pth", "rng_state_*.pt"):
+        rng_rank_files.extend(item.name for item in path.glob(pattern) if item.is_file())
+    rng_rank_files = sorted(set(rng_rank_files))
+    rng_indices = sorted(
+        {
+            int(match.group(1))
+            for name in rng_rank_files
+            if (match := re.fullmatch(r"rng_state_(\d+)\.(?:pth|pt)", name)) is not None
+        }
+    )
+    legacy_rng = next(
+        (name for name in ("rng_state.pth", "rng_state.pt") if (path / name).is_file()),
+        None,
+    )
+    missing_rng_ranks: list[int] = []
+    if expected_world_size > 1:
+        missing_rng_ranks = [index for index in range(expected_world_size) if index not in rng_indices]
+        if missing_rng_ranks:
+            missing_state.append(
+                f"rng_state_{missing_rng_ranks[0]}..rng_state_{missing_rng_ranks[-1]}"
+            )
+        state_files["rng"] = rng_rank_files or None
+        rng_mode = "per_rank"
+    else:
+        if legacy_rng is None:
+            missing_state.append("rng=('rng_state.pth', 'rng_state.pt')")
+        state_files["rng"] = legacy_rng
+        rng_mode = "single_process"
+
     adapter_config = path / "adapter_config.json"
     if not adapter_config.is_file():
         missing_state.append("adapter_config.json")
     if missing_state:
-        raise RuntimeError(f"Incomplete resumable checkpoint {path}: missing {missing_state}")
+        raise RuntimeError(
+            f"Incomplete resumable checkpoint {path}: missing {missing_state}; "
+            f"present_rng_files={rng_rank_files or legacy_rng or []}"
+        )
 
     return {
         "path": str(path),
@@ -148,6 +190,9 @@ def checkpoint_report_for_step(path: Path, expected_step: int) -> dict[str, Any]
         "unexpected_tensor_count": len(unexpected),
         "global_step": actual_step,
         "state_files": state_files,
+        "rng_state_mode": rng_mode,
+        "rng_rank_indices": rng_indices,
+        "rng_missing_ranks": missing_rng_ranks,
         "adapter_config": str(adapter_config),
     }
 
@@ -412,27 +457,43 @@ def main() -> None:
             reports = gather_reports(local_report)
             if len(reports) != EXPECTED_WORLD_SIZE:
                 raise RuntimeError(f"Expected {EXPECTED_WORLD_SIZE} rank reports, got {len(reports)}")
+            checkpoint: dict[str, Any] | None = None
+            rank0_audit_error: str | None = None
+            global_token_count = 0
+            global_ce = 0.0
             if current_rank == 0:
-                rank_ids = sorted(int(item["rank"]) for item in reports)
-                if rank_ids != list(range(EXPECTED_WORLD_SIZE)):
-                    raise RuntimeError(f"Unexpected rank reports: {rank_ids}")
-                local_batches = [item["forward_audit"]["batch"]["input_ids_shape"][0] for item in reports]
-                if local_batches != [EXPECTED_LOCAL_BATCH] * EXPECTED_WORLD_SIZE:
-                    raise RuntimeError(f"Local batch audit failed: {local_batches}")
-                global_loss_sum = sum(
-                    float(item["forward_audit"]["batch"]["manual_shifted_loss_sum"])
-                    for item in reports
-                )
-                global_token_count = sum(
-                    int(item["forward_audit"]["batch"]["valid_shifted_target_count"])
-                    for item in reports
-                )
-                if global_token_count <= 0:
-                    raise RuntimeError("Global shifted-token count is zero")
-                global_ce = global_loss_sum / global_token_count
-                checkpoint = checkpoint_report_for_step(
-                    checkpoint_path(args.output_dir, target_steps), target_steps
-                )
+                try:
+                    rank_ids = sorted(int(item["rank"]) for item in reports)
+                    if rank_ids != list(range(EXPECTED_WORLD_SIZE)):
+                        raise RuntimeError(f"Unexpected rank reports: {rank_ids}")
+                    local_batches = [item["forward_audit"]["batch"]["input_ids_shape"][0] for item in reports]
+                    if local_batches != [EXPECTED_LOCAL_BATCH] * EXPECTED_WORLD_SIZE:
+                        raise RuntimeError(f"Local batch audit failed: {local_batches}")
+                    global_loss_sum = sum(
+                        float(item["forward_audit"]["batch"]["manual_shifted_loss_sum"])
+                        for item in reports
+                    )
+                    global_token_count = sum(
+                        int(item["forward_audit"]["batch"]["valid_shifted_target_count"])
+                        for item in reports
+                    )
+                    if global_token_count <= 0:
+                        raise RuntimeError("Global shifted-token count is zero")
+                    global_ce = global_loss_sum / global_token_count
+                    checkpoint = checkpoint_report_for_step(
+                        checkpoint_path(args.output_dir, target_steps),
+                        target_steps,
+                        expected_world_size=EXPECTED_WORLD_SIZE,
+                    )
+                except Exception as exc:
+                    rank0_audit_error = f"{type(exc).__name__}: {exc}"
+
+            audit_errors: list[str | None] = [None] * EXPECTED_WORLD_SIZE
+            dist.all_gather_object(audit_errors, rank0_audit_error)
+            if any(error is not None for error in audit_errors):
+                raise RuntimeError(f"Distributed post-training audit failed: {audit_errors}")
+
+            if current_rank == 0:
                 report = {
                     "status": "ok",
                     "distributed": {
@@ -489,4 +550,8 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        if dist.is_available() and dist.is_initialized():
+            dist.destroy_process_group()
