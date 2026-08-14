@@ -53,7 +53,7 @@ PAPER_STAGE_TARGETS = {
 
 
 def present(value: Any) -> bool:
-    return value is not None and str(value).strip() not in {"", "null", "none"}
+    return value is not None and str(value).strip().lower() not in {"", "null", "none"}
 
 
 def norm(value: Any) -> str:
@@ -493,6 +493,8 @@ def main() -> None:
         )
     print(f"[summary] evaluations={len(evaluations)}")
     print(f"[status] {report['status']} issues={issues}")
+    if issues:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

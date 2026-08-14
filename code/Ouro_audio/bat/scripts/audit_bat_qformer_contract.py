@@ -176,6 +176,8 @@ def main() -> None:
     print(f"[parameters] {report['parameters']}")
     print(f"[report] {args.output}")
     print(f"[status] {report['status']} issues={issues}")
+    if issues:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

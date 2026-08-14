@@ -297,6 +297,8 @@ def load_audio(path: Path) -> tuple[np.ndarray, int]:
         array = array[:, 0]
     if array.ndim != 1:
         raise ValueError(f"Expected mono/first-channel waveform, got {array.shape} from {path}")
+    if not np.isfinite(array).all():
+        raise ValueError(f"AudioSet waveform contains non-finite values: {path}")
     return array, int(sample_rate)
 
 
@@ -346,10 +348,19 @@ def convolve_source(audio: np.ndarray, sample_rate: int, rir: np.ndarray) -> np.
     rendered = signal.fftconvolve(source, rir, mode="full")
     if rendered.ndim != 2 or rendered.shape[0] != 2:
         raise ValueError(f"Unexpected rendered shape {rendered.shape}")
+    if not np.isfinite(rendered).all():
+        raise ValueError("Rendered binaural waveform contains non-finite values")
     return crop_or_pad(rendered)
 
 
 def render_record(record: dict[str, Any], audio_root: Path, reverb_root: Path) -> tuple[torch.Tensor, dict[str, Any]]:
+    second_audio_present = present(record.get("audio_id2"))
+    second_reverb_present = present(record.get("reverb_id2"))
+    if second_audio_present != second_reverb_present:
+        raise ValueError(
+            "A BAT dual-source record must provide both audio_id2 and reverb_id2, "
+            f"got audio_id2={record.get('audio_id2')!r} reverb_id2={record.get('reverb_id2')!r}"
+        )
     audio_id = str(record["audio_id"])
     reverb_id = str(record["reverb_id"])
     audio_path = resolve_audio(audio_root, audio_id)
@@ -370,7 +381,7 @@ def render_record(record: dict[str, Any], audio_root: Path, reverb_root: Path) -
         "reverb_sha256": sha256_file(reverb_path),
         "reverb_shape": list(rir.shape),
     }
-    if present(record.get("audio_id2")) and present(record.get("reverb_id2")):
+    if second_audio_present and second_reverb_present:
         audio_id2 = str(record["audio_id2"])
         reverb_id2 = str(record["reverb_id2"])
         audio_path2 = resolve_audio(audio_root, audio_id2)
@@ -397,6 +408,8 @@ def render_record(record: dict[str, Any], audio_root: Path, reverb_root: Path) -
         source_info["source_shape"] = "dual"
     else:
         source_info["source_shape"] = "single"
+    if not np.isfinite(rendered).all():
+        raise ValueError("Mixed binaural waveform contains non-finite values")
     return torch.from_numpy(rendered).float(), source_info
 
 
@@ -484,7 +497,10 @@ def load_spatial_checkpoint(model: nn.Module, path: Path) -> dict[str, Any]:
             selected = name
             break
         except RuntimeError as exc:
-            missing, unexpected = model.load_state_dict(candidate, strict=False)
+            model_keys = set(model.state_dict().keys())
+            candidate_keys = set(candidate.keys())
+            missing = sorted(model_keys - candidate_keys)
+            unexpected = sorted(candidate_keys - model_keys)
             attempts.append({"candidate": name, "status": "failed", "error": repr(exc), "missing_count": len(missing), "unexpected_count": len(unexpected), "missing_preview": list(missing)[:12], "unexpected_preview": list(unexpected)[:12]})
     return {
         "path": str(path),
@@ -602,6 +618,7 @@ def main() -> None:
     print(f"[reverb] {args.reverb_root}")
 
     issues: list[str] = []
+    warnings: list[str] = []
     samples = select_samples(args.qa_root)
     model, source_contract = build_spatial_ast(args.spatial_ast_root)
     checkpoint_report = load_spatial_checkpoint(model, args.spatial_ast_checkpoint)
@@ -623,9 +640,9 @@ def main() -> None:
     dependency_compat = source_contract.get("dependency_compat", {})
     librosa_compat = source_contract.get("librosa_compat", {})
     if dependency_compat.get("mode") != "installed_timm":
-        issues.append("timm_compatibility_fallback_used")
+        warnings.append("timm_compatibility_fallback_used")
     if librosa_compat.get("mode") != "installed_librosa":
-        issues.append("librosa_compatibility_fallback_used")
+        warnings.append("librosa_compatibility_fallback_used")
     token_inputs: list[torch.Tensor] = []
     for label, record in samples:
         waveform, source_info = render_record(record, args.audio_root, args.reverb_root)
@@ -727,6 +744,7 @@ def main() -> None:
             "qformer_contract": "[B,515,768] -> [B,64,2048]",
         },
         "issues": issues,
+        "warnings": warnings,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -735,7 +753,9 @@ def main() -> None:
     print(f"[qformer] input={list(token_batch.shape)} output={list(projected.shape)}")
     print(f"[memory] peak_allocated={peak_allocated} peak_reserved={peak_reserved}")
     print(f"[report] {args.output}")
-    print(f"[status] {report['status']} issues={issues}")
+    print(f"[status] {report['status']} issues={issues} warnings={warnings}")
+    if issues:
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

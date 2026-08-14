@@ -89,7 +89,10 @@ def _load_spatial_ast_checkpoint(model: nn.Module, checkpoint_path: Path) -> dic
                 "attempts": attempts,
             }
         except RuntimeError as exc:
-            missing, unexpected = model.load_state_dict(candidate, strict=False)
+            model_keys = set(model.state_dict().keys())
+            candidate_keys = set(candidate.keys())
+            missing = sorted(model_keys - candidate_keys)
+            unexpected = sorted(candidate_keys - model_keys)
             attempts.append({
                 "candidate": candidate_name,
                 "status": "failed",
@@ -248,6 +251,8 @@ class BATAudioRenderer:
             value = value[:, 0]
         if value.ndim != 1:
             raise ValueError(f"Expected mono/first-channel AudioSet waveform, got {value.shape}: {path}")
+        if not np.isfinite(value).all():
+            raise ValueError(f"AudioSet waveform contains non-finite values: {path}")
         return value, int(sample_rate)
 
     @staticmethod
@@ -282,14 +287,27 @@ class BATAudioRenderer:
             rir = rir[None, :]
         if rir.ndim != 2 or rir.shape[0] != 2:
             raise ValueError(f"Expected binaural RIR [2,L], got {rir.shape}")
+        if not np.isfinite(rir).all():
+            raise ValueError(f"Binaural RIR contains non-finite values: audio={audio_id} reverb={reverb_id}")
         rendered = signal.fftconvolve(audio, rir, mode="full")
+        if not np.isfinite(rendered).all():
+            raise ValueError(f"Rendered binaural waveform contains non-finite values: audio={audio_id} reverb={reverb_id}")
         return torch.from_numpy(self._crop_or_pad(rendered)).float()
 
     def render_record(self, record: dict[str, Any]) -> torch.Tensor:
+        second_audio_present = _present(record.get("audio_id2"))
+        second_reverb_present = _present(record.get("reverb_id2"))
+        if second_audio_present != second_reverb_present:
+            raise ValueError(
+                "A BAT dual-source record must provide both audio_id2 and reverb_id2, "
+                f"got audio_id2={record.get('audio_id2')!r} reverb_id2={record.get('reverb_id2')!r}"
+            )
         first = self._render_one(str(record["audio_id"]), str(record["reverb_id"]))
-        if _present(record.get("audio_id2")) and _present(record.get("reverb_id2")):
+        if second_audio_present and second_reverb_present:
             second = self._render_one(str(record["audio_id2"]), str(record["reverb_id2"]))
             first = (first + second) / 2.0
+        if not torch.isfinite(first).all():
+            raise ValueError("BAT mixed binaural waveform contains non-finite values")
         return first
 
     def load_item(self, item: Any) -> torch.Tensor:
@@ -309,4 +327,6 @@ class BATAudioRenderer:
             )
         if waveform.ndim != 2 or waveform.shape[0] != 2:
             raise ValueError(f"Expected rendered binaural waveform [2,T], got {tuple(waveform.shape)}")
+        if not torch.isfinite(waveform).all():
+            raise ValueError("Provided rendered binaural waveform contains non-finite values")
         return torch.from_numpy(self._crop_or_pad(waveform.numpy())).float()

@@ -79,6 +79,13 @@ def as_long_batch(value: Any, device: torch.device) -> torch.Tensor:
     return tensor.to(device=device, dtype=torch.long)
 
 
+def shape_tuple(value: Any) -> tuple[int, ...]:
+    shape = getattr(value, "shape", value)
+    if shape is None:
+        raise TypeError(f"Cannot read shape from {type(value).__name__}")
+    return tuple(int(item) for item in shape)
+
+
 def parameter_groups(model: torch.nn.Module) -> dict[str, int]:
     groups = {"spatial_ast": 0, "qformer": 0, "gate": 0, "ouro_native": 0, "other": 0}
     for name, parameter in model.named_parameters():
@@ -167,11 +174,16 @@ def main() -> None:
     waveform = encoded.get("audio_waveform")
     if waveform is None:
         raise RuntimeError(f"Template did not produce audio_waveform; keys={sorted(encoded)}")
+    waveform_shape = shape_tuple(waveform) if torch.is_tensor(waveform) else None
+    if waveform_shape != (2, 320000):
+        raise RuntimeError(f"Template waveform contract mismatch: {type(waveform).__name__} {waveform_shape}")
+    if not bool(torch.isfinite(waveform.float()).all().item()):
+        raise RuntimeError("Template waveform contains NaN or Inf")
     waveform = waveform.unsqueeze(0).to(device=device, dtype=torch.float32)
 
-    if input_ids.shape != labels.shape:
-        raise RuntimeError(f"Template input/label shape mismatch: input={tuple(input_ids.shape)} labels={tuple(labels.shape)}")
-    if input_ids.shape[1] <= EXPECTED_AUDIO_TOKENS:
+    if shape_tuple(input_ids) != shape_tuple(labels):
+        raise RuntimeError(f"Template input/label shape mismatch: input={shape_tuple(input_ids)} labels={shape_tuple(labels)}")
+    if shape_tuple(input_ids)[1] <= EXPECTED_AUDIO_TOKENS:
         raise RuntimeError(f"Template produced no text after audio prefix: {tuple(input_ids.shape)}")
     if not bool((labels[:, :EXPECTED_AUDIO_TOKENS] == -100).all().item()):
         raise RuntimeError("Audio prefix labels are not fully masked")
@@ -204,6 +216,11 @@ def main() -> None:
         ouro_model.layers[0].register_full_backward_hook(layer_backward),
         ouro_model.early_exit_gate.register_full_backward_hook(gate_backward),
     ]
+    expected_waveform = model.audio_renderer.render_record(qformer_record).float().cpu()
+    actual_waveform = waveform.detach().float().cpu()[0]
+    render_error = float((actual_waveform - expected_waveform).abs().max().item())
+    if render_error > 1e-5:
+        raise RuntimeError(f"Template waveform does not match model renderer: max_abs_error={render_error}")
     try:
         outputs = model(
             input_ids=input_ids,
@@ -213,8 +230,12 @@ def main() -> None:
             use_cache=False,
         )
         logits = outputs.logits
-        if tuple(logits.shape[:2]) != tuple(labels.shape):
+        if shape_tuple(logits)[:2] != shape_tuple(labels):
             raise RuntimeError(f"Logits/labels shape mismatch: logits={tuple(logits.shape)} labels={tuple(labels.shape)}")
+        if not bool(torch.isfinite(logits.float()).all().item()):
+            raise RuntimeError("Ouro logits contain NaN or Inf")
+        if getattr(outputs, "past_key_values", None) is not None:
+            raise RuntimeError("KV cache is unexpectedly enabled during BAT multimodal training audit")
         shifted_logits = logits[:, :-1].contiguous()
         shifted_labels = labels[:, 1:].contiguous()
         manual_loss = F.cross_entropy(
@@ -224,13 +245,29 @@ def main() -> None:
         )
         if not torch.isfinite(manual_loss):
             raise RuntimeError("Manual shifted CE is non-finite")
+        if outputs.loss is None or not torch.isfinite(outputs.loss.detach().float()):
+            raise RuntimeError("Ouro did not return a finite training loss")
+        if not math.isclose(
+            float(outputs.loss.detach().float().cpu()),
+            float(manual_loss.detach().float().cpu()),
+            rel_tol=2e-3,
+            abs_tol=2e-3,
+        ):
+            raise RuntimeError(
+                f"Ouro loss mismatch: model={float(outputs.loss.detach().float().cpu())} "
+                f"manual={float(manual_loss.detach().float().cpu())}"
+            )
         manual_loss.backward()
     finally:
         for handle in handles:
             handle.remove()
 
     qformer_grad = sum(
-        int(parameter.grad is not None and torch.isfinite(parameter.grad).all().item())
+        int(
+            parameter.grad is not None
+            and torch.isfinite(parameter.grad).all().item()
+            and (parameter.grad.detach().float().abs() > 0).any().item()
+        )
         for parameter in model.audio_qformer.parameters()
         if parameter.requires_grad
     )
@@ -240,6 +277,12 @@ def main() -> None:
     groups = parameter_groups(model)
     if groups["spatial_ast"] or groups["gate"] or groups["ouro_native"] or groups["other"]:
         raise RuntimeError(f"Unexpected trainable groups before LoRA injection: {groups}")
+    frozen_with_gradient = [
+        name for name, parameter in model.named_parameters()
+        if not parameter.requires_grad and parameter.grad is not None
+    ]
+    if frozen_with_gradient:
+        raise RuntimeError(f"Frozen parameters unexpectedly received gradients: {frozen_with_gradient[:10]}")
     if layer_calls != EXPECTED_STEPS or gate_calls != EXPECTED_STEPS:
         raise RuntimeError(f"Ouro recurrent forward count mismatch: layer={layer_calls} gate={gate_calls}")
     if layer_backward_calls != EXPECTED_STEPS:
@@ -256,12 +299,14 @@ def main() -> None:
             "audio_prefix_tokens": EXPECTED_AUDIO_TOKENS,
             "audio_prefix_labels_all_ignore": True,
             "waveform_shape": list(waveform.shape),
+            "renderer_max_abs_error": render_error,
         },
         "forward": {
             "logits_shape": list(logits.shape),
             "manual_shifted_ce": float(manual_loss.detach().cpu().item()),
             "use_cache": False,
             "past_key_values_present": getattr(outputs, "past_key_values", None) is not None,
+            "model_loss": float(outputs.loss.detach().float().cpu()),
         },
         "recurrent_calls": {
             "expected_steps": EXPECTED_STEPS,

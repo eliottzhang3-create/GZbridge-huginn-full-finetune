@@ -49,8 +49,11 @@ def load_records(path: Path) -> list[dict[str, Any]]:
 
 
 def source_shape(row: dict[str, Any]) -> str:
-    second_audio = row.get("audio_id2") not in (None, "", "null")
-    second_reverb = row.get("reverb_id2") not in (None, "", "null")
+    def present(value: Any) -> bool:
+        return value is not None and str(value).strip().lower() not in {"", "null", "none"}
+
+    second_audio = present(row.get("audio_id2"))
+    second_reverb = present(row.get("reverb_id2"))
     if second_audio != second_reverb:
         raise ValueError(f"Partial second-source pair at question_id={row.get('question_id')}")
     return "dual" if second_audio else "single"

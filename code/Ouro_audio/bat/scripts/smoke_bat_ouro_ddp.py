@@ -25,13 +25,18 @@ import torch.nn.functional as F
 
 from bat.configs.training import BAT_TRAINING
 from smoke_bat_ouro_lora import (
+    EXPECTED_OURO_LAYER_COUNT,
+    EXPECTED_QFORMER_STATE_TENSORS,
     TARGET_MODULES,
+    adapter_config_report,
     find_module,
     lora_report,
     optimizer_report,
+    parameter_group_name,
     package_version,
     parameter_report,
     require_environment,
+    shape_tuple,
 )
 
 
@@ -158,32 +163,37 @@ def audit_audio_batch(model: torch.nn.Module, inputs: dict[str, Any]) -> dict[st
 def gradient_audit(model: torch.nn.Module) -> dict[str, Any]:
     """Audit the first real backward: only Q-Former and LoRA may receive grads."""
     groups = {"qformer": 0, "lora": 0, "spatial_ast": 0, "gate": 0, "ouro_native": 0, "other": 0}
+    nonzero_groups = {key: 0 for key in groups}
     nonfinite: list[str] = []
+    frozen_with_gradient: list[str] = []
     for name, parameter in model.named_parameters():
         if parameter.grad is None:
             continue
-        if "lora_A" in name or "lora_B" in name:
-            group = "lora"
-        elif "audio_qformer" in name:
-            group = "qformer"
-        elif "spatial_ast_encoder" in name:
-            group = "spatial_ast"
-        elif "early_exit_gate" in name:
-            group = "gate"
-        elif ".model." in name or name.endswith("lm_head.weight"):
-            group = "ouro_native"
-        else:
-            group = "other"
+        group = parameter_group_name(name)
         groups[group] += 1
-        if not bool(torch.isfinite(parameter.grad).all().item()):
+        gradient = parameter.grad.detach()
+        if not bool(torch.isfinite(gradient).all().item()):
             nonfinite.append(name)
+        elif bool((gradient.float().abs() > 0).any().item()):
+            nonzero_groups[group] += 1
+        if not parameter.requires_grad:
+            frozen_with_gradient.append(name)
     if groups["qformer"] <= 0 or groups["lora"] <= 0:
         raise RuntimeError(f"Expected finite Q-Former and LoRA gradients, got {groups}")
+    if nonzero_groups["qformer"] <= 0 or nonzero_groups["lora"] <= 0:
+        raise RuntimeError(f"Expected nonzero Q-Former and LoRA gradients, got nonzero={nonzero_groups}")
     if any(groups[key] for key in ("spatial_ast", "gate", "ouro_native", "other")):
         raise RuntimeError(f"Frozen BAT components unexpectedly received gradients: {groups}")
     if nonfinite:
         raise RuntimeError(f"Non-finite trainable gradients: {nonfinite[:10]}")
-    return {"finite_gradient_parameter_counts": groups, "nonfinite_names": nonfinite}
+    if frozen_with_gradient:
+        raise RuntimeError(f"Frozen parameters unexpectedly have gradients: {frozen_with_gradient[:10]}")
+    return {
+        "finite_gradient_parameter_counts": groups,
+        "nonzero_gradient_parameter_counts": nonzero_groups,
+        "nonfinite_names": nonfinite,
+        "frozen_with_gradient_names": frozen_with_gradient,
+    }
 
 
 def find_active_qformer(model: torch.nn.Module) -> torch.nn.Module:
@@ -248,6 +258,24 @@ def checkpoint_report_for_step(
             f"Unexpected BAT checkpoint keys: lora={len(lora_keys)} "
             f"qformer={len(qformer_keys)} unexpected={unexpected[:10]}"
         )
+    expected_lora_keys = EXPECTED_OURO_LAYER_COUNT * len(TARGET_MODULES) * 2
+    if len(lora_keys) != expected_lora_keys:
+        raise RuntimeError(f"Unexpected LoRA tensor count: saved={len(lora_keys)} expected={expected_lora_keys}")
+    lora_module_paths = {key.split(".lora_", 1)[0] for key in lora_keys if ".lora_" in key}
+    invalid_lora_module_paths = [
+        path for path in lora_module_paths if path.rsplit(".", 1)[-1] not in TARGET_MODULES
+    ]
+    if len(lora_module_paths) != EXPECTED_OURO_LAYER_COUNT * len(TARGET_MODULES) or invalid_lora_module_paths:
+        raise RuntimeError(
+            "Checkpoint LoRA module contract mismatch: "
+            f"module_count={len(lora_module_paths)} invalid={invalid_lora_module_paths[:10]}"
+        )
+    if len(qformer_keys) != EXPECTED_QFORMER_STATE_TENSORS:
+        raise RuntimeError(
+            f"Unexpected Q-Former tensor count: saved={len(qformer_keys)} "
+            f"expected={EXPECTED_QFORMER_STATE_TENSORS}"
+        )
+    adapter_config_payload = adapter_config_report(path / "adapter_config.json")
 
     state_path = path / "trainer_state.json"
     if not state_path.is_file():
@@ -303,8 +331,8 @@ def checkpoint_report_for_step(
         state_files["rng"] = legacy_rng
         rng_mode = "single_process"
 
-    adapter_config = path / "adapter_config.json"
-    if not adapter_config.is_file():
+    adapter_config_path = path / "adapter_config.json"
+    if not adapter_config_path.is_file():
         missing_state.append("adapter_config.json")
     if missing_state:
         raise RuntimeError(
@@ -316,6 +344,7 @@ def checkpoint_report_for_step(
         "path": str(path),
         "tensor_count": len(keys),
         "lora_tensor_count": len(lora_keys),
+        "expected_lora_tensor_count": expected_lora_keys,
         "qformer_tensor_count": len(qformer_keys),
         "unexpected_tensor_count": len(unexpected),
         "global_step": actual_step,
@@ -323,7 +352,7 @@ def checkpoint_report_for_step(
         "rng_state_mode": rng_mode,
         "rng_rank_indices": rng_indices,
         "rng_missing_ranks": missing_rng_ranks,
-        "adapter_config": str(adapter_config),
+        "adapter_config": adapter_config_payload,
     }
 
 
@@ -364,7 +393,10 @@ def main() -> None:
             f"DDP smoke requires exactly {expected_records} JSONL records; "
             f"got {dataset_records} from {args.dataset}"
         )
-    if args.output_dir.exists() and current_rank == 0:
+    # Every rank performs the same preflight check.  A rank-0-only failure
+    # would let the other ranks enter Swift/DDP and potentially hang while
+    # waiting for the failed rank.
+    if args.output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite {args.output_dir}")
     if str(args.output_report).replace("\\", "/").startswith("/hpc_stor03/public"):
         raise ValueError(f"Refusing public output path: {args.output_report}")
@@ -455,6 +487,7 @@ def main() -> None:
                 "audio_encoder_output_shape": None, "qformer_forward": 0,
                 "qformer_input_shape": None, "qformer_output_shape": None,
                 "audio_batch": None, "prefix_audit": None, "gradient_audit": None,
+                "past_key_values_present": None,
             }
             handles: list[Any] = []
             first_layer = ouro.layers[0]
@@ -493,8 +526,26 @@ def main() -> None:
                 if trace["loss"] is None:
                     logits = outputs.logits
                     labels = labels_before
-                    if logits.ndim != 3 or labels.ndim != 2 or tuple(logits.shape[:2]) != tuple(labels.shape):
+                    input_ids = inputs.get("input_ids")
+                    attention_mask = inputs.get("attention_mask")
+                    if not torch.is_tensor(input_ids) or not torch.is_tensor(attention_mask):
+                        raise RuntimeError("Real Swift batch is missing tensor input_ids or attention_mask")
+                    if shape_tuple(input_ids) != shape_tuple(labels) or shape_tuple(attention_mask) != shape_tuple(input_ids):
+                        raise RuntimeError(
+                            "Input/label/attention shapes are not aligned: "
+                            f"input_ids={shape_tuple(input_ids)} labels={shape_tuple(labels)} "
+                            f"attention_mask={shape_tuple(attention_mask)}"
+                        )
+                    if logits.ndim != 3 or labels.ndim != 2 or shape_tuple(logits)[:2] != shape_tuple(labels):
                         raise RuntimeError(f"Cannot audit shifted CE: logits={tuple(logits.shape)} labels={tuple(labels.shape)}")
+                    if not bool(torch.isfinite(logits.float()).all().item()):
+                        raise RuntimeError("Ouro logits contain NaN or Inf")
+                    if not bool(torch.isfinite(loss.detach().float()).all().item()):
+                        raise RuntimeError("Trainer loss is NaN or Inf")
+                    past_key_values_present = getattr(outputs, "past_key_values", None) is not None
+                    trace["past_key_values_present"] = past_key_values_present
+                    if past_key_values_present:
+                        raise RuntimeError("KV cache is unexpectedly enabled during BAT training")
                     logits_float = logits.float()
                     shifted_logits = logits_float[:, :-1].contiguous()
                     shifted_labels = labels[:, 1:].contiguous()
@@ -505,6 +556,8 @@ def main() -> None:
                     manual_valid = shifted_labels.reshape(-1) != -100
                     manual_sum = manual_token_loss[manual_valid].sum()
                     manual_count = int(manual_valid.sum().item())
+                    if manual_count <= 0:
+                        raise RuntimeError("The first BAT batch has no valid shifted language-model targets")
                     manual_value = float((manual_sum / manual_count).detach().cpu())
 
                     # Reproduce ms-swift v4.4.2's per-token loss path:
@@ -550,8 +603,8 @@ def main() -> None:
                             "loss_scale is not equivalent to the labels -100 mask; "
                             "ordinary CE contract is not verified"
                         )
-                    if int(inputs["input_ids"].shape[0]) != EXPECTED_LOCAL_BATCH:
-                        raise RuntimeError(f"Rank {current_rank} local batch is not 2: {tuple(inputs['input_ids'].shape)}")
+                    if int(input_ids.shape[0]) != EXPECTED_LOCAL_BATCH:
+                        raise RuntimeError(f"Rank {current_rank} local batch is not 2: {tuple(input_ids.shape)}")
                     if not bool((labels[:, :BAT_TRAINING.audio_token_count] == -100).all().item()):
                         raise RuntimeError("Audio prefix labels are not fully masked")
                     trace["audio_batch"] = audit_audio_batch(model, {
@@ -571,8 +624,21 @@ def main() -> None:
                     prefix_audit = getattr(causal, "_ouro_bat_last_audio_forward_audit", None)
                     if not isinstance(prefix_audit, dict) or not prefix_audit.get("audio_prefix_replaced"):
                         raise RuntimeError("Ouro audio prefix replacement audit was not captured")
-                    if prefix_audit.get("inputs_embeds_shape") != list(inputs["input_ids"].shape):
-                        raise RuntimeError(f"Audio/text embedding width mismatch: {prefix_audit}")
+                    # Normalize both sides before comparing.  The audit payload
+                    # is serialized as lists, while torch.Size/tuple values can
+                    # appear when this code runs through different DDP/PEFT
+                    # wrappers.  The previous direct list comparison produced a
+                    # false failure even though [B, T] was identical.
+                    expected_sequence_shape = shape_tuple(input_ids)
+                    actual_sequence_shape = tuple(
+                        int(value) for value in (prefix_audit.get("inputs_embeds_shape") or ())
+                    )
+                    if actual_sequence_shape != expected_sequence_shape:
+                        raise RuntimeError(
+                            "Audio/text embedding sequence shape mismatch: "
+                            f"expected={expected_sequence_shape} actual={actual_sequence_shape} "
+                            f"audit={prefix_audit}"
+                        )
                     trace["prefix_audit"] = prefix_audit
                     trace["batch"] = {
                         "input_ids_shape": list(inputs["input_ids"].shape),
@@ -646,6 +712,9 @@ def main() -> None:
             reports = gather_reports(local_report)
             if len(reports) != EXPECTED_WORLD_SIZE:
                 raise RuntimeError(f"Expected {EXPECTED_WORLD_SIZE} rank reports, got {len(reports)}")
+            # Do not inspect a distributed checkpoint until every rank has
+            # completed its local save, including its RNG state file.
+            barrier()
             checkpoint: dict[str, Any] | None = None
             rank0_audit_error: str | None = None
             global_token_count = 0
@@ -655,9 +724,31 @@ def main() -> None:
                     rank_ids = sorted(int(item["rank"]) for item in reports)
                     if rank_ids != list(range(EXPECTED_WORLD_SIZE)):
                         raise RuntimeError(f"Unexpected rank reports: {rank_ids}")
+                    signatures = [
+                        (
+                            item["parameters"]["groups"],
+                            item["lora"]["module_count"],
+                            item["lora"]["rank"],
+                            tuple(item["lora"]["target_modules"]),
+                            item["optimizer"]["betas"],
+                            item["optimizer"]["weight_decay_groups"],
+                            item["optimizer"]["scheduler_type"],
+                        )
+                        for item in reports
+                    ]
+                    if any(signature != signatures[0] for signature in signatures[1:]):
+                        raise RuntimeError(f"Rank optimizer/parameter contracts differ: {signatures}")
                     local_batches = [item["forward_audit"]["batch"]["input_ids_shape"][0] for item in reports]
                     if local_batches != [EXPECTED_LOCAL_BATCH] * EXPECTED_WORLD_SIZE:
                         raise RuntimeError(f"Local batch audit failed: {local_batches}")
+                    for item in reports:
+                        batch = item["forward_audit"]["batch"]
+                        if tuple(batch["input_ids_shape"]) != tuple(batch["labels_shape"]):
+                            raise RuntimeError(f"Rank batch input/label mismatch: {item['rank']} {batch}")
+                        if tuple(batch["attention_mask_shape"]) != tuple(batch["input_ids_shape"]):
+                            raise RuntimeError(f"Rank batch input/attention mismatch: {item['rank']} {batch}")
+                        if tuple(batch["audio_waveforms_shape"]) != (EXPECTED_LOCAL_BATCH, 2, 320000):
+                            raise RuntimeError(f"Rank audio batch shape mismatch: {item['rank']} {batch}")
                     global_loss_sum = sum(
                         float(item["forward_audit"]["batch"]["manual_shifted_loss_sum"])
                         for item in reports

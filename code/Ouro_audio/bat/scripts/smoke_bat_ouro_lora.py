@@ -29,6 +29,8 @@ TEMPLATE_TYPE = "ouro_bat_audio_prefix"
 EXPECTED_STEPS = 4
 GATE_MODULE = "early_exit_gate"
 TARGET_MODULES = BAT_TRAINING.lora_target_modules
+EXPECTED_OURO_LAYER_COUNT = 24
+EXPECTED_QFORMER_STATE_TENSORS = 175
 
 
 def package_version(name: str) -> str:
@@ -87,6 +89,33 @@ def normalized_name(name: str) -> str:
     return name.replace(".base_layer.", ".")
 
 
+def parameter_group_name(name: str) -> str:
+    """Classify a parameter after normalizing PEFT wrapper prefixes."""
+    normalized = normalized_name(name)
+    if "lora_A" in name or "lora_B" in name:
+        return "lora"
+    if normalized.startswith("audio_qformer."):
+        return "qformer"
+    if normalized.startswith("spatial_ast_encoder."):
+        return "spatial_ast"
+    if GATE_MODULE in name:
+        return "gate"
+    if normalized.startswith(("model.", "lm_head.")):
+        return "ouro_native"
+    return "other"
+
+
+def shape_tuple(value: Any) -> tuple[int, ...]:
+    """Convert torch.Size/list/tuple shape payloads to one canonical form."""
+    shape = getattr(value, "shape", value)
+    if shape is None:
+        raise TypeError(f"Cannot read a tensor shape from {type(value).__name__}")
+    try:
+        return tuple(int(item) for item in shape)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"Invalid shape payload: {value!r}") from exc
+
+
 def parameter_report(model: torch.nn.Module) -> dict[str, Any]:
     groups = {"qformer": 0, "lora": 0, "spatial_ast": 0, "gate": 0, "ouro_native": 0, "other": 0}
     trainable_names: list[str] = []
@@ -94,19 +123,7 @@ def parameter_report(model: torch.nn.Module) -> dict[str, Any]:
         if not parameter.requires_grad:
             continue
         trainable_names.append(name)
-        normalized = normalized_name(name)
-        if "lora_A" in name or "lora_B" in name:
-            groups["lora"] += parameter.numel()
-        elif normalized.startswith("audio_qformer."):
-            groups["qformer"] += parameter.numel()
-        elif normalized.startswith("spatial_ast_encoder."):
-            groups["spatial_ast"] += parameter.numel()
-        elif GATE_MODULE in name:
-            groups["gate"] += parameter.numel()
-        elif normalized.startswith(("model.", "lm_head.")):
-            groups["ouro_native"] += parameter.numel()
-        else:
-            groups["other"] += parameter.numel()
+        groups[parameter_group_name(name)] += parameter.numel()
     unexpected = {key: value for key, value in groups.items() if key in {"spatial_ast", "gate", "ouro_native", "other"} and value}
     if unexpected:
         raise RuntimeError(f"Unexpected trainable BAT groups: {unexpected}")
@@ -117,6 +134,82 @@ def parameter_report(model: torch.nn.Module) -> dict[str, Any]:
         "trainable_parameter_count": sum(groups.values()),
         "trainable_name_count": len(trainable_names),
         "trainable_name_preview": trainable_names[:80],
+    }
+
+
+def adapter_config_report(path: Path) -> dict[str, Any]:
+    """Validate the PEFT metadata saved alongside an adapter checkpoint."""
+    if not path.is_file():
+        raise RuntimeError(f"Missing adapter config: {path}")
+    config = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(config, dict):
+        raise RuntimeError(f"Adapter config is not an object: {path}")
+    target_modules = config.get("target_modules")
+    if isinstance(target_modules, (set, tuple)):
+        target_modules = list(target_modules)
+    if not isinstance(target_modules, list):
+        raise RuntimeError(f"Adapter target_modules is not a list: {target_modules!r}")
+    target_set = {str(item) for item in target_modules}
+    expected_set = set(TARGET_MODULES)
+    if target_set != expected_set:
+        raise RuntimeError(f"Unexpected adapter target_modules: saved={sorted(target_set)} expected={sorted(expected_set)}")
+    if int(config.get("r", -1)) != BAT_TRAINING.lora_rank:
+        raise RuntimeError(f"Unexpected adapter rank: saved={config.get('r')!r} expected={BAT_TRAINING.lora_rank}")
+    if int(config.get("lora_alpha", -1)) != BAT_TRAINING.lora_alpha:
+        raise RuntimeError(
+            f"Unexpected adapter alpha: saved={config.get('lora_alpha')!r} expected={BAT_TRAINING.lora_alpha}"
+        )
+    if not math.isclose(float(config.get("lora_dropout", -1.0)), BAT_TRAINING.lora_dropout, rel_tol=0.0, abs_tol=1e-8):
+        raise RuntimeError(
+            f"Unexpected adapter dropout: saved={config.get('lora_dropout')!r} expected={BAT_TRAINING.lora_dropout}"
+        )
+    modules_to_save = config.get("modules_to_save") or []
+    modules_to_save = {str(item) for item in modules_to_save}
+    if "audio_qformer" not in modules_to_save:
+        raise RuntimeError(f"Q-Former is missing from modules_to_save: {sorted(modules_to_save)}")
+    return {
+        "path": str(path),
+        "r": int(config["r"]),
+        "lora_alpha": int(config["lora_alpha"]),
+        "lora_dropout": float(config.get("lora_dropout", -1.0)),
+        "target_modules": sorted(target_set),
+        "modules_to_save": sorted(modules_to_save),
+    }
+
+
+def gradient_report(model: torch.nn.Module) -> dict[str, Any]:
+    """Audit the first backward without assuming every LoRA factor is nonzero."""
+    groups = {"qformer": 0, "lora": 0, "spatial_ast": 0, "gate": 0, "ouro_native": 0, "other": 0}
+    nonzero_groups = {key: 0 for key in groups}
+    nonfinite: list[str] = []
+    frozen_with_gradient: list[str] = []
+    for name, parameter in model.named_parameters():
+        if parameter.grad is None:
+            continue
+        group = parameter_group_name(name)
+        groups[group] += 1
+        gradient = parameter.grad.detach()
+        if not bool(torch.isfinite(gradient).all().item()):
+            nonfinite.append(name)
+        elif bool((gradient.float().abs() > 0).any().item()):
+            nonzero_groups[group] += 1
+        if not parameter.requires_grad:
+            frozen_with_gradient.append(name)
+    if groups["qformer"] <= 0 or groups["lora"] <= 0:
+        raise RuntimeError(f"Expected Q-Former and LoRA gradients, got {groups}")
+    if nonzero_groups["qformer"] <= 0 or nonzero_groups["lora"] <= 0:
+        raise RuntimeError(f"Expected nonzero Q-Former and LoRA gradients, got {nonzero_groups}")
+    if any(groups[key] for key in ("spatial_ast", "gate", "ouro_native", "other")):
+        raise RuntimeError(f"Frozen BAT components unexpectedly received gradients: {groups}")
+    if nonfinite:
+        raise RuntimeError(f"Non-finite gradients: {nonfinite[:10]}")
+    if frozen_with_gradient:
+        raise RuntimeError(f"Frozen parameters unexpectedly received gradients: {frozen_with_gradient[:10]}")
+    return {
+        "finite_gradient_parameter_counts": groups,
+        "nonzero_gradient_parameter_counts": nonzero_groups,
+        "nonfinite_names": nonfinite,
+        "frozen_with_gradient_names": frozen_with_gradient,
     }
 
 
@@ -132,7 +225,7 @@ def lora_report(model: torch.nn.Module) -> dict[str, Any]:
             invalid.append(name)
         values = getattr(module, "r", {})
         ranks.update(int(value) for value in values.values())
-    expected = 24 * len(TARGET_MODULES)
+    expected = EXPECTED_OURO_LAYER_COUNT * len(TARGET_MODULES)
     if len(modules) != expected:
         raise RuntimeError(f"Expected {expected} Ouro LoRA modules, found {len(modules)}")
     if invalid or ranks != {BAT_TRAINING.lora_rank}:
@@ -206,13 +299,40 @@ def checkpoint_report(path: Path) -> dict[str, Any]:
     unexpected = [key for key in keys if key not in lora_keys and key not in qformer_keys]
     if not lora_keys or not qformer_keys or unexpected:
         raise RuntimeError(f"Unexpected BAT checkpoint keys: lora={len(lora_keys)} qformer={len(qformer_keys)} unexpected={unexpected[:10]}")
+    expected_lora_keys = EXPECTED_OURO_LAYER_COUNT * len(TARGET_MODULES) * 2
+    if len(lora_keys) != expected_lora_keys:
+        raise RuntimeError(f"Unexpected LoRA tensor count: saved={len(lora_keys)} expected={expected_lora_keys}")
+    lora_module_paths = {key.split(".lora_", 1)[0] for key in lora_keys if ".lora_" in key}
+    invalid_lora_module_paths = [
+        path for path in lora_module_paths if path.rsplit(".", 1)[-1] not in TARGET_MODULES
+    ]
+    if len(lora_module_paths) != EXPECTED_OURO_LAYER_COUNT * len(TARGET_MODULES) or invalid_lora_module_paths:
+        raise RuntimeError(
+            "Checkpoint LoRA module contract mismatch: "
+            f"module_count={len(lora_module_paths)} invalid={invalid_lora_module_paths[:10]}"
+        )
+    if len(qformer_keys) != EXPECTED_QFORMER_STATE_TENSORS:
+        raise RuntimeError(
+            f"Unexpected Q-Former tensor count: saved={len(qformer_keys)} "
+            f"expected={EXPECTED_QFORMER_STATE_TENSORS}"
+        )
+    adapter_config = adapter_config_report(path / "adapter_config.json")
     state_path = path / "trainer_state.json"
     if not state_path.is_file():
         raise RuntimeError(f"Missing trainer_state.json: {state_path}")
     state = json.loads(state_path.read_text(encoding="utf-8"))
     if int(state.get("global_step", -1)) != 2:
         raise RuntimeError(f"Expected checkpoint global_step=2, got {state.get('global_step')}")
-    return {"path": str(path), "tensor_count": len(keys), "lora_tensor_count": len(lora_keys), "qformer_tensor_count": len(qformer_keys), "unexpected_tensor_count": len(unexpected), "global_step": 2}
+    return {
+        "path": str(path),
+        "tensor_count": len(keys),
+        "lora_tensor_count": len(lora_keys),
+        "expected_lora_tensor_count": expected_lora_keys,
+        "qformer_tensor_count": len(qformer_keys),
+        "unexpected_tensor_count": len(unexpected),
+        "global_step": 2,
+        "adapter_config": adapter_config,
+    }
 
 
 def main() -> None:
@@ -279,7 +399,11 @@ def main() -> None:
             model.train()
             parameters = parameter_report(model)
             lora = lora_report(model)
-            trace = {"forward": 0, "backward": 0, "layer": 0, "gate": 0, "layer_backward": 0, "gate_backward": 0, "loss": None, "batch": None}
+            trace = {
+                "forward": 0, "backward": 0, "layer": 0, "gate": 0,
+                "layer_backward": 0, "gate_backward": 0, "loss": None,
+                "batch": None, "gradient_audit": None, "past_key_values_present": None,
+            }
             handles: list[Any] = []
             first_layer = ouro.layers[0]
             handles.append(first_layer.register_forward_hook(lambda *_: trace.__setitem__("layer", trace["layer"] + 1)))
@@ -296,8 +420,31 @@ def main() -> None:
                 if trace["loss"] is None:
                     logits = outputs.logits
                     labels = inputs["labels"]
-                    if logits.ndim != 3 or labels.ndim != 2 or tuple(logits.shape[:2]) != tuple(labels.shape):
+                    input_ids = inputs.get("input_ids")
+                    attention_mask = inputs.get("attention_mask")
+                    waveform = inputs.get("audio_waveforms")
+                    if not torch.is_tensor(input_ids) or not torch.is_tensor(attention_mask):
+                        raise RuntimeError("Real Swift batch is missing tensor input_ids or attention_mask")
+                    if shape_tuple(input_ids) != shape_tuple(labels) or shape_tuple(attention_mask) != shape_tuple(input_ids):
+                        raise RuntimeError(
+                            "Input/label/attention shapes are not aligned: "
+                            f"input_ids={shape_tuple(input_ids)} labels={shape_tuple(labels)} "
+                            f"attention_mask={shape_tuple(attention_mask)}"
+                        )
+                    waveform_shape = shape_tuple(waveform) if torch.is_tensor(waveform) else None
+                    if waveform_shape != (1, 2, 320000):
+                        raise RuntimeError(f"Unexpected eager BAT waveform batch: {type(waveform).__name__} {waveform_shape}")
+                    if not bool(torch.isfinite(waveform.float()).all().item()):
+                        raise RuntimeError("Eager BAT waveform batch contains NaN or Inf")
+                    if logits.ndim != 3 or labels.ndim != 2 or shape_tuple(logits)[:2] != shape_tuple(labels):
                         raise RuntimeError(f"Cannot audit full shifted CE: logits={tuple(logits.shape)} labels={tuple(labels.shape)}")
+                    if not bool(torch.isfinite(logits.float()).all().item()):
+                        raise RuntimeError("Ouro logits contain NaN or Inf")
+                    if not bool(torch.isfinite(loss.detach().float()).all().item()):
+                        raise RuntimeError("Trainer loss is NaN or Inf")
+                    trace["past_key_values_present"] = getattr(outputs, "past_key_values", None) is not None
+                    if trace["past_key_values_present"]:
+                        raise RuntimeError("KV cache is unexpectedly enabled during BAT training smoke")
                     shifted_logits = logits[:, :-1].contiguous()
                     shifted_labels = labels[:, 1:].contiguous()
                     manual_loss = F.cross_entropy(
@@ -315,7 +462,7 @@ def main() -> None:
                         "input_ids_shape": list(inputs["input_ids"].shape),
                         "labels_shape": list(labels.shape),
                         "attention_mask_shape": list(inputs["attention_mask"].shape),
-                        "audio_waveforms_shape": list(inputs["audio_waveforms"].shape),
+                        "audio_waveforms_shape": list(waveform.shape),
                         "audio_prefix_label_ignore_count": int((labels[:, :BAT_TRAINING.audio_token_count] == -100).sum().item()),
                         "valid_shifted_target_count": int((shifted_labels != -100).sum().item()),
                         "manual_shifted_ce": manual_value,
@@ -327,7 +474,10 @@ def main() -> None:
 
             def backward(loss, **kwargs):
                 trace["backward"] += 1
-                return original_backward(loss, **kwargs)
+                result = original_backward(loss, **kwargs)
+                if trace["gradient_audit"] is None:
+                    trace["gradient_audit"] = gradient_report(model)
+                return result
 
             trainer.compute_loss = compute_loss
             trainer.accelerator.backward = backward
@@ -343,6 +493,8 @@ def main() -> None:
                 raise RuntimeError(f"Expected {schedule['total_steps']} optimizer steps, got {trainer.state.global_step}")
             if trace["forward"] != schedule["total_steps"] or trace["backward"] != schedule["total_steps"]:
                 raise RuntimeError(f"Unexpected trainer forward/backward counts: {trace}")
+            if trace["gradient_audit"] is None:
+                raise RuntimeError("First backward gradient audit was not captured")
             if trace["layer"] != EXPECTED_STEPS * schedule["total_steps"] or trace["gate"] != EXPECTED_STEPS * schedule["total_steps"]:
                 raise RuntimeError(f"Unexpected Ouro recurrent forward counts: {trace}")
             if trace["layer_backward"] != EXPECTED_STEPS * schedule["total_steps"]:
