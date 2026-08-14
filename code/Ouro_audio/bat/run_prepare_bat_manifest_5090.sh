@@ -4,7 +4,13 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 mkdir -p "$SCRIPT_DIR/log"
 STAGE="${BAT_STAGE:?Set BAT_STAGE=I, II or III}"
-OUTPUT="${BAT_MANIFEST_OUTPUT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/manifests/stage${STAGE}_train.jsonl}"
+case "$STAGE" in
+  I) DEFAULT_OUTPUT=/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/manifests/stage1_train.jsonl;;
+  II) DEFAULT_OUTPUT=/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/manifests/stage2_train.jsonl;;
+  III) DEFAULT_OUTPUT=/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/manifests/stage3_train.jsonl;;
+  *) echo "BAT_STAGE must be I, II or III, got: $STAGE" >&2; exit 2;;
+esac
+OUTPUT="${BAT_MANIFEST_OUTPUT:-$DEFAULT_OUTPUT}"
 LIMIT="${BAT_MANIFEST_LIMIT:-0}"
 SEED="${BAT_MANIFEST_SEED:-42}"
 QA_ROOT="${BAT_QA_ROOT:-}"

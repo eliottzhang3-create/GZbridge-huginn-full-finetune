@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+USER_CONDA_BASE=/hpc_stor03/sjtu_home/jinwei.zhang/env/miniconda3
+source "$USER_CONDA_BASE/etc/profile.d/conda.sh"
+conda activate "$USER_CONDA_BASE/envs/swift_ouro"
+REPO_ROOT=/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune
+cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/code/Ouro_audio:${PYTHONPATH:-}"
+export PYTHONUNBUFFERED=1
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+export TOKENIZERS_PARALLELISM=false
+
+STAGE1="${BAT_STAGE1_MANIFEST:?Set BAT_STAGE1_MANIFEST}"
+STAGE2="${BAT_STAGE2_MANIFEST:?Set BAT_STAGE2_MANIFEST}"
+STAGE3="${BAT_STAGE3_MANIFEST:?Set BAT_STAGE3_MANIFEST}"
+ROOT="${BAT_CURRICULUM_SMOKE_ROOT:?Set BAT_CURRICULUM_SMOKE_ROOT to a private output root}"
+MODEL_PATH="${OURO_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B}"
+PLUGIN_PATH="${OURO_BAT_PLUGIN_PATH:-$REPO_ROOT/code/Ouro_audio/plugins/ouro_bat_spatial_ast_swift.py}"
+MANIFEST="$ROOT/manifest.jsonl"
+REPORT="$ROOT/curriculum_report.json"
+TRAIN_OUTPUT="$ROOT/train"
+mkdir -p "$ROOT"
+case "$ROOT" in /hpc_stor03/public|/hpc_stor03/public/*) echo "Refusing public output" >&2; exit 2;; esac
+
+python -u code/Ouro_audio/bat/scripts/compose_bat_curriculum_manifest.py \
+  --stage1-manifest "$STAGE1" --stage2-manifest "$STAGE2" --stage3-manifest "$STAGE3" \
+  --output "$MANIFEST" --report "$REPORT" --global-batch-size 16 \
+  --limit-per-stage 16 --allow-count-drift
+python -u code/Ouro_audio/bat/scripts/audit_bat_curriculum_manifest.py \
+  --manifest "$MANIFEST" --report "$REPORT" \
+  --output-report "$ROOT/manifest_audit.json" --global-batch-size 16
+
+torchrun --standalone --nproc_per_node=8 \
+  code/Ouro_audio/bat/scripts/train_bat_ouro_curriculum.py \
+  --model-path "$MODEL_PATH" --plugin-path "$PLUGIN_PATH" \
+  --dataset "$MANIFEST" --curriculum-report "$REPORT" \
+  --output-dir "$TRAIN_OUTPUT" --world-size 8 --gradient-accumulation-steps 1
+
+python - "$TRAIN_OUTPUT" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+expected = {2: "I", 4: "II", 7: "III"}
+required_any = {
+    "model": ("adapter_model.safetensors", "pytorch_model.bin", "model.safetensors"),
+    "optimizer": ("optimizer.pt", "optimizer.bin"),
+    "scheduler": ("scheduler.pt",),
+    "trainer": ("trainer_state.json",),
+    "rng": ("rng_state.pth", "rng_state.pt"),
+}
+for step, stage in expected.items():
+    checkpoint = root / f"checkpoint-{step}"
+    if not checkpoint.is_dir():
+        raise SystemExit(f"missing checkpoint: {checkpoint}")
+    marker = json.loads((checkpoint / "curriculum_stage.json").read_text(encoding="utf-8"))
+    if marker.get("stage") != stage or int(marker.get("global_step", -1)) != step:
+        raise SystemExit(f"bad marker: {checkpoint}: {marker}")
+    for kind, candidates in required_any.items():
+        if not any((checkpoint / name).is_file() for name in candidates):
+            raise SystemExit(f"missing {kind} state in {checkpoint}: {candidates}")
+print("========== BAT OURO CURRICULUM REAL CALLBACK SMOKE PASSED ==========")
+PY
