@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -41,12 +42,26 @@ def count_jsonl(path: Path) -> int:
 def main() -> None:
     args = parse_args()
     BAT_TRAINING.validate()
+    process_rank = int(os.environ.get("RANK", "0"))
+    actual_world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if actual_world_size != args.world_size:
+        raise RuntimeError(
+            f"Distributed world-size mismatch: launcher={actual_world_size} argument={args.world_size}"
+        )
+    if actual_world_size > 1:
+        local_rank = int(os.environ.get("LOCAL_RANK", "-1"))
+        if local_rank < 0 or local_rank >= actual_world_size:
+            raise RuntimeError(f"Invalid LOCAL_RANK={local_rank} for WORLD_SIZE={actual_world_size}")
+        import torch
+        if not torch.cuda.is_available():
+            raise RuntimeError("BAT DDP training requires CUDA")
+        torch.cuda.set_device(local_rank)
     if str(args.output_dir).replace("\\", "/").startswith("/hpc_stor03/public"):
         raise ValueError(f"Refusing public output path: {args.output_dir}")
     for path in (args.model_path, args.plugin_path, args.dataset):
         if not path.expanduser().resolve().exists():
             raise FileNotFoundError(path)
-    if args.output_dir.exists() and any(args.output_dir.iterdir()):
+    if process_rank == 0 and args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"Refusing non-empty output directory: {args.output_dir}")
     if args.resume_from_checkpoint is not None and not args.resume_from_checkpoint.is_dir():
         raise FileNotFoundError(args.resume_from_checkpoint)
@@ -86,6 +101,7 @@ def main() -> None:
         argv.extend(["--resume_from_checkpoint", str(args.resume_from_checkpoint)])
 
     print("========== BAT OURO STAGE TRAINING ==========")
+    print(f"[rank] rank={process_rank} world_size={actual_world_size}")
     print(f"[stage] {args.stage} dataset={args.dataset} records={dataset_size}")
     print(f"[paper] {json.dumps({
         'sound_source': BAT_TRAINING.sound_source,
@@ -102,7 +118,8 @@ def main() -> None:
         'batch_size': BAT_TRAINING.per_device_batch_size,
     }, ensure_ascii=False)}")
     print(f"[schedule] {json.dumps(dict(schedule), ensure_ascii=False)}")
-    print(f"[argv] {' '.join(argv)}")
+    if process_rank == 0:
+        print(f"[argv] {' '.join(argv)}")
     SwiftSft(argv).main()
 
 
