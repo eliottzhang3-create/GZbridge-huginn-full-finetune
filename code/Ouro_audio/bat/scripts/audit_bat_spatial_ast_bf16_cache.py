@@ -57,6 +57,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--finite-mode", choices=("all", "sample", "none"), default="all")
     parser.add_argument("--finite-sample-values", type=int, default=8192)
+    parser.add_argument("--source-limit", type=int, default=0, help="Audit only the first N source rows; 0 means all")
     return parser.parse_args()
 
 
@@ -64,6 +65,8 @@ def main() -> None:
     args = parse_args()
     if args.finite_sample_values <= 0:
         raise ValueError("--finite-sample-values must be positive")
+    if args.source_limit < 0:
+        raise ValueError("--source-limit must be non-negative")
     private_output(args.output)
     source_path = args.source_manifest
     index_path = args.cache_dir / "index.jsonl"
@@ -74,6 +77,10 @@ def main() -> None:
         raise FileNotFoundError(index_path)
 
     source_rows = read_jsonl(source_path)
+    if args.source_limit:
+        source_rows = source_rows[: args.source_limit]
+        if not source_rows:
+            raise ValueError("--source-limit selected zero source rows")
     index_rows = read_jsonl(index_path)
     expected_keys = {str(row["source_key"]) for row in source_rows}
     index_keys = [str(row.get("source_key")) for row in index_rows]
@@ -168,6 +175,7 @@ def main() -> None:
         "cache_dir": str(args.cache_dir),
         "index": str(index_path),
         "finite_mode": args.finite_mode,
+        "source_limit": args.source_limit,
         "counts": {
             "source_rows": len(source_rows),
             "index_rows": len(index_rows),

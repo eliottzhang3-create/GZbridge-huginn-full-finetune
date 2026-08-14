@@ -14,6 +14,7 @@ SOURCE_MANIFEST="${BAT_FEATURE_SOURCE_MANIFEST:?Set BAT_FEATURE_SOURCE_MANIFEST}
 CACHE_DIR="${BAT_FEATURE_CACHE_DIR:?Set BAT_FEATURE_CACHE_DIR}"
 OUTPUT="${BAT_FEATURE_AUDIT_OUTPUT:?Set BAT_FEATURE_AUDIT_OUTPUT to a private output path}"
 FINITE_MODE="${BAT_FEATURE_AUDIT_FINITE_MODE:-all}"
+SOURCE_LIMIT="${BAT_FEATURE_AUDIT_SOURCE_LIMIT:-0}"
 
 case "$OUTPUT" in
   /hpc_stor03/public|/hpc_stor03/public/*)
@@ -26,4 +27,5 @@ python -u code/Ouro_audio/bat/scripts/audit_bat_spatial_ast_bf16_cache.py \
   --source-manifest "$SOURCE_MANIFEST" \
   --cache-dir "$CACHE_DIR" \
   --output "$OUTPUT" \
-  --finite-mode "$FINITE_MODE"
+  --finite-mode "$FINITE_MODE" \
+  --source-limit "$SOURCE_LIMIT"
