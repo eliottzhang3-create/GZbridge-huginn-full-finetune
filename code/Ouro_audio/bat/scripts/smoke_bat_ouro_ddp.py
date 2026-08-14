@@ -186,6 +186,28 @@ def gradient_audit(model: torch.nn.Module) -> dict[str, Any]:
     return {"finite_gradient_parameter_counts": groups, "nonfinite_names": nonfinite}
 
 
+def find_active_qformer(model: torch.nn.Module) -> torch.nn.Module:
+    """Select the trainable Q-Former inside PEFT's modules_to_save wrapper."""
+    candidates = [
+        (name, module)
+        for name, module in model.named_modules()
+        if module.__class__.__name__ == "BATQFormer"
+    ]
+    active = [
+        (name, module)
+        for name, module in candidates
+        if "modules_to_save" in name and ".default" in name
+    ]
+    if len(active) == 1:
+        return active[0][1]
+    if len(candidates) == 1:
+        return candidates[0][1]
+    raise RuntimeError(
+        "Unable to identify the active BATQFormer: "
+        f"candidates={[name for name, _ in candidates]} active={[name for name, _ in active]}"
+    )
+
+
 def barrier() -> None:
     if dist.is_available() and dist.is_initialized():
         dist.barrier()
@@ -437,7 +459,7 @@ def main() -> None:
             handles: list[Any] = []
             first_layer = ouro.layers[0]
             audio_encoder = find_module(model, "SpatialASTAudioEncoder")
-            qformer = find_module(model, "BATQFormer")
+            qformer = find_active_qformer(model)
 
             def audio_encoder_hook(_module, hook_inputs, hook_output):
                 trace["audio_encoder_forward"] += 1
