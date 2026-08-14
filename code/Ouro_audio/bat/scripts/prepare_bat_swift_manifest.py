@@ -2,9 +2,14 @@
 """Convert one official BAT QA JSON into ms-swift standard JSONL.
 
 The generated manifest remains private on the remote filesystem.  The audio
-item is deliberately the original BAT record rather than a copied waveform:
-the registered BAT template resolves AudioSet and binaural RIR references at
-collation time, preserving the official lazy audio pipeline.
+item is a canonical, fixed-schema BAT record rather than the arbitrary raw
+QA dictionary.  This is important because Hugging Face Datasets infers Arrow
+features for nested JSON objects: if ``audio_id2`` is absent in early
+single-source rows and a string in later dual-source rows, it infers a null
+feature and fails when the later string is encountered.
+
+The registered BAT template still resolves AudioSet and binaural RIR
+references at collation time, preserving the official lazy audio pipeline.
 """
 
 from __future__ import annotations
@@ -39,6 +44,21 @@ STAGES = {
     "III": ("stage3-mixup", {"A", "B", "C", "D", "E"}),
 }
 
+CANONICAL_AUDIO_FIELDS = (
+    "audio_id",
+    "reverb_id",
+    "audio_id2",
+    "reverb_id2",
+    "question",
+    "answer",
+    "question_type",
+    "question_id",
+)
+
+
+def present(value: Any) -> bool:
+    return value is not None and str(value).strip().lower() not in {"", "null", "none"}
+
 
 def load_records(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
@@ -49,9 +69,6 @@ def load_records(path: Path) -> list[dict[str, Any]]:
 
 
 def source_shape(row: dict[str, Any]) -> str:
-    def present(value: Any) -> bool:
-        return value is not None and str(value).strip().lower() not in {"", "null", "none"}
-
     second_audio = present(row.get("audio_id2"))
     second_reverb = present(row.get("reverb_id2"))
     if second_audio != second_reverb:
@@ -66,22 +83,44 @@ def bat_type(row: dict[str, Any]) -> str:
     return RAW_TO_TYPE[raw]
 
 
+def canonical_audio_record(row: dict[str, Any]) -> dict[str, str]:
+    """Return the fixed-schema record consumed by ``BATAudioRenderer``.
+
+    All fields are present and string-typed.  Empty strings represent an
+    absent second source; ``source_shape`` and the renderer's ``_present``
+    helper interpret them as missing without creating a nullable Arrow field.
+    """
+    second_audio = row.get("audio_id2")
+    second_reverb = row.get("reverb_id2")
+    return {
+        "audio_id": str(row["audio_id"]),
+        "reverb_id": str(row["reverb_id"]),
+        "audio_id2": "" if not present(second_audio) else str(second_audio),
+        "reverb_id2": "" if not present(second_reverb) else str(second_reverb),
+        "question": str(row["question"]),
+        "answer": str(row["answer"]),
+        "question_type": str(row["question_type"]),
+        "question_id": str(row["question_id"]),
+    }
+
+
 def convert(row: dict[str, Any], stage: str) -> dict[str, Any]:
     required = ("audio_id", "reverb_id", "question", "answer", "question_type", "question_id")
     missing = [key for key in required if row.get(key) in (None, "")]
     if missing:
         raise ValueError(f"Missing {missing} at question_id={row.get('question_id')}")
     kind = bat_type(row)
+    source = canonical_audio_record(row)
     return {
         "messages": [
             {"role": "user", "content": PROMPT.format(instruction=str(row["question"]))},
             {"role": "assistant", "content": str(row["answer"])},
         ],
-        "audios": [row],
+        "audios": [source],
         "bat_stage": stage,
         "bat_type": kind,
-        "question_id": row["question_id"],
-        "question_type": row["question_type"],
+        "question_id": source["question_id"],
+        "question_type": source["question_type"],
         "source_shape": source_shape(row),
     }
 

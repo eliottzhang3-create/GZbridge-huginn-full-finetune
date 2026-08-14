@@ -24,6 +24,16 @@ EXPECTED_SOURCE_SHAPES = {
     "II": {"single", "dual"},
     "III": {"single", "dual"},
 }
+CANONICAL_AUDIO_FIELDS = {
+    "audio_id",
+    "reverb_id",
+    "audio_id2",
+    "reverb_id2",
+    "question",
+    "answer",
+    "question_type",
+    "question_id",
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -107,6 +117,17 @@ def audit_record(record: dict[str, Any], stage: str, index: int, issues: list[st
         source = {}
     else:
         source = audios[0]
+    if source and set(source) != CANONICAL_AUDIO_FIELDS:
+        issues.append(
+            f"{prefix}:audios[0] schema mismatch; observed={sorted(source)} "
+            f"expected={sorted(CANONICAL_AUDIO_FIELDS)}"
+        )
+    if source:
+        non_string_fields = sorted(
+            field for field in CANONICAL_AUDIO_FIELDS if field in source and not isinstance(source[field], str)
+        )
+        if non_string_fields:
+            issues.append(f"{prefix}:audios[0] non-string fields={non_string_fields}")
     for field in ("audio_id", "reverb_id", "question", "answer", "question_type", "question_id"):
         if not present(source.get(field)):
             issues.append(f"{prefix}:source missing {field}")
