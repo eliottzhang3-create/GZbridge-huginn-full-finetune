@@ -40,6 +40,7 @@ torchrun --standalone --nproc_per_node=8 \
 
 python - "$TRAIN_OUTPUT" <<'PY'
 import json
+import re
 import sys
 from pathlib import Path
 
@@ -58,7 +59,6 @@ required_any = {
     "optimizer": ("optimizer.pt", "optimizer.bin"),
     "scheduler": ("scheduler.pt",),
     "trainer": ("trainer_state.json",),
-    "rng": ("rng_state.pth", "rng_state.pt"),
 }
 for step, stage in expected.items():
     checkpoint = root / f"checkpoint-{step}"
@@ -70,5 +70,23 @@ for step, stage in expected.items():
     for kind, candidates in required_any.items():
         if not any((checkpoint / name).is_file() for name in candidates):
             raise SystemExit(f"missing {kind} state in {checkpoint}: {candidates}")
+    rng_files = sorted(
+        path.name
+        for pattern in ("rng_state_*.pth", "rng_state_*.pt")
+        for path in checkpoint.glob(pattern)
+        if path.is_file()
+    )
+    rng_ranks = sorted(
+        {
+            int(match.group(1))
+            for name in rng_files
+            if (match := re.fullmatch(r"rng_state_(\d+)\.(?:pth|pt)", name)) is not None
+        }
+    )
+    missing_rng = [rank for rank in range(8) if rank not in rng_ranks]
+    if missing_rng:
+        raise SystemExit(
+            f"missing DDP RNG states in {checkpoint}: missing_ranks={missing_rng} present={rng_files}"
+        )
 print("========== BAT OURO CURRICULUM REAL CALLBACK SMOKE PASSED ==========")
 PY
