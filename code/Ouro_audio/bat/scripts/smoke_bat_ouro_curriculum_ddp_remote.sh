@@ -44,6 +44,14 @@ import sys
 from pathlib import Path
 
 root = Path(sys.argv[1])
+run_candidates = sorted(
+    path for path in root.iterdir()
+    if path.is_dir() and (path / "checkpoint-7").is_dir()
+)
+if len(run_candidates) != 1:
+    raise SystemExit(f"expected one Swift run directory containing checkpoint-7 under {root}, found: {run_candidates}")
+root = run_candidates[0]
+print(f"[checkpoint-audit] effective_run_dir={root}")
 expected = {2: "I", 4: "II", 7: "III"}
 required_any = {
     "model": ("adapter_model.safetensors", "pytorch_model.bin", "model.safetensors"),
