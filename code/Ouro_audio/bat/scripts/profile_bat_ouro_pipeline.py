@@ -19,8 +19,6 @@ step-level wall timer is also retained because bucket all-reduces can overlap
 with autograd and therefore their durations must not simply be summed.
 """
 
-from __future__ import annotations
-
 import argparse
 import importlib.util
 import json
@@ -237,7 +235,7 @@ class DDPCommunicationProfiler:
         self.current_step = int(step_index)
         self._records = []
 
-    def hook(self, _state: Any, bucket: Any):
+    def hook(self, _state: Any, bucket: dist.GradBucket) -> torch.futures.Future:
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
