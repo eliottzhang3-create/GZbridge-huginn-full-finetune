@@ -235,7 +235,7 @@ class DDPCommunicationProfiler:
         self.current_step = int(step_index)
         self._records = []
 
-    def hook(self, _state: Any, bucket: dist.GradBucket) -> torch.futures.Future:
+    def hook(self, _state: Any, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
         start_event = torch.cuda.Event(enable_timing=True)
         end_event = torch.cuda.Event(enable_timing=True)
         start_event.record()
