@@ -12,9 +12,11 @@ This is deliberately a profiler, not a training job:
 * it writes no checkpoint and does not update any model parameter.
 
 The report separates steady-state data wait, host-to-device transfer,
-Spatial-AST, Q-Former, Ouro forward, and backward-plus-DDP time.  CUDA event
-timers are used for GPU regions; backward time includes DDP gradient
-all-reduce when launched with more than one rank.
+Spatial-AST, Q-Former, Ouro forward, backward main-stream time, and DDP
+communication-hook time.  The DDP hook performs the same averaged all-reduce
+as the default reducer while recording each gradient bucket's completion.  A
+step-level wall timer is also retained because bucket all-reduces can overlap
+with autograd and therefore their durations must not simply be summed.
 """
 
 from __future__ import annotations
@@ -58,6 +60,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--measure-ddp-communication",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Use an asynchronous DDP communication hook to measure gradient buckets.",
+    )
     parser.add_argument("--expected-world-size", type=int, default=EXPECTED_WORLD_SIZE)
     return parser.parse_args()
 
@@ -205,6 +213,107 @@ class CudaRegionTimer:
 
     def milliseconds(self) -> float:
         return float(self.start.elapsed_time(self.end))
+
+
+class DDPCommunicationProfiler:
+    """Record real DDP bucket all-reduces without waiting in the hook.
+
+    DDP communication hooks replace the reducer's default hook, so this hook
+    must preserve the default semantics: all-reduce the bucket and divide by
+    world size.  The asynchronous Future is returned directly, preserving
+    communication/compute overlap instead of serializing every bucket with a
+    blocking ``wait``.
+    """
+
+    def __init__(self, world_size: int):
+        self.world_size = int(world_size)
+        self.current_step: int | None = None
+        self._records: list[dict[str, Any]] = []
+        self._pending_callbacks = 0
+
+    def begin_step(self, step_index: int) -> None:
+        if self._pending_callbacks:
+            raise RuntimeError("Previous DDP communication callbacks are still pending")
+        self.current_step = int(step_index)
+        self._records = []
+
+    def hook(self, _state: Any, bucket: Any):
+        start_event = torch.cuda.Event(enable_timing=True)
+        end_event = torch.cuda.Event(enable_timing=True)
+        start_event.record()
+        launched_at = time.perf_counter()
+        try:
+            bucket_index = int(bucket.index())
+        except Exception:
+            bucket_index = -1
+        bucket_numel = int(bucket.buffer().numel())
+        self._pending_callbacks += 1
+        work = dist.all_reduce(bucket.buffer(), async_op=True)
+        future = work.get_future()
+
+        def complete(fut: Any):
+            # The Future callback runs after the asynchronous collective has
+            # completed.  Recording the end event here lets us inspect a CUDA
+            # duration after the enclosing backward has synchronized.
+            end_event.record()
+            completed_at = time.perf_counter()
+            record = {
+                "step_index": self.current_step,
+                "bucket_index": bucket_index,
+                "bucket_numel": bucket_numel,
+                "launched_at": launched_at,
+                "completed_at": completed_at,
+                "start_event": start_event,
+                "end_event": end_event,
+            }
+            self._records.append(record)
+            try:
+                tensor = fut.value()[0]
+                tensor.div_(self.world_size)
+                return tensor
+            finally:
+                self._pending_callbacks -= 1
+
+        return future.then(complete)
+
+    def finish_step(self) -> dict[str, Any]:
+        # The caller synchronizes the CUDA device before asking for these
+        # values.  Keep this method defensive because a failed collective
+        # should result in an explicit audit error, not a misleading zero.
+        deadline = time.perf_counter() + 5.0
+        while self._pending_callbacks and time.perf_counter() < deadline:
+            time.sleep(0.001)
+        if self._pending_callbacks:
+            raise RuntimeError(
+                f"Timed out waiting for DDP communication callbacks: pending={self._pending_callbacks}"
+            )
+        records = list(self._records)
+        bucket_details: list[dict[str, Any]] = []
+        for record in records:
+            try:
+                cuda_seconds = float(record["start_event"].elapsed_time(record["end_event"]) / 1000.0)
+            except Exception as exc:
+                cuda_seconds = None
+                record["cuda_timer_error"] = f"{type(exc).__name__}: {exc}"
+            bucket_details.append({
+                "step_index": record["step_index"],
+                "bucket_index": record["bucket_index"],
+                "bucket_numel": record["bucket_numel"],
+                "cpu_completion_seconds": float(record["completed_at"] - record["launched_at"]),
+                "cuda_seconds": cuda_seconds,
+                **({"cuda_timer_error": record["cuda_timer_error"]} if "cuda_timer_error" in record else {}),
+            })
+        cpu_starts = [float(record["launched_at"]) for record in records]
+        cpu_ends = [float(record["completed_at"]) for record in records]
+        cpu_span = max(cpu_ends) - min(cpu_starts) if records else 0.0
+        cuda_values = [item["cuda_seconds"] for item in bucket_details if item["cuda_seconds"] is not None]
+        return {
+            "enabled": True,
+            "bucket_count": len(bucket_details),
+            "bucket_sum_seconds": float(sum(cuda_values)) if cuda_values else 0.0,
+            "bucket_span_seconds": float(cpu_span),
+            "bucket_details": bucket_details,
+        }
 
 
 def install_module_timer(module: torch.nn.Module) -> tuple[CudaRegionTimer, list[Any]]:
@@ -371,6 +480,7 @@ def main() -> None:
     if hasattr(causal, "model") and hasattr(causal.model, "config"):
         causal.model.config.use_cache = False
 
+    communication_profiler: DDPCommunicationProfiler | None = None
     if current_world > 1:
         model = DistributedDataParallel(
             model,
@@ -378,6 +488,9 @@ def main() -> None:
             output_device=current_local_rank,
             find_unused_parameters=False,
         )
+        if args.measure_ddp_communication:
+            communication_profiler = DDPCommunicationProfiler(current_world)
+            model.register_comm_hook(communication_profiler, communication_profiler.hook)
 
     template = get_template(
         template_type=TEMPLATE_TYPE,
@@ -426,6 +539,10 @@ def main() -> None:
     h2d_values: list[float] = []
     forward_values: list[float] = []
     backward_values: list[float] = []
+    backward_cuda_event_values: list[float] = []
+    ddp_bucket_sum_values: list[float] = []
+    ddp_bucket_span_values: list[float] = []
+    backward_compute_approx_values: list[float] = []
     spatial_values: list[float] = []
     qformer_values: list[float] = []
     step_values: list[float] = []
@@ -465,10 +582,30 @@ def main() -> None:
                 raise RuntimeError("Profiler observed a non-finite or missing loss")
 
             backward_timer = CudaRegionTimer()
+            backward_wall_started = time.perf_counter()
+            if communication_profiler is not None:
+                communication_profiler.begin_step(step_index)
             backward_timer.begin()
             loss.backward()
             backward_timer.finish()
             torch.cuda.synchronize(device)
+            backward_plus_ddp_wall = time.perf_counter() - backward_wall_started
+            communication = (
+                communication_profiler.finish_step()
+                if communication_profiler is not None
+                else {
+                    "enabled": False,
+                    "bucket_count": 0,
+                    "bucket_sum_seconds": 0.0,
+                    "bucket_span_seconds": 0.0,
+                    "bucket_details": [],
+                }
+            )
+            if current_world > 1 and args.measure_ddp_communication and communication["bucket_count"] <= 0:
+                raise RuntimeError(
+                    "DDP communication hook observed no gradient buckets; "
+                    "the backward/all-reduce split is invalid"
+                )
 
             forward_ms = forward_timer.milliseconds()
             backward_ms = backward_timer.milliseconds()
@@ -477,7 +614,13 @@ def main() -> None:
                 data_wait_values.append(data_wait)
                 h2d_values.append(h2d_seconds)
                 forward_values.append(forward_ms / 1000.0)
-                backward_values.append(backward_ms / 1000.0)
+                backward_values.append(backward_plus_ddp_wall)
+                backward_cuda_event_values.append(backward_ms / 1000.0)
+                ddp_bucket_sum_values.append(float(communication["bucket_sum_seconds"]))
+                ddp_bucket_span_values.append(float(communication["bucket_span_seconds"]))
+                backward_compute_approx_values.append(
+                    max(0.0, backward_plus_ddp_wall - float(communication["bucket_span_seconds"]))
+                )
                 spatial_values.append(spatial_timer.milliseconds() / 1000.0)
                 qformer_values.append(qformer_timer.milliseconds() / 1000.0)
                 step_values.append(time.perf_counter() - step_started)
@@ -490,7 +633,16 @@ def main() -> None:
                         "spatial_ast_seconds": spatial_timer.milliseconds() / 1000.0,
                         "qformer_seconds": qformer_timer.milliseconds() / 1000.0,
                         "ouro_forward_seconds": forward_ms / 1000.0,
-                        "backward_plus_ddp_allreduce_seconds": backward_ms / 1000.0,
+                        "backward_plus_ddp_allreduce_seconds": backward_plus_ddp_wall,
+                        "backward_cuda_event_seconds": backward_ms / 1000.0,
+                        "ddp_allreduce_bucket_sum_seconds": float(communication["bucket_sum_seconds"]),
+                        "ddp_allreduce_bucket_span_seconds": float(communication["bucket_span_seconds"]),
+                        "backward_compute_excluding_ddp_approx_seconds": max(
+                            0.0,
+                            backward_plus_ddp_wall - float(communication["bucket_span_seconds"]),
+                        ),
+                        "ddp_allreduce_bucket_count": int(communication["bucket_count"]),
+                        "ddp_allreduce_buckets": communication["bucket_details"],
                         "step_wall_seconds": time.perf_counter() - step_started,
                         "loss": float(loss.detach().float().cpu().item()),
                         "sources": source_records,
@@ -518,6 +670,10 @@ def main() -> None:
             "qformer": summarize(qformer_values),
             "ouro_forward": summarize(forward_values),
             "backward_plus_ddp_allreduce": summarize(backward_values),
+            "backward_cuda_event_main_stream": summarize(backward_cuda_event_values),
+            "ddp_allreduce_bucket_sum": summarize(ddp_bucket_sum_values),
+            "ddp_allreduce_bucket_span": summarize(ddp_bucket_span_values),
+            "backward_compute_excluding_ddp_approx": summarize(backward_compute_approx_values),
             "step_wall_from_data_to_sync": summarize(step_values),
         },
         "loss": summarize(losses),
@@ -573,7 +729,11 @@ def main() -> None:
             "ddp": {
                 "enabled": current_world > 1,
                 "backend": dist.get_backend() if current_world > 1 else None,
-                "backward_timing_includes_allreduce": current_world > 1,
+                "communication_hook_enabled": communication_profiler is not None,
+                "communication_hook_semantics": "async all_reduce + divide by world_size",
+                "backward_plus_ddp_wall_timer": "loss.backward() through CUDA synchronization",
+                "bucket_sum_caveat": "sum can overcount overlapping buckets",
+                "bucket_span_caveat": "CPU callback span estimates the overlapping communication window",
             },
             "rank_reports": reports,
         }
@@ -581,6 +741,13 @@ def main() -> None:
         print(f"[report] {output}", flush=True)
         print(f"[ranks] {len(reports)}", flush=True)
         print(f"[rank0 timings] {json.dumps(local_report['timings_seconds'], ensure_ascii=False)}", flush=True)
+        print(
+            f"[rank0 ddp split] backward_plus_ddp_wall={local_report['timings_seconds']['backward_plus_ddp_allreduce']} "
+            f"backward_cuda={local_report['timings_seconds']['backward_cuda_event_main_stream']} "
+            f"allreduce_bucket_span={local_report['timings_seconds']['ddp_allreduce_bucket_span']} "
+            f"backward_excluding_ddp_approx={local_report['timings_seconds']['backward_compute_excluding_ddp_approx']}",
+            flush=True,
+        )
         print(f"[rank0 slowest_steps] {json.dumps(local_report['slowest_steps'], ensure_ascii=False)}", flush=True)
         print(f"[rank0 memory] {json.dumps(local_report['memory'], ensure_ascii=False)}", flush=True)
         print(f"[update_probe] {json.dumps(parameter_probe_report, ensure_ascii=False)}", flush=True)
