@@ -16,10 +16,10 @@ if [[ "$GPU_COUNT" != "8" || "$WORLD_SIZE" != "8" || "$GRAD_ACCUM" != "1" ]]; th
 fi
 
 vc submit \
-  -p pdgpu-5090 \
+  -p pdgpu-3090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 32 -m 256G -g 8 -n 1 \
-  -j "bat-ouro-curriculum-5090-$(date +%m%d%H%M)" \
+  -j "bat-ouro-curriculum-3090-$(date +%m%d%H%M)" \
   -d "$SCRIPT_DIR" \
-  JOB=1:1 "$SCRIPT_DIR/log/bat_ouro_curriculum_5090.JOB.log" \
+  JOB=1:1 "$SCRIPT_DIR/log/bat_ouro_curriculum_3090.JOB.log" \
   --cmd "BAT_WORLD_SIZE=8 BAT_GRADIENT_ACCUMULATION_STEPS=1 BAT_CURRICULUM_MANIFEST=$(printf '%q' "$DATASET") BAT_CURRICULUM_REPORT=$(printf '%q' "$REPORT") BAT_CURRICULUM_OUTPUT_DIR=$(printf '%q' "$OUTPUT_DIR") BAT_LAUNCH_MODE=ddp bash scripts/train_bat_ouro_curriculum_remote.sh"

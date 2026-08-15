@@ -39,6 +39,7 @@ import torch.nn.functional as F
 
 SAMPLE_RATE = 32_000
 TARGET_SAMPLES = 10 * SAMPLE_RATE
+RIR_TARGET_SAMPLES = 2 * SAMPLE_RATE
 EXPECTED_TOKEN_COUNT = 515
 EXPECTED_HIDDEN_SIZE = 768
 
@@ -328,7 +329,9 @@ def load_rir(path: Path) -> np.ndarray:
         raise ValueError(f"Expected binaural RIR [2,L], got {array.shape} from {path}")
     if not np.isfinite(array).all():
         raise ValueError(f"RIR contains non-finite values: {path}")
-    return array
+    normalized = np.zeros((2, RIR_TARGET_SAMPLES), dtype=np.float32)
+    normalized[:, : min(RIR_TARGET_SAMPLES, array.shape[-1])] = array[:, :RIR_TARGET_SAMPLES]
+    return normalized
 
 
 def crop_or_pad(waveform: np.ndarray, target_samples: int = TARGET_SAMPLES) -> np.ndarray:
@@ -736,6 +739,8 @@ def main() -> None:
             "audio_channel_policy": "AudioSet first channel if source file is multi-channel",
             "resample_hz": SAMPLE_RATE,
             "normalization": "RMS target -14 dBFS",
+            "rir_length_policy": "crop_or_zero_pad_to_2_seconds_before_convolution",
+            "rir_target_samples": RIR_TARGET_SAMPLES,
             "rir_convolution": "full FFT convolution per source, then crop/pad to 10 seconds",
             "dual_source_mix": "render each source separately and average the two binaural waveforms",
             "spatial_ast_official_input": "waveforms [B,1,320000] plus binaural RIR [B,2,L]",

@@ -29,6 +29,7 @@ import torch.nn.functional as F
 
 SAMPLE_RATE = 32_000
 TARGET_SAMPLES = 10 * SAMPLE_RATE
+RIR_TARGET_SAMPLES = 2 * SAMPLE_RATE
 SPATIAL_AST_TOKEN_COUNT = 515
 SPATIAL_AST_HIDDEN_SIZE = 768
 BAT_QUERY_COUNT = 64
@@ -277,6 +278,13 @@ class BATAudioRenderer:
         output[:, : min(TARGET_SAMPLES, value.shape[-1])] = value[:, :TARGET_SAMPLES]
         return output
 
+    @staticmethod
+    def _crop_or_pad_rir(value: np.ndarray) -> np.ndarray:
+        """Match the official BAT/Spatial-AST two-second RIR contract."""
+        output = np.zeros((2, RIR_TARGET_SAMPLES), dtype=np.float32)
+        output[:, : min(RIR_TARGET_SAMPLES, value.shape[-1])] = value[:, :RIR_TARGET_SAMPLES]
+        return output
+
     def _render_one(self, audio_id: str, reverb_id: str) -> torch.Tensor:
         from scipy import signal
 
@@ -289,6 +297,11 @@ class BATAudioRenderer:
             raise ValueError(f"Expected binaural RIR [2,L], got {rir.shape}")
         if not np.isfinite(rir).all():
             raise ValueError(f"Binaural RIR contains non-finite values: audio={audio_id} reverb={reverb_id}")
+        # Official Spatial-AST preprocessing pads/truncates each binaural RIR
+        # to exactly two seconds at 32 kHz before convolution.  This changes
+        # only the rare late-tail samples beyond the official contract; the
+        # rendered waveform is still cropped/padded to 10 seconds below.
+        rir = self._crop_or_pad_rir(rir)
         rendered = signal.fftconvolve(audio, rir, mode="full")
         if not np.isfinite(rendered).all():
             raise ValueError(f"Rendered binaural waveform contains non-finite values: audio={audio_id} reverb={reverb_id}")
