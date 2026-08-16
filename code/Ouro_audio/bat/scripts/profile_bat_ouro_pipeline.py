@@ -69,7 +69,7 @@ def parse_args() -> argparse.Namespace:
         "--torch-compile",
         action=argparse.BooleanOptionalAction,
         default=False,
-        help="Compile the complete registered BAT model before the optional DDP wrapper.",
+        help="Compile only OuroForCausalLM.model, the four-cycle Transformer core.",
     )
     parser.add_argument(
         "--compile-mode",
@@ -549,6 +549,46 @@ def snapshot_dynamo_counters() -> dict[str, Any] | None:
     return snapshot
 
 
+def compile_ouro_transformer_core(
+    causal: torch.nn.Module,
+    mode: str,
+    dynamic: bool,
+) -> tuple[torch.nn.Module, dict[str, Any]]:
+    """Compile only the Ouro recurrent Transformer core.
+
+    The registered BAT model has this structure after LoRA injection:
+
+        PeftModel -> OuroForCausalLM -> model -> 24 Transformer layers
+
+    The audio renderer, frozen Spatial-AST, trainable Q-Former, audio-prefix
+    replacement, LM head, and Peft outer wrapper remain eager.  Assigning the
+    compiled module back to ``OuroForCausalLM.model`` makes the real causal-LM
+    forward use the compiled four-cycle Transformer without compiling the
+    entire multimodal Python path.
+    """
+    transformer_core = getattr(causal, "model", None)
+    if not isinstance(transformer_core, torch.nn.Module):
+        raise RuntimeError("Unable to locate OuroForCausalLM.model Transformer core")
+    original_class = type(transformer_core).__name__
+    compiled_core = torch.compile(
+        transformer_core,
+        backend="inductor",
+        mode=mode,
+        dynamic=dynamic,
+        fullgraph=False,
+    )
+    causal.model = compiled_core
+    return compiled_core, {
+        "target": "OuroForCausalLM.model",
+        "target_class_before_compile": original_class,
+        "target_class_after_compile": type(compiled_core).__name__,
+        "outer_multimodal_model_compiled": False,
+        "spatial_ast_compiled": False,
+        "qformer_compiled": False,
+        "audio_renderer_compiled": False,
+    }
+
+
 def gather_reports(report: dict[str, Any], current_world: int) -> list[dict[str, Any]]:
     if current_world == 1:
         return [report]
@@ -674,18 +714,19 @@ def main() -> None:
     if args.torch_compile:
         compile_started = time.perf_counter()
         try:
-            model = torch.compile(
-                model,
-                backend="inductor",
+            compiled_core, target_report = compile_ouro_transformer_core(
+                causal,
                 mode=args.compile_mode,
                 dynamic=args.compile_dynamic,
-                fullgraph=False,
             )
         except Exception as exc:
-            raise RuntimeError(f"torch.compile setup failed: {type(exc).__name__}: {exc}") from exc
+            raise RuntimeError(
+                f"Ouro Transformer-core torch.compile setup failed: {type(exc).__name__}: {exc}"
+            ) from exc
         compile_report.update({
             "enabled": True,
-            "wrapper_class": type(model).__name__,
+            "wrapper_class": type(compiled_core).__name__,
+            **target_report,
             "setup_seconds": time.perf_counter() - compile_started,
         })
 
