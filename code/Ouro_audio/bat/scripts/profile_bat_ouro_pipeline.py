@@ -674,6 +674,7 @@ def main() -> None:
         "wrapper_class": None,
         "repro_after_aot_disabled": False,
         "inductor_graph_repro_disabled": False,
+        "dynamo_optimize_ddp_disabled": False,
     }
     if args.torch_compile:
         try:
@@ -694,6 +695,19 @@ def main() -> None:
             _dynamo.reset()
             dynamo_config = getattr(_dynamo, "config", None)
             if dynamo_config is not None:
+                # The benchmark compiles only OuroForCausalLM.model and then
+                # wraps the complete multimodal model in ordinary DDP below.
+                # PyTorch's Dynamo DDP optimizer is a different compilation
+                # path: it partitions the already-compiled submodule and
+                # assumes every FX graph output is a Tensor node.  Ouro's
+                # native recurrent return structure contains auxiliary
+                # Python values/lists, so that path can fail in AOTAutograd
+                # with ``AttributeError: 'float' object has no attribute
+                # 'meta'``.  Disable only that optimizer; DDP itself and its
+                # gradient all-reduce remain enabled and are still measured.
+                if hasattr(dynamo_config, "optimize_ddp"):
+                    dynamo_config.optimize_ddp = False
+                    compile_report["dynamo_optimize_ddp_disabled"] = True
                 if hasattr(dynamo_config, "repro_after"):
                     dynamo_config.repro_after = None
                 if hasattr(dynamo_config, "repro_after_aot"):
