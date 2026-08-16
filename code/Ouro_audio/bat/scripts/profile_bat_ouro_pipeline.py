@@ -635,9 +635,9 @@ def main() -> None:
     }
     if args.torch_compile:
         try:
-            import torch._dynamo
+            from torch import _dynamo
 
-            torch._dynamo.reset()
+            _dynamo.reset()
         except Exception:
             pass
     if args.torch_compile:
