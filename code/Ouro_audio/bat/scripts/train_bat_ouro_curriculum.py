@@ -298,11 +298,16 @@ def main() -> None:
                 raise RuntimeError(f"Compile training audit failed: {audit_state['issues']}")
             if rank() == 0:
                 for step, stage in sorted(callback.step_to_stage.items()):
-                    checkpoint_dir = effective_output_dir / f"checkpoint-{step}"
-                    marker = checkpoint_dir / "curriculum_stage.json"
-                    if not marker.is_file():
-                        raise RuntimeError(f"Missing curriculum marker for Stage-{stage}: {marker}")
-                    print(f"[checkpoint] stage={stage} global_step={step} path={checkpoint_dir}", flush=True)
+                    marker = callback.marker_paths.get(step)
+                    if marker is None or not marker.is_file():
+                        expected = effective_output_dir / f"checkpoint-{step}" / "curriculum_stage.json"
+                        raise RuntimeError(f"Missing curriculum marker for Stage-{stage}: {expected}")
+                    current_marker = effective_output_dir / f"checkpoint-{step}" / "curriculum_stage.json"
+                    location = "current" if marker.resolve() == current_marker.resolve() else "resume-source"
+                    print(
+                        f"[checkpoint] stage={stage} global_step={step} path={marker.parent} location={location}",
+                        flush=True,
+                    )
             return result
 
     warmup_steps = int(curriculum_report["warmup_steps"])

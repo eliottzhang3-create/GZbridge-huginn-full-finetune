@@ -41,6 +41,10 @@ class CurriculumBoundaryCheckpointCallback(TrainerCallback):
         self.checkpoint_root = checkpoint_root.resolve() if checkpoint_root is not None else None
         self.resume_checkpoint = resume_checkpoint.resolve() if resume_checkpoint is not None else None
         self.saved_steps: set[int] = set()
+        # Boundary markers can live in different versioned run directories:
+        # on resume, the source Stage-I marker remains in v0 while newly
+        # produced Stage-II/III markers are written into v1.
+        self.marker_paths: dict[int, Path] = {}
         self._load_existing_boundary_markers()
         self._load_resume_marker()
 
@@ -63,21 +67,35 @@ class CurriculumBoundaryCheckpointCallback(TrainerCallback):
                 continue
             if marker.get("status") == "ok" and marker.get("stage") == stage and int(marker.get("global_step", -1)) == step:
                 self.saved_steps.add(step)
+                self.marker_paths[step] = marker_path
 
     def _load_resume_marker(self) -> None:
-        """Count the source checkpoint's boundary as already completed."""
+        """Inherit all valid boundaries from the source run on resume."""
         if self.resume_checkpoint is None:
             return
-        marker_path = self.resume_checkpoint / "curriculum_stage.json"
-        if not marker_path.is_file():
-            return
-        try:
-            marker = json.loads(marker_path.read_text(encoding="utf-8"))
-            step = int(marker.get("global_step", -1))
-        except (OSError, json.JSONDecodeError, TypeError, ValueError):
-            return
-        if marker.get("status") == "ok" and step in self.boundary_steps and marker.get("stage") == self.step_to_stage[step]:
-            self.saved_steps.add(step)
+        source_run_root = self.resume_checkpoint.parent
+        candidates = [
+            source_run_root / f"checkpoint-{step}" / "curriculum_stage.json"
+            for step in self.boundary_steps
+        ]
+        # Also include the explicitly supplied checkpoint itself in case a
+        # launcher points at a nonstandard nested checkpoint location.
+        candidates.append(self.resume_checkpoint / "curriculum_stage.json")
+        for marker_path in candidates:
+            if not marker_path.is_file():
+                continue
+            try:
+                marker = json.loads(marker_path.read_text(encoding="utf-8"))
+                step = int(marker.get("global_step", -1))
+            except (OSError, json.JSONDecodeError, TypeError, ValueError):
+                continue
+            if (
+                marker.get("status") == "ok"
+                and step in self.boundary_steps
+                and marker.get("stage") == self.step_to_stage[step]
+            ):
+                self.saved_steps.add(step)
+                self.marker_paths[step] = marker_path
 
     def on_step_end(
         self,
@@ -122,6 +140,7 @@ class CurriculumBoundaryCheckpointCallback(TrainerCallback):
         temporary = marker_path.with_name(marker_path.name + ".tmp")
         temporary.write_text(json.dumps(marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         temporary.replace(marker_path)
+        self.marker_paths[step] = marker_path
         return control
 
     def missing_boundary_steps(self) -> list[int]:
