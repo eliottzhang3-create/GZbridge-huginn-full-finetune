@@ -236,9 +236,6 @@ class DDPCommunicationProfiler:
         self._records = []
 
     def hook(self, _state: Any, bucket: dist.GradBucket) -> torch.futures.Future[torch.Tensor]:
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
         launched_at = time.perf_counter()
         try:
             bucket_index = int(bucket.index())
@@ -251,9 +248,10 @@ class DDPCommunicationProfiler:
 
         def complete(fut: Any):
             # The Future callback runs after the asynchronous collective has
-            # completed.  Recording the end event here lets us inspect a CUDA
-            # duration after the enclosing backward has synchronized.
-            end_event.record()
+            # completed.  We deliberately use CPU timestamps here.  A CUDA
+            # event recorded from this CPU Future callback is associated with
+            # the current compute stream, not necessarily NCCL's stream, and
+            # can incorrectly include unrelated autograd work.
             completed_at = time.perf_counter()
             record = {
                 "step_index": self.current_step,
@@ -261,8 +259,6 @@ class DDPCommunicationProfiler:
                 "bucket_numel": bucket_numel,
                 "launched_at": launched_at,
                 "completed_at": completed_at,
-                "start_event": start_event,
-                "end_event": end_event,
             }
             self._records.append(record)
             try:
@@ -288,27 +284,20 @@ class DDPCommunicationProfiler:
         records = list(self._records)
         bucket_details: list[dict[str, Any]] = []
         for record in records:
-            try:
-                cuda_seconds = float(record["start_event"].elapsed_time(record["end_event"]) / 1000.0)
-            except Exception as exc:
-                cuda_seconds = None
-                record["cuda_timer_error"] = f"{type(exc).__name__}: {exc}"
             bucket_details.append({
                 "step_index": record["step_index"],
                 "bucket_index": record["bucket_index"],
                 "bucket_numel": record["bucket_numel"],
                 "cpu_completion_seconds": float(record["completed_at"] - record["launched_at"]),
-                "cuda_seconds": cuda_seconds,
-                **({"cuda_timer_error": record["cuda_timer_error"]} if "cuda_timer_error" in record else {}),
             })
         cpu_starts = [float(record["launched_at"]) for record in records]
         cpu_ends = [float(record["completed_at"]) for record in records]
         cpu_span = max(cpu_ends) - min(cpu_starts) if records else 0.0
-        cuda_values = [item["cuda_seconds"] for item in bucket_details if item["cuda_seconds"] is not None]
+        cpu_latencies = [item["cpu_completion_seconds"] for item in bucket_details]
         return {
             "enabled": True,
             "bucket_count": len(bucket_details),
-            "bucket_sum_seconds": float(sum(cuda_values)) if cuda_values else 0.0,
+            "bucket_latency_sum_seconds": float(sum(cpu_latencies)) if cpu_latencies else 0.0,
             "bucket_span_seconds": float(cpu_span),
             "bucket_details": bucket_details,
         }
@@ -538,7 +527,7 @@ def main() -> None:
     forward_values: list[float] = []
     backward_values: list[float] = []
     backward_cuda_event_values: list[float] = []
-    ddp_bucket_sum_values: list[float] = []
+    ddp_bucket_latency_sum_values: list[float] = []
     ddp_bucket_span_values: list[float] = []
     backward_compute_approx_values: list[float] = []
     spatial_values: list[float] = []
@@ -594,7 +583,7 @@ def main() -> None:
                 else {
                     "enabled": False,
                     "bucket_count": 0,
-                    "bucket_sum_seconds": 0.0,
+                    "bucket_latency_sum_seconds": 0.0,
                     "bucket_span_seconds": 0.0,
                     "bucket_details": [],
                 }
@@ -614,7 +603,7 @@ def main() -> None:
                 forward_values.append(forward_ms / 1000.0)
                 backward_values.append(backward_plus_ddp_wall)
                 backward_cuda_event_values.append(backward_ms / 1000.0)
-                ddp_bucket_sum_values.append(float(communication["bucket_sum_seconds"]))
+                ddp_bucket_latency_sum_values.append(float(communication["bucket_latency_sum_seconds"]))
                 ddp_bucket_span_values.append(float(communication["bucket_span_seconds"]))
                 backward_compute_approx_values.append(
                     max(0.0, backward_plus_ddp_wall - float(communication["bucket_span_seconds"]))
@@ -633,7 +622,7 @@ def main() -> None:
                         "ouro_forward_seconds": forward_ms / 1000.0,
                         "backward_plus_ddp_allreduce_seconds": backward_plus_ddp_wall,
                         "backward_cuda_event_seconds": backward_ms / 1000.0,
-                        "ddp_allreduce_bucket_sum_seconds": float(communication["bucket_sum_seconds"]),
+                        "ddp_allreduce_bucket_latency_sum_seconds": float(communication["bucket_latency_sum_seconds"]),
                         "ddp_allreduce_bucket_span_seconds": float(communication["bucket_span_seconds"]),
                         "backward_compute_excluding_ddp_approx_seconds": max(
                             0.0,
@@ -669,7 +658,7 @@ def main() -> None:
             "ouro_forward": summarize(forward_values),
             "backward_plus_ddp_allreduce": summarize(backward_values),
             "backward_cuda_event_main_stream": summarize(backward_cuda_event_values),
-            "ddp_allreduce_bucket_sum": summarize(ddp_bucket_sum_values),
+            "ddp_allreduce_bucket_latency_sum": summarize(ddp_bucket_latency_sum_values),
             "ddp_allreduce_bucket_span": summarize(ddp_bucket_span_values),
             "backward_compute_excluding_ddp_approx": summarize(backward_compute_approx_values),
             "step_wall_from_data_to_sync": summarize(step_values),
@@ -730,8 +719,8 @@ def main() -> None:
                 "communication_hook_enabled": communication_profiler is not None,
                 "communication_hook_semantics": "async all_reduce + divide by world_size",
                 "backward_plus_ddp_wall_timer": "loss.backward() through CUDA synchronization",
-                "bucket_sum_caveat": "sum can overcount overlapping buckets",
-                "bucket_span_caveat": "CPU callback span estimates the overlapping communication window",
+                "bucket_latency_sum_caveat": "sum of Future callback latencies can overcount overlapping buckets",
+                "bucket_span_caveat": "CPU Future callback span estimates the overlapping communication window",
             },
             "rank_reports": reports,
         }
