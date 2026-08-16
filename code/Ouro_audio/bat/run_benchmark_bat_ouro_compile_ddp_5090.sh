@@ -23,7 +23,7 @@ esac
 vc submit \
   -p pdgpu-3090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
-  -c 32 -m 256G -g 8 -n 1 \
+  -c 64 -m 256G -g 8 -n 1 \
   -j "bat-ouro-compile-ddp-8x3090-$(date +%m%d%H%M)" \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/bat_ouro_compile_ddp_3090.JOB.log" \

@@ -21,7 +21,7 @@ esac
 vc submit \
   -p pdgpu-3090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
-  -c 32 -m 256G -g 1 -n 1 \
+  -c 8 -m 32G -g 1 -n 1 \
   -j "bat-ouro-attention-audit-3090-$(date +%m%d%H%M)" \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/bat_ouro_attention_audit_3090.JOB.log" \
