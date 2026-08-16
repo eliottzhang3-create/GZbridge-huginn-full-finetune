@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import sys
 from collections import Counter
 from pathlib import Path
@@ -44,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-report", type=Path, required=True)
     parser.add_argument("--progress-every", type=int, default=10000)
     parser.add_argument(
+        "--tail-records",
+        type=int,
+        default=650000,
+        help="Audit only the final N physical JSONL records; use 0 to audit the full manifest.",
+    )
+    parser.add_argument(
         "--thresholds",
         type=int,
         nargs="+",
@@ -73,9 +80,16 @@ def import_plugin(path: Path):
     return module
 
 
-def iter_manifest(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:
+def manifest_physical_line_count(path: Path) -> int:
+    with path.open("r", encoding="utf-8") as handle:
+        return sum(1 for _ in handle)
+
+
+def iter_manifest(path: Path, start_line: int = 1) -> Iterable[tuple[int, dict[str, Any]]]:
     with path.open("r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
+            if line_number < start_line:
+                continue
             if not line.strip():
                 raise ValueError(f"Blank line in manifest at line {line_number}")
             try:
@@ -182,9 +196,19 @@ def main() -> None:
         raise FileNotFoundError(plugin_path)
     if args.progress_every <= 0:
         raise ValueError("progress-every must be positive")
+    if args.tail_records < 0:
+        raise ValueError("tail-records must be non-negative")
     thresholds = sorted({int(value) for value in args.thresholds})
     if any(value <= 0 for value in thresholds):
         raise ValueError("thresholds must be positive")
+
+    total_manifest_lines = manifest_physical_line_count(manifest)
+    if args.tail_records == 0:
+        selection_start_line = 1
+        selected_manifest_lines = total_manifest_lines
+    else:
+        selection_start_line = max(1, total_manifest_lines - args.tail_records + 1)
+        selected_manifest_lines = total_manifest_lines - selection_start_line + 1
 
     print("========== BAT OURO PRODUCTION TOKEN-LENGTH AUDIT ==========")
     print(f"[manifest] {manifest}")
@@ -192,6 +216,10 @@ def main() -> None:
     print(f"[plugin] {plugin_path}")
     print("[audio] bypassed: cached dummy waveform; no AudioSet/RIR/Spatial-AST access")
     print(f"[contract] audio_prefix_tokens={EXPECTED_AUDIO_TOKENS} template_max_length={TEMPLATE_MAX_LENGTH}")
+    print(
+        f"[selection] total_manifest_lines={total_manifest_lines} "
+        f"start_line={selection_start_line} selected_tail_lines={selected_manifest_lines}"
+    )
 
     template = build_template(args)
     lengths: list[int] = []
@@ -205,7 +233,7 @@ def main() -> None:
     max_records: list[dict[str, Any]] = []
     record_count = 0
 
-    for line_number, row in iter_manifest(manifest):
+    for line_number, row in iter_manifest(manifest, start_line=selection_start_line):
         record_count += 1
         try:
             encoded = template.encode(row)
@@ -252,6 +280,14 @@ def main() -> None:
     if prefix_id_errors:
         issues.append("audio_prefix_ids_not_constant")
 
+    observed_max_length = max(sorted_lengths) if sorted_lengths else 0
+    recommended_padding_length = (
+        int(math.ceil(observed_max_length * 1.05)) if observed_max_length else 0
+    )
+    warnings: list[str] = []
+    if recommended_padding_length > TEMPLATE_MAX_LENGTH:
+        warnings.append("recommended_padding_exceeds_template_max_length")
+
     report = {
         "status": "ok" if not issues else "incomplete",
         "manifest": str(manifest),
@@ -262,6 +298,13 @@ def main() -> None:
         "record_count": record_count,
         "encoded_count": len(lengths),
         "encoding_error_count": encoding_error_count,
+        "selection": {
+            "mode": "tail" if args.tail_records else "full",
+            "requested_tail_records": args.tail_records or None,
+            "total_manifest_physical_lines": total_manifest_lines,
+            "selection_start_line": selection_start_line,
+            "selected_manifest_physical_lines": selected_manifest_lines,
+        },
         "contract": {
             "audio_prefix_token_count": EXPECTED_AUDIO_TOKENS,
             "template_max_length": TEMPLATE_MAX_LENGTH,
@@ -272,7 +315,7 @@ def main() -> None:
         },
         "length_statistics": {
             "min": min(sorted_lengths) if sorted_lengths else 0,
-            "max": max(sorted_lengths) if sorted_lengths else 0,
+            "max": observed_max_length,
             "mean": float(mean(sorted_lengths)) if sorted_lengths else 0.0,
             "p50": percentile(sorted_lengths, 0.50),
             "p90": percentile(sorted_lengths, 0.90),
@@ -280,15 +323,24 @@ def main() -> None:
             "p99": percentile(sorted_lengths, 0.99),
             "p999": percentile(sorted_lengths, 0.999),
         },
+        "recommended_padding": {
+            "formula": "ceil(max_observed_length * 1.05)",
+            "max_observed_length": observed_max_length,
+            "margin_fraction": 0.05,
+            "recommended_sequence_length": recommended_padding_length,
+            "within_template_max_length": recommended_padding_length <= TEMPLATE_MAX_LENGTH,
+        },
         "threshold_exceedance_counts": threshold_counts,
         "max_length_records": max_records,
         "length_histogram": dict(sorted(length_counts.items(), key=lambda item: int(item[0]))),
         "errors_preview": errors,
+        "warnings": warnings,
         "issues": issues,
     }
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"[summary] records={record_count} encoded={len(lengths)} max={report['length_statistics']['max']}")
+    print(f"[summary] recommended_padding_length={recommended_padding_length}")
     print(f"[summary] thresholds={threshold_counts}")
     print(f"[report] {output}")
     print(f"[status] {report['status']} issues={issues[:10]}")

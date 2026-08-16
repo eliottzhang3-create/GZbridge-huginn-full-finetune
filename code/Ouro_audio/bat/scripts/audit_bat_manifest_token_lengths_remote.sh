@@ -21,6 +21,7 @@ OUTPUT_REPORT="${BAT_TOKEN_AUDIT_OUTPUT_REPORT:?Set BAT_TOKEN_AUDIT_OUTPUT_REPOR
 MODEL_PATH="${OURO_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B}"
 PLUGIN_PATH="${OURO_BAT_PLUGIN_PATH:-$REPO_ROOT/code/Ouro_audio/plugins/ouro_bat_spatial_ast_swift.py}"
 PROGRESS_EVERY="${BAT_TOKEN_AUDIT_PROGRESS_EVERY:-10000}"
+TAIL_RECORDS="${BAT_TOKEN_AUDIT_TAIL_RECORDS:-650000}"
 
 case "$OUTPUT_REPORT" in
   /hpc_stor03/public|/hpc_stor03/public/*)
@@ -34,10 +35,12 @@ echo "manifest=$MANIFEST"
 echo "output=$OUTPUT_REPORT"
 echo "model=$MODEL_PATH"
 echo "audio_io=disabled dummy_waveform_only"
+echo "tail_records=$TAIL_RECORDS"
 
 python -u code/Ouro_audio/bat/scripts/audit_bat_manifest_token_lengths.py \
   --manifest "$MANIFEST" \
   --model-path "$MODEL_PATH" \
   --plugin-path "$PLUGIN_PATH" \
   --output-report "$OUTPUT_REPORT" \
-  --progress-every "$PROGRESS_EVERY"
+  --progress-every "$PROGRESS_EVERY" \
+  --tail-records "$TAIL_RECORDS"
