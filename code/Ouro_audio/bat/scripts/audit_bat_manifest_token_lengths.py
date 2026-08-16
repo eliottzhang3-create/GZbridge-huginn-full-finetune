@@ -18,9 +18,11 @@ import sys
 from collections import Counter
 from pathlib import Path
 from statistics import mean
+from types import SimpleNamespace
 from typing import Any, Iterable
 
 import torch
+from transformers import AutoConfig
 
 
 EXPECTED_AUDIO_TOKENS = 64
@@ -124,6 +126,26 @@ def build_template(args: argparse.Namespace):
     # build_processor loads only the local tokenizer/processor.  It does not
     # load Ouro weights and does not require CUDA.
     processor = plugin.build_processor(str(resolve(args.model_path)))
+    # get_template() normally receives a processor produced by
+    # get_model_processor(), which attaches these two metadata objects after
+    # loading the model.  This audit intentionally skips model loading, so
+    # provide the same minimal metadata contract explicitly.
+    config = AutoConfig.from_pretrained(
+        str(resolve(args.model_path)),
+        trust_remote_code=True,
+        local_files_only=True,
+    )
+    processor.model_info = SimpleNamespace(
+        model_dir=str(resolve(args.model_path)),
+        config=config,
+        task_type="causal_lm",
+        max_model_len=TEMPLATE_MAX_LENGTH,
+    )
+    processor.model_meta = SimpleNamespace(
+        is_multimodal=True,
+        template=TEMPLATE_TYPE,
+        candidate_templates=[TEMPLATE_TYPE],
+    )
     from swift import get_template
 
     template = get_template(
