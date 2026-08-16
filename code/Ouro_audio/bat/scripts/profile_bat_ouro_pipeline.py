@@ -56,6 +56,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup-steps", type=int, default=3)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--local-batch-size", type=int, default=2)
+    parser.add_argument(
+        "--static-sequence-length",
+        type=int,
+        default=None,
+        help="Pad every profiling batch to this fixed token length; useful for static torch.compile graph reuse.",
+    )
     parser.add_argument("--num-workers", type=int, default=4)
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument("--persistent-workers", action=argparse.BooleanOptionalAction, default=True)
@@ -182,7 +188,11 @@ def to_list(value: Any) -> list[int]:
     return [int(item) for item in value]
 
 
-def make_collator(template: Any, pad_token_id: int):
+def make_collator(
+    template: Any,
+    pad_token_id: int,
+    static_sequence_length: int | None = None,
+):
     def collate(batch: list[dict[str, Any]]) -> dict[str, Any]:
         if not batch:
             raise RuntimeError("Profiler received an empty batch")
@@ -190,7 +200,17 @@ def make_collator(template: Any, pad_token_id: int):
         label_rows = [to_list(item["labels"]) for item in batch]
         if any(len(a) != len(b) for a, b in zip(input_rows, label_rows)):
             raise RuntimeError("Template input_ids/labels are not aligned")
-        max_length = max(len(row) for row in input_rows)
+        observed_max_length = max(len(row) for row in input_rows)
+        max_length = (
+            static_sequence_length
+            if static_sequence_length is not None
+            else observed_max_length
+        )
+        if max_length < observed_max_length:
+            raise RuntimeError(
+                "Static profiling sequence length is too short: "
+                f"configured={max_length} observed_batch_max={observed_max_length}"
+            )
         input_ids = torch.full((len(batch), max_length), pad_token_id, dtype=torch.long)
         labels = torch.full((len(batch), max_length), -100, dtype=torch.long)
         attention_mask = torch.zeros((len(batch), max_length), dtype=torch.long)
@@ -621,6 +641,11 @@ def main() -> None:
         raise ValueError("steps, local-batch-size must be positive and warmup-steps must be non-negative")
     if args.num_workers < 0 or args.prefetch_factor <= 0:
         raise ValueError("num-workers must be non-negative and prefetch-factor must be positive")
+    if args.static_sequence_length is not None:
+        if args.static_sequence_length <= 0:
+            raise ValueError("static-sequence-length must be positive when provided")
+        if args.static_sequence_length > 512:
+            raise ValueError("static-sequence-length must not exceed the template max_length=512")
     output = args.output_report.expanduser().resolve()
     if str(output).replace("\\", "/").startswith("/hpc_stor03/public"):
         raise ValueError(f"Profiler output must be private: {output}")
@@ -659,6 +684,7 @@ def main() -> None:
         print(f"[world] world_size={current_world} local_batch={args.local_batch_size} device={device}")
         print(f"[dataset] path={args.dataset} start={args.start_index} records={total_records}")
         print(f"[dataloader] workers={args.num_workers} prefetch_factor={args.prefetch_factor} persistent={args.persistent_workers}")
+        print(f"[shapes] static_sequence_length={args.static_sequence_length}")
 
     model, processor = get_model_processor(
         str(args.model_path.resolve()),
@@ -688,6 +714,7 @@ def main() -> None:
         "enabled": False,
         "mode": args.compile_mode,
         "dynamic": bool(args.compile_dynamic),
+        "static_sequence_length": args.static_sequence_length,
         "wrapper_class": None,
         "repro_after_aot_disabled": False,
         "inductor_graph_repro_disabled": False,
@@ -805,7 +832,11 @@ def main() -> None:
         "drop_last": True,
         "num_workers": args.num_workers,
         "pin_memory": True,
-        "collate_fn": make_collator(template, int(pad_token_id)),
+        "collate_fn": make_collator(
+            template,
+            int(pad_token_id),
+            static_sequence_length=args.static_sequence_length,
+        ),
     }
     if args.num_workers > 0:
         loader_kwargs["prefetch_factor"] = args.prefetch_factor
@@ -1063,6 +1094,7 @@ def main() -> None:
             "torch_compile": bool(args.torch_compile),
             "compile_mode": args.compile_mode,
             "compile_dynamic": bool(args.compile_dynamic),
+            "static_sequence_length": args.static_sequence_length,
             "attention_profile": bool(args.attention_profile),
             "compile_report": local_report["compile"],
             "attention_kernel_audit": local_report["attention_kernel_audit"],
