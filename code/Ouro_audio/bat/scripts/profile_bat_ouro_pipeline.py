@@ -633,6 +633,7 @@ def main() -> None:
         "dynamic": bool(args.compile_dynamic),
         "wrapper_class": None,
         "repro_after_aot_disabled": False,
+        "inductor_graph_repro_disabled": False,
     }
     if args.torch_compile:
         try:
@@ -642,18 +643,32 @@ def main() -> None:
             # which masks the real compiler error with PermissionError.  This
             # benchmark must report the real compile failure and must not
             # generate a large repro tree as a side effect.
-            os.environ["TORCHDYNAMO_REPRO_AFTER_AOT"] = "0"
+            # PyTorch 2.11 uses TORCHDYNAMO_REPRO_AFTER (not the older
+            # REPRO_AFTER_AOT spelling) to select the AOT repro wrapper.
+            os.environ.pop("TORCHDYNAMO_REPRO_AFTER", None)
+            os.environ.pop("TORCHDYNAMO_REPRO_AFTER_AOT", None)
             os.environ["TORCHDYNAMO_REPRO_LEVEL"] = "0"
             from torch import _dynamo
+            from torch._dynamo.repro import after_aot
 
             _dynamo.reset()
             dynamo_config = getattr(_dynamo, "config", None)
             if dynamo_config is not None:
+                if hasattr(dynamo_config, "repro_after"):
+                    dynamo_config.repro_after = None
                 if hasattr(dynamo_config, "repro_after_aot"):
                     dynamo_config.repro_after_aot = False
                 if hasattr(dynamo_config, "repro_level"):
                     dynamo_config.repro_level = 0
             compile_report["repro_after_aot_disabled"] = True
+
+            # PyTorch 2.11's Inductor path can call save_graph_repro directly
+            # while preparing every FX graph, even when repro_after is None.
+            # That helper probes nvcc and is unusable in this cluster image.
+            # Replace only this diagnostic helper; compilation itself remains
+            # enabled and any real Inductor error is still raised normally.
+            after_aot.save_graph_repro = lambda *args, **kwargs: None
+            compile_report["inductor_graph_repro_disabled"] = True
         except Exception:
             pass
     if args.torch_compile:
