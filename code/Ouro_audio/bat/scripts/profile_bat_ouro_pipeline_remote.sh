@@ -33,6 +33,10 @@ LOCAL_BATCH_SIZE="${BAT_PROFILE_LOCAL_BATCH_SIZE:-2}"
 NUM_WORKERS="${BAT_PROFILE_NUM_WORKERS:-4}"
 PREFETCH_FACTOR="${BAT_PROFILE_PREFETCH_FACTOR:-2}"
 PERSISTENT_WORKERS="${BAT_PROFILE_PERSISTENT_WORKERS:-true}"
+TORCH_COMPILE="${BAT_PROFILE_TORCH_COMPILE:-false}"
+COMPILE_MODE="${BAT_PROFILE_COMPILE_MODE:-default}"
+COMPILE_DYNAMIC="${BAT_PROFILE_COMPILE_DYNAMIC:-true}"
+ATTENTION_PROFILE="${BAT_PROFILE_ATTENTION_PROFILE:-false}"
 
 case "$OUTPUT_REPORT" in
   /hpc_stor03/public|/hpc_stor03/public/*)
@@ -59,11 +63,27 @@ if [[ "$PERSISTENT_WORKERS" == "true" ]]; then
 else
   ARGS+=(--no-persistent-workers)
 fi
+if [[ "$TORCH_COMPILE" == "true" ]]; then
+  ARGS+=(--torch-compile --compile-mode "$COMPILE_MODE")
+else
+  ARGS+=(--no-torch-compile)
+fi
+if [[ "$COMPILE_DYNAMIC" == "true" ]]; then
+  ARGS+=(--compile-dynamic)
+else
+  ARGS+=(--no-compile-dynamic)
+fi
+if [[ "$ATTENTION_PROFILE" == "true" ]]; then
+  ARGS+=(--attention-profile)
+else
+  ARGS+=(--no-attention-profile)
+fi
 
 echo "========== BAT OURO PURE PROFILING LAUNCH =========="
 echo "world_size=$WORLD_SIZE local_batch_size=$LOCAL_BATCH_SIZE global_batch_size=$((WORLD_SIZE * LOCAL_BATCH_SIZE))"
 echo "dataset=$DATASET start_index=$START_INDEX steps=$STEPS warmup_steps=$WARMUP_STEPS"
 echo "workers=$NUM_WORKERS prefetch_factor=$PREFETCH_FACTOR persistent_workers=$PERSISTENT_WORKERS"
+echo "torch_compile=$TORCH_COMPILE compile_mode=$COMPILE_MODE compile_dynamic=$COMPILE_DYNAMIC attention_profile=$ATTENTION_PROFILE"
 echo "OMP_NUM_THREADS=$OMP_NUM_THREADS MKL_NUM_THREADS=$MKL_NUM_THREADS OPENBLAS_NUM_THREADS=$OPENBLAS_NUM_THREADS"
 
 if [[ "$WORLD_SIZE" -le 1 ]]; then

@@ -30,6 +30,7 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from torch.profiler import ProfilerActivity
 from peft import LoraConfig, TaskType, get_peft_model
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, Dataset
@@ -63,6 +64,30 @@ def parse_args() -> argparse.Namespace:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Use an asynchronous DDP communication hook to measure gradient buckets.",
+    )
+    parser.add_argument(
+        "--torch-compile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Compile the complete registered BAT model before the optional DDP wrapper.",
+    )
+    parser.add_argument(
+        "--compile-mode",
+        choices=("default", "reduce-overhead", "max-autotune"),
+        default="default",
+        help="torch.compile mode used by the isolated benchmark.",
+    )
+    parser.add_argument(
+        "--compile-dynamic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Allow dynamic sequence shapes in torch.compile.",
+    )
+    parser.add_argument(
+        "--attention-profile",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Profile one real forward/backward and identify the selected SDPA backend.",
     )
     parser.add_argument("--expected-world-size", type=int, default=EXPECTED_WORLD_SIZE)
     return parser.parse_args()
@@ -303,6 +328,124 @@ class DDPCommunicationProfiler:
         }
 
 
+class AttentionKernelProfiler:
+    """Collect only the SDPA-related events from one real CUDA step.
+
+    The generic ``aten::scaled_dot_product_attention`` event is not enough to
+    prove which backend was selected.  We therefore inspect both the operator
+    events and their backend-specific descendants, such as
+    ``_scaled_dot_product_flash_attention`` and
+    ``_scaled_dot_product_efficient_attention``.  If only the generic event is
+    visible, the audit remains incomplete instead of claiming Flash Attention.
+    """
+
+    def __init__(self):
+        self._profiler = None
+
+    def __enter__(self):
+        self._profiler = torch.profiler.profile(
+            activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+            record_shapes=True,
+            profile_memory=False,
+            with_stack=False,
+            with_flops=False,
+        )
+        self._profiler.__enter__()
+        return self
+
+    @staticmethod
+    def _seconds(value: Any) -> float | None:
+        if value is None:
+            return None
+        try:
+            return float(value) / 1_000_000.0
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _backend(name: str) -> str | None:
+        lowered = name.lower()
+        if "flash_attention" in lowered or "flashattention" in lowered:
+            return "flash"
+        if "efficient_attention" in lowered or "efficientattention" in lowered:
+            return "efficient"
+        if "scaled_dot_product_attention_math" in lowered or "sdpa_math" in lowered:
+            return "math"
+        return None
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        if self._profiler is not None:
+            self._profiler.__exit__(exc_type, exc_value, traceback)
+
+    def report(self) -> dict[str, Any]:
+        if self._profiler is None:
+            raise RuntimeError("Attention profiler was not started")
+
+        operator_events: list[dict[str, Any]] = []
+        backend_events: list[dict[str, Any]] = []
+        seen_operator: set[tuple[str, int]] = set()
+        seen_backend: set[tuple[str, int]] = set()
+
+        def consume(event: Any, default_count: int = 0) -> None:
+            name = str(getattr(event, "key", ""))
+            lowered = name.lower()
+            is_operator = "scaled_dot_product" in lowered
+            backend = self._backend(name)
+            if not is_operator and backend is None:
+                return
+            count = int(getattr(event, "count", default_count) or default_count)
+            row = {
+                "name": name,
+                "count": count,
+                "cpu_total_seconds": self._seconds(getattr(event, "cpu_time_total", None)),
+                "cuda_total_seconds": self._seconds(getattr(event, "self_cuda_time_total", None)),
+            }
+            key = (name, count)
+            if is_operator and key not in seen_operator:
+                seen_operator.add(key)
+                operator_events.append(row)
+            if backend is not None and key not in seen_backend:
+                seen_backend.add(key)
+                row["backend"] = backend
+                backend_events.append(row)
+
+        for event in self._profiler.key_averages():
+            consume(event)
+        # Depending on the PyTorch profiler build, backend CUDA kernels may be
+        # exposed only as individual FunctionEvents rather than grouped key
+        # averages.  Inspect both views so a kernel is not missed.
+        for event in self._profiler.events():
+            consume(event, default_count=1)
+
+        backends = sorted({str(item["backend"]) for item in backend_events})
+        if "flash" in backends:
+            selected_backend = "flash"
+        elif "efficient" in backends:
+            selected_backend = "efficient"
+        elif "math" in backends:
+            selected_backend = "math"
+        elif operator_events:
+            selected_backend = "generic_sdpa_unresolved"
+        else:
+            selected_backend = "not_observed"
+
+        return {
+            "status": "ok" if selected_backend in {"flash", "efficient", "math"} else "incomplete",
+            "selected_backend": selected_backend,
+            "runtime_sdp_flags": {
+                "flash_sdp_enabled": bool(getattr(torch.backends.cuda, "flash_sdp_enabled", lambda: False)()),
+                "mem_efficient_sdp_enabled": bool(getattr(torch.backends.cuda, "mem_efficient_sdp_enabled", lambda: False)()),
+                "math_sdp_enabled": bool(getattr(torch.backends.cuda, "math_sdp_enabled", lambda: False)()),
+                "device_capability": list(torch.cuda.get_device_capability()),
+                "torch_version": torch.__version__,
+            },
+            "backend_events": backend_events,
+            "operator_events": operator_events,
+            "backend_event_count": len(backend_events),
+            "operator_event_count": len(operator_events),
+        }
+
+
 def install_module_timer(module: torch.nn.Module) -> tuple[CudaRegionTimer, list[Any]]:
     timer = CudaRegionTimer()
 
@@ -392,6 +535,20 @@ def summarize(values: list[float]) -> dict[str, float]:
     }
 
 
+def snapshot_dynamo_counters() -> dict[str, Any] | None:
+    try:
+        from torch._dynamo.utils import counters
+    except Exception:
+        return None
+    snapshot: dict[str, Any] = {}
+    for group, values in counters.items():
+        if hasattr(values, "items"):
+            snapshot[str(group)] = {str(key): int(value) for key, value in values.items()}
+        else:
+            snapshot[str(group)] = int(values)
+    return snapshot
+
+
 def gather_reports(report: dict[str, Any], current_world: int) -> list[dict[str, Any]]:
     if current_world == 1:
         return [report]
@@ -417,6 +574,8 @@ def main() -> None:
         raise RuntimeError("BAT profiling requires a submitted CUDA job")
 
     current_world = world_size()
+    if args.attention_profile and current_world != 1:
+        raise ValueError("Attention kernel audit must run single-card; use the DDP benchmark separately")
     current_rank, current_local_rank = initialize_distributed(args.expected_world_size)
     device = torch.device(f"cuda:{current_local_rank}")
     total_records = (args.warmup_steps + args.steps) * current_world * args.local_batch_size
@@ -466,6 +625,38 @@ def main() -> None:
     causal.config.use_cache = False
     if hasattr(causal, "model") and hasattr(causal.model, "config"):
         causal.model.config.use_cache = False
+
+    compile_report: dict[str, Any] = {
+        "requested": bool(args.torch_compile),
+        "enabled": False,
+        "mode": args.compile_mode,
+        "dynamic": bool(args.compile_dynamic),
+        "wrapper_class": None,
+    }
+    if args.torch_compile:
+        try:
+            import torch._dynamo
+
+            torch._dynamo.reset()
+        except Exception:
+            pass
+    if args.torch_compile:
+        compile_started = time.perf_counter()
+        try:
+            model = torch.compile(
+                model,
+                backend="inductor",
+                mode=args.compile_mode,
+                dynamic=args.compile_dynamic,
+                fullgraph=False,
+            )
+        except Exception as exc:
+            raise RuntimeError(f"torch.compile setup failed: {type(exc).__name__}: {exc}") from exc
+        compile_report.update({
+            "enabled": True,
+            "wrapper_class": type(model).__name__,
+            "setup_seconds": time.perf_counter() - compile_started,
+        })
 
     communication_profiler: DDPCommunicationProfiler | None = None
     if current_world > 1:
@@ -518,9 +709,16 @@ def main() -> None:
         loader_kwargs["persistent_workers"] = args.persistent_workers
     loader = DataLoader(**loader_kwargs)
 
-    base_for_hooks = find_causal_model(model)
-    spatial_timer, spatial_handles = install_module_timer(base_for_hooks.spatial_ast_encoder)
-    qformer_timer, qformer_handles = install_module_timer(base_for_hooks.audio_qformer)
+    # Module hooks can force graph breaks in torch.compile.  The compile
+    # benchmark therefore measures the complete forward/backward path, while
+    # the eager profiler keeps the detailed Spatial-AST/Q-Former timers.
+    base_for_hooks = causal
+    if args.torch_compile:
+        spatial_timer, spatial_handles = CudaRegionTimer(), []
+        qformer_timer, qformer_handles = CudaRegionTimer(), []
+    else:
+        spatial_timer, spatial_handles = install_module_timer(base_for_hooks.spatial_ast_encoder)
+        qformer_timer, qformer_handles = install_module_timer(base_for_hooks.audio_qformer)
     trainable_probe = parameter_update_probe(model)
     data_wait_values: list[float] = []
     h2d_values: list[float] = []
@@ -535,6 +733,8 @@ def main() -> None:
     step_values: list[float] = []
     losses: list[float] = []
     step_details: list[dict[str, Any]] = []
+    attention_report: dict[str, Any] | None = None
+    compile_first_step_seconds: float | None = None
     iterator = iter(loader)
     torch.cuda.reset_peak_memory_stats(device)
     try:
@@ -554,29 +754,40 @@ def main() -> None:
             torch.cuda.synchronize(device)
             h2d_seconds = time.perf_counter() - h2d_started
 
-            forward_timer = CudaRegionTimer()
-            forward_timer.begin()
-            outputs = model(
-                input_ids=inputs["input_ids"],
-                attention_mask=inputs["attention_mask"],
-                labels=inputs["labels"],
-                audio_waveforms=inputs["audio_waveforms"],
-                use_cache=False,
-            )
-            forward_timer.finish()
-            loss = outputs.loss
-            if loss is None or not torch.isfinite(loss.detach().float()):
-                raise RuntimeError("Profiler observed a non-finite or missing loss")
+            attention_context = None
+            if args.attention_profile and step_index == args.warmup_steps:
+                attention_context = AttentionKernelProfiler()
+                attention_context.__enter__()
+            try:
+                forward_timer = CudaRegionTimer()
+                forward_timer.begin()
+                outputs = model(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    labels=inputs["labels"],
+                    audio_waveforms=inputs["audio_waveforms"],
+                    use_cache=False,
+                )
+                forward_timer.finish()
+                loss = outputs.loss
+                if loss is None or not torch.isfinite(loss.detach().float()):
+                    raise RuntimeError("Profiler observed a non-finite or missing loss")
 
-            backward_timer = CudaRegionTimer()
-            backward_wall_started = time.perf_counter()
-            if communication_profiler is not None:
-                communication_profiler.begin_step(step_index)
-            backward_timer.begin()
-            loss.backward()
-            backward_timer.finish()
-            torch.cuda.synchronize(device)
-            backward_plus_ddp_wall = time.perf_counter() - backward_wall_started
+                backward_timer = CudaRegionTimer()
+                backward_wall_started = time.perf_counter()
+                if communication_profiler is not None:
+                    communication_profiler.begin_step(step_index)
+                backward_timer.begin()
+                loss.backward()
+                backward_timer.finish()
+                torch.cuda.synchronize(device)
+                backward_plus_ddp_wall = time.perf_counter() - backward_wall_started
+            finally:
+                if attention_context is not None:
+                    attention_context.__exit__(None, None, None)
+                    attention_report = attention_context.report()
+            if args.torch_compile and step_index == 0:
+                compile_first_step_seconds = time.perf_counter() - step_started
             communication = (
                 communication_profiler.finish_step()
                 if communication_profiler is not None
@@ -608,8 +819,12 @@ def main() -> None:
                 backward_compute_approx_values.append(
                     max(0.0, backward_plus_ddp_wall - float(communication["bucket_span_seconds"]))
                 )
-                spatial_values.append(spatial_timer.milliseconds() / 1000.0)
-                qformer_values.append(qformer_timer.milliseconds() / 1000.0)
+                if args.torch_compile:
+                    spatial_values.append(0.0)
+                    qformer_values.append(0.0)
+                else:
+                    spatial_values.append(spatial_timer.milliseconds() / 1000.0)
+                    qformer_values.append(qformer_timer.milliseconds() / 1000.0)
                 step_values.append(time.perf_counter() - step_started)
                 losses.append(float(loss.detach().float().cpu().item()))
                 step_details.append(
@@ -617,8 +832,8 @@ def main() -> None:
                         "measured_step_index": step_index - args.warmup_steps,
                         "data_wait_seconds": data_wait,
                         "host_to_device_seconds": h2d_seconds,
-                        "spatial_ast_seconds": spatial_timer.milliseconds() / 1000.0,
-                        "qformer_seconds": qformer_timer.milliseconds() / 1000.0,
+                        "spatial_ast_seconds": 0.0 if args.torch_compile else spatial_timer.milliseconds() / 1000.0,
+                        "qformer_seconds": 0.0 if args.torch_compile else qformer_timer.milliseconds() / 1000.0,
                         "ouro_forward_seconds": forward_ms / 1000.0,
                         "backward_plus_ddp_allreduce_seconds": backward_plus_ddp_wall,
                         "backward_cuda_event_seconds": backward_ms / 1000.0,
@@ -644,6 +859,14 @@ def main() -> None:
             handle.remove()
 
     parameter_probe_report = finish_parameter_update_probe(model, trainable_probe)
+    if args.torch_compile:
+        dynamo_counters = snapshot_dynamo_counters()
+        compile_report["dynamo_counters"] = dynamo_counters
+        stats = (dynamo_counters or {}).get("stats", {})
+        graph_breaks = (dynamo_counters or {}).get("graph_break", {})
+        compile_report["unique_graphs"] = int(stats.get("unique_graphs", 0))
+        compile_report["graph_break_count"] = int(sum(graph_breaks.values()))
+        compile_report["compilation_observed"] = compile_report["unique_graphs"] > 0
     local_report = {
         "rank": current_rank,
         "local_rank": current_local_rank,
@@ -673,6 +896,11 @@ def main() -> None:
             "peak_reserved_bytes": int(torch.cuda.max_memory_reserved(device)),
         },
         "parameter_update_probe": parameter_probe_report,
+        "compile": compile_report | {
+            "first_step_wall_seconds": compile_first_step_seconds,
+            "detailed_module_timers_disabled": bool(args.torch_compile),
+        },
+        "attention_kernel_audit": attention_report,
         "contracts": {
             "audio_token_count": EXPECTED_AUDIO_TOKENS,
             "spatial_ast_output": list(EXPECTED_SPATIAL_AST_SHAPE),
@@ -687,8 +915,14 @@ def main() -> None:
     reports = gather_reports(local_report, current_world)
     if current_rank == 0:
         output.parent.mkdir(parents=True, exist_ok=True)
+        issues: list[str] = []
+        if args.attention_profile and (attention_report is None or attention_report.get("status") != "ok"):
+            issues.append("attention_kernel_not_identified")
+        if args.torch_compile and local_report["compile"].get("compilation_observed") is False:
+            issues.append("torch_compile_no_graph_observed")
         report = {
-            "status": "ok",
+            "status": "ok" if not issues else "incomplete",
+            "issues": issues,
             "scope": "pure_profile_no_optimizer_update",
             "model_path": str(args.model_path.resolve()),
             "plugin_path": str(args.plugin_path.resolve()),
@@ -696,6 +930,12 @@ def main() -> None:
             "start_index": args.start_index,
             "steps": args.steps,
             "warmup_steps": args.warmup_steps,
+            "torch_compile": bool(args.torch_compile),
+            "compile_mode": args.compile_mode,
+            "compile_dynamic": bool(args.compile_dynamic),
+            "attention_profile": bool(args.attention_profile),
+            "compile_report": local_report["compile"],
+            "attention_kernel_audit": local_report["attention_kernel_audit"],
             "local_batch_size": args.local_batch_size,
             "global_batch_size": args.local_batch_size * current_world,
             "dataloader": {
@@ -738,7 +978,13 @@ def main() -> None:
         print(f"[rank0 slowest_steps] {json.dumps(local_report['slowest_steps'], ensure_ascii=False)}", flush=True)
         print(f"[rank0 memory] {json.dumps(local_report['memory'], ensure_ascii=False)}", flush=True)
         print(f"[update_probe] {json.dumps(parameter_probe_report, ensure_ascii=False)}", flush=True)
-        print("========== BAT OURO PURE PIPELINE PROFILING PASSED ==========", flush=True)
+        print(f"[compile] {json.dumps(local_report['compile'], ensure_ascii=False)}", flush=True)
+        if attention_report is not None:
+            print(f"[attention] {json.dumps(attention_report, ensure_ascii=False)}", flush=True)
+        print(
+            f"========== BAT OURO PURE PIPELINE PROFILING {report['status'].upper()} ==========",
+            flush=True,
+        )
 
     if current_world > 1:
         dist.barrier()
