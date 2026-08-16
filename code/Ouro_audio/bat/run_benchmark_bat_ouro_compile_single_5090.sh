@@ -21,10 +21,10 @@ case "$OUTPUT_REPORT" in
 esac
 
 vc submit \
-  -p pdgpu-5090 \
+  -p pdgpu-3090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
   -c 32 -m 256G -g 1 -n 1 \
-  -j "bat-ouro-compile-single-5090-$(date +%m%d%H%M)" \
+  -j "bat-ouro-compile-single-3090-$(date +%m%d%H%M)" \
   -d "$SCRIPT_DIR" \
-  JOB=1:1 "$SCRIPT_DIR/log/bat_ouro_compile_single_5090.JOB.log" \
+  JOB=1:1 "$SCRIPT_DIR/log/bat_ouro_compile_single_3090.JOB.log" \
   --cmd "BAT_PROFILE_WORLD_SIZE=1 BAT_PROFILE_DATASET=$(printf '%q' "$DATASET") BAT_PROFILE_OUTPUT_REPORT=$(printf '%q' "$OUTPUT_REPORT") BAT_PROFILE_STEPS=$(printf '%q' "$STEPS") BAT_PROFILE_WARMUP_STEPS=$(printf '%q' "$WARMUP_STEPS") BAT_PROFILE_LOCAL_BATCH_SIZE=$(printf '%q' "$LOCAL_BATCH_SIZE") BAT_PROFILE_NUM_WORKERS=$(printf '%q' "$NUM_WORKERS") BAT_PROFILE_TORCH_COMPILE=true BAT_PROFILE_COMPILE_MODE=$(printf '%q' "$COMPILE_MODE") BAT_PROFILE_COMPILE_DYNAMIC=$(printf '%q' "$COMPILE_DYNAMIC") BAT_PROFILE_ATTENTION_PROFILE=false bash scripts/profile_bat_ouro_pipeline_remote.sh"
