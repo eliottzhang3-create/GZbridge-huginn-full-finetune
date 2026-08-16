@@ -549,6 +549,23 @@ def snapshot_dynamo_counters() -> dict[str, Any] | None:
     return snapshot
 
 
+def summarize_dynamo_counters(snapshot: dict[str, Any] | None) -> dict[str, int]:
+    """Extract cumulative compile counters in a stable, JSON-safe shape."""
+    if not snapshot:
+        return {
+            "unique_graphs": 0,
+            "graph_break_count": 0,
+            "calls_captured": 0,
+        }
+    stats = snapshot.get("stats", {})
+    graph_breaks = snapshot.get("graph_break", {})
+    return {
+        "unique_graphs": int(stats.get("unique_graphs", 0)),
+        "graph_break_count": int(sum(graph_breaks.values())) if hasattr(graph_breaks, "values") else 0,
+        "calls_captured": int(stats.get("calls_captured", 0)),
+    }
+
+
 def compile_ouro_transformer_core(
     causal: torch.nn.Module,
     mode: str,
@@ -821,6 +838,7 @@ def main() -> None:
     step_details: list[dict[str, Any]] = []
     attention_report: dict[str, Any] | None = None
     compile_first_step_seconds: float | None = None
+    compile_step_counters: list[dict[str, Any]] = []
     iterator = iter(loader)
     torch.cuda.reset_peak_memory_stats(device)
     try:
@@ -845,6 +863,8 @@ def main() -> None:
                 attention_context = AttentionKernelProfiler()
                 attention_context.__enter__()
             try:
+                if args.torch_compile and current_rank == 0:
+                    print(f"[compile] entering_forward step={step_index}", flush=True)
                 forward_timer = CudaRegionTimer()
                 forward_timer.begin()
                 outputs = model(
@@ -874,6 +894,29 @@ def main() -> None:
                     attention_report = attention_context.report()
             if args.torch_compile and step_index == 0:
                 compile_first_step_seconds = time.perf_counter() - step_started
+            if args.torch_compile:
+                cumulative = summarize_dynamo_counters(snapshot_dynamo_counters())
+                previous = (
+                    compile_step_counters[-1]["cumulative"]
+                    if compile_step_counters
+                    else {"unique_graphs": 0, "graph_break_count": 0, "calls_captured": 0}
+                )
+                delta = {
+                    key: int(cumulative[key]) - int(previous.get(key, 0))
+                    for key in cumulative
+                }
+                compile_step_counters.append({
+                    "step_index": int(step_index),
+                    "cumulative": cumulative,
+                    "delta_from_previous_step": delta,
+                })
+                if current_rank == 0:
+                    print(
+                        f"[compile] completed_step={step_index} "
+                        f"unique_graphs_total={cumulative['unique_graphs']} "
+                        f"unique_graphs_delta={delta['unique_graphs']}",
+                        flush=True,
+                    )
             communication = (
                 communication_profiler.finish_step()
                 if communication_profiler is not None
@@ -953,6 +996,7 @@ def main() -> None:
         compile_report["unique_graphs"] = int(stats.get("unique_graphs", 0))
         compile_report["graph_break_count"] = int(sum(graph_breaks.values()))
         compile_report["compilation_observed"] = compile_report["unique_graphs"] > 0
+        compile_report["step_counters"] = compile_step_counters
     local_report = {
         "rank": current_rank,
         "local_rank": current_local_rank,
