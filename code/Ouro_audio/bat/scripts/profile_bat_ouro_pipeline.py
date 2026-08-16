@@ -632,12 +632,28 @@ def main() -> None:
         "mode": args.compile_mode,
         "dynamic": bool(args.compile_dynamic),
         "wrapper_class": None,
+        "repro_after_aot_disabled": False,
     }
     if args.torch_compile:
         try:
+            # If Inductor compilation fails, torch 2.11 may enter its AOT
+            # compiler-repro path and invoke ``nvcc --version``.  The cluster
+            # image can contain nvcc without granting execute permission,
+            # which masks the real compiler error with PermissionError.  This
+            # benchmark must report the real compile failure and must not
+            # generate a large repro tree as a side effect.
+            os.environ["TORCHDYNAMO_REPRO_AFTER_AOT"] = "0"
+            os.environ["TORCHDYNAMO_REPRO_LEVEL"] = "0"
             from torch import _dynamo
 
             _dynamo.reset()
+            dynamo_config = getattr(_dynamo, "config", None)
+            if dynamo_config is not None:
+                if hasattr(dynamo_config, "repro_after_aot"):
+                    dynamo_config.repro_after_aot = False
+                if hasattr(dynamo_config, "repro_level"):
+                    dynamo_config.repro_level = 0
+            compile_report["repro_after_aot_disabled"] = True
         except Exception:
             pass
     if args.torch_compile:
