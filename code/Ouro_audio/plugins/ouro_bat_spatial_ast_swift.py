@@ -78,6 +78,7 @@ OURO_HIDDEN_SIZE = 2048
 EXPECTED_UT_STEPS = 4
 EXPECTED_EARLY_EXIT_THRESHOLD = 1.0
 AUDIO_AUDIT_ENABLED = os.environ.get("BAT_AUDIO_AUDIT", "0") == "1"
+DEFAULT_TRAIN_SEQUENCE_LENGTH = 176
 
 
 def env_path(name: str, default: Path) -> Path:
@@ -382,6 +383,14 @@ class OuroBATTemplate(Template):
             env_path("BAT_REVERB_ROOT", DEFAULT_REVERB_ROOT),
         )
         self.audio_token_count = AUDIO_TOKEN_COUNT
+        self.train_sequence_length = int(
+            os.environ.get("BAT_MAX_SEQUENCE_LENGTH", str(DEFAULT_TRAIN_SEQUENCE_LENGTH))
+        )
+        if self.train_sequence_length <= self.audio_token_count:
+            raise ValueError(
+                "BAT_MAX_SEQUENCE_LENGTH must be greater than the audio prefix width: "
+                f"length={self.train_sequence_length} prefix={self.audio_token_count}"
+            )
 
     def replace_tag(self, media_type: str, index: int, inputs: StdTemplateInputs):
         if media_type == "audio":
@@ -394,7 +403,6 @@ class OuroBATTemplate(Template):
         audios = getattr(inputs, "audios", None) or []
         if len(audios) != 1:
             raise ValueError(f"Ouro BAT template requires exactly one audio record, got {len(audios)}")
-        waveform = self.audio_renderer.load_item(audios[0])
         tokenizer = self.processor.tokenizer if hasattr(self.processor, "tokenizer") else self.processor
         dummy_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
         if dummy_id is None:
@@ -409,6 +417,45 @@ class OuroBATTemplate(Template):
             labels = labels.tolist()
         if labels is not None:
             labels = [int(value) for value in labels]
+
+        if labels is not None and len(labels) != len(input_ids):
+            raise ValueError(
+                "Swift encoded input_ids and labels must have equal text width before BAT audio prefix: "
+                f"input_ids={len(input_ids)} labels={len(labels)}"
+            )
+
+        # Training always uses one static full width so the compiled Ouro core
+        # sees one shape throughout all three curriculum stages.  The audio
+        # prefix consumes 64 positions, therefore only the text portion is
+        # budgeted here.  This check deliberately happens before
+        # ``load_item``: an overlong record is retained, truncated, and only
+        # then pays the AudioSet/RIR rendering cost.
+        training_mode = getattr(self, "mode", "train") == "train"
+        if training_mode:
+            text_budget = self.train_sequence_length - self.audio_token_count
+            if len(input_ids) > text_budget:
+                input_ids = input_ids[:text_budget]
+                if labels is not None:
+                    labels = labels[:text_budget]
+
+            valid_text_length = len(input_ids)
+            pad_count = text_budget - valid_text_length
+            if pad_count < 0:
+                raise RuntimeError(
+                    f"BAT text truncation failed: text_length={valid_text_length} budget={text_budget}"
+                )
+            input_ids = input_ids + [int(dummy_id)] * pad_count
+            if labels is not None:
+                labels = labels + [-100] * pad_count
+
+            encoded["attention_mask"] = [
+                1
+            ] * (self.audio_token_count + valid_text_length) + [0] * pad_count
+
+        # The expensive waveform path is intentionally after the text budget
+        # decision.  Truncation never drops the record; it only limits the
+        # language-side context to the production fixed width.
+        waveform = self.audio_renderer.load_item(audios[0])
         prefix_ids = [int(dummy_id)] * self.audio_token_count
         encoded["input_ids"] = prefix_ids + list(input_ids)
         if labels is not None:

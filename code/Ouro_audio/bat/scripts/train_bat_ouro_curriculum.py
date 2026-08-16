@@ -6,7 +6,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import time
 from pathlib import Path
+from typing import Any
+
+from transformers import TrainerCallback
 
 from bat.configs.training import BAT_TRAINING
 from bat.curriculum import count_jsonl, load_report, validate_curriculum_report
@@ -25,6 +29,27 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--world-size", type=int, default=8)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=1)
     parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
+    parser.add_argument(
+        "--max-sequence-length", type=int, default=176,
+        help="Fixed full Ouro sequence width during training, including the 64 audio prefix tokens.",
+    )
+    parser.add_argument(
+        "--torch-compile", action=argparse.BooleanOptionalAction, default=False,
+        help="Compile only OuroForCausalLM.model with the validated static-shape DDP configuration.",
+    )
+    parser.add_argument(
+        "--compile-mode", choices=("default", "reduce-overhead", "max-autotune"),
+        default="reduce-overhead",
+    )
+    parser.add_argument(
+        "--compile-dynamic", action=argparse.BooleanOptionalAction, default=False,
+        help="Must remain false for the fixed-width production graph; enabled only for explicit experiments.",
+    )
+    parser.add_argument(
+        "--compile-audit-output", type=Path, default=None,
+        help="Optional private JSON report for compile counters, step speed, and first-batch contracts.",
+    )
+    parser.add_argument("--logging-steps", type=int, default=100)
     return parser.parse_args()
 
 
@@ -32,9 +57,70 @@ def rank() -> int:
     return int(os.environ.get("RANK", "0"))
 
 
+class CompileTrainingAuditCallback(TrainerCallback):
+    """Small opt-in callback used by the compile fresh/resume smoke."""
+
+    def __init__(self, output: Path, compile_report: dict[str, Any], audit_state: dict[str, Any]):
+        self.output = output.resolve()
+        self.compile_report = compile_report
+        self.audit_state = audit_state
+        self.step_started: float | None = None
+        self.step_wall_seconds: list[dict[str, Any]] = []
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        del args, state, control, kwargs
+        self.step_started = time.perf_counter()
+
+    def on_step_end(self, args, state, control, **kwargs):
+        del args, control, kwargs
+        if self.step_started is not None:
+            self.step_wall_seconds.append({
+                "global_step": int(state.global_step),
+                "wall_seconds": time.perf_counter() - self.step_started,
+            })
+        self.step_started = None
+
+    def on_train_end(self, args, state, control, **kwargs):
+        del control, kwargs
+        from bat.ouro_compile import dynamo_counter_summary
+
+        report = {
+            "status": "ok" if not self.audit_state.get("issues") else "incomplete",
+            "compile": dict(self.compile_report),
+            "dynamo_counters": dynamo_counter_summary(),
+            "global_step": int(state.global_step),
+            "step_wall_seconds": self.step_wall_seconds,
+            "first_step_wall_seconds": (
+                self.step_wall_seconds[0]["wall_seconds"] if self.step_wall_seconds else None
+            ),
+            "steady_state_step_wall_seconds": self.step_wall_seconds[1:],
+            "batch_contract": self.audit_state,
+            "effective_output_dir": str(Path(args.output_dir).resolve()),
+        }
+        if rank() == 0:
+            self.output.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.output.with_name(self.output.name + ".tmp")
+            temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(self.output)
+            print(f"[compile-audit] report={self.output}", flush=True)
+
+
 def main() -> None:
     args = parse_args()
     BAT_TRAINING.validate()
+    if args.max_sequence_length != 176:
+        raise ValueError(
+            "The current BAT production contract is fixed at 176 full tokens; "
+            f"got --max-sequence-length={args.max_sequence_length}"
+        )
+    if args.compile_dynamic:
+        raise ValueError(
+            "Production curriculum compile requires --no-compile-dynamic; "
+            "dynamic=True is not allowed after the validated static-shape smoke."
+        )
+    if args.logging_steps <= 0:
+        raise ValueError("--logging-steps must be positive")
+    os.environ["BAT_MAX_SEQUENCE_LENGTH"] = str(args.max_sequence_length)
     actual_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if actual_world_size != args.world_size:
         raise RuntimeError(f"World-size mismatch: launcher={actual_world_size} argument={args.world_size}")
@@ -91,6 +177,108 @@ def main() -> None:
             # effective directory; the outer CLI path is only the requested
             # parent directory and must not be used for checkpoint inspection.
             effective_output_dir = Path(trainer.args.output_dir).resolve()
+            compile_report: dict[str, Any] = {
+                "requested": bool(args.torch_compile),
+                "enabled": False,
+                "mode": args.compile_mode,
+                "dynamic": bool(args.compile_dynamic),
+                "static_sequence_length": args.max_sequence_length,
+            }
+            if args.torch_compile:
+                from bat.ouro_compile import (
+                    compile_ouro_transformer_core,
+                    find_ouro_causal_model,
+                    prepare_compile_runtime,
+                )
+
+                runtime_report = prepare_compile_runtime()
+                compile_started = time.perf_counter()
+                causal = find_ouro_causal_model(trainer.model)
+                compiled_core, target_report = compile_ouro_transformer_core(
+                    causal, mode=args.compile_mode, dynamic=False
+                )
+                compile_report.update({
+                    "enabled": True,
+                    **runtime_report,
+                    **target_report,
+                    "wrapper_class": type(compiled_core).__name__,
+                    "setup_seconds": time.perf_counter() - compile_started,
+                })
+                trainer._ouro_compile_report = compile_report
+                if rank() == 0:
+                    print(f"[compile] {json.dumps(compile_report, ensure_ascii=False)}", flush=True)
+
+            audit_state: dict[str, Any] = {
+                "forward_calls_observed": 0,
+                "input_ids_shapes": [],
+                "labels_shapes": [],
+                "attention_mask_shapes": [],
+                "audio_waveforms_shapes": [],
+                "audio_prefix_label_ignore_count": 0,
+                "padding_label_violation_count": 0,
+                "attention_padding_positions": 0,
+                "issues": [],
+            }
+            if args.compile_audit_output is not None:
+                original_compute_loss = trainer.compute_loss
+
+                def audited_compute_loss(model, inputs, *compute_args, **compute_kwargs):
+                    input_ids = inputs.get("input_ids")
+                    labels = inputs.get("labels")
+                    attention_mask = inputs.get("attention_mask")
+                    waveforms = inputs.get("audio_waveforms")
+                    if hasattr(input_ids, "shape"):
+                        audit_state["forward_calls_observed"] += 1
+                        audit_state["input_ids_shapes"].append(list(input_ids.shape))
+                        if tuple(input_ids.shape[-1:]) != (args.max_sequence_length,):
+                            audit_state["issues"].append(
+                                f"input_width={tuple(input_ids.shape)} expected={args.max_sequence_length}"
+                            )
+                    if hasattr(labels, "shape"):
+                        audit_state["labels_shapes"].append(list(labels.shape))
+                        if input_ids is not None and tuple(labels.shape) != tuple(input_ids.shape):
+                            audit_state["issues"].append(
+                                f"labels_shape={tuple(labels.shape)} input_ids_shape={tuple(input_ids.shape)}"
+                            )
+                        if labels.shape[-1] >= 64:
+                            prefix_ignored = int((labels[:, :64] == -100).sum().item())
+                            audit_state["audio_prefix_label_ignore_count"] += prefix_ignored
+                            expected_prefix = int(labels.shape[0] * 64)
+                            if prefix_ignored != expected_prefix:
+                                audit_state["issues"].append(
+                                    f"audio_prefix_labels={prefix_ignored} expected={expected_prefix}"
+                                )
+                    if hasattr(attention_mask, "shape"):
+                        audit_state["attention_mask_shapes"].append(list(attention_mask.shape))
+                        if input_ids is not None and tuple(attention_mask.shape) != tuple(input_ids.shape):
+                            audit_state["issues"].append(
+                                f"attention_mask_shape={tuple(attention_mask.shape)} input_ids_shape={tuple(input_ids.shape)}"
+                            )
+                        if labels is not None:
+                            padding = attention_mask == 0
+                            audit_state["attention_padding_positions"] += int(padding.sum().item())
+                            violations = int(((labels != -100) & padding).sum().item())
+                            audit_state["padding_label_violation_count"] += violations
+                            if violations:
+                                audit_state["issues"].append(
+                                    f"padding_labels_not_ignored={violations}"
+                                )
+                    if hasattr(waveforms, "shape"):
+                        audit_state["audio_waveforms_shapes"].append(list(waveforms.shape))
+                        if waveforms.ndim != 3 or tuple(waveforms.shape[1:]) != (2, 320000):
+                            audit_state["issues"].append(
+                                f"audio_waveforms_shape={tuple(waveforms.shape)} expected=[B,2,320000]"
+                            )
+                    return original_compute_loss(model, inputs, *compute_args, **compute_kwargs)
+
+                # An instance attribute is intentionally used here: Trainer
+                # calls it with (model, inputs, ...), and no descriptor rebinding
+                # is needed for this audit wrapper.
+                trainer.compute_loss = audited_compute_loss
+                trainer.add_callback(CompileTrainingAuditCallback(
+                    args.compile_audit_output, compile_report, audit_state
+                ))
+
             callback = CurriculumBoundaryCheckpointCallback(
                 args.curriculum_report,
                 global_batch_size,
@@ -106,6 +294,8 @@ def main() -> None:
             missing = callback.missing_boundary_steps()
             if missing:
                 raise RuntimeError(f"Missing curriculum boundary checkpoints: {missing}")
+            if args.compile_audit_output is not None and audit_state["issues"]:
+                raise RuntimeError(f"Compile training audit failed: {audit_state['issues']}")
             if rank() == 0:
                 for step, stage in sorted(callback.step_to_stage.items()):
                     checkpoint_dir = effective_output_dir / f"checkpoint-{step}"
@@ -131,7 +321,7 @@ def main() -> None:
         "--max_steps", str(total_steps), "--num_train_epochs", "1",
         "--per_device_train_batch_size", str(BAT_TRAINING.per_device_batch_size),
         "--gradient_accumulation_steps", str(args.gradient_accumulation_steps),
-        "--gradient_checkpointing", "false", "--logging_steps", "100",
+        "--gradient_checkpointing", "false", "--logging_steps", str(args.logging_steps),
         "--save_strategy", "no", "--save_only_model", "false", "--save_total_limit", "3",
         "--remove_unused_columns", "false", "--dataloader_num_workers", "4",
         "--dataloader_pin_memory", "true", "--dataloader_drop_last", "false",

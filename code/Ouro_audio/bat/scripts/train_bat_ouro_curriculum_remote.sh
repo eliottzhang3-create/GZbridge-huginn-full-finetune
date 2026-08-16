@@ -20,6 +20,10 @@ REPORT="${BAT_CURRICULUM_REPORT:?Set BAT_CURRICULUM_REPORT}"
 OUTPUT_DIR="${BAT_CURRICULUM_OUTPUT_DIR:?Set BAT_CURRICULUM_OUTPUT_DIR to a private checkpoint directory}"
 LAUNCH_MODE="${BAT_LAUNCH_MODE:-ddp}"
 GRAD_ACCUM="${BAT_GRADIENT_ACCUMULATION_STEPS:-1}"
+MAX_SEQUENCE_LENGTH="${BAT_MAX_SEQUENCE_LENGTH:-176}"
+TORCH_COMPILE="${BAT_TORCH_COMPILE:-true}"
+COMPILE_MODE="${BAT_COMPILE_MODE:-reduce-overhead}"
+COMPILE_DYNAMIC="${BAT_COMPILE_DYNAMIC:-false}"
 
 case "$OUTPUT_DIR" in /hpc_stor03/public|/hpc_stor03/public/*) echo "Refusing public output" >&2; exit 2;; esac
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -27,7 +31,19 @@ if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   export CUDA_VISIBLE_DEVICES="$(seq -s, 0 "$last_gpu")"
 fi
 
-ARGS=(--model-path "$MODEL_PATH" --plugin-path "$PLUGIN_PATH" --dataset "$DATASET" --curriculum-report "$REPORT" --output-dir "$OUTPUT_DIR" --world-size "$WORLD_SIZE" --gradient-accumulation-steps "$GRAD_ACCUM")
+ARGS=(--model-path "$MODEL_PATH" --plugin-path "$PLUGIN_PATH" --dataset "$DATASET" --curriculum-report "$REPORT" --output-dir "$OUTPUT_DIR" --world-size "$WORLD_SIZE" --gradient-accumulation-steps "$GRAD_ACCUM" --max-sequence-length "$MAX_SEQUENCE_LENGTH")
+case "$TORCH_COMPILE" in
+  true|1|yes|on)
+    ARGS+=(--torch-compile --compile-mode "$COMPILE_MODE")
+    case "$COMPILE_DYNAMIC" in
+      true|1|yes|on) ARGS+=(--compile-dynamic) ;;
+      false|0|no|off) ARGS+=(--no-compile-dynamic) ;;
+      *) echo "Unsupported BAT_COMPILE_DYNAMIC=$COMPILE_DYNAMIC" >&2; exit 2 ;;
+    esac
+    ;;
+  false|0|no|off) ;;
+  *) echo "Unsupported BAT_TORCH_COMPILE=$TORCH_COMPILE" >&2; exit 2 ;;
+esac
 if [[ -n "${BAT_CURRICULUM_RESUME_FROM_CHECKPOINT:-}" ]]; then
   ARGS+=(--resume-from-checkpoint "$BAT_CURRICULUM_RESUME_FROM_CHECKPOINT")
 fi
@@ -38,6 +54,7 @@ echo "per_device_batch_size=2 gradient_accumulation_steps=$GRAD_ACCUM global_bat
 echo "dataset=$DATASET"
 echo "curriculum_report=$REPORT"
 echo "output_dir=$OUTPUT_DIR"
+echo "max_sequence_length=$MAX_SEQUENCE_LENGTH torch_compile=$TORCH_COMPILE compile_mode=$COMPILE_MODE compile_dynamic=$COMPILE_DYNAMIC"
 
 case "$LAUNCH_MODE" in
   single)
