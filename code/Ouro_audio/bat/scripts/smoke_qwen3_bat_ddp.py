@@ -382,6 +382,7 @@ def main() -> None:
                 "runtime": None,
                 "step_counters": [],
                 "reuse_verified": False,
+                "reuse_observation": "not_requested" if not args.torch_compile else "pending",
             }
             if args.torch_compile:
                 compile_report["runtime"] = prepare_compile_runtime()
@@ -590,7 +591,16 @@ def main() -> None:
                     raise RuntimeError(f"Qwen3 DDP compile graph was not reused: {unique_graphs}")
                 compile_report["step_counters"] = counters
                 compile_report["unique_graphs"] = unique_graphs[-1]
-                compile_report["reuse_verified"] = len(unique_graphs) >= 2
+                if len(unique_graphs) >= 2:
+                    compile_report["reuse_verified"] = True
+                    compile_report["reuse_observation"] = "verified_across_steps"
+                else:
+                    # A one-step resume run can validate that the compiled
+                    # core executes, but cannot observe reuse within the same
+                    # process. The preceding fresh compile smoke already
+                    # owns the two-step graph-reuse assertion.
+                    compile_report["reuse_verified"] = False
+                    compile_report["reuse_observation"] = "insufficient_steps_for_in_process_reuse"
             if trace["audio_batch"] is None or trace["gradient_audit"] is None:
                 raise RuntimeError("Missing Qwen3 DDP audio or gradient audit")
             local_optimizer = optimizer_report(trainer, model)
@@ -629,13 +639,19 @@ def main() -> None:
                                 item["compile"].get("target"),
                                 int(item["compile"].get("unique_graphs", 0)),
                                 bool(item["compile"].get("reuse_verified")),
+                                item["compile"].get("reuse_observation"),
                             )
                             for item in reports
                         ]
                         if any(signature != compile_signatures[0] for signature in compile_signatures[1:]):
                             raise RuntimeError(f"Compile contracts differ across ranks: {compile_signatures}")
-                        if not compile_signatures[0][0] or compile_signatures[0][1] or not compile_signatures[0][4]:
+                        if not compile_signatures[0][0] or compile_signatures[0][1] or compile_signatures[0][3] <= 0:
                             raise RuntimeError(f"Invalid static compile contract: {compile_signatures[0]}")
+                        if (
+                            compile_signatures[0][5] == "verified_across_steps"
+                            and not compile_signatures[0][4]
+                        ):
+                            raise RuntimeError(f"Compile reuse contract is inconsistent: {compile_signatures[0]}")
                     local_batches = [item["forward_audit"]["batch"]["input_ids_shape"][0] for item in reports]
                     if local_batches != [args.per_device_batch_size] * EXPECTED_WORLD_SIZE:
                         raise RuntimeError(f"Local batch audit failed: {local_batches}")

@@ -38,6 +38,7 @@ def prepare_compile_runtime() -> dict[str, Any]:
         "repro_after_aot_disabled": False,
         "inductor_graph_repro_disabled": False,
         "dynamo_optimize_ddp_disabled": False,
+        "compile_threads_env": os.environ.get("TORCHINDUCTOR_COMPILE_THREADS"),
     }
     os.environ.pop("TORCHDYNAMO_REPRO_AFTER", None)
     os.environ.pop("TORCHDYNAMO_REPRO_AFTER_AOT", None)

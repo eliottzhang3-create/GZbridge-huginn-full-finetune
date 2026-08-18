@@ -15,6 +15,7 @@ export MASTER_PORT="${MASTER_PORT:-29647}"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
+export TORCHINDUCTOR_COMPILE_THREADS="${QWEN3_BAT_COMPILE_THREADS:-2}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
@@ -54,6 +55,7 @@ echo "model=$MODEL_PATH"
 echo "dataset=$DATASET records=128"
 echo "world_size=8 per_device_batch_size=8 global_batch_size=64 max_steps=2 sequence_length=176"
 echo "dataloader_num_workers_per_rank=$DATALOADER_NUM_WORKERS total_worker_processes=$((8 * DATALOADER_NUM_WORKERS))"
+echo "inductor_compile_threads_per_rank=$TORCHINDUCTOR_COMPILE_THREADS total_compile_workers=$((8 * TORCHINDUCTOR_COMPILE_THREADS))"
 echo "compile_target=Qwen3ForCausalLM.model dynamic=false mode=default"
 echo "compile_excluded=Spatial-AST,Q-Former,audio-renderer,lm_head"
 
