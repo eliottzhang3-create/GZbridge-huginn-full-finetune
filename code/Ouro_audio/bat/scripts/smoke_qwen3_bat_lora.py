@@ -87,6 +87,27 @@ def find_module(model: torch.nn.Module, class_name: str) -> torch.nn.Module:
     return matches[0]
 
 
+def find_trainable_module(model: torch.nn.Module, class_name: str) -> torch.nn.Module:
+    """Find the trainable PEFT copy when ``modules_to_save`` duplicates a module.
+
+    PEFT's ``ModulesToSaveWrapper`` intentionally keeps the original frozen
+    module and creates a trainable copy under ``modules_to_save.default``.
+    Therefore a class-name search can legitimately return two BATQFormer
+    instances after PEFT injection.
+    """
+    matches = [module for module in model.modules() if module.__class__.__name__ == class_name]
+    trainable = [
+        module for module in matches
+        if any(parameter.requires_grad for parameter in module.parameters())
+    ]
+    if len(trainable) != 1:
+        raise RuntimeError(
+            f"Expected one trainable {class_name} after PEFT modules_to_save, "
+            f"found total={len(matches)} trainable={len(trainable)}"
+        )
+    return trainable[0]
+
+
 def normalized_name(name: str) -> str:
     for prefix in ("base_model.model.", "base_model."):
         if name.startswith(prefix):
@@ -369,7 +390,7 @@ def main() -> None:
         def train(self, trainer):
             model = trainer.model
             causal = find_module(model, "Qwen3ForCausalLM")
-            qformer = find_module(model, "BATQFormer")
+            qformer = find_trainable_module(model, "BATQFormer")
             encoder = find_module(model, "SpatialASTAudioEncoder")
             if int(getattr(causal.config, "num_hidden_layers", -1)) != EXPECTED_QWEN3_LAYERS:
                 raise RuntimeError("Unexpected Qwen3 layer count")
