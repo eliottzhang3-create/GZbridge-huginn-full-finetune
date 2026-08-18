@@ -159,6 +159,34 @@ def retained_checkpoint_paths(output_dir: Path) -> list[Path]:
     return [path for _, path in sorted(checkpoints, key=lambda item: item[0])]
 
 
+def ddp_barrier() -> None:
+    """Synchronize ranks when the Swift Trainer has initialized DDP."""
+    import torch.distributed as dist
+
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
+
+def ensure_final_checkpoint(trainer) -> Path:
+    """Save the final full Trainer state when it was not a periodic step.
+
+    Calling Trainer's native private save path on every rank is intentional:
+    it writes the optimizer/scheduler/trainer state and each rank's RNG state
+    using the same implementation as periodic checkpoint saves.
+    """
+    final_step = int(trainer.state.global_step)
+    if final_step <= 0:
+        raise RuntimeError(f"Cannot save final checkpoint at invalid global step {final_step}")
+    output_dir = Path(trainer.args.output_dir).resolve()
+    final_checkpoint = output_dir / f"checkpoint-{final_step}"
+    if not final_checkpoint.is_dir():
+        save_checkpoint = getattr(trainer, "_save_checkpoint", None)
+        if save_checkpoint is None:
+            raise RuntimeError("Swift Trainer does not expose native _save_checkpoint")
+        save_checkpoint(trainer.model, None)
+    return final_checkpoint
+
+
 def main() -> None:
     args = parse_args()
     validate_base_contract()
@@ -217,29 +245,49 @@ def main() -> None:
                 if rank() == 0:
                     print(f"[compile] {json.dumps(compile_report, ensure_ascii=False)}", flush=True)
             result = super().train(trainer)
+            final_checkpoint = ensure_final_checkpoint(trainer)
+            ddp_barrier()
+
+            audit_error: str | None = None
             if rank() == 0:
-                effective_output_dir = Path(trainer.args.output_dir).resolve()
-                checkpoints = retained_checkpoint_paths(effective_output_dir)
-                if not checkpoints:
-                    raise RuntimeError(
-                        "No periodic checkpoint was retained; expected native Trainer saves "
-                        f"every {PERIODIC_SAVE_STEPS} steps"
+                try:
+                    effective_output_dir = Path(trainer.args.output_dir).resolve()
+                    checkpoints = retained_checkpoint_paths(effective_output_dir)
+                    if not checkpoints:
+                        raise RuntimeError(
+                            "No checkpoint was retained after final save; expected native Trainer saves "
+                            f"every {PERIODIC_SAVE_STEPS} steps"
+                        )
+                    if len(checkpoints) > MAX_PERIODIC_CHECKPOINTS:
+                        raise RuntimeError(
+                            "Native checkpoint retention exceeded limit: "
+                            f"found={len(checkpoints)} limit={MAX_PERIODIC_CHECKPOINTS}"
+                        )
+                    print(
+                        f"[checkpoint] final_step={trainer.state.global_step} "
+                        f"final_path={final_checkpoint} retained={len(checkpoints)} "
+                        f"save_steps={PERIODIC_SAVE_STEPS} save_total_limit={MAX_PERIODIC_CHECKPOINTS}",
+                        flush=True,
                     )
-                if len(checkpoints) > MAX_PERIODIC_CHECKPOINTS:
-                    raise RuntimeError(
-                        "Native checkpoint retention exceeded limit: "
-                        f"found={len(checkpoints)} limit={MAX_PERIODIC_CHECKPOINTS}"
-                    )
-                print(
-                    f"[checkpoint] retained={len(checkpoints)} "
-                    f"save_steps={PERIODIC_SAVE_STEPS} save_total_limit={MAX_PERIODIC_CHECKPOINTS}",
-                    flush=True,
-                )
-                for checkpoint in checkpoints:
-                    audit = checkpoint_state_report(checkpoint)
-                    print(f"[checkpoint] audit={json.dumps(audit, ensure_ascii=False)}", flush=True)
-                    if audit["status"] != "ok":
-                        raise RuntimeError(f"Incomplete Stage-III checkpoint: {audit}")
+                    for checkpoint in checkpoints:
+                        audit = checkpoint_state_report(checkpoint)
+                        print(f"[checkpoint] audit={json.dumps(audit, ensure_ascii=False)}", flush=True)
+                        if audit["status"] != "ok":
+                            raise RuntimeError(f"Incomplete Stage-III checkpoint: {audit}")
+                except Exception as exc:
+                    audit_error = f"{type(exc).__name__}: {exc}"
+
+            import torch.distributed as dist
+
+            if dist.is_available() and dist.is_initialized():
+                error_payload: list[str | None] = [audit_error if rank() == 0 else None]
+                dist.broadcast_object_list(error_payload, src=0)
+                audit_error = error_payload[0]
+                if audit_error is not None:
+                    raise RuntimeError(f"Stage-III checkpoint audit failed: {audit_error}")
+                dist.barrier()
+            elif audit_error is not None:
+                raise RuntimeError(f"Stage-III checkpoint audit failed: {audit_error}")
             return result
 
     actual_schedule = report["actual_training_schedule"]
