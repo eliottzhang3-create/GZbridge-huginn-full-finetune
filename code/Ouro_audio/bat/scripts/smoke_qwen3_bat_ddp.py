@@ -473,7 +473,15 @@ def main() -> None:
                         denominator = int(num_items_in_batch)
                     if denominator <= 0:
                         raise RuntimeError(f"Invalid Swift loss denominator: {denominator}")
-                    swift_formula_value = float((swift_sum / denominator).detach().cpu())
+                    # With token-averaged DDP, ``num_items_in_batch`` is the
+                    # global valid-item count while this rank owns only its
+                    # local loss sum.  Transformers rescales by world_size
+                    # before DDP's gradient averaging so the resulting
+                    # gradient equals global_loss_sum / global_item_count.
+                    ddp_world_size_rescale = current_world if num_items_in_batch is not None else 1
+                    swift_formula_value = float(
+                        (swift_sum / denominator * ddp_world_size_rescale).detach().cpu()
+                    )
                     trainer_value = float(loss.detach().float().cpu())
                     if not math.isclose(trainer_value, swift_formula_value, rel_tol=2e-3, abs_tol=2e-3):
                         raise RuntimeError(
@@ -498,6 +506,7 @@ def main() -> None:
                         "manual_shifted_loss_sum": float(manual_sum.detach().cpu()),
                         "manual_shifted_ce": manual_value,
                         "swift_loss_denominator": denominator,
+                        "ddp_world_size_rescale": ddp_world_size_rescale,
                         "swift_reproduced_ce": swift_formula_value,
                         "loss_scale_binary_equivalent": loss_scale_binary_equivalent,
                         "trainer_ce": trainer_value,
