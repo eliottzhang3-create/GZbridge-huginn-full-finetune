@@ -424,6 +424,19 @@ def main() -> None:
                     # shifted-token count.  Swift also implements the shift
                     # by rolling labels/loss_scale over the full sequence.
                     swift_labels = torch.roll(labels, shifts=-1, dims=-1).reshape(-1)
+                    swift_label_matrix = swift_labels.reshape_as(labels)
+                    # Explicitly prove that Swift's full-sequence roll is
+                    # exactly the standard causal-LM next-token alignment:
+                    # prediction at position t is trained against label t+1.
+                    if not torch.equal(swift_label_matrix[:, :-1], shifted_labels):
+                        raise RuntimeError(
+                            "Swift label roll is not equivalent to next-token labels[:, 1:]"
+                        )
+                    if not bool((swift_label_matrix[:, -1] == -100).all().item()):
+                        raise RuntimeError(
+                            "Swift roll exposes a non-ignored wrapped final target; "
+                            "next-token loss would be misaligned"
+                        )
                     swift_token_losses = F.cross_entropy(
                         logits_float.reshape(-1, logits_float.shape[-1]),
                         swift_labels,
@@ -442,6 +455,16 @@ def main() -> None:
                     else:
                         loss_scale_binary_equivalent = True
                     swift_sum = swift_token_losses.sum()
+                    if not math.isclose(
+                        float(swift_sum.detach().cpu()),
+                        float(manual_sum.detach().cpu()),
+                        rel_tol=2e-3,
+                        abs_tol=2e-3,
+                    ):
+                        raise RuntimeError(
+                            "Swift next-token loss sum differs from explicit "
+                            "logits[:, :-1] vs labels[:, 1:] loss sum"
+                        )
                     if num_items_in_batch is None:
                         denominator = shifted_count
                     elif torch.is_tensor(num_items_in_batch):
@@ -478,6 +501,12 @@ def main() -> None:
                         "swift_reproduced_ce": swift_formula_value,
                         "loss_scale_binary_equivalent": loss_scale_binary_equivalent,
                         "trainer_ce": trainer_value,
+                        "next_token_alignment": {
+                            "logits_slice": "logits[:, :-1]",
+                            "label_slice": "labels[:, 1:]",
+                            "swift_equivalent": "torch.roll(labels, -1) with final wrapped target ignored",
+                            "verified": True,
+                        },
                         "shift_verified": True,
                     }
                     trace["loss"] = {"value": trainer_value, "logits_shape": list(logits.shape), "labels_shape": list(labels.shape)}
