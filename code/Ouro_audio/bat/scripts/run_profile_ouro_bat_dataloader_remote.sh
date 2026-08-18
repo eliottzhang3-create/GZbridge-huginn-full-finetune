@@ -35,7 +35,7 @@ echo "model=$MODEL_PATH"
 echo "plugin=$PLUGIN_PATH"
 echo "output=$OUTPUT_REPORT"
 echo "workers=0,2,4,8 local_batch_size=8 assumed_global_batch_size=64"
-echo "warmup=${OURO_BAT_DATALOADER_WARMUP_BATCHES:-2} measure=${OURO_BAT_DATALOADER_MEASURE_BATCHES:-5}"
+echo "total_batches=${OURO_BAT_DATALOADER_TOTAL_BATCHES:-24} warmup=${OURO_BAT_DATALOADER_WARMUP_BATCHES:-2} rows=$(( ${OURO_BAT_DATALOADER_TOTAL_BATCHES:-24} * 8 ))"
 
 python -u code/Ouro_audio/bat/scripts/profile_ouro_bat_dataloader.py \
   --model-path "$MODEL_PATH" \
@@ -44,7 +44,7 @@ python -u code/Ouro_audio/bat/scripts/profile_ouro_bat_dataloader.py \
   --output-report "$OUTPUT_REPORT" \
   --start-index "${OURO_BAT_DATALOADER_START_INDEX:-0}" \
   --warmup-batches "${OURO_BAT_DATALOADER_WARMUP_BATCHES:-2}" \
-  --measure-batches "${OURO_BAT_DATALOADER_MEASURE_BATCHES:-5}" \
+  --total-batches "${OURO_BAT_DATALOADER_TOTAL_BATCHES:-24}" \
   --prefetch-factor "${OURO_BAT_DATALOADER_PREFETCH_FACTOR:-2}" \
   --persistent-workers \
   --pin-memory

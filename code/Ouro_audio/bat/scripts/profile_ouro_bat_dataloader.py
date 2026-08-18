@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import os
 import sys
 import time
@@ -59,7 +60,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-report", type=Path, required=True)
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--warmup-batches", type=int, default=2)
-    parser.add_argument("--measure-batches", type=int, default=5)
+    parser.add_argument(
+        "--total-batches",
+        type=int,
+        default=24,
+        help=(
+            "Total batches consumed for each worker configuration, including "
+            "warmup batches. With local batch size 8, 24 batches consume 1536 rows."
+        ),
+    )
     parser.add_argument("--prefetch-factor", type=int, default=2)
     parser.add_argument(
         "--persistent-workers",
@@ -203,8 +212,8 @@ def close_loader(loader: DataLoader, iterator: Any) -> None:
 def main() -> None:
     args = parse_args()
     BAT_TRAINING.validate()
-    if args.warmup_batches < 0 or args.measure_batches <= 0:
-        raise ValueError("warmup-batches must be non-negative and measure-batches must be positive")
+    if args.warmup_batches < 0 or args.total_batches <= args.warmup_batches:
+        raise ValueError("total-batches must be greater than warmup-batches >= 0")
     if args.start_index < 0 or args.prefetch_factor <= 0:
         raise ValueError("start-index must be non-negative and prefetch-factor must be positive")
     output = args.output_report.expanduser().resolve()
@@ -222,7 +231,8 @@ def main() -> None:
     if plugin.MODEL_TYPE != MODEL_TYPE or plugin.TEMPLATE_TYPE != TEMPLATE_TYPE:
         raise RuntimeError("Ouro BAT plugin registration constants do not match the DataLoader profiler")
 
-    total_batches = args.warmup_batches + args.measure_batches
+    total_batches = args.total_batches
+    measure_batches = total_batches - args.warmup_batches
     rows, manifest_read_seconds = load_rows(
         args.dataset.resolve(),
         args.start_index,
@@ -238,7 +248,11 @@ def main() -> None:
     print(f"[packages] ms-swift={package_version('ms-swift')} transformers={package_version('transformers')} torch={torch.__version__}")
     print(f"[dataset] {args.dataset} start_index={args.start_index} rows={len(rows)}")
     print(f"[batch] local_batch_size={LOCAL_BATCH_SIZE} assumed_world_size={ASSUMED_WORLD_SIZE} global_batch_size={LOCAL_BATCH_SIZE * ASSUMED_WORLD_SIZE}")
-    print(f"[benchmark] warmup_batches={args.warmup_batches} measure_batches={args.measure_batches} workers={WORKER_CONFIGS}")
+    print(
+        f"[benchmark] total_batches={total_batches} warmup_batches={args.warmup_batches} "
+        f"measure_batches={measure_batches} rows={total_batches * LOCAL_BATCH_SIZE} "
+        f"workers={WORKER_CONFIGS}"
+    )
     print("[scope] DataLoader/template/audio renderer only; no Ouro forward/backward/optimizer/Spatial-AST/Q-Former")
 
     setup_started = time.perf_counter()
@@ -299,27 +313,64 @@ def main() -> None:
         iterator = iter(loader)
         all_times: list[float] = []
         measured_times: list[float] = []
+        measured_completion_seconds: list[float] = []
         batch_audits: list[dict[str, Any]] = []
         first_batch_seconds = None
         worker_started = time.perf_counter()
+        measurement_started = None
         try:
             for batch_index in range(total_batches):
                 started = time.perf_counter()
                 batch = next(iterator)
-                elapsed = time.perf_counter() - started
+                batch_ready = time.perf_counter()
+                elapsed = batch_ready - started
                 if first_batch_seconds is None:
                     first_batch_seconds = elapsed
                 audit = validate_batch(batch, LOCAL_BATCH_SIZE)
                 all_times.append(elapsed)
                 if batch_index >= args.warmup_batches:
+                    if measurement_started is None:
+                        measurement_started = started
                     measured_times.append(elapsed)
+                    measured_completion_seconds.append(
+                        batch_ready - measurement_started
+                    )
                     if len(batch_audits) < 2:
                         batch_audits.append(audit)
             worker_elapsed = time.perf_counter() - worker_started
         finally:
             close_loader(loader, iterator)
-        if len(measured_times) != args.measure_batches:
-            raise RuntimeError(f"Worker={num_workers} measured {len(measured_times)} batches, expected {args.measure_batches}")
+        if len(measured_times) != measure_batches:
+            raise RuntimeError(
+                f"Worker={num_workers} measured {len(measured_times)} batches, "
+                f"expected {measure_batches}"
+            )
+        measured_wall_seconds = sum(measured_times)
+        if measured_wall_seconds <= 0:
+            raise RuntimeError(f"Worker={num_workers} has non-positive measured wall time")
+        batches_per_second = measure_batches / measured_wall_seconds
+        samples_per_second = measure_batches * LOCAL_BATCH_SIZE / measured_wall_seconds
+        # This is the direct requested interpretation: how many local batches
+        # would pass in one second at the measured steady rate.  Keep the
+        # existing names as aliases for compatibility with prior reports.
+        batches_per_one_second = batches_per_second
+        samples_per_one_second = samples_per_second
+
+        # Also retain an observation-window statistic.  It counts actual
+        # completions in each one-second wall-clock window rather than
+        # extrapolating a rate.  This makes aggressive DataLoader prefetching
+        # visible in the report (especially for workers=8).
+        observation_seconds = measured_completion_seconds[-1]
+        window_count = max(1, math.ceil(observation_seconds))
+        one_second_window_batch_counts = []
+        for window_index in range(window_count):
+            window_start = float(window_index)
+            window_end = window_start + 1.0
+            count = sum(
+                window_start <= completion < window_end
+                for completion in measured_completion_seconds
+            )
+            one_second_window_batch_counts.append(int(count))
         result = {
             "num_workers": num_workers,
             "prefetch_factor": args.prefetch_factor if num_workers > 0 else None,
@@ -329,12 +380,24 @@ def main() -> None:
             "assumed_world_size": ASSUMED_WORLD_SIZE,
             "global_batch_size": LOCAL_BATCH_SIZE * ASSUMED_WORLD_SIZE,
             "warmup_batches": args.warmup_batches,
-            "measured_batches": args.measure_batches,
+            "total_batches": total_batches,
+            "total_rows_consumed": total_batches * LOCAL_BATCH_SIZE,
+            "measured_batches": measure_batches,
             "first_batch_seconds": first_batch_seconds,
             "all_batch_wait": summarize(all_times),
             "measured_batch_wait": summarize(measured_times),
-            "steady_batches_per_second": args.measure_batches / sum(measured_times),
-            "steady_samples_per_second": args.measure_batches * LOCAL_BATCH_SIZE / sum(measured_times),
+            "measured_wall_seconds": measured_wall_seconds,
+            "batches_per_one_second": batches_per_one_second,
+            "samples_per_one_second": samples_per_one_second,
+            "steady_batches_per_second": batches_per_one_second,
+            "steady_samples_per_second": samples_per_one_second,
+            "one_second_observation_window": {
+                "window_seconds": 1.0,
+                "observation_seconds": observation_seconds,
+                "window_count": window_count,
+                "actual_batch_counts": one_second_window_batch_counts,
+                "max_actual_batches_in_one_second": max(one_second_window_batch_counts),
+            },
             "worker_configuration_wall_seconds": worker_elapsed,
             "batch_audits": batch_audits,
         }
@@ -343,8 +406,9 @@ def main() -> None:
             f"[workers={num_workers}] first={first_batch_seconds:.4f}s "
             f"p50={result['measured_batch_wait']['p50_seconds']:.4f}s "
             f"p95={result['measured_batch_wait']['p95_seconds']:.4f}s "
-            f"batches_per_sec={result['steady_batches_per_second']:.4f} "
-            f"samples_per_sec={result['steady_samples_per_second']:.4f}",
+            f"batches_per_1s={result['batches_per_one_second']:.4f} "
+            f"samples_per_1s={result['samples_per_one_second']:.4f} "
+            f"observed_1s_max_batches={result['one_second_observation_window']['max_actual_batches_in_one_second']}",
             flush=True,
         )
 
