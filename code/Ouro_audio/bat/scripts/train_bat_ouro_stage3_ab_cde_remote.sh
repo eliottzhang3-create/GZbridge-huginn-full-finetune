@@ -16,7 +16,6 @@ export BAT_MAX_SEQUENCE_LENGTH="${BAT_MAX_SEQUENCE_LENGTH:-176}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
-export TORCHINDUCTOR_COMPILE_THREADS="${BAT_OURO_COMPILE_THREADS:-2}"
 
 WORLD_SIZE=8
 if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
@@ -36,22 +35,19 @@ ARGS=(
   --report "$REPORT"
   --output-dir "$OUTPUT_DIR"
   --world-size "$WORLD_SIZE"
-  --torch-compile
-  --compile-mode reduce-overhead
-  --no-compile-dynamic
 )
 if [[ -n "${BAT_STAGE3_AB_CDE_RESUME_FROM_CHECKPOINT:-}" ]]; then
   ARGS+=(--resume-from-checkpoint "$BAT_STAGE3_AB_CDE_RESUME_FROM_CHECKPOINT")
 fi
 
 echo "========== BAT OURO STAGE-III A+B -> C+D+E LAUNCH =========="
-echo "world_size=$WORLD_SIZE per_device_batch_size=2 global_batch_size=16"
+echo "world_size=$WORLD_SIZE per_device_batch_size=8 global_batch_size=64"
 echo "dataset=$DATASET"
 echo "report=$REPORT"
 echo "output_dir=$OUTPUT_DIR"
 echo "dataloader_num_workers=0 pin_memory=false"
 echo "max_sequence_length=176"
-echo "torch_compile=true target=OuroForCausalLM.model mode=reduce-overhead dynamic=false compile_threads=$TORCHINDUCTOR_COMPILE_THREADS"
+echo "torch_compile=false eager_transformer=true"
 
 torchrun --standalone --nproc_per_node=8 \
   code/Ouro_audio/bat/scripts/train_bat_ouro_stage3_ab_cde.py "${ARGS[@]}"

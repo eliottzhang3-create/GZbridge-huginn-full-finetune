@@ -13,21 +13,19 @@ import argparse
 import json
 import math
 import os
-import time
 from pathlib import Path
 from typing import Any
 
 from bat.configs.training import BAT_TRAINING
 from bat.curriculum import count_jsonl
-from bat.ouro_compile import compile_ouro_transformer_core, find_ouro_causal_model, prepare_compile_runtime
 
 
 MODEL_TYPE = "ouro_bat_spatial_ast"
 TEMPLATE_TYPE = "ouro_bat_audio_prefix"
-PER_DEVICE_BATCH_SIZE = 2
+PER_DEVICE_BATCH_SIZE = 8
 WORLD_SIZE_REQUIRED = 8
 GRADIENT_ACCUMULATION_STEPS = 1
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.002
 MAX_SEQUENCE_LENGTH = 176
 PERIODIC_SAVE_STEPS = 6_000
 MAX_PERIODIC_CHECKPOINTS = 9
@@ -43,9 +41,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--world-size", type=int, default=WORLD_SIZE_REQUIRED)
     parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
-    parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--compile-mode", choices=("default", "reduce-overhead", "max-autotune"), default="reduce-overhead")
-    parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 
@@ -75,8 +70,8 @@ def load_and_validate_report(path: Path, global_batch_size: int) -> dict[str, An
     if report.get("route") != "stage3_ab_cde_2epoch":
         raise ValueError(f"Unexpected route in report: {report.get('route')!r}")
     # The route report records the batch contract used when the manifest was
-    # composed (64). The ordered manifest is intentionally reused with the
-    # actual training global batch of 16; all blocks remain divisible by 16.
+    # composed (64). The ordered manifest is reused with the same actual
+    # training global batch of 64; all blocks remain divisible by 64.
     if int(report.get("global_batch_size", -1)) != 64:
         raise ValueError(f"Unexpected manifest composition batch: {report.get('global_batch_size')}")
     if int(report.get("per_device_batch_size", -1)) != 8 or int(report.get("world_size", -1)) != 8:
@@ -227,23 +222,6 @@ def main() -> None:
 
     class Stage3AbCdeSwiftSft(SwiftSft):
         def train(self, trainer):
-            if args.torch_compile:
-                runtime_report = prepare_compile_runtime()
-                compile_started = time.perf_counter()
-                causal = find_ouro_causal_model(trainer.model)
-                compiled_core, target_report = compile_ouro_transformer_core(
-                    causal,
-                    mode=args.compile_mode,
-                    dynamic=args.compile_dynamic,
-                )
-                compile_report = {
-                    "enabled": True,
-                    "setup_seconds": time.perf_counter() - compile_started,
-                    **runtime_report,
-                    **target_report,
-                }
-                if rank() == 0:
-                    print(f"[compile] {json.dumps(compile_report, ensure_ascii=False)}", flush=True)
             result = super().train(trainer)
             final_checkpoint = ensure_final_checkpoint(trainer)
             ddp_barrier()
@@ -330,7 +308,7 @@ def main() -> None:
         f"save_total_limit={MAX_PERIODIC_CHECKPOINTS} full_resumable=true"
     )
     print(f"[data] dataloader_num_workers=0 pin_memory=false")
-    print(f"[compile] requested={args.torch_compile} target=OuroForCausalLM.model mode={args.compile_mode} dynamic={args.compile_dynamic}")
+    print("[compile] disabled; eager Ouro Transformer execution")
     if rank() == 0:
         print(f"[argv] {' '.join(argv)}")
     Stage3AbCdeSwiftSft(argv).main()

@@ -19,15 +19,14 @@ from typing import Any
 
 from bat.configs.training import BAT_TRAINING
 from bat.curriculum import count_jsonl
-from bat.qwen3_compile import compile_qwen3_transformer_core, prepare_compile_runtime
 
 
 MODEL_TYPE = "qwen3_bat_spatial_ast"
 TEMPLATE_TYPE = "qwen3_bat_audio_prefix"
-PER_DEVICE_BATCH_SIZE = 2
+PER_DEVICE_BATCH_SIZE = 8
 WORLD_SIZE_REQUIRED = 8
 GRADIENT_ACCUMULATION_STEPS = 1
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.002
 MAX_SEQUENCE_LENGTH = 176
 EXPECTED_QWEN3_LAYERS = 36
 EXPECTED_LORA_TARGETS = ("q_proj", "v_proj")
@@ -45,9 +44,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--world-size", type=int, default=WORLD_SIZE_REQUIRED)
     parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
-    parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=False)
-    parser.add_argument("--compile-mode", choices=("default", "reduce-overhead", "max-autotune"), default="default")
-    parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 
@@ -285,14 +281,6 @@ def main() -> None:
 
             model.train()
             encoder.eval()
-            if args.torch_compile:
-                runtime = prepare_compile_runtime()
-                _, target = compile_qwen3_transformer_core(
-                    causal,
-                    mode=args.compile_mode,
-                    dynamic=args.compile_dynamic,
-                )
-                print(f"[compile] runtime={json.dumps(runtime, ensure_ascii=False)} target={json.dumps(target, ensure_ascii=False)}", flush=True)
 
             result = super().train(trainer)
             final_checkpoint = ensure_final_checkpoint(trainer)
@@ -378,7 +366,7 @@ def main() -> None:
     print(f"[lora] targets={EXPECTED_LORA_TARGETS} rank=8 alpha=32 dropout=0.05")
     print(f"[audio] tokens=64 sequence_length={MAX_SEQUENCE_LENGTH} RIR=crop_or_zero_pad_to_2s")
     print(f"[schedule] learning_rate={LEARNING_RATE} warmup_steps={warmup_steps} scheduler=half-cycle cosine decay")
-    print(f"[compile] requested={args.torch_compile} target=Qwen3ForCausalLM.model dynamic={args.compile_dynamic} mode={args.compile_mode}")
+    print("[compile] disabled; eager Qwen3 Transformer execution")
     print(
         f"[checkpoint] native_save_strategy=steps save_steps={PERIODIC_SAVE_STEPS} "
         f"save_total_limit={MAX_PERIODIC_CHECKPOINTS} full_resumable=true"

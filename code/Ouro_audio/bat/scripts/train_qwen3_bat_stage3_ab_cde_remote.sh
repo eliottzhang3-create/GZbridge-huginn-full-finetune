@@ -15,7 +15,6 @@ export MASTER_PORT="${MASTER_PORT:-29667}"
 export OMP_NUM_THREADS=1
 export MKL_NUM_THREADS=1
 export OPENBLAS_NUM_THREADS=1
-export TORCHINDUCTOR_COMPILE_THREADS="${QWEN3_BAT_COMPILE_THREADS:-2}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
@@ -36,9 +35,6 @@ ARGS=(
   --report "$REPORT"
   --output-dir "$OUTPUT_DIR"
   --world-size "$WORLD_SIZE"
-  --torch-compile
-  --compile-mode default
-  --no-compile-dynamic
 )
 if [[ -n "${QWEN3_BAT_STAGE3_AB_CDE_RESUME_FROM_CHECKPOINT:-}" ]]; then
   ARGS+=(--resume-from-checkpoint "$QWEN3_BAT_STAGE3_AB_CDE_RESUME_FROM_CHECKPOINT")
@@ -49,14 +45,12 @@ case "$OUTPUT_DIR:$REPORT" in
 esac
 
 echo "========== QWEN3-4B BAT STAGE-III A+B -> C+D+E LAUNCH =========="
-echo "world_size=$WORLD_SIZE per_device_batch_size=2 global_batch_size=16"
+echo "world_size=$WORLD_SIZE per_device_batch_size=8 global_batch_size=64"
 echo "dataset=$DATASET"
 echo "report=$REPORT"
 echo "output_dir=$OUTPUT_DIR"
 echo "dataloader_num_workers_per_rank=0"
-echo "inductor_compile_threads_per_rank=$TORCHINDUCTOR_COMPILE_THREADS total_compile_workers=$((WORLD_SIZE * TORCHINDUCTOR_COMPILE_THREADS))"
-echo "compile_target=Qwen3ForCausalLM.model dynamic=false mode=default"
-echo "compile_excluded=Spatial-AST,Q-Former,audio-renderer,lm_head"
+echo "torch_compile=false eager_transformer=true"
 
 torchrun --standalone --nproc_per_node=8 \
   code/Ouro_audio/bat/scripts/train_qwen3_bat_stage3_ab_cde.py "${ARGS[@]}"
