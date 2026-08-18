@@ -1,24 +1,37 @@
 #!/usr/bin/env python3
-"""Train Ouro on the custom two-epoch Stage-III A+B -> C+D+E route."""
+"""Train Ouro on the custom two-epoch Stage-III A+B -> C+D+E route.
+
+This Ouro-only entry point uses a simple native Trainer checkpoint policy:
+save a full resumable checkpoint every ``PERIODIC_SAVE_STEPS`` optimizer
+steps and retain at most ``MAX_PERIODIC_CHECKPOINTS`` checkpoints.  The
+Qwen3 entry point has its own implementation and is not modified here.
+"""
 
 from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
+import time
 from pathlib import Path
 from typing import Any
 
 from bat.configs.training import BAT_TRAINING
 from bat.curriculum import count_jsonl
+from bat.ouro_compile import compile_ouro_transformer_core, find_ouro_causal_model, prepare_compile_runtime
 
 
 MODEL_TYPE = "ouro_bat_spatial_ast"
 TEMPLATE_TYPE = "ouro_bat_audio_prefix"
-PER_DEVICE_BATCH_SIZE = 8
+PER_DEVICE_BATCH_SIZE = 2
 WORLD_SIZE_REQUIRED = 8
 GRADIENT_ACCUMULATION_STEPS = 1
-LEARNING_RATE = 0.002
+LEARNING_RATE = 0.001
+MAX_SEQUENCE_LENGTH = 176
+PERIODIC_SAVE_STEPS = 6_000
+MAX_PERIODIC_CHECKPOINTS = 9
+WARMUP_RATIO = 0.13
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,6 +43,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--world-size", type=int, default=WORLD_SIZE_REQUIRED)
     parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
+    parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compile-mode", choices=("default", "reduce-overhead", "max-autotune"), default="reduce-overhead")
+    parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
     return parser.parse_args()
 
 
@@ -58,18 +74,15 @@ def load_and_validate_report(path: Path, global_batch_size: int) -> dict[str, An
         raise ValueError(f"Stage-III route report is not ok: {path}")
     if report.get("route") != "stage3_ab_cde_2epoch":
         raise ValueError(f"Unexpected route in report: {report.get('route')!r}")
-    if int(report.get("global_batch_size", -1)) != global_batch_size:
-        raise ValueError(
-            f"Global batch mismatch: report={report.get('global_batch_size')} expected={global_batch_size}"
-        )
-    if int(report.get("per_device_batch_size", -1)) != PER_DEVICE_BATCH_SIZE:
-        raise ValueError("Stage-III route report has an unexpected per-device batch size")
-    if int(report.get("world_size", -1)) != WORLD_SIZE_REQUIRED:
-        raise ValueError("Stage-III route report has an unexpected world size")
-    if int(report.get("gradient_accumulation_steps", -1)) != GRADIENT_ACCUMULATION_STEPS:
-        raise ValueError("Stage-III route requires gradient accumulation 1")
-    if float(report.get("learning_rate", -1.0)) != LEARNING_RATE:
-        raise ValueError("Stage-III route requires learning rate 0.002")
+    # The route report records the batch contract used when the manifest was
+    # composed (64). The ordered manifest is intentionally reused with the
+    # actual training global batch of 16; all blocks remain divisible by 16.
+    if int(report.get("global_batch_size", -1)) != 64:
+        raise ValueError(f"Unexpected manifest composition batch: {report.get('global_batch_size')}")
+    if int(report.get("per_device_batch_size", -1)) != 8 or int(report.get("world_size", -1)) != 8:
+        raise ValueError("Unexpected source route report distributed metadata")
+    if int(report.get("gradient_accumulation_steps", -1)) != 1:
+        raise ValueError("Unexpected source route report gradient accumulation")
     if report.get("runtime_shuffle") is not False:
         raise ValueError("Stage-III route must disable runtime shuffle")
     blocks = report.get("blocks")
@@ -79,29 +92,39 @@ def load_and_validate_report(path: Path, global_batch_size: int) -> dict[str, An
     observed = [(int(item.get("epoch", -1)), str(item.get("group"))) for item in blocks]
     if observed != expected:
         raise ValueError(f"Unexpected block order: {observed}")
-    previous_step = 0
     previous_record = 0
     for item in blocks:
-        start_step = int(item.get("start_step", -1))
-        end_step = int(item.get("end_step", -1))
         start_record = int(item.get("start_record", -1))
         end_record = int(item.get("end_record", -1))
         written = int(item.get("written_records", -1))
-        if start_step != previous_step or start_record != previous_record:
+        if start_record != previous_record:
             raise ValueError(f"Non-contiguous Stage-III block: {item}")
-        if written <= 0 or written % global_batch_size or end_step != start_step + written // global_batch_size:
+        if written <= 0 or written % global_batch_size:
             raise ValueError(f"Invalid Stage-III block step range: {item}")
         if end_record != start_record + written:
             raise ValueError(f"Invalid Stage-III block record range: {item}")
-        previous_step = end_step
         previous_record = end_record
-    if int(report.get("total_steps", -1)) != previous_step or int(report.get("total_records", -1)) != previous_record:
-        raise ValueError("Stage-III report totals do not match block ranges")
-    boundaries = report.get("epoch_boundary_steps")
-    if boundaries != {"1": 13_630, "2": 27_260}:
-        raise ValueError(f"Unexpected epoch boundary steps: {boundaries}")
-    if int(report.get("warmup_steps", -1)) != 3_544:
-        raise ValueError(f"Unexpected warmup_steps: {report.get('warmup_steps')}")
+    if int(report.get("total_records", -1)) != previous_record:
+        raise ValueError("Stage-III report total records do not match block ranges")
+    if previous_record % global_batch_size:
+        raise ValueError(f"Manifest records are not divisible by actual global batch: {previous_record}/{global_batch_size}")
+
+    actual_step = 0
+    actual_boundaries: dict[str, int] = {}
+    for item in blocks:
+        actual_step += int(item["written_records"]) // global_batch_size
+        if str(item["group"]) == "C+D+E":
+            actual_boundaries[str(int(item["epoch"]))] = actual_step
+    if set(actual_boundaries) != {"1", "2"}:
+        raise ValueError(f"Unable to compute actual epoch boundaries: {actual_boundaries}")
+    report["actual_training_schedule"] = {
+        "global_batch_size": global_batch_size,
+        "total_steps": actual_step,
+        "warmup_steps": int(math.ceil(actual_step * WARMUP_RATIO)),
+        "epoch_boundary_steps": actual_boundaries,
+        "route_report_global_batch_size": int(report["global_batch_size"]),
+        "route_report_learning_rate": report.get("learning_rate"),
+    }
     return report
 
 
@@ -113,13 +136,27 @@ def checkpoint_state_report(path: Path) -> dict[str, Any]:
         "scheduler.pt",
         "trainer_state.json",
         "training_args.bin",
-        "stage3_epoch.json",
     ]
     missing = [name for name in required if not (path / name).is_file()]
     rng_files = sorted(list(path.glob("rng_state_*.pth")) + list(path.glob("rng_state_*.pt")))
     if len(rng_files) < WORLD_SIZE_REQUIRED:
         missing.append(f"rng_state_*.pth>={WORLD_SIZE_REQUIRED}")
     return {"path": str(path), "missing": missing, "rng_files": [item.name for item in rng_files], "status": "ok" if not missing else "incomplete"}
+
+
+def retained_checkpoint_paths(output_dir: Path) -> list[Path]:
+    """Return native Trainer checkpoint directories in global-step order."""
+    checkpoints: list[tuple[int, Path]] = []
+    for path in output_dir.glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        try:
+            step = int(path.name.removeprefix("checkpoint-"))
+        except ValueError:
+            continue
+        if step > 0:
+            checkpoints.append((step, path))
+    return [path for _, path in sorted(checkpoints, key=lambda item: item[0])]
 
 
 def main() -> None:
@@ -159,37 +196,60 @@ def main() -> None:
         raise RuntimeError(f"Manifest count mismatch: actual={dataset_records} report={report['total_records']}")
 
     from swift.pipelines.train.sft import SwiftSft
-    from stage3_ab_cde_checkpoint import Stage3EpochCheckpointCallback
 
     class Stage3AbCdeSwiftSft(SwiftSft):
         def train(self, trainer):
-            effective_output_dir = Path(trainer.args.output_dir).resolve()
-            callback = Stage3EpochCheckpointCallback(
-                args.report,
-                checkpoint_root=effective_output_dir,
-                resume_checkpoint=args.resume_from_checkpoint,
-            )
-            trainer.add_callback(callback)
+            if args.torch_compile:
+                runtime_report = prepare_compile_runtime()
+                compile_started = time.perf_counter()
+                causal = find_ouro_causal_model(trainer.model)
+                compiled_core, target_report = compile_ouro_transformer_core(
+                    causal,
+                    mode=args.compile_mode,
+                    dynamic=args.compile_dynamic,
+                )
+                compile_report = {
+                    "enabled": True,
+                    "setup_seconds": time.perf_counter() - compile_started,
+                    **runtime_report,
+                    **target_report,
+                }
+                if rank() == 0:
+                    print(f"[compile] {json.dumps(compile_report, ensure_ascii=False)}", flush=True)
             result = super().train(trainer)
-            missing = callback.missing_boundary_steps()
-            if missing:
-                raise RuntimeError(f"Missing Stage-III epoch checkpoints: {missing}")
             if rank() == 0:
-                for step, epoch in sorted(callback.step_to_epoch.items()):
-                    checkpoint = effective_output_dir / f"checkpoint-{step}"
+                effective_output_dir = Path(trainer.args.output_dir).resolve()
+                checkpoints = retained_checkpoint_paths(effective_output_dir)
+                if not checkpoints:
+                    raise RuntimeError(
+                        "No periodic checkpoint was retained; expected native Trainer saves "
+                        f"every {PERIODIC_SAVE_STEPS} steps"
+                    )
+                if len(checkpoints) > MAX_PERIODIC_CHECKPOINTS:
+                    raise RuntimeError(
+                        "Native checkpoint retention exceeded limit: "
+                        f"found={len(checkpoints)} limit={MAX_PERIODIC_CHECKPOINTS}"
+                    )
+                print(
+                    f"[checkpoint] retained={len(checkpoints)} "
+                    f"save_steps={PERIODIC_SAVE_STEPS} save_total_limit={MAX_PERIODIC_CHECKPOINTS}",
+                    flush=True,
+                )
+                for checkpoint in checkpoints:
                     audit = checkpoint_state_report(checkpoint)
-                    print(f"[checkpoint] epoch={epoch} global_step={step} audit={json.dumps(audit, ensure_ascii=False)}", flush=True)
+                    print(f"[checkpoint] audit={json.dumps(audit, ensure_ascii=False)}", flush=True)
                     if audit["status"] != "ok":
                         raise RuntimeError(f"Incomplete Stage-III checkpoint: {audit}")
             return result
 
-    total_steps = int(report["total_steps"])
-    warmup_steps = int(report["warmup_steps"])
+    actual_schedule = report["actual_training_schedule"]
+    total_steps = int(actual_schedule["total_steps"])
+    warmup_steps = int(actual_schedule["warmup_steps"])
     argv: list[str] = [
         "--model", str(args.model_path), "--model_type", MODEL_TYPE, "--template", TEMPLATE_TYPE,
         "--external_plugins", str(args.plugin_path), "--dataset", str(args.dataset),
         "--split_dataset_ratio", "0", "--dataset_shuffle", "false", "--train_dataloader_shuffle", "false",
-        "--sortish_sampler", "false", "--group_by_length", "false", "--max_length", "512",
+        "--sortish_sampler", "false", "--group_by_length", "false", "--max_length", str(MAX_SEQUENCE_LENGTH),
         "--output_dir", str(args.output_dir), "--tuner_type", "lora", "--tuner_backend", "peft",
         "--target_modules", *BAT_TRAINING.lora_target_modules, "--modules_to_save", "audio_qformer",
         "--freeze_llm", "true", "--freeze_vit", "true", "--freeze_aligner", "false",
@@ -200,9 +260,10 @@ def main() -> None:
         "--per_device_train_batch_size", str(PER_DEVICE_BATCH_SIZE),
         "--gradient_accumulation_steps", str(GRADIENT_ACCUMULATION_STEPS),
         "--gradient_checkpointing", "false", "--logging_steps", "100",
-        "--save_strategy", "no", "--save_only_model", "false", "--save_total_limit", "2",
-        "--remove_unused_columns", "false", "--dataloader_num_workers", "4",
-        "--dataloader_pin_memory", "true", "--dataloader_drop_last", "false",
+        "--save_strategy", "steps", "--save_steps", str(PERIODIC_SAVE_STEPS),
+        "--save_only_model", "false", "--save_total_limit", str(MAX_PERIODIC_CHECKPOINTS),
+        "--remove_unused_columns", "false", "--dataloader_num_workers", "0",
+        "--dataloader_pin_memory", "false", "--dataloader_drop_last", "false",
         "--dataset_num_proc", "1", "--lazy_tokenize", "true", "--load_from_cache_file", "false",
         "--loss_scale", "all", "--seed", "42", "--data_seed", "42", "--optim", "adamw_torch",
         "--adam_beta1", str(BAT_TRAINING.beta1), "--adam_beta2", str(BAT_TRAINING.beta2),
@@ -216,7 +277,12 @@ def main() -> None:
     print(f"[ddp] world_size={actual_world_size} per_device_batch_size={PER_DEVICE_BATCH_SIZE} global_batch_size={global_batch_size}")
     print(f"[route] manifest={args.dataset} records={dataset_records} total_steps={total_steps}")
     print(f"[schedule] learning_rate={LEARNING_RATE} warmup_steps={warmup_steps} scheduler=half-cycle cosine decay")
-    print(f"[checkpoint] epoch_boundaries={report['epoch_boundary_steps']}")
+    print(
+        f"[checkpoint] native_save_strategy=steps save_steps={PERIODIC_SAVE_STEPS} "
+        f"save_total_limit={MAX_PERIODIC_CHECKPOINTS} full_resumable=true"
+    )
+    print(f"[data] dataloader_num_workers=0 pin_memory=false")
+    print(f"[compile] requested={args.torch_compile} target=OuroForCausalLM.model mode={args.compile_mode} dynamic={args.compile_dynamic}")
     if rank() == 0:
         print(f"[argv] {' '.join(argv)}")
     Stage3AbCdeSwiftSft(argv).main()
