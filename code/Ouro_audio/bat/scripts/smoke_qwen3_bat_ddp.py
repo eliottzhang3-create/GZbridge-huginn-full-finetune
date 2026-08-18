@@ -3,7 +3,7 @@
 
 This is deliberately independent of the BAT three-stage curriculum.  The
 manifest must contain the Stage-III A/B/C/D/E route, while the smoke itself
-uses two optimizer steps: one global batch per epoch, two epochs.  It audits
+uses a short configurable number of optimizer steps.  It audits
 the real ms-swift/PEFT/Accelerate DDP path and supports a resumable second
 phase through ``--resume-from-checkpoint``.
 """
@@ -24,6 +24,11 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from bat.configs.training import BAT_TRAINING
+from bat.qwen3_compile import (
+    compile_qwen3_transformer_core,
+    dynamo_counter_summary,
+    prepare_compile_runtime,
+)
 from smoke_qwen3_bat_lora import (
     EXPECTED_AUDIO_TOKENS,
     EXPECTED_QWEN3_LAYERS,
@@ -65,6 +70,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-steps", type=int, default=EXPECTED_SMOKE_STEPS)
     parser.add_argument("--save-steps", type=int, default=None)
     parser.add_argument("--resume-from-checkpoint", type=Path, default=None)
+    parser.add_argument("--per-device-batch-size", type=int, default=EXPECTED_LOCAL_BATCH)
+    parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compile-mode", choices=("default", "reduce-overhead", "max-autotune"), default="default")
+    parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--dataloader-num-workers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -283,10 +293,12 @@ def make_argv(args: argparse.Namespace, target_steps: int, save_steps: int, warm
         "--lora_alpha", str(BAT_TRAINING.lora_alpha), "--lora_dropout", str(BAT_TRAINING.lora_dropout),
         "--learning_rate", str(BAT_TRAINING.learning_rate), "--lr_scheduler_type", "cosine",
         "--warmup_steps", str(warmup_steps), "--max_steps", str(target_steps), "--num_train_epochs", "2",
-        "--per_device_train_batch_size", str(EXPECTED_LOCAL_BATCH), "--gradient_accumulation_steps", "1",
+        "--per_device_train_batch_size", str(args.per_device_batch_size), "--gradient_accumulation_steps", "1",
         "--gradient_checkpointing", "false", "--logging_steps", "1", "--save_strategy", "steps",
         "--save_steps", str(save_steps), "--save_total_limit", "2", "--save_only_model", "false",
-        "--dataloader_num_workers", "0", "--dataloader_pin_memory", "false", "--dataset_num_proc", "1",
+        "--dataloader_num_workers", str(args.dataloader_num_workers),
+        "--dataloader_pin_memory", "true" if args.dataloader_num_workers > 0 else "false",
+        "--dataset_num_proc", "1",
         "--lazy_tokenize", "false", "--load_from_cache_file", "false", "--loss_scale", "all",
         "--seed", "42", "--data_seed", "42", "--optim", "adamw_torch", "--adam_beta1", str(BAT_TRAINING.beta1),
         "--adam_beta2", str(BAT_TRAINING.beta2), "--weight_decay", str(BAT_TRAINING.weight_decay),
@@ -308,6 +320,10 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", str(current_rank)))
     if current_world != EXPECTED_WORLD_SIZE:
         raise RuntimeError(f"Qwen3 DDP smoke requires WORLD_SIZE=8, got {current_world}")
+    if args.per_device_batch_size <= 0:
+        raise ValueError("per-device-batch-size must be positive")
+    if args.dataloader_num_workers < 0:
+        raise ValueError("dataloader-num-workers must be non-negative")
     if local_rank < 0 or local_rank >= current_world:
         raise RuntimeError(f"Invalid LOCAL_RANK={local_rank}")
     torch.cuda.set_device(local_rank)
@@ -358,6 +374,23 @@ def main() -> None:
                 raise RuntimeError("Q-Former is unexpectedly frozen")
             model.train()
             encoder.eval()
+            compile_report: dict[str, Any] = {
+                "requested": bool(args.torch_compile),
+                "dynamic": bool(args.compile_dynamic),
+                "mode": args.compile_mode,
+                "target": None,
+                "runtime": None,
+                "step_counters": [],
+                "reuse_verified": False,
+            }
+            if args.torch_compile:
+                compile_report["runtime"] = prepare_compile_runtime()
+                _, target_report = compile_qwen3_transformer_core(
+                    causal,
+                    mode=args.compile_mode,
+                    dynamic=args.compile_dynamic,
+                )
+                compile_report.update(target_report)
             parameters = parameter_report(model)
             lora = lora_report(model)
             trace: dict[str, Any] = {
@@ -366,9 +399,10 @@ def main() -> None:
                 "past_key_values_present": None, "audio_forward_audit": None,
             }
             handles: list[Any] = []
-            layer0 = causal.model.layers[0]
-            handles.append(layer0.register_forward_hook(lambda *_: trace.__setitem__("layer_forward", trace["layer_forward"] + 1)))
-            handles.append(layer0.register_full_backward_hook(lambda *_: trace.__setitem__("layer_backward", trace["layer_backward"] + 1)))
+            if not args.torch_compile:
+                layer0 = causal.model.layers[0]
+                handles.append(layer0.register_forward_hook(lambda *_: trace.__setitem__("layer_forward", trace["layer_forward"] + 1)))
+                handles.append(layer0.register_full_backward_hook(lambda *_: trace.__setitem__("layer_backward", trace["layer_backward"] + 1)))
             original_compute_loss = trainer.compute_loss
             original_backward = trainer.accelerator.backward
 
@@ -389,11 +423,11 @@ def main() -> None:
                     input_ids = inputs["input_ids"]
                     attention_mask = inputs["attention_mask"]
                     waveform = inputs.get("audio_waveforms")
-                    if shape_tuple(input_ids) != (EXPECTED_LOCAL_BATCH, EXPECTED_SEQUENCE_LENGTH):
+                    if shape_tuple(input_ids) != (args.per_device_batch_size, EXPECTED_SEQUENCE_LENGTH):
                         raise RuntimeError(f"Unexpected Qwen3 local input shape: {shape_tuple(input_ids)}")
                     if shape_tuple(labels) != shape_tuple(input_ids) or shape_tuple(attention_mask) != shape_tuple(input_ids):
                         raise RuntimeError("Qwen3 DDP input/label/attention shapes are not aligned")
-                    if shape_tuple(waveform) != (EXPECTED_LOCAL_BATCH, 2, 320000):
+                    if shape_tuple(waveform) != (args.per_device_batch_size, 2, 320000):
                         raise RuntimeError(f"Unexpected Qwen3 local waveform shape: {shape_tuple(waveform)}")
                     if logits.ndim != 3 or tuple(logits.shape[:2]) != tuple(labels.shape):
                         raise RuntimeError(f"Unexpected Qwen3 logits shape: {shape_tuple(logits)}")
@@ -519,6 +553,8 @@ def main() -> None:
                         "shift_verified": True,
                     }
                     trace["loss"] = {"value": trainer_value, "logits_shape": list(logits.shape), "labels_shape": list(labels.shape)}
+                if args.torch_compile:
+                    trace.setdefault("compile_step_counters", []).append(dynamo_counter_summary())
                 return result if return_outputs else loss
 
             def backward(loss, **kwargs):
@@ -543,14 +579,25 @@ def main() -> None:
                 raise RuntimeError(f"Rank {current_rank} expected global_step={target_steps}, got {trainer.state.global_step}")
             if trace["forward"] != expected_steps or trace["backward"] != expected_steps:
                 raise RuntimeError(f"Unexpected Qwen3 DDP forward/backward counts: {trace}")
-            if trace["layer_forward"] != expected_steps or trace["layer_backward"] != expected_steps:
+            if not args.torch_compile and (trace["layer_forward"] != expected_steps or trace["layer_backward"] != expected_steps):
                 raise RuntimeError(f"Unexpected Qwen3 DDP layer counts: {trace}")
+            if args.torch_compile:
+                counters = trace.get("compile_step_counters", [])
+                if not counters or counters[-1]["unique_graphs"] <= 0:
+                    raise RuntimeError(f"Qwen3 DDP compile produced no graph: {counters}")
+                unique_graphs = [item["unique_graphs"] for item in counters]
+                if len(unique_graphs) > 1 and any(value != unique_graphs[0] for value in unique_graphs[1:]):
+                    raise RuntimeError(f"Qwen3 DDP compile graph was not reused: {unique_graphs}")
+                compile_report["step_counters"] = counters
+                compile_report["unique_graphs"] = unique_graphs[-1]
+                compile_report["reuse_verified"] = len(unique_graphs) >= 2
             if trace["audio_batch"] is None or trace["gradient_audit"] is None:
                 raise RuntimeError("Missing Qwen3 DDP audio or gradient audit")
             local_optimizer = optimizer_report(trainer, model)
             local_report = {
                 "rank": current_rank, "local_rank": local_rank, "world_size": current_world,
                 "parameters": parameters, "lora": lora, "optimizer": local_optimizer,
+                "compile": compile_report,
                 "forward_audit": trace, "global_step": int(trainer.state.global_step),
                 "elapsed_seconds": time.perf_counter() - started,
                 "memory": {
@@ -574,8 +621,23 @@ def main() -> None:
                     ]
                     if any(signature != signatures[0] for signature in signatures[1:]):
                         raise RuntimeError(f"Rank contracts differ: {signatures}")
+                    if args.torch_compile:
+                        compile_signatures = [
+                            (
+                                bool(item["compile"]["requested"]),
+                                bool(item["compile"]["dynamic"]),
+                                item["compile"].get("target"),
+                                int(item["compile"].get("unique_graphs", 0)),
+                                bool(item["compile"].get("reuse_verified")),
+                            )
+                            for item in reports
+                        ]
+                        if any(signature != compile_signatures[0] for signature in compile_signatures[1:]):
+                            raise RuntimeError(f"Compile contracts differ across ranks: {compile_signatures}")
+                        if not compile_signatures[0][0] or compile_signatures[0][1] or not compile_signatures[0][4]:
+                            raise RuntimeError(f"Invalid static compile contract: {compile_signatures[0]}")
                     local_batches = [item["forward_audit"]["batch"]["input_ids_shape"][0] for item in reports]
-                    if local_batches != [EXPECTED_LOCAL_BATCH] * EXPECTED_WORLD_SIZE:
+                    if local_batches != [args.per_device_batch_size] * EXPECTED_WORLD_SIZE:
                         raise RuntimeError(f"Local batch audit failed: {local_batches}")
                     global_count = sum(int(item["forward_audit"]["batch"]["valid_shifted_target_count"]) for item in reports)
                     global_sum = sum(float(item["forward_audit"]["batch"]["manual_shifted_loss_sum"]) for item in reports)
@@ -602,7 +664,8 @@ def main() -> None:
                     "stage3_types": sorted(STAGE3_TYPES),
                     "distributed": {
                         "backend": dist.get_backend(), "world_size": EXPECTED_WORLD_SIZE,
-                        "per_device_batch_size": EXPECTED_LOCAL_BATCH, "global_batch_size": EXPECTED_GLOBAL_BATCH,
+                        "per_device_batch_size": args.per_device_batch_size,
+                        "global_batch_size": EXPECTED_WORLD_SIZE * args.per_device_batch_size,
                         "gradient_accumulation_steps": 1, "dataset_records": len(rows),
                         "target_global_step": target_steps, "initial_global_step": initial_step,
                         "optimizer_steps": expected_steps,
@@ -617,7 +680,12 @@ def main() -> None:
                     "argv": argv,
                 }
                 write_json(args.output_report, report)
-                print(f"[ddp] backend={dist.get_backend()} world_size=8 global_batch=16", flush=True)
+                print(
+                    f"[ddp] backend={dist.get_backend()} world_size={current_world} "
+                    f"per_device_batch={args.per_device_batch_size} "
+                    f"global_batch={EXPECTED_WORLD_SIZE * args.per_device_batch_size}",
+                    flush=True,
+                )
                 print(f"[route] stage3_ab_cde curriculum=false types={sorted(STAGE3_TYPES)}", flush=True)
                 print(f"[checkpoint] {json.dumps(checkpoint, ensure_ascii=False)}", flush=True)
                 print(f"[report] {args.output_report}", flush=True)

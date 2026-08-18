@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Strict single-card Qwen3 BAT multimodal LoRA + Q-Former smoke.
 
-The smoke intentionally uses exactly two private JSONL records and two
-optimizer steps.  It validates the real ms-swift/PEFT path rather than a
+The default smoke uses two private JSONL records and two optimizer steps.  It
+also supports a fixed-shape compile smoke with a larger batch.  It validates
+the real ms-swift/PEFT path rather than a
 standalone hand-written forward:
 
 * Spatial-AST is frozen;
@@ -28,6 +29,11 @@ import torch
 import torch.nn.functional as F
 
 from bat.configs.training import BAT_TRAINING
+from bat.qwen3_compile import (
+    compile_qwen3_transformer_core,
+    dynamo_counter_summary,
+    prepare_compile_runtime,
+)
 
 
 MODEL_TYPE = "qwen3_bat_spatial_ast"
@@ -65,6 +71,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--output-report", type=Path, required=True)
+    parser.add_argument("--expected-records", type=int, default=2)
+    parser.add_argument("--per-device-batch-size", type=int, default=2)
+    parser.add_argument("--max-steps", type=int, default=None)
+    parser.add_argument("--torch-compile", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--compile-mode", choices=("default", "reduce-overhead", "max-autotune"), default="default")
+    parser.add_argument("--compile-dynamic", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--dataloader-num-workers", type=int, default=0)
     return parser.parse_args()
 
 
@@ -113,6 +126,10 @@ def normalized_name(name: str) -> str:
     for prefix in ("module.", "base_model.model.", "base_model."):
         if name.startswith(prefix):
             name = name[len(prefix):]
+    # torch.compile's OptimizedModule exposes the original parameters below
+    # ``_orig_mod``.  Normalize that implementation detail so the compile
+    # smoke applies the same Qwen-native/frozen audit as the eager smoke.
+    name = name.replace("._orig_mod.", ".").replace("_orig_mod.", "")
     return name.replace(".base_layer.", ".")
 
 
@@ -355,8 +372,16 @@ def main() -> None:
         if not path.expanduser().resolve().exists():
             raise FileNotFoundError(path)
     records = count_jsonl(args.dataset)
-    if records != 2:
-        raise RuntimeError(f"Qwen3 LoRA smoke requires exactly 2 JSONL records; got {records}")
+    if records != args.expected_records:
+        raise RuntimeError(
+            f"Qwen3 LoRA smoke expected {args.expected_records} JSONL records; got {records}"
+        )
+    if args.per_device_batch_size <= 0:
+        raise ValueError("per-device-batch-size must be positive")
+    if args.dataloader_num_workers < 0:
+        raise ValueError("dataloader-num-workers must be non-negative")
+    if args.max_steps is not None and args.max_steps <= 0:
+        raise ValueError("max-steps must be positive when provided")
     if args.output_dir.exists():
         raise FileExistsError(f"Refusing to overwrite {args.output_dir}")
     if str(args.output_report).replace("\\", "/").startswith("/hpc_stor03/public"):
@@ -364,7 +389,23 @@ def main() -> None:
 
     from swift.pipelines.train.sft import SwiftSft
 
-    schedule = BAT_TRAINING.schedule(dataset_size=2, world_size=1, gradient_accumulation_steps=1, stage_name="I")
+    steps_per_epoch = max(1, math.ceil(records / args.per_device_batch_size))
+    total_steps = args.max_steps if args.max_steps is not None else steps_per_epoch * 2
+    schedule = {
+        "stage": "I",
+        "dataset_size": records,
+        "world_size": 1,
+        "per_device_batch_size": args.per_device_batch_size,
+        "effective_batch_size": args.per_device_batch_size,
+        "steps_per_epoch": steps_per_epoch,
+        "epochs": 2,
+        "total_steps": total_steps,
+        "warmup_epochs": 2,
+        "warmup_steps": min(total_steps, steps_per_epoch * 2),
+        "scheduler": BAT_TRAINING.scheduler,
+        "epoch_partitioning_factor": BAT_TRAINING.epoch_partitioning_factor,
+        "batch_size_contract_override": args.per_device_batch_size != BAT_TRAINING.per_device_batch_size,
+    }
     argv = [
         "--model", str(args.model_path), "--model_type", MODEL_TYPE, "--template", TEMPLATE_TYPE,
         "--external_plugins", str(args.plugin_path), "--dataset", str(args.dataset),
@@ -377,10 +418,12 @@ def main() -> None:
         "--lora_alpha", str(BAT_TRAINING.lora_alpha), "--lora_dropout", str(BAT_TRAINING.lora_dropout),
         "--learning_rate", str(BAT_TRAINING.learning_rate), "--lr_scheduler_type", "cosine",
         "--warmup_steps", str(schedule["warmup_steps"]), "--max_steps", str(schedule["total_steps"]),
-        "--num_train_epochs", str(schedule["epochs"]), "--per_device_train_batch_size", str(BAT_TRAINING.per_device_batch_size),
+        "--num_train_epochs", str(schedule["epochs"]), "--per_device_train_batch_size", str(args.per_device_batch_size),
         "--gradient_accumulation_steps", "1", "--gradient_checkpointing", "false", "--logging_steps", "1",
         "--save_strategy", "steps", "--save_steps", "2", "--save_total_limit", "1", "--save_only_model", "false",
-        "--dataloader_num_workers", "0", "--dataloader_pin_memory", "false", "--dataset_num_proc", "1",
+        "--dataloader_num_workers", str(args.dataloader_num_workers),
+        "--dataloader_pin_memory", "true" if args.dataloader_num_workers > 0 else "false",
+        "--dataset_num_proc", "1",
         "--lazy_tokenize", "false", "--load_from_cache_file", "false", "--loss_scale", "all",
         "--seed", "42", "--data_seed", "42", "--optim", "adamw_torch", "--adam_beta1", str(BAT_TRAINING.beta1),
         "--adam_beta2", str(BAT_TRAINING.beta2), "--weight_decay", str(BAT_TRAINING.weight_decay),
@@ -403,6 +446,23 @@ def main() -> None:
                 raise RuntimeError("Q-Former is unexpectedly frozen")
             model.train()
             encoder.eval()
+            compile_report: dict[str, Any] = {
+                "requested": bool(args.torch_compile),
+                "dynamic": bool(args.compile_dynamic),
+                "mode": args.compile_mode,
+                "target": None,
+                "runtime": None,
+                "step_counters": [],
+                "reuse_verified": False,
+            }
+            if args.torch_compile:
+                compile_report["runtime"] = prepare_compile_runtime()
+                _, target_report = compile_qwen3_transformer_core(
+                    causal,
+                    mode=args.compile_mode,
+                    dynamic=args.compile_dynamic,
+                )
+                compile_report.update(target_report)
             parameters = parameter_report(model)
             lora = lora_report(model)
             trace: dict[str, Any] = {
@@ -411,9 +471,10 @@ def main() -> None:
                 "past_key_values_present": None, "audio_forward_audit": None,
             }
             handles: list[Any] = []
-            layer0 = causal.model.layers[0]
-            handles.append(layer0.register_forward_hook(lambda *_: trace.__setitem__("layer_forward", trace["layer_forward"] + 1)))
-            handles.append(layer0.register_full_backward_hook(lambda *_: trace.__setitem__("layer_backward", trace["layer_backward"] + 1)))
+            if not args.torch_compile:
+                layer0 = causal.model.layers[0]
+                handles.append(layer0.register_forward_hook(lambda *_: trace.__setitem__("layer_forward", trace["layer_forward"] + 1)))
+                handles.append(layer0.register_full_backward_hook(lambda *_: trace.__setitem__("layer_backward", trace["layer_backward"] + 1)))
             original_compute_loss = trainer.compute_loss
             original_backward = trainer.accelerator.backward
 
@@ -431,9 +492,9 @@ def main() -> None:
                         raise RuntimeError(
                             f"Input/label/mask mismatch: input={shape_tuple(input_ids)} labels={shape_tuple(labels)} mask={shape_tuple(attention_mask)}"
                         )
-                    if shape_tuple(input_ids) != (2, EXPECTED_SEQUENCE_LENGTH):
+                    if shape_tuple(input_ids) != (args.per_device_batch_size, EXPECTED_SEQUENCE_LENGTH):
                         raise RuntimeError(f"Unexpected fixed batch shape: {shape_tuple(input_ids)}")
-                    if shape_tuple(waveform) != (2, 2, 320000):
+                    if shape_tuple(waveform) != (args.per_device_batch_size, 2, 320000):
                         raise RuntimeError(f"Unexpected waveform shape: {shape_tuple(waveform)}")
                     if not bool(torch.isfinite(waveform.float()).all().item()):
                         raise RuntimeError("Waveform contains NaN or Inf")
@@ -471,6 +532,9 @@ def main() -> None:
                         "manual_shifted_ce": manual_value, "trainer_ce": trainer_value, "shift_verified": True,
                     }
                     trace["loss"] = {"value": trainer_value, "logits_shape": list(logits.shape), "labels_shape": list(labels.shape)}
+                if args.torch_compile:
+                    trace_compile = dynamo_counter_summary()
+                    trace.setdefault("compile_step_counters", []).append(trace_compile)
                 return result if return_outputs else loss
 
             def backward(loss, **kwargs):
@@ -494,8 +558,18 @@ def main() -> None:
                 raise RuntimeError(f"Expected {schedule['total_steps']} optimizer steps, got {trainer.state.global_step}")
             if trace["forward"] != schedule["total_steps"] or trace["backward"] != schedule["total_steps"]:
                 raise RuntimeError(f"Unexpected Qwen3 forward/backward counts: {trace}")
-            if trace["layer_forward"] != schedule["total_steps"] or trace["layer_backward"] != schedule["total_steps"]:
+            if not args.torch_compile and (trace["layer_forward"] != schedule["total_steps"] or trace["layer_backward"] != schedule["total_steps"]):
                 raise RuntimeError(f"Unexpected Qwen3 layer counts: {trace}")
+            if args.torch_compile:
+                counters = trace.get("compile_step_counters", [])
+                if not counters or counters[-1]["unique_graphs"] <= 0:
+                    raise RuntimeError(f"Qwen3 compile produced no graph: {counters}")
+                unique_graphs = [item["unique_graphs"] for item in counters]
+                if len(unique_graphs) > 1 and any(value != unique_graphs[0] for value in unique_graphs[1:]):
+                    raise RuntimeError(f"Qwen3 compile graph was not reused: {unique_graphs}")
+                compile_report["step_counters"] = counters
+                compile_report["unique_graphs"] = unique_graphs[-1]
+                compile_report["reuse_verified"] = len(unique_graphs) >= 2
             if trace["gradient_audit"] is None:
                 raise RuntimeError("Gradient audit was not captured")
             optimizer = optimizer_report(trainer, model)
@@ -506,6 +580,7 @@ def main() -> None:
                 "audio_contract": getattr(causal, "_qwen3_bat_audio_contract", None),
                 "schedule": dict(schedule), "dataset_records": records, "argv": argv,
                 "parameters": parameters, "lora": lora, "optimizer": optimizer,
+                "compile": compile_report,
                 "forward_audit": trace, "checkpoint": checkpoint,
                 "elapsed_seconds": time.perf_counter() - started,
                 "trainer": {"class": f"{trainer.__class__.__module__}.{trainer.__class__.__name__}", "global_step": int(trainer.state.global_step), "log_history": trainer.state.log_history},
