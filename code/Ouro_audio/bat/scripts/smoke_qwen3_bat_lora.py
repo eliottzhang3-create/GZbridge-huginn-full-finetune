@@ -109,7 +109,8 @@ def find_trainable_module(model: torch.nn.Module, class_name: str) -> torch.nn.M
 
 
 def normalized_name(name: str) -> str:
-    for prefix in ("base_model.model.", "base_model."):
+    # DDP may expose parameters through a leading ``module.`` wrapper.
+    for prefix in ("module.", "base_model.model.", "base_model."):
         if name.startswith(prefix):
             name = name[len(prefix):]
     return name.replace(".base_layer.", ".")
