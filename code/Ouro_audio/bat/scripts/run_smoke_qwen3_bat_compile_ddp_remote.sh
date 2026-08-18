@@ -27,6 +27,14 @@ MODEL_PATH="${QWEN3_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Qwen3-
 PLUGIN_PATH="${QWEN3_BAT_PLUGIN_PATH:-$REPO_ROOT/code/Ouro_audio/plugins/qwen3_bat_spatial_ast_swift.py}"
 OUTPUT_DIR="${QWEN3_BAT_COMPILE_DDP_OUTPUT_DIR:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/qwen3/compile_ddp_8x_b8-$(date +%Y%m%d-%H%M%S)}"
 REPORT="${QWEN3_BAT_COMPILE_DDP_REPORT:-$OUTPUT_DIR/audit.json}"
+DATALOADER_NUM_WORKERS="${QWEN3_BAT_COMPILE_DATALOADER_NUM_WORKERS:-0}"
+
+if [[ "$DATALOADER_NUM_WORKERS" =~ ^[0-9]+$ ]]; then
+  :
+else
+  echo "Invalid QWEN3_BAT_COMPILE_DATALOADER_NUM_WORKERS=$DATALOADER_NUM_WORKERS" >&2
+  exit 2
+fi
 
 case "$DATASET:$OUTPUT_DIR:$REPORT" in
   /hpc_stor03/public*|*:/hpc_stor03/public*) echo "Refusing public path" >&2; exit 2;;
@@ -45,6 +53,7 @@ echo "========== QWEN3 BAT COMPILE 8-RANK DDP SMOKE =========="
 echo "model=$MODEL_PATH"
 echo "dataset=$DATASET records=128"
 echo "world_size=8 per_device_batch_size=8 global_batch_size=64 max_steps=2 sequence_length=176"
+echo "dataloader_num_workers_per_rank=$DATALOADER_NUM_WORKERS total_worker_processes=$((8 * DATALOADER_NUM_WORKERS))"
 echo "compile_target=Qwen3ForCausalLM.model dynamic=false mode=default"
 echo "compile_excluded=Spatial-AST,Q-Former,audio-renderer,lm_head"
 
@@ -59,7 +68,7 @@ torchrun --standalone --nproc_per_node=8 \
   --max-steps 2 \
   --save-steps 2 \
   --per-device-batch-size 8 \
-  --dataloader-num-workers 4 \
+  --dataloader-num-workers "$DATALOADER_NUM_WORKERS" \
   --torch-compile \
   --compile-mode default \
   --no-compile-dynamic
