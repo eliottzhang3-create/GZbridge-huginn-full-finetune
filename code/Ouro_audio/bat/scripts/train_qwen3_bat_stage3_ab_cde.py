@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Any
@@ -23,13 +24,16 @@ from bat.qwen3_compile import compile_qwen3_transformer_core, prepare_compile_ru
 
 MODEL_TYPE = "qwen3_bat_spatial_ast"
 TEMPLATE_TYPE = "qwen3_bat_audio_prefix"
-PER_DEVICE_BATCH_SIZE = 8
+PER_DEVICE_BATCH_SIZE = 2
 WORLD_SIZE_REQUIRED = 8
 GRADIENT_ACCUMULATION_STEPS = 1
-LEARNING_RATE = 0.002
+LEARNING_RATE = 0.001
 MAX_SEQUENCE_LENGTH = 176
 EXPECTED_QWEN3_LAYERS = 36
 EXPECTED_LORA_TARGETS = ("q_proj", "v_proj")
+PERIODIC_SAVE_STEPS = 6_000
+MAX_PERIODIC_CHECKPOINTS = 9
+WARMUP_RATIO = 0.13
 
 
 def parse_args() -> argparse.Namespace:
@@ -74,16 +78,15 @@ def load_and_validate_report(path: Path, global_batch_size: int) -> dict[str, An
         raise ValueError(f"Stage-III route report is not ok: {path}")
     if report.get("route") != "stage3_ab_cde_2epoch":
         raise ValueError(f"Unexpected route in report: {report.get('route')!r}")
-    if int(report.get("global_batch_size", -1)) != global_batch_size:
-        raise ValueError(f"Global batch mismatch: report={report.get('global_batch_size')} expected={global_batch_size}")
-    if int(report.get("per_device_batch_size", -1)) != PER_DEVICE_BATCH_SIZE:
-        raise ValueError("Stage-III route has an unexpected per-device batch size")
-    if int(report.get("world_size", -1)) != WORLD_SIZE_REQUIRED:
-        raise ValueError("Stage-III route has an unexpected world size")
+    # The manifest/report was composed with global batch 64.  The same ordered
+    # manifest is intentionally trained here with global batch 16, so compute
+    # the actual optimizer schedule from written records below.
+    if int(report.get("global_batch_size", -1)) != 64:
+        raise ValueError(f"Unexpected manifest composition batch: {report.get('global_batch_size')}")
+    if int(report.get("per_device_batch_size", -1)) != 8 or int(report.get("world_size", -1)) != 8:
+        raise ValueError("Unexpected source route report distributed metadata")
     if int(report.get("gradient_accumulation_steps", -1)) != GRADIENT_ACCUMULATION_STEPS:
         raise ValueError("Stage-III route requires gradient accumulation 1")
-    if float(report.get("learning_rate", -1.0)) != LEARNING_RATE:
-        raise ValueError("Stage-III route requires learning rate 0.002")
     if report.get("runtime_shuffle") is not False:
         raise ValueError("Stage-III route must disable runtime shuffle")
     blocks = report.get("blocks")
@@ -93,28 +96,39 @@ def load_and_validate_report(path: Path, global_batch_size: int) -> dict[str, An
     observed = [(int(item.get("epoch", -1)), str(item.get("group"))) for item in blocks]
     if observed != expected:
         raise ValueError(f"Unexpected block order: {observed}")
-    previous_step = 0
     previous_record = 0
     for item in blocks:
-        start_step = int(item.get("start_step", -1))
-        end_step = int(item.get("end_step", -1))
         start_record = int(item.get("start_record", -1))
         end_record = int(item.get("end_record", -1))
         written = int(item.get("written_records", -1))
-        if start_step != previous_step or start_record != previous_record:
+        if start_record != previous_record:
             raise ValueError(f"Non-contiguous Stage-III block: {item}")
-        if written <= 0 or written % global_batch_size or end_step != start_step + written // global_batch_size:
+        if written <= 0 or written % global_batch_size:
             raise ValueError(f"Invalid Stage-III block step range: {item}")
         if end_record != start_record + written:
             raise ValueError(f"Invalid Stage-III block record range: {item}")
-        previous_step = end_step
         previous_record = end_record
-    if int(report.get("total_steps", -1)) != previous_step or int(report.get("total_records", -1)) != previous_record:
-        raise ValueError("Stage-III report totals do not match block ranges")
-    if report.get("epoch_boundary_steps") != {"1": 13_630, "2": 27_260}:
-        raise ValueError(f"Unexpected epoch boundaries: {report.get('epoch_boundary_steps')}")
-    if int(report.get("warmup_steps", -1)) != 3_544:
-        raise ValueError(f"Unexpected warmup_steps: {report.get('warmup_steps')}")
+    if int(report.get("total_records", -1)) != previous_record:
+        raise ValueError("Stage-III report total records do not match block ranges")
+    if previous_record % global_batch_size:
+        raise ValueError(f"Manifest records are not divisible by actual global batch: {previous_record}/{global_batch_size}")
+
+    actual_step = 0
+    actual_boundaries: dict[str, int] = {}
+    for item in blocks:
+        actual_step += int(item["written_records"]) // global_batch_size
+        if str(item["group"]) == "C+D+E":
+            actual_boundaries[str(int(item["epoch"]))] = actual_step
+    if set(actual_boundaries) != {"1", "2"}:
+        raise ValueError(f"Unable to compute actual epoch boundaries: {actual_boundaries}")
+    report["actual_training_schedule"] = {
+        "global_batch_size": global_batch_size,
+        "total_steps": actual_step,
+        "warmup_steps": int(math.ceil(actual_step * WARMUP_RATIO)),
+        "epoch_boundary_steps": actual_boundaries,
+        "route_report_global_batch_size": int(report["global_batch_size"]),
+        "route_report_learning_rate": report.get("learning_rate"),
+    }
     return report
 
 
@@ -128,7 +142,6 @@ def checkpoint_state_report(path: Path) -> dict[str, Any]:
         "scheduler.pt",
         "trainer_state.json",
         "training_args.bin",
-        "stage3_epoch.json",
     )
     missing = [name for name in required if not (path / name).is_file()]
     rng_files = sorted(list(path.glob("rng_state_*.pth")) + list(path.glob("rng_state_*.pt")))
@@ -174,6 +187,21 @@ def checkpoint_state_report(path: Path) -> dict[str, Any]:
     }
 
 
+def retained_checkpoint_paths(output_dir: Path) -> list[Path]:
+    """Return native Trainer checkpoint directories in global-step order."""
+    checkpoints: list[tuple[int, Path]] = []
+    for path in output_dir.glob("checkpoint-*"):
+        if not path.is_dir():
+            continue
+        try:
+            step = int(path.name.removeprefix("checkpoint-"))
+        except ValueError:
+            continue
+        if step > 0:
+            checkpoints.append((step, path))
+    return [path for _, path in sorted(checkpoints, key=lambda item: item[0])]
+
+
 def main() -> None:
     args = parse_args()
     validate_base_contract()
@@ -207,7 +235,6 @@ def main() -> None:
         raise RuntimeError(f"Manifest count mismatch: actual={dataset_records} report={report['total_records']}")
 
     from swift.pipelines.train.sft import SwiftSft
-    from stage3_ab_cde_checkpoint import Stage3EpochCheckpointCallback
     from smoke_qwen3_bat_lora import find_module, find_trainable_module
 
     class Qwen3Stage3SwiftSft(SwiftSft):
@@ -239,27 +266,35 @@ def main() -> None:
                 )
                 print(f"[compile] runtime={json.dumps(runtime, ensure_ascii=False)} target={json.dumps(target, ensure_ascii=False)}", flush=True)
 
-            callback = Stage3EpochCheckpointCallback(
-                args.report,
-                checkpoint_root=Path(trainer.args.output_dir).resolve(),
-                resume_checkpoint=args.resume_from_checkpoint,
-            )
-            trainer.add_callback(callback)
             result = super().train(trainer)
-            missing = callback.missing_boundary_steps()
-            if missing:
-                raise RuntimeError(f"Missing Stage-III epoch checkpoints: {missing}")
             if rank() == 0:
-                for step, epoch in sorted(callback.step_to_epoch.items()):
-                    checkpoint = Path(trainer.args.output_dir).resolve() / f"checkpoint-{step}"
+                effective_output_dir = Path(trainer.args.output_dir).resolve()
+                checkpoints = retained_checkpoint_paths(effective_output_dir)
+                if not checkpoints:
+                    raise RuntimeError(
+                        "No periodic checkpoint was retained; expected native Trainer saves "
+                        f"every {PERIODIC_SAVE_STEPS} steps"
+                    )
+                if len(checkpoints) > MAX_PERIODIC_CHECKPOINTS:
+                    raise RuntimeError(
+                        "Native checkpoint retention exceeded limit: "
+                        f"found={len(checkpoints)} limit={MAX_PERIODIC_CHECKPOINTS}"
+                    )
+                print(
+                    f"[checkpoint] retained={len(checkpoints)} "
+                    f"save_steps={PERIODIC_SAVE_STEPS} save_total_limit={MAX_PERIODIC_CHECKPOINTS}",
+                    flush=True,
+                )
+                for checkpoint in checkpoints:
                     audit = checkpoint_state_report(checkpoint)
-                    print(f"[checkpoint] epoch={epoch} global_step={step} audit={json.dumps(audit, ensure_ascii=False)}", flush=True)
+                    print(f"[checkpoint] audit={json.dumps(audit, ensure_ascii=False)}", flush=True)
                     if audit["status"] != "ok":
                         raise RuntimeError(f"Incomplete Qwen3 Stage-III checkpoint: {audit}")
             return result
 
-    total_steps = int(report["total_steps"])
-    warmup_steps = int(report["warmup_steps"])
+    actual_schedule = report["actual_training_schedule"]
+    total_steps = int(actual_schedule["total_steps"])
+    warmup_steps = int(actual_schedule["warmup_steps"])
     argv: list[str] = [
         "--model", str(args.model_path), "--model_type", MODEL_TYPE, "--template", TEMPLATE_TYPE,
         "--external_plugins", str(args.plugin_path), "--dataset", str(args.dataset),
@@ -275,9 +310,10 @@ def main() -> None:
         "--per_device_train_batch_size", str(PER_DEVICE_BATCH_SIZE),
         "--gradient_accumulation_steps", str(GRADIENT_ACCUMULATION_STEPS),
         "--gradient_checkpointing", "false", "--logging_steps", "100",
-        "--save_strategy", "no", "--save_only_model", "false", "--save_total_limit", "2",
-        "--remove_unused_columns", "false", "--dataloader_num_workers", "4",
-        "--dataloader_pin_memory", "true", "--dataloader_drop_last", "false",
+        "--save_strategy", "steps", "--save_steps", str(PERIODIC_SAVE_STEPS),
+        "--save_only_model", "false", "--save_total_limit", str(MAX_PERIODIC_CHECKPOINTS),
+        "--remove_unused_columns", "false", "--dataloader_num_workers", "0",
+        "--dataloader_pin_memory", "false", "--dataloader_drop_last", "false",
         "--dataset_num_proc", "1", "--lazy_tokenize", "true", "--load_from_cache_file", "false",
         "--loss_scale", "all", "--seed", "42", "--data_seed", "42", "--optim", "adamw_torch",
         "--adam_beta1", str(BAT_TRAINING.beta1), "--adam_beta2", str(BAT_TRAINING.beta2),
@@ -295,7 +331,11 @@ def main() -> None:
     print(f"[audio] tokens=64 sequence_length={MAX_SEQUENCE_LENGTH} RIR=crop_or_zero_pad_to_2s")
     print(f"[schedule] learning_rate={LEARNING_RATE} warmup_steps={warmup_steps} scheduler=half-cycle cosine decay")
     print(f"[compile] requested={args.torch_compile} target=Qwen3ForCausalLM.model dynamic={args.compile_dynamic} mode={args.compile_mode}")
-    print(f"[checkpoint] epoch_boundaries={report['epoch_boundary_steps']}")
+    print(
+        f"[checkpoint] native_save_strategy=steps save_steps={PERIODIC_SAVE_STEPS} "
+        f"save_total_limit={MAX_PERIODIC_CHECKPOINTS} full_resumable=true"
+    )
+    print(f"[data] dataloader_num_workers=0 pin_memory=false")
     if rank() == 0:
         print(f"[argv] {' '.join(argv)}")
     Qwen3Stage3SwiftSft(argv).main()

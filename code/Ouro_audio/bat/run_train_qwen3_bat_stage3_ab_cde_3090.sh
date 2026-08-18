@@ -19,7 +19,7 @@ done
 vc submit \
   -p pdgpu-3090 \
   -i docker.v2.aispeech.com/sjtu/sjtu_wumengyue-mhl:0.0.1 \
-  -c 64 -m 256G -g 8 -n 1 \
+  -c 32 -m 256G -g 8 -n 1 \
   -j "qwen3-bat-stage3-ab-cde-3090-$(date +%m%d%H%M)" \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/qwen3_bat_stage3_ab_cde_3090.JOB.log" \
