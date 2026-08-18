@@ -374,11 +374,18 @@ def main() -> None:
 
             def compute_loss(actual_model, inputs, return_outputs=False, num_items_in_batch=None):
                 trace["forward"] += 1
+                # Swift may consume/transform these auxiliary tensors while
+                # computing its loss.  Preserve the real batch contract
+                # before delegating to the trainer.
+                labels_before = inputs["labels"].detach().clone()
+                loss_scale_before = inputs.get("loss_scale")
+                if torch.is_tensor(loss_scale_before):
+                    loss_scale_before = loss_scale_before.detach().clone()
                 result = original_compute_loss(actual_model, inputs, return_outputs=True, num_items_in_batch=num_items_in_batch)
                 loss, outputs = result
                 if trace["loss"] is None:
                     logits = outputs.logits
-                    labels = inputs["labels"]
+                    labels = labels_before
                     input_ids = inputs["input_ids"]
                     attention_mask = inputs["attention_mask"]
                     waveform = inputs.get("audio_waveforms")
@@ -397,21 +404,64 @@ def main() -> None:
                         raise RuntimeError("Qwen3 KV cache is unexpectedly enabled")
                     if not bool((labels[:, :EXPECTED_AUDIO_TOKENS] == -100).all().item()):
                         raise RuntimeError("Qwen3 audio prefix labels are not fully masked")
-                    shifted_logits = logits[:, :-1].float().contiguous()
+                    logits_float = logits.float()
+                    shifted_logits = logits_float[:, :-1].contiguous()
                     shifted_labels = labels[:, 1:].contiguous()
-                    valid = shifted_labels != -100
-                    valid_count = int(valid.sum().item())
-                    if valid_count <= 0:
+                    shifted_valid = shifted_labels != -100
+                    shifted_count = int(shifted_valid.sum().item())
+                    if shifted_count <= 0:
                         raise RuntimeError("No valid shifted targets in Qwen3 DDP batch")
-                    token_losses = F.cross_entropy(
+                    shifted_token_losses = F.cross_entropy(
                         shifted_logits.reshape(-1, shifted_logits.shape[-1]),
                         shifted_labels.reshape(-1), ignore_index=-100, reduction="none",
                     )
-                    manual_sum = token_losses[valid.reshape(-1)].sum()
-                    manual_value = float((manual_sum / valid_count).detach().cpu())
+                    manual_sum = shifted_token_losses[shifted_valid.reshape(-1)].sum()
+                    manual_value = float((manual_sum / shifted_count).detach().cpu())
+
+                    # Reproduce ms-swift 4.4.2's loss path exactly.  In the
+                    # distributed trainer the denominator is supplied by
+                    # ``num_items_in_batch`` and may differ from the local
+                    # shifted-token count.  Swift also implements the shift
+                    # by rolling labels/loss_scale over the full sequence.
+                    swift_labels = torch.roll(labels, shifts=-1, dims=-1).reshape(-1)
+                    swift_token_losses = F.cross_entropy(
+                        logits_float.reshape(-1, logits_float.shape[-1]),
+                        swift_labels,
+                        ignore_index=-100,
+                        reduction="none",
+                    )
+                    swift_valid = swift_labels != -100
+                    if loss_scale_before is not None:
+                        if not torch.is_tensor(loss_scale_before):
+                            raise RuntimeError(f"Unexpected loss_scale type: {type(loss_scale_before).__name__}")
+                        swift_scale = torch.roll(loss_scale_before, shifts=-1, dims=-1).reshape(-1).to(swift_token_losses.dtype)
+                        swift_token_losses = swift_token_losses * swift_scale
+                        loss_scale_binary_equivalent = bool(
+                            torch.equal(swift_scale, swift_valid.to(swift_scale.dtype))
+                        )
+                    else:
+                        loss_scale_binary_equivalent = True
+                    swift_sum = swift_token_losses.sum()
+                    if num_items_in_batch is None:
+                        denominator = shifted_count
+                    elif torch.is_tensor(num_items_in_batch):
+                        denominator = int(num_items_in_batch.detach().cpu().item())
+                    else:
+                        denominator = int(num_items_in_batch)
+                    if denominator <= 0:
+                        raise RuntimeError(f"Invalid Swift loss denominator: {denominator}")
+                    swift_formula_value = float((swift_sum / denominator).detach().cpu())
                     trainer_value = float(loss.detach().float().cpu())
-                    if not math.isclose(trainer_value, manual_value, rel_tol=2e-3, abs_tol=2e-3):
-                        raise RuntimeError(f"Qwen3 DDP CE mismatch: trainer={trainer_value} manual={manual_value}")
+                    if not math.isclose(trainer_value, swift_formula_value, rel_tol=2e-3, abs_tol=2e-3):
+                        raise RuntimeError(
+                            "Qwen3 DDP Swift loss mismatch: "
+                            f"trainer={trainer_value} reproduced={swift_formula_value} "
+                            f"manual_shifted_local_mean={manual_value} denominator={denominator}"
+                        )
+                    if not loss_scale_binary_equivalent:
+                        raise RuntimeError(
+                            "Qwen3 DDP loss_scale is not equivalent to the labels -100 mask"
+                        )
                     trace["audio_batch"] = audit_audio_batch(model, inputs)
                     audio_audit = getattr(causal, "_qwen3_bat_last_audio_forward_audit", None)
                     if not isinstance(audio_audit, dict) or not audio_audit.get("audio_prefix_replaced"):
@@ -421,8 +471,14 @@ def main() -> None:
                         "input_ids_shape": list(input_ids.shape), "labels_shape": list(labels.shape),
                         "attention_mask_shape": list(attention_mask.shape), "audio_waveforms_shape": list(waveform.shape),
                         "audio_prefix_label_ignore_count": int((labels[:, :EXPECTED_AUDIO_TOKENS] == -100).sum().item()),
-                        "valid_shifted_target_count": valid_count, "manual_shifted_loss_sum": float(manual_sum.detach().cpu()),
-                        "manual_shifted_ce": manual_value, "trainer_ce": trainer_value, "shift_verified": True,
+                        "valid_shifted_target_count": shifted_count,
+                        "manual_shifted_loss_sum": float(manual_sum.detach().cpu()),
+                        "manual_shifted_ce": manual_value,
+                        "swift_loss_denominator": denominator,
+                        "swift_reproduced_ce": swift_formula_value,
+                        "loss_scale_binary_equivalent": loss_scale_binary_equivalent,
+                        "trainer_ce": trainer_value,
+                        "shift_verified": True,
                     }
                     trace["loss"] = {"value": trainer_value, "logits_shape": list(logits.shape), "labels_shape": list(labels.shape)}
                 return result if return_outputs else loss
