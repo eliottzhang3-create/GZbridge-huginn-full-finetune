@@ -7,6 +7,7 @@ conda activate swift_ouro
 
 REPO_ROOT="/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune"
 cd "$REPO_ROOT"
+export PYTHONPATH="$REPO_ROOT/code/Ouro_audio:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1
 export TOKENIZERS_PARALLELISM=false
 export HF_HUB_OFFLINE=1
