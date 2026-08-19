@@ -132,7 +132,8 @@ def main() -> None:
     attention_mask = torch.ones_like(input_ids)
     # The input is deliberately fixed across all steps.  No renderer or
     # filesystem data is touched; this is a pure model/DDP isolation test.
-    waveforms = torch.randn(args.local_batch_size, 2, 320000, device=device, dtype=torch.float32, generator=torch.Generator(device=device).manual_seed(1234 + rank)) * 0.01
+    torch.cuda.manual_seed_all(1234 + rank)
+    waveforms = torch.randn(args.local_batch_size, 2, 320000, device=device, dtype=torch.float32) * 0.01
     optimizer = torch.optim.AdamW((parameter for parameter in ddp.parameters() if parameter.requires_grad), lr=1e-4, betas=(0.9, 0.95), weight_decay=0.05)
     times: list[float] = []
     losses: list[float] = []

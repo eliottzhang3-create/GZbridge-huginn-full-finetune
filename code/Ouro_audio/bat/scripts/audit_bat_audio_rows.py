@@ -36,7 +36,21 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def audio_record(record: dict[str, Any]) -> dict[str, Any]:
+    """Return the flat audio descriptor from either supported manifest shape."""
+    audios = record.get("audios")
+    if audios is not None:
+        if not isinstance(audios, list) or len(audios) != 1 or not isinstance(audios[0], dict):
+            raise ValueError(
+                "Expected exactly one dictionary in prepared-manifest audios: "
+                f"type={type(audios).__name__} value={audios!r}"
+            )
+        return audios[0]
+    return record
+
+
 def source_pairs(record: dict[str, Any]) -> list[tuple[str, str]]:
+    record = audio_record(record)
     pairs: list[tuple[str, str]] = []
     for suffix in ("", "2"):
         audio_id = record.get(f"audio_id{suffix}")
@@ -52,13 +66,14 @@ def source_pairs(record: dict[str, Any]) -> list[tuple[str, str]]:
 
 
 def record_summary(index: int, line_number: int, record: dict[str, Any]) -> dict[str, Any]:
+    audio = audio_record(record)
     return {
         "record_index": index,
         "line_number": line_number,
         "question_id": record.get("question_id"),
         "question_type": record.get("question_type"),
         "bat_type": record.get("bat_type"),
-        "source_shape": "dual" if record.get("audio_id2") not in (None, "", "null") else "single",
+        "source_shape": "dual" if audio.get("audio_id2") not in (None, "", "null") else "single",
     }
 
 

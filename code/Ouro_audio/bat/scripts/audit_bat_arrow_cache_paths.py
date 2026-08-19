@@ -62,6 +62,7 @@ def main() -> None:
     from datasets import load_dataset
 
     started = time.time()
+    process_start = process_stats()
     print("========== BAT ARROW/CACHE PATH AUDIT ==========" , flush=True)
     print(f"[manifest] {args.manifest.resolve()} limit={args.limit}", flush=True)
     print(f"[cache] HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE')} HF_HOME={os.environ.get('HF_HOME')}", flush=True)
@@ -103,7 +104,7 @@ def main() -> None:
             "first_row_index": first_row,
             "last_row_index": last_row,
         },
-        "process_start": process_stats(),
+        "process_start": process_start,
         "process_end": process_stats(),
         "filesystems": filesystem_stats((args.manifest, output, args.cache_dir or args.manifest.parent)),
         "elapsed_seconds": time.time() - started,
