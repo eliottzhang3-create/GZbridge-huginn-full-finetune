@@ -80,6 +80,7 @@ def main() -> None:
         "cache_free_bytes_after_load": free_bytes_after,
         "cache_minimum_free_bytes": minimum_free_bytes,
         "hf_datasets_cache": os.environ.get("HF_DATASETS_CACHE"),
+        "modelscope_cache": os.environ.get("MODELSCOPE_CACHE"),
         "elapsed_seconds": time.time() - started,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)

@@ -36,26 +36,33 @@ def dataset_cache_files(dataset: Any) -> list[Path]:
     return list(unique.values())
 
 
-def assert_local_arrow_cache(dataset: Any, cache_root: str) -> dict[str, Any]:
-    root = Path(cache_root).expanduser().resolve()
+def assert_local_arrow_cache(dataset: Any, cache_root: str | list[str] | tuple[str, ...]) -> dict[str, Any]:
+    roots_input = [cache_root] if isinstance(cache_root, str) else list(cache_root)
+    roots = [Path(item).expanduser().resolve() for item in roots_input]
     files = dataset_cache_files(dataset)
     if not files:
         raise RuntimeError("Training dataset exposes no Arrow cache_files; cannot prove local cache reuse")
     outside: list[str] = []
     for path in files:
-        try:
-            path.relative_to(root)
-        except ValueError:
+        if not any(_is_relative_to(path, root) for root in roots):
             outside.append(str(path))
     if outside:
         raise RuntimeError(
-            "Training dataset uses Arrow files outside BAT_LOCAL_ARROW_CACHE: "
-            f"root={root} outside={outside[:8]}"
+            "Training dataset uses Arrow files outside the allowed local cache roots: "
+            f"roots={[str(root) for root in roots]} outside={outside[:8]}"
         )
     return {
         "status": "ok",
-        "cache_root": str(root),
+        "cache_roots": [str(root) for root in roots],
         "cache_files": [str(path) for path in files],
         "cache_file_count": len(files),
         "cache_bytes": sum(path.stat().st_size for path in files if path.is_file()),
     }
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False

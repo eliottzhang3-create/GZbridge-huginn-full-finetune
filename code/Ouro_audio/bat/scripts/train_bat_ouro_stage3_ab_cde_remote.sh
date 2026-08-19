@@ -34,18 +34,24 @@ OUTPUT_DIR="${BAT_STAGE3_AB_CDE_OUTPUT_DIR:?Set BAT_STAGE3_AB_CDE_OUTPUT_DIR}"
 # eight DDP ranks.  /tmp is job-local; a fresh job therefore intentionally
 # rebuilds the cache.  The report lives beside (not inside) OUTPUT_DIR so the
 # fresh-run non-empty-output guard remains meaningful.
-LOCAL_ARROW_CACHE="${BAT_LOCAL_CACHE_ROOT:-/tmp/bat_ouro_arrow_cache_${USER:-user}_$$}/datasets"
+LOCAL_CACHE_ROOT="${BAT_LOCAL_CACHE_ROOT:-/tmp/bat_ouro_arrow_cache_${USER:-user}_$$}"
+LOCAL_ARROW_CACHE="$LOCAL_CACHE_ROOT/datasets"
+LOCAL_MODELSCOPE_CACHE="$LOCAL_CACHE_ROOT/modelscope"
 PREWARM_REPORT="${BAT_ARROW_PREWARM_REPORT:-${OUTPUT_DIR}.arrow_cache_prewarm.json}"
-case "$LOCAL_ARROW_CACHE" in
+case "$LOCAL_CACHE_ROOT" in
   /tmp/*) ;;
-  *) echo "Refusing non-local Arrow cache path: $LOCAL_ARROW_CACHE" >&2; exit 2 ;;
+  *) echo "Refusing non-local cache path: $LOCAL_CACHE_ROOT" >&2; exit 2 ;;
 esac
 export BAT_LOCAL_ARROW_CACHE="$LOCAL_ARROW_CACHE"
+export BAT_LOCAL_CACHE_ROOT="$LOCAL_CACHE_ROOT"
 export HF_DATASETS_CACHE="$LOCAL_ARROW_CACHE"
+export MODELSCOPE_CACHE="$LOCAL_MODELSCOPE_CACHE"
 export BAT_ARROW_PREWARM_REPORT="$PREWARM_REPORT"
 
 mkdir -p "$LOCAL_ARROW_CACHE"
+mkdir -p "$LOCAL_MODELSCOPE_CACHE"
 echo "[cache] prewarming local Arrow cache=$LOCAL_ARROW_CACHE"
+echo "[cache] local ModelScope cache=$MODELSCOPE_CACHE"
 python -u code/Ouro_audio/bat/scripts/prewarm_bat_arrow_cache.py \
   --manifest "$DATASET" \
   --cache-dir "$LOCAL_ARROW_CACHE" \
@@ -78,6 +84,7 @@ echo "dataloader_num_workers=0 pin_memory=false"
 echo "max_sequence_length=176"
 echo "torch_compile=false eager_transformer=true"
 echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
+echo "MODELSCOPE_CACHE=$MODELSCOPE_CACHE"
 echo "runtime_monitor_interval_steps=$BAT_RUNTIME_MONITOR_INTERVAL_STEPS"
 echo "arrow_prewarm_report=$PREWARM_REPORT"
 echo "python_faulthandler=$PYTHONFAULTHANDLER"

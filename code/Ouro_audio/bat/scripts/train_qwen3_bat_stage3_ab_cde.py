@@ -270,9 +270,10 @@ def main() -> None:
     class Qwen3Stage3SwiftSft(SwiftSft):
         def train(self, trainer):
             cache_root = os.environ.get("BAT_LOCAL_ARROW_CACHE")
-            if not cache_root:
-                raise RuntimeError("BAT_LOCAL_ARROW_CACHE is required for formal Qwen3 Stage-III training")
-            cache_audit = assert_local_arrow_cache(trainer.train_dataset, cache_root)
+            modelscope_cache = os.environ.get("MODELSCOPE_CACHE")
+            if not cache_root or not modelscope_cache:
+                raise RuntimeError("BAT_LOCAL_ARROW_CACHE and MODELSCOPE_CACHE are required for formal Qwen3 Stage-III training")
+            cache_audit = assert_local_arrow_cache(trainer.train_dataset, [cache_root, modelscope_cache])
             print(f"[cache-provenance] {json.dumps(cache_audit, ensure_ascii=False)}", flush=True)
             monitor_interval = int(os.environ.get("BAT_RUNTIME_MONITOR_INTERVAL_STEPS", "500"))
             trainer.add_callback(
