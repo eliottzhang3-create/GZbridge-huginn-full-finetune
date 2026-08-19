@@ -6,6 +6,7 @@ import json
 import os
 import resource
 import subprocess
+import time
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -18,11 +19,24 @@ def require_private_absolute(path: Path) -> Path:
     return path
 
 
-def write_json(path: Path, payload: dict[str, Any]) -> None:
+def write_json(path: Path, payload: dict[str, Any], *, atomic: bool = True) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    temporary.replace(path)
+    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if not atomic:
+        path.write_text(text, encoding="utf-8")
+        return
+    temporary = path.with_name(
+        f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    )
+    temporary.write_text(text, encoding="utf-8")
+    for attempt in range(5):
+        try:
+            temporary.replace(path)
+            return
+        except FileNotFoundError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
 
 
 def read_jsonl(path: Path) -> Iterable[tuple[int, dict[str, Any]]]:

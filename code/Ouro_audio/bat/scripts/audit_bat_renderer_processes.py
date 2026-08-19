@@ -59,7 +59,7 @@ def run_rank(args: argparse.Namespace, rank: int, world_size: int) -> None:
         "process_start": process_stats(),
     }
     write_json(output, report)
-    write_json(progress, {"status": "started", "rank": rank, "world_size": world_size, "phase": "before_first_record", "process": process_stats()})
+    write_json(progress, {"status": "started", "rank": rank, "world_size": world_size, "phase": "before_first_record", "process": process_stats()}, atomic=False)
     try:
         for global_index, (line_number, record) in enumerate(read_jsonl(args.manifest)):
             if global_index >= args.global_record_limit:
@@ -70,25 +70,25 @@ def run_rank(args: argparse.Namespace, rank: int, world_size: int) -> None:
             summary = record_summary(global_index, line_number, record)
             pairs = source_pairs(record)
             rendered_sources: list[torch.Tensor] = []
-            write_json(progress, {"status": "running", "phase": "record_start", **summary, "source_count": len(pairs), "process": process_stats()})
+            write_json(progress, {"status": "running", "phase": "record_start", **summary, "source_count": len(pairs), "process": process_stats()}, atomic=False)
             for source_slot, (audio_id, reverb_id) in enumerate(pairs):
                 audio_path = renderer._resolve_audio(renderer.audio_root, audio_id)
                 reverb_path = renderer._resolve_reverb(renderer.reverb_root, reverb_id)
-                write_json(progress, {"status": "running", "phase": "source_start", **summary, "source_slot": source_slot, "audio_id": audio_id, "reverb_id": reverb_id, "audio_path": str(audio_path), "reverb_path": str(reverb_path), "process": process_stats()})
+                write_json(progress, {"status": "running", "phase": "source_start", **summary, "source_slot": source_slot, "audio_id": audio_id, "reverb_id": reverb_id, "audio_path": str(audio_path), "reverb_path": str(reverb_path), "process": process_stats()}, atomic=False)
                 waveform = renderer._render_one(audio_id, reverb_id)
                 tensor = waveform if torch.is_tensor(waveform) else torch.as_tensor(waveform)
                 if tuple(tensor.shape) != (2, 320000) or not bool(torch.isfinite(tensor.float()).all().item()):
                     raise RuntimeError(f"Invalid source render rank={rank} global_index={global_index} slot={source_slot}")
                 rendered_sources.append(tensor.float())
                 report["sources_rendered"] += 1
-                write_json(progress, {"status": "running", "phase": "source_done", **summary, "source_slot": source_slot, "waveform_shape": list(tensor.shape), "process": process_stats()})
+                write_json(progress, {"status": "running", "phase": "source_done", **summary, "source_slot": source_slot, "waveform_shape": list(tensor.shape), "process": process_stats()}, atomic=False)
             mixed = rendered_sources[0]
             if len(rendered_sources) == 2:
                 mixed = (mixed + rendered_sources[1]) / 2.0
             if tuple(mixed.shape) != (2, 320000) or not bool(torch.isfinite(mixed.float()).all().item()):
                 raise RuntimeError(f"Invalid final render rank={rank} global_index={global_index}")
             report["records_rendered"] += 1
-            write_json(progress, {"status": "running", "phase": "record_done", **summary, "waveform_shape": list(mixed.shape), "process": process_stats()})
+            write_json(progress, {"status": "running", "phase": "record_done", **summary, "waveform_shape": list(mixed.shape), "process": process_stats()}, atomic=False)
             if report["records_rendered"] == 1 or report["records_rendered"] % 50 == 0:
                 print(f"[rank{rank}] records={report['records_rendered']} sources={report['sources_rendered']}", flush=True)
     except BaseException as exc:
@@ -97,13 +97,13 @@ def run_rank(args: argparse.Namespace, rank: int, world_size: int) -> None:
         report["process_end"] = process_stats()
         report["elapsed_seconds"] = time.time() - started
         write_json(output, report)
-        write_json(progress, {"status": "failed_python", "rank": rank, "error": report["failure"], "process": process_stats()})
+        write_json(progress, {"status": "failed_python", "rank": rank, "error": report["failure"], "process": process_stats()}, atomic=False)
         raise
     report["status"] = "ok"
     report["process_end"] = process_stats()
     report["elapsed_seconds"] = time.time() - started
     write_json(output, report)
-    write_json(progress, {"status": "ok", "rank": rank, "records_rendered": report["records_rendered"], "sources_rendered": report["sources_rendered"], "process": process_stats()})
+    write_json(progress, {"status": "ok", "rank": rank, "records_rendered": report["records_rendered"], "sources_rendered": report["sources_rendered"], "process": process_stats()}, atomic=False)
 
 
 def combine(args: argparse.Namespace) -> None:
