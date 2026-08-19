@@ -11,9 +11,10 @@ export PYTHONUNBUFFERED=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
-export BAT_AUDIO_AUDIT="${BAT_AUDIO_AUDIT:-0}"
-export BAT_MAX_SEQUENCE_LENGTH="${BAT_MAX_SEQUENCE_LENGTH:-176}"
+export BAT_AUDIO_AUDIT=0
+export BAT_MAX_SEQUENCE_LENGTH=176
 export BAT_RUNTIME_MONITOR_INTERVAL_STEPS="${BAT_RUNTIME_MONITOR_INTERVAL_STEPS:-500}"
+export PYTHONFAULTHANDLER=1
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -35,6 +36,10 @@ OUTPUT_DIR="${BAT_STAGE3_AB_CDE_OUTPUT_DIR:?Set BAT_STAGE3_AB_CDE_OUTPUT_DIR}"
 # fresh-run non-empty-output guard remains meaningful.
 LOCAL_ARROW_CACHE="${BAT_LOCAL_CACHE_ROOT:-/tmp/bat_ouro_arrow_cache_${USER:-user}_$$}/datasets"
 PREWARM_REPORT="${BAT_ARROW_PREWARM_REPORT:-${OUTPUT_DIR}.arrow_cache_prewarm.json}"
+case "$LOCAL_ARROW_CACHE" in
+  /tmp/*) ;;
+  *) echo "Refusing non-local Arrow cache path: $LOCAL_ARROW_CACHE" >&2; exit 2 ;;
+esac
 export BAT_LOCAL_ARROW_CACHE="$LOCAL_ARROW_CACHE"
 export HF_DATASETS_CACHE="$LOCAL_ARROW_CACHE"
 export BAT_ARROW_PREWARM_REPORT="$PREWARM_REPORT"
@@ -45,6 +50,12 @@ python -u code/Ouro_audio/bat/scripts/prewarm_bat_arrow_cache.py \
   --manifest "$DATASET" \
   --cache-dir "$LOCAL_ARROW_CACHE" \
   --report "$PREWARM_REPORT"
+
+VISIBLE_GPU_COUNT="$(python -c 'import torch; print(torch.cuda.device_count())')"
+if [[ "$VISIBLE_GPU_COUNT" != "8" ]]; then
+  echo "Expected 8 visible GPUs, got $VISIBLE_GPU_COUNT" >&2
+  exit 2
+fi
 
 ARGS=(
   --model-path "$MODEL_PATH"
@@ -69,6 +80,7 @@ echo "torch_compile=false eager_transformer=true"
 echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
 echo "runtime_monitor_interval_steps=$BAT_RUNTIME_MONITOR_INTERVAL_STEPS"
 echo "arrow_prewarm_report=$PREWARM_REPORT"
+echo "python_faulthandler=$PYTHONFAULTHANDLER"
 
 torchrun --standalone --nproc_per_node=8 \
   code/Ouro_audio/bat/scripts/train_bat_ouro_stage3_ab_cde.py "${ARGS[@]}"

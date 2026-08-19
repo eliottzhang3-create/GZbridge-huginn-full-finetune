@@ -21,6 +21,7 @@ export TOKENIZERS_PARALLELISM=false
 export BAT_MAX_SEQUENCE_LENGTH=176
 export BAT_AUDIO_AUDIT=0
 export BAT_RUNTIME_MONITOR_INTERVAL_STEPS="${BAT_RUNTIME_MONITOR_INTERVAL_STEPS:-500}"
+export PYTHONFAULTHANDLER=1
 
 WORLD_SIZE=8
 MODEL_PATH="${QWEN3_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Qwen3-4B-Base}"
@@ -33,6 +34,10 @@ OUTPUT_DIR="${QWEN3_BAT_STAGE3_AB_CDE_OUTPUT_DIR:?Set QWEN3_BAT_STAGE3_AB_CDE_OU
 # single node then read the completed files; they do not race to create them.
 LOCAL_ARROW_CACHE="${BAT_LOCAL_CACHE_ROOT:-/tmp/bat_qwen3_arrow_cache_${USER:-user}_$$}/datasets"
 PREWARM_REPORT="${BAT_ARROW_PREWARM_REPORT:-${OUTPUT_DIR}.arrow_cache_prewarm.json}"
+case "$LOCAL_ARROW_CACHE" in
+  /tmp/*) ;;
+  *) echo "Refusing non-local Arrow cache path: $LOCAL_ARROW_CACHE" >&2; exit 2 ;;
+esac
 export BAT_LOCAL_ARROW_CACHE="$LOCAL_ARROW_CACHE"
 export HF_DATASETS_CACHE="$LOCAL_ARROW_CACHE"
 export BAT_ARROW_PREWARM_REPORT="$PREWARM_REPORT"
@@ -43,6 +48,12 @@ python -u code/Ouro_audio/bat/scripts/prewarm_bat_arrow_cache.py \
   --manifest "$DATASET" \
   --cache-dir "$LOCAL_ARROW_CACHE" \
   --report "$PREWARM_REPORT"
+
+VISIBLE_GPU_COUNT="$(python -c 'import torch; print(torch.cuda.device_count())')"
+if [[ "$VISIBLE_GPU_COUNT" != "8" ]]; then
+  echo "Expected 8 visible GPUs, got $VISIBLE_GPU_COUNT" >&2
+  exit 2
+fi
 
 ARGS=(
   --model-path "$MODEL_PATH"
@@ -70,6 +81,7 @@ echo "torch_compile=false eager_transformer=true"
 echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
 echo "runtime_monitor_interval_steps=$BAT_RUNTIME_MONITOR_INTERVAL_STEPS"
 echo "arrow_prewarm_report=$PREWARM_REPORT"
+echo "python_faulthandler=$PYTHONFAULTHANDLER"
 
 torchrun --standalone --nproc_per_node=8 \
   code/Ouro_audio/bat/scripts/train_qwen3_bat_stage3_ab_cde.py "${ARGS[@]}"

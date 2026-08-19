@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 import time
 from pathlib import Path
 from typing import Any
@@ -41,7 +42,8 @@ def _fd_count() -> int | None:
 
 def _mapped_region_count() -> int | None:
     try:
-        return sum(1 for _ in Path("/proc/self/maps").open("r", encoding="utf-8"))
+        with Path("/proc/self/maps").open("r", encoding="utf-8") as handle:
+            return sum(1 for _ in handle)
     except Exception:
         return None
 
@@ -110,15 +112,30 @@ class BATRuntimeMonitorCallback(TrainerCallback):
         self.interval_steps = max(1, int(interval_steps))
         self.cache_root = cache_root
         self.path = self.output_dir / f"runtime_monitor_rank{os.environ.get('RANK', '0')}.jsonl"
+        self._disabled = False
 
     def _record(self, step: int, event: str) -> None:
+        if self._disabled:
+            return
         payload = collect_runtime_stats(step=step, cache_root=self.cache_root)
         payload["event"] = event
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
-            handle.flush()
-            os.fsync(handle.fileno())
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+        except Exception as exc:
+            # Telemetry must never become a new training failure mode.  Disable
+            # this rank's monitor after the first write error and leave the
+            # warning in the job log for diagnosis.
+            self._disabled = True
+            print(
+                f"[runtime-monitor] warning: disabled after write failure at step={step}: "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def on_train_begin(self, args, state, control, **kwargs):
         self._record(int(getattr(state, "global_step", 0)), "train_begin")

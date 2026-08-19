@@ -34,11 +34,11 @@ def main() -> None:
         raise ValueError(f"Refusing public report path: {report_path}")
 
     cache_dir.mkdir(parents=True, exist_ok=True)
-    minimum_free_bytes = int(os.environ.get("BAT_ARROW_CACHE_MIN_FREE_BYTES", 2 * 1024**3))
-    free_bytes = shutil.disk_usage(cache_dir).free
-    if free_bytes < minimum_free_bytes:
+    minimum_free_bytes = int(os.environ.get("BAT_ARROW_CACHE_MIN_FREE_BYTES", 4 * 1024**3))
+    free_bytes_before = shutil.disk_usage(cache_dir).free
+    if free_bytes_before < minimum_free_bytes:
         raise RuntimeError(
-            f"Insufficient local cache space: free={free_bytes} bytes, "
+            f"Insufficient local cache space before load: free={free_bytes_before} bytes, "
             f"required_at_least={minimum_free_bytes} bytes, path={cache_dir}"
         )
     os.environ["HF_DATASETS_CACHE"] = str(cache_dir)
@@ -61,6 +61,12 @@ def main() -> None:
         cache_files.append({"filename": str(path), "exists": path.is_file(), "size_bytes": path.stat().st_size if path.is_file() else None})
     if not cache_files or not all(item["exists"] for item in cache_files):
         raise RuntimeError(f"Local Arrow cache was not materialized correctly: {cache_files}")
+    free_bytes_after = shutil.disk_usage(cache_dir).free
+    if free_bytes_after < minimum_free_bytes:
+        raise RuntimeError(
+            f"Insufficient local cache space after load: free={free_bytes_after} bytes, "
+            f"required_at_least={minimum_free_bytes} bytes, path={cache_dir}"
+        )
 
     payload = {
         "status": "ok",
@@ -70,7 +76,8 @@ def main() -> None:
         "dataset_features": {key: str(value) for key, value in dataset.features.items()},
         "cache_files": cache_files,
         "cache_bytes": sum(int(item["size_bytes"] or 0) for item in cache_files),
-        "cache_free_bytes_before_load": free_bytes,
+        "cache_free_bytes_before_load": free_bytes_before,
+        "cache_free_bytes_after_load": free_bytes_after,
         "cache_minimum_free_bytes": minimum_free_bytes,
         "hf_datasets_cache": os.environ.get("HF_DATASETS_CACHE"),
         "elapsed_seconds": time.time() - started,

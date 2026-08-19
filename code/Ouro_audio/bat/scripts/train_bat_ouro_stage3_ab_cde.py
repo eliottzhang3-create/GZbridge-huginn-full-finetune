@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 from bat.configs.training import BAT_TRAINING
+from bat.cache_contract import assert_local_arrow_cache
 from bat.curriculum import count_jsonl
 from bat.runtime_monitor import BATRuntimeMonitorCallback
 
@@ -223,6 +224,11 @@ def main() -> None:
 
     class Stage3AbCdeSwiftSft(SwiftSft):
         def train(self, trainer):
+            cache_root = os.environ.get("BAT_LOCAL_ARROW_CACHE")
+            if not cache_root:
+                raise RuntimeError("BAT_LOCAL_ARROW_CACHE is required for formal Ouro Stage-III training")
+            cache_audit = assert_local_arrow_cache(trainer.train_dataset, cache_root)
+            print(f"[cache-provenance] {json.dumps(cache_audit, ensure_ascii=False)}", flush=True)
             monitor_interval = int(os.environ.get("BAT_RUNTIME_MONITOR_INTERVAL_STEPS", "500"))
             trainer.add_callback(
                 BATRuntimeMonitorCallback(
@@ -283,8 +289,18 @@ def main() -> None:
             return result
 
     actual_schedule = report["actual_training_schedule"]
-    total_steps = int(actual_schedule["total_steps"])
+    planned_total_steps = int(actual_schedule["total_steps"])
+    total_steps = planned_total_steps
     warmup_steps = int(actual_schedule["warmup_steps"])
+    override_text = os.environ.get("BAT_MAX_STEPS_OVERRIDE", "")
+    if override_text:
+        override_steps = int(override_text)
+        if override_steps < 1 or override_steps > planned_total_steps:
+            raise ValueError(
+                f"BAT_MAX_STEPS_OVERRIDE must be in [1, {planned_total_steps}], got {override_steps}"
+            )
+        total_steps = override_steps
+        warmup_steps = max(1, int(math.ceil(total_steps * WARMUP_RATIO)))
     argv: list[str] = [
         "--model", str(args.model_path), "--model_type", MODEL_TYPE, "--template", TEMPLATE_TYPE,
         "--external_plugins", str(args.plugin_path), "--dataset", str(args.dataset),
@@ -315,7 +331,12 @@ def main() -> None:
 
     print("========== BAT OURO STAGE-III A+B -> C+D+E TRAINING ==========")
     print(f"[ddp] world_size={actual_world_size} per_device_batch_size={PER_DEVICE_BATCH_SIZE} global_batch_size={global_batch_size}")
-    print(f"[route] manifest={args.dataset} records={dataset_records} total_steps={total_steps}")
+    print(
+        f"[route] manifest={args.dataset} records={dataset_records} "
+        f"planned_steps={planned_total_steps} effective_steps={total_steps}"
+    )
+    if override_text:
+        print(f"[smoke] BAT_MAX_STEPS_OVERRIDE={total_steps}; this is not a production run")
     print(f"[schedule] learning_rate={LEARNING_RATE} warmup_steps={warmup_steps} scheduler=half-cycle cosine decay")
     print(
         f"[checkpoint] native_save_strategy=steps save_steps={PERIODIC_SAVE_STEPS} "
