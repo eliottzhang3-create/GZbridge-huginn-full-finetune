@@ -13,6 +13,7 @@ export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
 export BAT_AUDIO_AUDIT="${BAT_AUDIO_AUDIT:-0}"
 export BAT_MAX_SEQUENCE_LENGTH="${BAT_MAX_SEQUENCE_LENGTH:-176}"
+export BAT_RUNTIME_MONITOR_INTERVAL_STEPS="${BAT_RUNTIME_MONITOR_INTERVAL_STEPS:-500}"
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
@@ -27,6 +28,23 @@ PLUGIN_PATH="${OURO_BAT_PLUGIN_PATH:-$REPO_ROOT/code/Ouro_audio/plugins/ouro_bat
 DATASET="${BAT_STAGE3_AB_CDE_MANIFEST:?Set BAT_STAGE3_AB_CDE_MANIFEST}"
 REPORT="${BAT_STAGE3_AB_CDE_REPORT:?Set BAT_STAGE3_AB_CDE_REPORT}"
 OUTPUT_DIR="${BAT_STAGE3_AB_CDE_OUTPUT_DIR:?Set BAT_STAGE3_AB_CDE_OUTPUT_DIR}"
+
+# Arrow metadata is built once by this single process and then reused by all
+# eight DDP ranks.  /tmp is job-local; a fresh job therefore intentionally
+# rebuilds the cache.  The report lives beside (not inside) OUTPUT_DIR so the
+# fresh-run non-empty-output guard remains meaningful.
+LOCAL_ARROW_CACHE="${BAT_LOCAL_CACHE_ROOT:-/tmp/bat_ouro_arrow_cache_${USER:-user}_$$}/datasets"
+PREWARM_REPORT="${BAT_ARROW_PREWARM_REPORT:-${OUTPUT_DIR}.arrow_cache_prewarm.json}"
+export BAT_LOCAL_ARROW_CACHE="$LOCAL_ARROW_CACHE"
+export HF_DATASETS_CACHE="$LOCAL_ARROW_CACHE"
+export BAT_ARROW_PREWARM_REPORT="$PREWARM_REPORT"
+
+mkdir -p "$LOCAL_ARROW_CACHE"
+echo "[cache] prewarming local Arrow cache=$LOCAL_ARROW_CACHE"
+python -u code/Ouro_audio/bat/scripts/prewarm_bat_arrow_cache.py \
+  --manifest "$DATASET" \
+  --cache-dir "$LOCAL_ARROW_CACHE" \
+  --report "$PREWARM_REPORT"
 
 ARGS=(
   --model-path "$MODEL_PATH"
@@ -48,6 +66,9 @@ echo "output_dir=$OUTPUT_DIR"
 echo "dataloader_num_workers=0 pin_memory=false"
 echo "max_sequence_length=176"
 echo "torch_compile=false eager_transformer=true"
+echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
+echo "runtime_monitor_interval_steps=$BAT_RUNTIME_MONITOR_INTERVAL_STEPS"
+echo "arrow_prewarm_report=$PREWARM_REPORT"
 
 torchrun --standalone --nproc_per_node=8 \
   code/Ouro_audio/bat/scripts/train_bat_ouro_stage3_ab_cde.py "${ARGS[@]}"

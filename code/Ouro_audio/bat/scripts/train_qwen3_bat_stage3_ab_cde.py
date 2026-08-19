@@ -19,6 +19,7 @@ from typing import Any
 
 from bat.configs.training import BAT_TRAINING
 from bat.curriculum import count_jsonl
+from bat.runtime_monitor import BATRuntimeMonitorCallback
 
 
 MODEL_TYPE = "qwen3_bat_spatial_ast"
@@ -263,6 +264,19 @@ def main() -> None:
 
     class Qwen3Stage3SwiftSft(SwiftSft):
         def train(self, trainer):
+            monitor_interval = int(os.environ.get("BAT_RUNTIME_MONITOR_INTERVAL_STEPS", "500"))
+            trainer.add_callback(
+                BATRuntimeMonitorCallback(
+                    Path(trainer.args.output_dir),
+                    interval_steps=monitor_interval,
+                    cache_root=os.environ.get("BAT_LOCAL_ARROW_CACHE"),
+                )
+            )
+            print(
+                f"[runtime-monitor] interval_steps={monitor_interval} "
+                f"path={Path(trainer.args.output_dir) / f'runtime_monitor_rank{rank()}.jsonl'}",
+                flush=True,
+            )
             model = trainer.model
             causal = find_module(model, "Qwen3ForCausalLM")
             qformer = find_trainable_module(model, "BATQFormer")
@@ -372,6 +386,11 @@ def main() -> None:
         f"save_total_limit={MAX_PERIODIC_CHECKPOINTS} full_resumable=true"
     )
     print(f"[data] dataloader_num_workers=0 pin_memory=false")
+    print(
+        f"[cache] HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE')} "
+        f"local_arrow_cache={os.environ.get('BAT_LOCAL_ARROW_CACHE')} "
+        f"prewarm_report={os.environ.get('BAT_ARROW_PREWARM_REPORT')}"
+    )
     if rank() == 0:
         print(f"[argv] {' '.join(argv)}")
     Qwen3Stage3SwiftSft(argv).main()

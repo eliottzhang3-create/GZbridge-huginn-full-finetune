@@ -18,6 +18,7 @@ from typing import Any
 
 from bat.configs.training import BAT_TRAINING
 from bat.curriculum import count_jsonl
+from bat.runtime_monitor import BATRuntimeMonitorCallback
 
 
 MODEL_TYPE = "ouro_bat_spatial_ast"
@@ -222,6 +223,19 @@ def main() -> None:
 
     class Stage3AbCdeSwiftSft(SwiftSft):
         def train(self, trainer):
+            monitor_interval = int(os.environ.get("BAT_RUNTIME_MONITOR_INTERVAL_STEPS", "500"))
+            trainer.add_callback(
+                BATRuntimeMonitorCallback(
+                    Path(trainer.args.output_dir),
+                    interval_steps=monitor_interval,
+                    cache_root=os.environ.get("BAT_LOCAL_ARROW_CACHE"),
+                )
+            )
+            print(
+                f"[runtime-monitor] interval_steps={monitor_interval} "
+                f"path={Path(trainer.args.output_dir) / f'runtime_monitor_rank{rank()}.jsonl'}",
+                flush=True,
+            )
             result = super().train(trainer)
             final_checkpoint = ensure_final_checkpoint(trainer)
             ddp_barrier()
@@ -308,6 +322,11 @@ def main() -> None:
         f"save_total_limit={MAX_PERIODIC_CHECKPOINTS} full_resumable=true"
     )
     print(f"[data] dataloader_num_workers=0 pin_memory=false")
+    print(
+        f"[cache] HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE')} "
+        f"local_arrow_cache={os.environ.get('BAT_LOCAL_ARROW_CACHE')} "
+        f"prewarm_report={os.environ.get('BAT_ARROW_PREWARM_REPORT')}"
+    )
     print("[compile] disabled; eager Ouro Transformer execution")
     if rank() == 0:
         print(f"[argv] {' '.join(argv)}")

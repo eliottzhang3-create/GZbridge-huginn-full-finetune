@@ -8,6 +8,15 @@ REPORT="${BAT_STAGE3_AB_CDE_REPORT:?Set BAT_STAGE3_AB_CDE_REPORT}"
 OUTPUT_DIR="${BAT_STAGE3_AB_CDE_OUTPUT_DIR:?Set BAT_STAGE3_AB_CDE_OUTPUT_DIR}"
 RESUME_CHECKPOINT="${BAT_STAGE3_AB_CDE_RESUME_FROM_CHECKPOINT:-}"
 
+CMD_PREFIX="BAT_STAGE3_AB_CDE_MANIFEST=$(printf '%q' "$MANIFEST") BAT_STAGE3_AB_CDE_REPORT=$(printf '%q' "$REPORT") BAT_STAGE3_AB_CDE_OUTPUT_DIR=$(printf '%q' "$OUTPUT_DIR") BAT_STAGE3_AB_CDE_RESUME_FROM_CHECKPOINT=$(printf '%q' "$RESUME_CHECKPOINT") "
+for name in OURO_MODEL_PATH OURO_BAT_PLUGIN_PATH BAT_LOCAL_CACHE_ROOT BAT_RUNTIME_MONITOR_INTERVAL_STEPS BAT_ARROW_PREWARM_REPORT MASTER_PORT; do
+  value="${!name:-}"
+  if [ -n "$value" ]; then
+    printf -v quoted_value '%q' "$value"
+    CMD_PREFIX="${CMD_PREFIX}${name}=${quoted_value} "
+  fi
+done
+
 if [[ "${BAT_GPU_COUNT:-8}" != "8" ]]; then
   echo "Stage-III A+B -> C+D+E route requires 8 GPUs" >&2
   exit 2
@@ -20,4 +29,4 @@ vc submit \
   -j "bat-ouro-stage3-ab-cde-$(date +%m%d%H%M)" \
   -d "$SCRIPT_DIR" \
   JOB=1:1 "$SCRIPT_DIR/log/bat_ouro_stage3_ab_cde_5090.JOB.log" \
-  --cmd "BAT_STAGE3_AB_CDE_MANIFEST=$(printf '%q' "$MANIFEST") BAT_STAGE3_AB_CDE_REPORT=$(printf '%q' "$REPORT") BAT_STAGE3_AB_CDE_OUTPUT_DIR=$(printf '%q' "$OUTPUT_DIR") BAT_STAGE3_AB_CDE_RESUME_FROM_CHECKPOINT=$(printf '%q' "$RESUME_CHECKPOINT") BAT_LAUNCH_MODE=ddp bash scripts/train_bat_ouro_stage3_ab_cde_remote.sh"
+  --cmd "${CMD_PREFIX}BAT_LAUNCH_MODE=ddp bash scripts/train_bat_ouro_stage3_ab_cde_remote.sh"
