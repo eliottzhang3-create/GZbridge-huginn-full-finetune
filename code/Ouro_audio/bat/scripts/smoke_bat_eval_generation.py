@@ -76,6 +76,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-beams", type=int, default=4)
     parser.add_argument("--rir-policy", choices=("official_bat", "checkpoint_matched"), default="official_bat")
     parser.add_argument("--include-nonbinary", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--binary-answer-prompt",
+        choices=("auto", "on", "off"),
+        default="auto",
+        help=(
+            "Append a yes/no-only instruction to binary evaluation questions. "
+            "auto enables it for Qwen3 and disables it for Ouro."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -198,14 +207,36 @@ def parameter_contract(model: torch.nn.Module, model_kind: str) -> dict[str, Any
     }
 
 
-def build_encoded_prompt(template: Any, record: dict[str, Any]) -> tuple[list[int], dict[str, Any]]:
+def binary_answer_prompt_applies(record: dict[str, Any], model_kind: str, mode: str) -> bool:
+    if mode == "off":
+        return False
+    if mode == "auto" and model_kind != "qwen3":
+        return False
+    question_type = str(record.get("question_type", "")).upper()
+    normalized_answer = " ".join(str(record.get("answer", "")).strip().lower().split())
+    return question_type in {"MIXUP_DIRECTION", "MIXUP_DISTANCE_BOTH"} or normalized_answer in {"yes", "no"}
+
+
+def build_encoded_prompt(
+    template: Any,
+    record: dict[str, Any],
+    model_kind: str,
+    binary_answer_prompt_mode: str,
+) -> tuple[list[int], dict[str, Any]]:
     # The dummy waveform prevents the template from touching AudioSet/RIR.  The
     # real waveform is injected immediately before generation by the explicit
     # evaluation renderer.
     dummy_record = dict(record)
     dummy_record["waveform"] = torch.zeros((2, 320_000), dtype=torch.float32)
+    original_instruction = str(record["question"])
+    apply_binary_prompt = binary_answer_prompt_applies(record, model_kind, binary_answer_prompt_mode)
+    effective_instruction = original_instruction
+    if apply_binary_prompt:
+        effective_instruction = (
+            f'{original_instruction}\n\nPlease answer only "yes" or "no".'
+        )
     encoded = template.encode({
-        "messages": [{"role": "user", "content": BAT_PROMPT.format(instruction=str(record["question"]))}],
+        "messages": [{"role": "user", "content": BAT_PROMPT.format(instruction=effective_instruction)}],
         "audios": [dummy_record],
     })
     input_ids = as_ids(encoded.get("input_ids"))
@@ -217,6 +248,11 @@ def build_encoded_prompt(template: Any, record: dict[str, Any]) -> tuple[list[in
         "template_input_length": len(input_ids),
         "audio_prefix_tokens": 64,
         "dummy_waveform_used_for_template": True,
+        "model_kind": model_kind,
+        "binary_answer_prompt_mode": binary_answer_prompt_mode,
+        "binary_answer_prompt_applied": apply_binary_prompt,
+        "original_instruction": original_instruction,
+        "effective_instruction": effective_instruction,
     }
 
 
@@ -344,6 +380,7 @@ def main() -> None:
     renderer = BATEvalAudioRenderer(args.audio_root, args.reverb_root, args.rir_policy)
     output_rows: list[dict[str, Any]] = []
     issues: list[str] = []
+    binary_prompt_count = 0
     specs = selected_specs(args.include_nonbinary)
     for spec in specs:
         split_path = args.qa_root / spec["relative_path"]
@@ -351,7 +388,13 @@ def main() -> None:
         for index, record in enumerate(records[: args.max_records_per_split]):
             eval_id = stable_eval_id(spec["relative_path"], index, record)
             try:
-                input_ids, template_audit = build_encoded_prompt(template, record)
+                input_ids, template_audit = build_encoded_prompt(
+                    template,
+                    record,
+                    args.model_kind,
+                    args.binary_answer_prompt,
+                )
+                binary_prompt_count += int(template_audit["binary_answer_prompt_applied"])
                 waveform = renderer.render_record(record).unsqueeze(0).to(device=device, dtype=torch.float32)
                 attention_mask = torch.ones((1, len(input_ids)), dtype=torch.long, device=device)
                 input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
@@ -405,6 +448,8 @@ def main() -> None:
                     "audio_id2": record.get("audio_id2"),
                     "reverb_id2": record.get("reverb_id2"),
                     "question": record.get("question"),
+                    "effective_instruction": template_audit["effective_instruction"],
+                    "binary_answer_prompt_applied": template_audit["binary_answer_prompt_applied"],
                     "ground_truth_answer": record.get("answer"),
                     "record_digest": record_digest(record),
                     "template_audit": template_audit,
@@ -459,6 +504,9 @@ def main() -> None:
             "repetition_penalty": 1.0,
             "length_penalty": 1.0,
             "repeat": args.repeat,
+            "binary_answer_prompt_mode": args.binary_answer_prompt,
+            "binary_answer_prompt_count": binary_prompt_count,
+            "binary_answer_prompt_text": 'Please answer only "yes" or "no".',
         },
         "sample_count": len(output_rows),
         "successful_sample_count": sum(row.get("status", "ok") != "error" for row in output_rows),

@@ -35,6 +35,7 @@ MAX_NEW="${BAT_EVAL_MAX_NEW_TOKENS:-200}"
 BEAMS="${BAT_EVAL_NUM_BEAMS:-4}"
 RIR_POLICY="${BAT_EVAL_RIR_POLICY:-official_bat}"
 INCLUDE_NONBINARY="${BAT_EVAL_INCLUDE_NONBINARY:-0}"
+BINARY_ANSWER_PROMPT="${BAT_EVAL_BINARY_ANSWER_PROMPT:-auto}"
 
 ARGS=(
   --model-kind "$MODEL_KIND"
@@ -54,10 +55,11 @@ ARGS=(
   --max-new-tokens "$MAX_NEW"
   --num-beams "$BEAMS"
   --rir-policy "$RIR_POLICY"
+  --binary-answer-prompt "$BINARY_ANSWER_PROMPT"
 )
 if [ "$INCLUDE_NONBINARY" = "1" ]; then ARGS+=(--include-nonbinary); fi
 
 echo "========== BAT PHASE 2 EVALUATION GENERATION SMOKE LAUNCH =========="
 echo "[model] $MODEL_KIND checkpoint=$CHECKPOINT"
-echo "[scope] records_per_split=$MAX_RECORDS repeat=$REPEAT rir_policy=$RIR_POLICY"
+echo "[scope] records_per_split=$MAX_RECORDS repeat=$REPEAT rir_policy=$RIR_POLICY binary_answer_prompt=$BINARY_ANSWER_PROMPT"
 python -u code/Ouro_audio/bat/scripts/smoke_bat_eval_generation.py "${ARGS[@]}"
