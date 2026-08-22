@@ -49,6 +49,9 @@ class OuroUniversalTransformerCache(Cache):
     """Transformers-4.54-compatible implementation of Ouro's cache contract."""
 
     _ouro_cache_compat = True
+    # This is the official Ouro layout: current_ut * num_hidden_layers plus
+    # the physical layer index. It is not a single-slot/final-loop cache.
+    cache_semantics = "official_loop_indexed_per_ut_cache"
 
     def __init__(self, max_cache_size: Optional[int] = None):
         # Do not call Cache.__init__: the upstream Ouro implementation also
@@ -186,4 +189,6 @@ def patch_ouro_cache(model: Any) -> dict[str, str]:
         "module": module_name,
         "original_class": f"{original.__module__}.{original.__name__}",
         "patched_class": f"{OuroUniversalTransformerCache.__module__}.{OuroUniversalTransformerCache.__name__}",
+        "cache_semantics": OuroUniversalTransformerCache.cache_semantics,
+        "logical_slot_contract": "current_ut * num_hidden_layers + layer_idx",
     }

@@ -10,6 +10,7 @@ repeating the expensive audio/Spatial-AST path.
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import json
 import os
@@ -305,6 +306,21 @@ def selected_specs(include_nonbinary: bool) -> list[dict[str, Any]]:
     return [spec for spec in EVAL_SPECS if include_nonbinary or spec["name"] != "E-nonbinary"]
 
 
+def effective_generation_limits(spec_name: str, max_new_tokens: int, num_beams: int) -> tuple[int, int]:
+    """Apply the same bounded A/C generation contract as formal evaluation."""
+
+    if spec_name in {"A", "C"}:
+        return min(max_new_tokens, 10), 1
+    return max_new_tokens, num_beams
+
+
+def is_cuda_oom(exc: BaseException) -> bool:
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message and ("cuda" in message or "gpu" in message)
+
+
 def main() -> None:
     args = parse_args()
     fail_if_public(args.output_jsonl)
@@ -381,12 +397,22 @@ def main() -> None:
     output_rows: list[dict[str, Any]] = []
     issues: list[str] = []
     binary_prompt_count = 0
+    aborted_on_cuda_oom = False
+    first_cuda_oom: dict[str, Any] | None = None
     specs = selected_specs(args.include_nonbinary)
     for spec in specs:
+        effective_max_new_tokens, effective_num_beams = effective_generation_limits(
+            spec["name"], args.max_new_tokens, args.num_beams
+        )
         split_path = args.qa_root / spec["relative_path"]
         records, _ = load_json_records(split_path)
         for index, record in enumerate(records[: args.max_records_per_split]):
             eval_id = stable_eval_id(spec["relative_path"], index, record)
+            input_ids: list[int] | None = None
+            template_audit: dict[str, Any] | None = None
+            waveform: Any = None
+            attention_mask: Any = None
+            input_tensor: Any = None
             try:
                 input_ids, template_audit = build_encoded_prompt(
                     template,
@@ -401,36 +427,43 @@ def main() -> None:
                 repeat_rows: list[dict[str, Any]] = []
                 for repeat_index in range(args.repeat):
                     started = time.perf_counter()
-                    with torch.inference_mode():
-                        output_ids = model.generate(
-                            input_ids=input_tensor,
-                            attention_mask=attention_mask,
-                            audio_waveforms=waveform,
-                            max_new_tokens=args.max_new_tokens,
-                            num_beams=args.num_beams,
-                            do_sample=False,
-                            top_p=1.0,
-                            repetition_penalty=1.0,
-                            length_penalty=1.0,
-                            use_cache=True,
-                            eos_token_id=getattr(base_config, "eos_token_id", None),
-                            pad_token_id=getattr(base_config, "pad_token_id", None) or tokenizer.eos_token_id,
-                        )
-                    torch.cuda.synchronize(device)
-                    elapsed = time.perf_counter() - started
-                    if output_ids.shape[1] <= len(input_ids):
-                        generated_ids = output_ids[0, 0:0]
-                    else:
-                        generated_ids = output_ids[0, len(input_ids):]
-                    generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
-                    repeat_rows.append({
-                        "repeat_index": repeat_index,
-                        "generated_token_count": int(generated_ids.numel()),
-                        "generated_text": generated_text,
-                        "elapsed_seconds": elapsed,
-                        "parser": parse_smoke_output(record, generated_text),
-                        "reference_comparison": reference_comparison(record, generated_text),
-                    })
+                    output_ids: Any = None
+                    generated_ids: Any = None
+                    try:
+                        with torch.inference_mode():
+                            output_ids = model.generate(
+                                input_ids=input_tensor,
+                                attention_mask=attention_mask,
+                                audio_waveforms=waveform,
+                                max_new_tokens=effective_max_new_tokens,
+                                num_beams=effective_num_beams,
+                                do_sample=False,
+                                top_p=1.0,
+                                repetition_penalty=1.0,
+                                length_penalty=1.0,
+                                use_cache=True,
+                                eos_token_id=getattr(base_config, "eos_token_id", None),
+                                pad_token_id=getattr(base_config, "pad_token_id", None) or tokenizer.eos_token_id,
+                            )
+                        torch.cuda.synchronize(device)
+                        elapsed = time.perf_counter() - started
+                        if output_ids.shape[1] <= len(input_ids):
+                            generated_ids = output_ids[0, 0:0]
+                        else:
+                            generated_ids = output_ids[0, len(input_ids):]
+                        generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True)
+                        repeat_rows.append({
+                            "repeat_index": repeat_index,
+                            "generated_token_count": int(generated_ids.numel()),
+                            "generated_text": generated_text,
+                            "elapsed_seconds": elapsed,
+                            "parser": parse_smoke_output(record, generated_text),
+                            "reference_comparison": reference_comparison(record, generated_text),
+                        })
+                    finally:
+                        del output_ids, generated_ids
+                        gc.collect()
+                        torch.cuda.empty_cache()
                 deterministic = all(row["generated_text"] == repeat_rows[0]["generated_text"] for row in repeat_rows[1:])
                 if not deterministic:
                     issues.append(f"nondeterministic:{eval_id}")
@@ -457,12 +490,29 @@ def main() -> None:
                     "repeat_count": args.repeat,
                     "deterministic": deterministic,
                     "repeats": repeat_rows,
+                    "generation_limits": {
+                        "max_new_tokens": effective_max_new_tokens,
+                        "num_beams": effective_num_beams,
+                    },
                 })
                 print(f"[sample] {eval_id} type={spec['name']} deterministic={deterministic} text={repeat_rows[0]['generated_text']!r}")
             except Exception as exc:
                 issues.append(f"generation_failed:{eval_id}:{type(exc).__name__}")
                 output_rows.append({"eval_id": eval_id, "split": spec["relative_path"], "status": "error", "error": repr(exc)})
-                print(f"[sample-error] {eval_id} {type(exc).__name__}: {exc}", file=sys.stderr)
+                if is_cuda_oom(exc):
+                    aborted_on_cuda_oom = True
+                    first_cuda_oom = {"eval_id": eval_id, "record_index": index, "error": repr(exc)}
+                    print(f"[sample-abort] first CUDA OOM at {eval_id}; stopping smoke", file=sys.stderr)
+                else:
+                    print(f"[sample-error] {eval_id} {type(exc).__name__}: {exc}", file=sys.stderr)
+            finally:
+                del waveform, input_tensor, attention_mask, input_ids, template_audit
+                gc.collect()
+                torch.cuda.empty_cache()
+            if aborted_on_cuda_oom:
+                break
+        if aborted_on_cuda_oom:
+            break
 
     args.output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     temporary_jsonl = args.output_jsonl.with_name(args.output_jsonl.name + ".tmp")
@@ -471,7 +521,7 @@ def main() -> None:
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
     temporary_jsonl.replace(args.output_jsonl)
     report = {
-        "status": "ok" if not issues and output_rows else "incomplete",
+        "status": "ok" if not issues and output_rows and not aborted_on_cuda_oom else "incomplete",
         "scope": {
             "phase": "II_generation_smoke",
             "official_eval_splits": [spec["relative_path"] for spec in specs],
@@ -507,6 +557,11 @@ def main() -> None:
             "binary_answer_prompt_mode": args.binary_answer_prompt,
             "binary_answer_prompt_count": binary_prompt_count,
             "binary_answer_prompt_text": 'Please answer only "yes" or "no".',
+            "A_C_default_cap": {"max_new_tokens": 10, "num_beams": 1},
+        },
+        "termination": {
+            "aborted_on_cuda_oom": aborted_on_cuda_oom,
+            "first_cuda_oom": first_cuda_oom,
         },
         "sample_count": len(output_rows),
         "successful_sample_count": sum(row.get("status", "ok") != "error" for row in output_rows),

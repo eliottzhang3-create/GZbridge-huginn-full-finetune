@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import gc
 import importlib.metadata
 import importlib.util
 import json
@@ -64,6 +65,18 @@ SUPPORTED_TYPES = ("A", "B", "C", "D", "E-direction", "E-distance")
 SPEC_BY_NAME = {spec["name"]: spec for spec in EVAL_SPECS if spec["name"] in SUPPORTED_TYPES}
 
 
+def default_generation_limits(eval_type: str) -> tuple[int, int]:
+    """Return safe defaults for one-record online evaluation."""
+
+    # A/C classification answers are the problematic case in practice: an
+    # unconstrained model can continue producing text instead of terminating
+    # after the label list. Ten new tokens and greedy decoding are sufficient
+    # for the BAT classification contract and avoid beam-cache amplification.
+    if eval_type in {"A", "C"}:
+        return 10, 1
+    return 200, 4
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--eval-type", choices=SUPPORTED_TYPES, required=True)
@@ -81,8 +94,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--start-index", type=int, default=0)
     parser.add_argument("--max-records", type=int, default=0, help="0 means the complete official split")
-    parser.add_argument("--max-new-tokens", type=int, default=200)
-    parser.add_argument("--num-beams", type=int, default=4)
+    # Resolve task-specific defaults after --eval-type is known. The remote
+    # launcher leaves these unset unless the user explicitly overrides them.
+    parser.add_argument("--max-new-tokens", type=int, default=None)
+    parser.add_argument("--num-beams", type=int, default=None)
     parser.add_argument("--rir-policy", choices=("official_bat", "checkpoint_matched"), default="official_bat")
     parser.add_argument("--binary-answer-prompt", choices=("off", "on", "auto"), default="off")
     parser.add_argument(
@@ -396,6 +411,37 @@ def binary_score(reference: str, generated: str) -> dict[str, Any]:
     }
 
 
+def is_cuda_oom(exc: BaseException) -> bool:
+    """Recognize both PyTorch CUDA OOM types and wrapped OOM messages."""
+
+    if isinstance(exc, torch.cuda.OutOfMemoryError):
+        return True
+    message = str(exc).lower()
+    return "out of memory" in message and ("cuda" in message or "gpu" in message)
+
+
+def release_generation_tensors(
+    *,
+    output_ids: Any,
+    generated_ids: Any,
+    waveform: Any,
+    input_tensor: Any,
+    attention_mask: Any,
+    input_ids: Any,
+    prompt_audit: Any,
+    device: torch.device,
+) -> None:
+    """Release per-record CPU/GPU objects before the next evaluation row."""
+
+    # generated_ids is normally a view into output_ids. Both names are
+    # deliberately deleted so a future materialized-view change cannot retain
+    # a complete beam output across records.
+    del output_ids, generated_ids, waveform, input_tensor, attention_mask, input_ids, prompt_audit
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+
 def metric_summary(spec_name: str, location_rows: list[dict[str, Any]], binary_rows: list[dict[str, Any]], detection: DetectionScorer | None) -> dict[str, Any]:
     if spec_name in {"B", "D"}:
         total = len(location_rows)
@@ -435,10 +481,19 @@ def metric_summary(spec_name: str, location_rows: list[dict[str, Any]], binary_r
 def main() -> None:
     args = parse_args()
     spec = SPEC_BY_NAME[args.eval_type]
+    default_max_new_tokens, default_num_beams = default_generation_limits(args.eval_type)
+    if args.max_new_tokens is None:
+        args.max_new_tokens = default_max_new_tokens
+    if args.num_beams is None:
+        args.num_beams = default_num_beams
     fail_if_public(args.output_jsonl)
     fail_if_public(args.output_report)
     if args.start_index < 0 or args.max_records < 0 or args.max_new_tokens <= 0 or args.num_beams <= 0:
         raise ValueError("start-index/max-records must be non-negative and generation limits positive")
+    if args.eval_type in {"A", "C"} and args.max_new_tokens > 10:
+        raise ValueError("A/C evaluation is capped at max_new_tokens<=10 to prevent runaway generations")
+    if args.eval_type in {"A", "C"} and args.num_beams != 1:
+        raise ValueError("A/C evaluation requires greedy single-beam generation: num_beams=1")
     if args.output_jsonl.exists() and not args.overwrite:
         raise FileExistsError(f"Refusing to overwrite existing JSONL: {args.output_jsonl}")
     if args.output_report.exists() and not args.overwrite:
@@ -509,11 +564,25 @@ def main() -> None:
     torch.cuda.synchronize(device)
     load_seconds = time.perf_counter() - load_started
     errors_count = 0
+    attempted_records = 0
+    successful_records = 0
+    aborted_on_cuda_oom = False
+    first_cuda_oom: dict[str, Any] | None = None
     with output_jsonl.open("w", encoding="utf-8", newline="\n") as handle:
         for local_index, record in enumerate(selected):
             absolute_index = args.start_index + local_index
             eval_id = stable_eval_id(spec["relative_path"], absolute_index, record)
             started = time.perf_counter()
+            # Initialize every temporary explicitly so the finally block is
+            # safe even when rendering or input construction fails.
+            input_ids: list[int] | None = None
+            prompt_audit: dict[str, Any] | None = None
+            waveform: Any = None
+            input_tensor: Any = None
+            attention_mask: Any = None
+            output_ids: Any = None
+            generated_ids: Any = None
+            row: dict[str, Any]
             try:
                 for field in ("audio_id", "reverb_id"):
                     if not record.get(field):
@@ -544,6 +613,8 @@ def main() -> None:
                 torch.cuda.synchronize(device)
                 generated_ids = output_ids[0, len(input_ids):]
                 generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
+                generated_token_count = int(generated_ids.numel())
+                waveform_shape = list(waveform.shape)
                 if args.eval_type in {"B", "D"}:
                     score = location_score(str(record["answer"]), generated_text)
                     location_rows.append(score)
@@ -564,16 +635,24 @@ def main() -> None:
                     "question": record.get("question"),
                     "reference_answer": record.get("answer"),
                     "generated_text": generated_text,
-                    "generated_token_count": int(generated_ids.numel()),
+                    "generated_token_count": generated_token_count,
                     "prompt_audit": prompt_audit,
-                    "waveform_shape": list(waveform.shape),
+                    "waveform_shape": waveform_shape,
                     "score": score,
                     "record_digest": record_digest(record),
                     "elapsed_seconds": time.perf_counter() - started,
                 }
+                successful_records += 1
             except Exception as exc:
                 errors_count += 1
-                errors.append({"eval_id": eval_id, "record_index": absolute_index, "error": repr(exc)})
+                oom = is_cuda_oom(exc)
+                error_item = {
+                    "eval_id": eval_id,
+                    "record_index": absolute_index,
+                    "error": repr(exc),
+                    "cuda_oom": oom,
+                }
+                errors.append(error_item)
                 row = {
                     "status": "error",
                     "eval_id": eval_id,
@@ -584,27 +663,72 @@ def main() -> None:
                     "error": repr(exc),
                     "record_digest": record_digest(record),
                     "elapsed_seconds": time.perf_counter() - started,
+                    "cuda_oom": oom,
                 }
-                print(f"[error] index={absolute_index} eval_id={eval_id} {exc}", file=sys.stderr)
+                if oom:
+                    aborted_on_cuda_oom = True
+                    first_cuda_oom = error_item
+                    print(
+                        f"[abort] first CUDA OOM at index={absolute_index} eval_id={eval_id}; "
+                        "stopping evaluation immediately",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(f"[error] index={absolute_index} eval_id={eval_id} {exc}", file=sys.stderr)
+            finally:
+                try:
+                    release_generation_tensors(
+                        output_ids=output_ids,
+                        generated_ids=generated_ids,
+                        waveform=waveform,
+                        input_tensor=input_tensor,
+                        attention_mask=attention_mask,
+                        input_ids=input_ids,
+                        prompt_audit=prompt_audit,
+                        device=device,
+                    )
+                except Exception as cleanup_exc:
+                    # Cleanup must never suppress the row/report write after
+                    # an evaluation error, especially after a CUDA OOM.
+                    print(f"[cleanup-warning] index={absolute_index} {cleanup_exc}", file=sys.stderr)
+                finally:
+                    # The helper releases its own references; clear the
+                    # caller's references as well, otherwise Python would
+                    # retain them until the next loop iteration.
+                    output_ids = None
+                    generated_ids = None
+                    waveform = None
+                    input_tensor = None
+                    attention_mask = None
+                    input_ids = None
+                    prompt_audit = None
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
             handle.flush()
+            attempted_records += 1
             progress = {
-                "status": "running",
+                "status": "aborted_cuda_oom" if aborted_on_cuda_oom else "running",
                 "eval_type": args.eval_type,
                 "split": spec["relative_path"],
                 "total_records": len(selected),
-                "completed_records": local_index + 1,
+                "attempted_records": attempted_records,
+                "completed_records": attempted_records,
+                "successful_records": successful_records,
+                "remaining_records": len(selected) - attempted_records,
                 "last_record_index": absolute_index,
                 "errors": errors_count,
+                "aborted_on_cuda_oom": aborted_on_cuda_oom,
+                "first_cuda_oom": first_cuda_oom,
                 "output_jsonl": str(output_jsonl),
                 "updated_unix": time.time(),
             }
             progress_path.write_text(json.dumps(progress, indent=2) + "\n", encoding="utf-8")
             if (local_index + 1) % 100 == 0 or local_index == 0:
                 print(f"[progress] {local_index + 1}/{len(selected)} last={absolute_index} errors={errors_count}")
+            if aborted_on_cuda_oom:
+                break
     metrics = metric_summary(args.eval_type, location_rows, binary_rows, detection)
     report = {
-        "status": "ok" if errors_count == 0 and metrics.get("status", "ok") == "ok" else "incomplete",
+        "status": "ok" if not aborted_on_cuda_oom and errors_count == 0 and metrics.get("status", "ok") == "ok" else "incomplete",
         "scope": "formal_online_generate_and_score",
         "official_bat_contract": {
             "eval_type": args.eval_type,
@@ -629,7 +753,10 @@ def main() -> None:
             "source_total_records": len(records),
             "start_index": args.start_index,
             "selected_records": len(selected),
-            "completed_records": len(selected) - errors_count,
+            "attempted_records": attempted_records,
+            "completed_records": attempted_records,
+            "successful_records": successful_records,
+            "remaining_records": len(selected) - attempted_records,
             "errors": errors_count,
         },
         "generation": {
@@ -641,6 +768,10 @@ def main() -> None:
             "length_penalty": 1.0,
             "use_cache": True,
             "binary_answer_prompt": args.binary_answer_prompt,
+        },
+        "termination": {
+            "aborted_on_cuda_oom": aborted_on_cuda_oom,
+            "first_cuda_oom": first_cuda_oom,
         },
         "scoring": metrics,
         "outputs": {
@@ -654,7 +785,10 @@ def main() -> None:
     temporary = args.output_report.with_name(args.output_report.name + ".tmp")
     temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(args.output_report)
-    progress_path.write_text(json.dumps({**report["dataset"], "status": report["status"]}, indent=2) + "\n", encoding="utf-8")
+    progress_path.write_text(
+        json.dumps({**report["dataset"], **report["termination"], "status": report["status"]}, indent=2) + "\n",
+        encoding="utf-8",
+    )
     print(f"[report] {args.output_report}")
     print(f"[jsonl] {output_jsonl}")
     print(f"[status] {report['status']} metrics={json.dumps(metrics, ensure_ascii=False)}")

@@ -14,6 +14,7 @@ conda activate /hpc_stor03/sjtu_home/jinwei.zhang/env/miniconda3/envs/swift_ouro
 export PYTHONPATH="${REPO}/code/Ouro_audio:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 MODEL_PATH=${BAT_EVAL_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B}
 CHECKPOINT=${BAT_EVAL_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/bat/stage3_ab_cde_localcache_0819_v2/v0-20260819-120617/checkpoint-10500}
@@ -41,13 +42,22 @@ ARGS=(
   --device "${BAT_EVAL_DEVICE:-cuda:0}"
   --start-index "${BAT_EVAL_START_INDEX:-0}"
   --max-records "${BAT_EVAL_MAX_RECORDS:-0}"
-  --max-new-tokens "${BAT_EVAL_MAX_NEW_TOKENS:-200}"
-  --num-beams "${BAT_EVAL_NUM_BEAMS:-4}"
   --rir-policy "${BAT_EVAL_RIR_POLICY:-official_bat}"
   --binary-answer-prompt "${BAT_EVAL_BINARY_ANSWER_PROMPT:-off}"
   --detection-mode "${BAT_EVAL_DETECTION_MODE:-model_output_embedding}"
   --label-csv "${LABEL_CSV}"
 )
+
+# Leave generation limits unset by default so the Python evaluator selects
+# task-specific safe defaults: A/C => 10 tokens, greedy single beam; the
+# location/reasoning families retain their historical limits unless the user
+# explicitly overrides them.
+if [[ -n "${BAT_EVAL_MAX_NEW_TOKENS:-}" ]]; then
+  ARGS+=(--max-new-tokens "${BAT_EVAL_MAX_NEW_TOKENS}")
+fi
+if [[ -n "${BAT_EVAL_NUM_BEAMS:-}" ]]; then
+  ARGS+=(--num-beams "${BAT_EVAL_NUM_BEAMS}")
+fi
 
 if [[ "${BAT_EVAL_OVERWRITE:-0}" == "1" ]]; then
   ARGS+=(--overwrite)
