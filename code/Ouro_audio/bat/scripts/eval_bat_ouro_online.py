@@ -19,6 +19,7 @@ to construct the required 355-dimensional multi-hot target vector.
 from __future__ import annotations
 
 import argparse
+import atexit
 import csv
 import gc
 import importlib.metadata
@@ -63,6 +64,159 @@ from bat.scripts.smoke_bat_eval_generation import (
 
 SUPPORTED_TYPES = ("A", "B", "C", "D", "E-direction", "E-distance")
 SPEC_BY_NAME = {spec["name"]: spec for spec in EVAL_SPECS if spec["name"] in SUPPORTED_TYPES}
+
+
+def _process_rss_bytes() -> int | None:
+    """Return the current process RSS without introducing psutil as a dependency."""
+
+    try:
+        for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines():
+            key, _, value = line.partition(":")
+            if key == "VmRSS":
+                fields = value.strip().split()
+                if fields and fields[0].isdigit():
+                    return int(fields[0]) * 1024
+    except Exception:
+        return None
+    return None
+
+
+def _runtime_snapshot(device: torch.device) -> dict[str, Any]:
+    """Collect low-cost state that survives in the heartbeat before a native crash."""
+
+    snapshot: dict[str, Any] = {
+        "pid": os.getpid(),
+        "rss_bytes": _process_rss_bytes(),
+        "cuda": None,
+    }
+    if device.type == "cuda":
+        try:
+            index = int(device.index if device.index is not None else torch.cuda.current_device())
+            snapshot["cuda"] = {
+                "device": index,
+                "allocated_bytes": int(torch.cuda.memory_allocated(index)),
+                "reserved_bytes": int(torch.cuda.memory_reserved(index)),
+                "max_allocated_bytes": int(torch.cuda.max_memory_allocated(index)),
+                "max_reserved_bytes": int(torch.cuda.max_memory_reserved(index)),
+            }
+        except Exception as exc:
+            snapshot["cuda"] = {"error": f"{type(exc).__name__}: {exc}"}
+    return snapshot
+
+
+class EvalHeartbeat:
+    """Append-free atomic phase marker for diagnosing native process exits.
+
+    The regular progress file is intentionally a compact dataset summary.  This
+    separate heartbeat is updated before and after every expensive phase, so a
+    SIGSEGV/SIGBUS leaves the last known phase, record, source paths and memory
+    counters on disk even though Python cannot run an exception handler.
+    """
+
+    def __init__(self, path: Path, device: torch.device):
+        self.path = path
+        self.device = device
+        self.started_unix = time.time()
+        self.finished = False
+
+    def write(
+        self,
+        *,
+        status: str,
+        event: str,
+        phase: str,
+        record_index: int | None = None,
+        eval_id: str | None = None,
+        **fields: Any,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "status": status,
+            "event": event,
+            "phase": phase,
+            "updated_unix": time.time(),
+            "elapsed_seconds": time.time() - self.started_unix,
+            "record_index": record_index,
+            "eval_id": eval_id,
+            "runtime": _runtime_snapshot(self.device),
+        }
+        payload.update(fields)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            temporary = self.path.with_name(
+                f".{self.path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+            )
+            temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            temporary.replace(self.path)
+        except Exception as exc:
+            # Diagnostics must never turn into a new evaluation failure mode.
+            print(
+                f"[heartbeat-warning] event={event} phase={phase} "
+                f"{type(exc).__name__}: {exc}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    def mark_finished(self) -> None:
+        self.finished = True
+
+
+def inspect_reverb_metadata(reverb_root: Path, reference: Any) -> dict[str, Any]:
+    """Inspect an NPY header without materializing the RIR array.
+
+    This is deliberately metadata-only.  It makes unusually long or malformed
+    RIRs visible in the heartbeat/JSONL row before scipy performs convolution.
+    """
+
+    import numpy as np
+
+    normalized = str(reference).replace("\\", "/").lstrip("./")
+    path = resolve_reverb_path(reverb_root, normalized)
+    result: dict[str, Any] = {"reference": normalized, "path": str(path) if path else None}
+    if path is None:
+        result.update({"status": "missing"})
+        return result
+    try:
+        array = np.load(path, mmap_mode="r", allow_pickle=False)
+        shape = tuple(int(value) for value in array.shape)
+        result.update({
+            "status": "ok",
+            "shape": list(shape),
+            "dtype": str(array.dtype),
+            "bytes": int(path.stat().st_size),
+        })
+        if len(shape) == 1:
+            result["time_samples"] = shape[0]
+            result["channel_count"] = 1
+        elif len(shape) == 2 and shape[0] <= 8:
+            result["time_samples"] = shape[1]
+            result["channel_count"] = shape[0]
+        elif len(shape) == 2 and shape[1] <= 8:
+            result["time_samples"] = shape[0]
+            result["channel_count"] = shape[1]
+        else:
+            result["time_samples"] = None
+            result["channel_count"] = None
+        result["duration_seconds"] = (
+            float(result["time_samples"]) / 32_000.0
+            if result.get("time_samples") is not None
+            else None
+        )
+        result["longer_than_training_target"] = bool(
+            result.get("time_samples") is not None and int(result["time_samples"]) > 64_000
+        )
+        del array
+    except Exception as exc:
+        result.update({"status": "invalid", "error": f"{type(exc).__name__}: {exc}"})
+    return result
+
+
+def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically replace a small JSON diagnostic file."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp")
+    temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def default_generation_limits(eval_type: str) -> tuple[int, int]:
@@ -525,6 +679,33 @@ def main() -> None:
     errors: list[dict[str, Any]] = []
     output_jsonl = args.output_jsonl.resolve()
     progress_path = output_jsonl.with_name(output_jsonl.name + ".progress.json")
+    heartbeat_path = output_jsonl.with_name(output_jsonl.name + ".heartbeat.json")
+    heartbeat = EvalHeartbeat(heartbeat_path, device)
+    heartbeat.write(
+        status="starting",
+        event="evaluation_start",
+        phase="startup",
+        eval_type=args.eval_type,
+        split=spec["relative_path"],
+        selected_records=len(selected),
+        start_index=args.start_index,
+        rir_policy=args.rir_policy,
+    )
+
+    def mark_unfinished_exit() -> None:
+        if not heartbeat.finished:
+            heartbeat.write(
+                status="process_exit_without_completion",
+                event="atexit",
+                phase="unknown_after_last_heartbeat",
+                note=(
+                    "The process reached atexit without the evaluator writing a terminal status. "
+                    "If no Python exception was logged, inspect the last heartbeat phase for a "
+                    "native signal or external termination."
+                ),
+            )
+
+    atexit.register(mark_unfinished_exit)
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
     print("========== BAT OURO ONLINE EVALUATION ==========")
     print(f"[type] {args.eval_type} split={spec['relative_path']} records={len(selected)}")
@@ -562,16 +743,34 @@ def main() -> None:
     detection = DetectionScorer(args, model, tokenizer) if args.eval_type in {"A", "C"} else None
     torch.cuda.synchronize(device)
     load_seconds = time.perf_counter() - load_started
+    heartbeat.write(
+        status="running",
+        event="model_ready",
+        phase="model_ready",
+        load_seconds=load_seconds,
+        model_contract=contract,
+    )
     errors_count = 0
     attempted_records = 0
     successful_records = 0
     aborted_on_cuda_oom = False
     first_cuda_oom: dict[str, Any] | None = None
+    rir_metadata_cache: dict[str, dict[str, Any]] = {}
     with output_jsonl.open("w", encoding="utf-8", newline="\n") as handle:
         for local_index, record in enumerate(selected):
             absolute_index = args.start_index + local_index
             eval_id = stable_eval_id(spec["relative_path"], absolute_index, record)
             started = time.perf_counter()
+            heartbeat.write(
+                status="running",
+                event="record_start",
+                phase="record_start",
+                record_index=absolute_index,
+                eval_id=eval_id,
+                question_id=str(record.get("question_id")),
+                question_type=str(record.get("question_type")),
+                source_shape=source_shape(record),
+            )
             # Initialize every temporary explicitly so the finally block is
             # safe even when rendering or input construction fails.
             input_ids: list[int] | None = None
@@ -581,19 +780,110 @@ def main() -> None:
             attention_mask: Any = None
             output_ids: Any = None
             generated_ids: Any = None
+            rir_metadata: list[dict[str, Any]] = []
             row: dict[str, Any]
             try:
-                for field in ("audio_id", "reverb_id"):
-                    if not record.get(field):
-                        raise ValueError(f"Missing {field}")
-                if resolve_audio_path(args.audio_root, str(record["audio_id"])) is None:
-                    raise FileNotFoundError(f"Missing audio: {record['audio_id']}")
-                if resolve_reverb_path(args.reverb_root, str(record["reverb_id"])) is None:
-                    raise FileNotFoundError(f"Missing reverb: {record['reverb_id']}")
+                heartbeat.write(
+                    status="running",
+                    event="asset_check_start",
+                    phase="asset_check",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                )
+                expected_shape = spec["source_shape"]
+                actual_shape = source_shape(record)
+                if actual_shape != expected_shape:
+                    raise ValueError(
+                        f"Evaluation source-shape contract mismatch: expected={expected_shape} got={actual_shape}"
+                    )
+                actual_type = str(record.get("question_type", "")).upper()
+                if actual_type not in spec["question_types"]:
+                    raise ValueError(
+                        f"Evaluation question_type contract mismatch: expected={spec['question_types']} got={actual_type!r}"
+                    )
+                for suffix in ("", "2"):
+                    audio_id = record.get(f"audio_id{suffix}")
+                    reverb_id = record.get(f"reverb_id{suffix}")
+                    audio_missing = audio_id is None or str(audio_id).strip().lower() in {"", "none", "null"}
+                    reverb_missing = reverb_id is None or str(reverb_id).strip().lower() in {"", "none", "null"}
+                    if suffix == "2" and audio_missing and reverb_missing:
+                        continue
+                    if audio_missing:
+                        raise ValueError(f"Missing audio_id{suffix}")
+                    if reverb_missing:
+                        raise ValueError(f"Missing reverb_id{suffix}")
+                    if resolve_audio_path(args.audio_root, str(audio_id)) is None:
+                        raise FileNotFoundError(f"Missing audio: {audio_id}")
+                    if resolve_reverb_path(args.reverb_root, str(reverb_id)) is None:
+                        raise FileNotFoundError(f"Missing reverb: {reverb_id}")
+                for field in ("reverb_id", "reverb_id2"):
+                    reference = record.get(field)
+                    if reference is None or str(reference).strip().lower() in {"", "none", "null"}:
+                        continue
+                    cache_key = str(reference).replace("\\", "/").lstrip("./")
+                    if cache_key not in rir_metadata_cache:
+                        rir_metadata_cache[cache_key] = inspect_reverb_metadata(args.reverb_root, reference)
+                    rir_metadata.append(rir_metadata_cache[cache_key])
+                heartbeat.write(
+                    status="running",
+                    event="asset_check_done",
+                    phase="asset_check",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                    rir_metadata=rir_metadata,
+                )
+
+                heartbeat.write(
+                    status="running",
+                    event="input_start",
+                    phase="input",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                )
                 input_ids, prompt_audit = build_input(template, record, args.binary_answer_prompt)
+                heartbeat.write(
+                    status="running",
+                    event="input_done",
+                    phase="input",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                    input_length=len(input_ids),
+                    prompt_audit=prompt_audit,
+                )
+
+                heartbeat.write(
+                    status="running",
+                    event="render_start",
+                    phase="render",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                    audio_id=str(record.get("audio_id")),
+                    reverb_id=str(record.get("reverb_id")),
+                    audio_id2=str(record.get("audio_id2")) if record.get("audio_id2") else None,
+                    reverb_id2=str(record.get("reverb_id2")) if record.get("reverb_id2") else None,
+                    rir_metadata=rir_metadata,
+                )
                 waveform = renderer.render_record(record).unsqueeze(0).to(device=device, dtype=torch.float32)
+                heartbeat.write(
+                    status="running",
+                    event="render_done",
+                    phase="render",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                    waveform_shape=list(waveform.shape),
+                )
                 input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
                 attention_mask = torch.ones_like(input_tensor)
+                heartbeat.write(
+                    status="running",
+                    event="generate_start",
+                    phase="generate",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                    input_length=len(input_ids),
+                    max_new_tokens=args.max_new_tokens,
+                    num_beams=args.num_beams,
+                )
                 with torch.inference_mode():
                     output_ids = model.generate(
                         input_ids=input_tensor,
@@ -614,6 +904,23 @@ def main() -> None:
                 generated_text = tokenizer.decode(generated_ids, skip_special_tokens=True).strip()
                 generated_token_count = int(generated_ids.numel())
                 waveform_shape = list(waveform.shape)
+                heartbeat.write(
+                    status="running",
+                    event="generate_done",
+                    phase="generate",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                    output_shape=list(output_ids.shape),
+                    generated_token_count=generated_token_count,
+                    generated_text_preview=generated_text[:200],
+                )
+                heartbeat.write(
+                    status="running",
+                    event="score_start",
+                    phase="score",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                )
                 if args.eval_type in {"B", "D"}:
                     score = location_score(str(record["answer"]), generated_text)
                     location_rows.append(score)
@@ -622,6 +929,14 @@ def main() -> None:
                     binary_rows.append(score)
                 else:
                     score = detection.add(str(record["answer"]), generated_text, generated_ids)
+                heartbeat.write(
+                    status="running",
+                    event="score_done",
+                    phase="score",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                    score=score,
+                )
                 row = {
                     "status": "ok",
                     "eval_id": eval_id,
@@ -637,6 +952,7 @@ def main() -> None:
                     "generated_token_count": generated_token_count,
                     "prompt_audit": prompt_audit,
                     "waveform_shape": waveform_shape,
+                    "rir_metadata": rir_metadata,
                     "score": score,
                     "record_digest": record_digest(record),
                     "elapsed_seconds": time.perf_counter() - started,
@@ -652,6 +968,16 @@ def main() -> None:
                     "cuda_oom": oom,
                 }
                 errors.append(error_item)
+                heartbeat.write(
+                    status="aborted_cuda_oom" if oom else "failed_python",
+                    event="record_error",
+                    phase="exception",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                    error=repr(exc),
+                    cuda_oom=oom,
+                    rir_metadata=rir_metadata,
+                )
                 row = {
                     "status": "error",
                     "eval_id": eval_id,
@@ -663,6 +989,7 @@ def main() -> None:
                     "record_digest": record_digest(record),
                     "elapsed_seconds": time.perf_counter() - started,
                     "cuda_oom": oom,
+                    "rir_metadata": rir_metadata,
                 }
                 if oom:
                     aborted_on_cuda_oom = True
@@ -675,6 +1002,13 @@ def main() -> None:
                 else:
                     print(f"[error] index={absolute_index} eval_id={eval_id} {exc}", file=sys.stderr)
             finally:
+                heartbeat.write(
+                    status="running",
+                    event="cleanup_start",
+                    phase="cleanup",
+                    record_index=absolute_index,
+                    eval_id=eval_id,
+                )
                 try:
                     release_generation_tensors(
                         output_ids=output_ids,
@@ -701,6 +1035,13 @@ def main() -> None:
                     attention_mask = None
                     input_ids = None
                     prompt_audit = None
+                    heartbeat.write(
+                        status="running",
+                        event="cleanup_done",
+                        phase="cleanup",
+                        record_index=absolute_index,
+                        eval_id=eval_id,
+                    )
             handle.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n")
             handle.flush()
             attempted_records += 1
@@ -718,9 +1059,10 @@ def main() -> None:
                 "aborted_on_cuda_oom": aborted_on_cuda_oom,
                 "first_cuda_oom": first_cuda_oom,
                 "output_jsonl": str(output_jsonl),
+                "heartbeat": str(heartbeat_path),
                 "updated_unix": time.time(),
             }
-            progress_path.write_text(json.dumps(progress, indent=2) + "\n", encoding="utf-8")
+            write_json_atomic(progress_path, progress)
             if (local_index + 1) % 100 == 0 or local_index == 0:
                 print(f"[progress] {local_index + 1}/{len(selected)} last={absolute_index} errors={errors_count}")
             if aborted_on_cuda_oom:
@@ -776,6 +1118,7 @@ def main() -> None:
         "outputs": {
             "jsonl": str(output_jsonl),
             "progress": str(progress_path.resolve()),
+            "heartbeat": str(heartbeat_path.resolve()),
             "report": str(args.output_report.resolve()),
         },
         "errors": errors[:100],
@@ -784,10 +1127,20 @@ def main() -> None:
     temporary = args.output_report.with_name(args.output_report.name + ".tmp")
     temporary.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(args.output_report)
-    progress_path.write_text(
-        json.dumps({**report["dataset"], **report["termination"], "status": report["status"]}, indent=2) + "\n",
-        encoding="utf-8",
+    write_json_atomic(
+        progress_path,
+        {**report["dataset"], **report["termination"], "status": report["status"], "heartbeat": str(heartbeat_path)},
     )
+    heartbeat.write(
+        status="completed" if report["status"] == "ok" else "completed_incomplete",
+        event="evaluation_end",
+        phase="complete",
+        attempted_records=attempted_records,
+        successful_records=successful_records,
+        errors=errors_count,
+        report_status=report["status"],
+    )
+    heartbeat.mark_finished()
     print(f"[report] {args.output_report}")
     print(f"[jsonl] {output_jsonl}")
     print(f"[status] {report['status']} metrics={json.dumps(metrics, ensure_ascii=False)}")

@@ -334,15 +334,48 @@ class BATEvalAudioRenderer:
             raise FileNotFoundError(f"Missing assets audio={audio_id} reverb={reverb_id}")
         audio, sample_rate = self._load_source(audio_path)
         audio = self._normalize(self._resample(audio, sample_rate))[None, :]
-        rir = np.asarray(np.load(reverb_path, allow_pickle=False), dtype=np.float32)
-        if rir.ndim != 2 or rir.shape[0] != 2 or not np.isfinite(rir).all():
-            raise ValueError(f"Invalid binaural RIR: {reverb_path} shape={rir.shape}")
+        # Read only the NPY header first.  Some extracted RIR files are longer
+        # than the 2-second training target; materializing an arbitrarily long
+        # raw array here was an avoidable host-memory hazard in online eval.
+        rir_array = np.load(reverb_path, mmap_mode="r", allow_pickle=False)
+        shape = tuple(int(value) for value in rir_array.shape)
+        if len(shape) != 2 or shape[0] != 2:
+            raise ValueError(f"Invalid binaural RIR: {reverb_path} shape={shape}")
+        if shape[1] <= 0:
+            raise ValueError(f"Empty binaural RIR: {reverb_path}")
         if self.rir_policy == "checkpoint_matched":
-            rir = self._crop_or_pad_rir(rir)
-        rendered = signal.fftconvolve(audio, rir, mode="full")
+            # The checkpoint-matched contract needs exactly 2 seconds.  Copy
+            # only that prefix and zero-pad without loading any late tail.
+            rir = self._crop_or_pad_rir(
+                np.asarray(rir_array[:, :RIR_TARGET_SAMPLES], dtype=np.float32)
+            )
+        else:
+            # For official_bat, taps after 10 seconds cannot affect the first
+            # 10 seconds of a causal convolution.  Keeping only this prefix is
+            # therefore output-equivalent to raw-RIR -> full convolution ->
+            # final [2,320000] crop, without materializing the late tail.
+            rir = np.asarray(rir_array[:, :TARGET_SAMPLES], dtype=np.float32)
+        del rir_array
+        if not np.isfinite(rir).all():
+            raise ValueError(f"Invalid binaural RIR values: {reverb_path} shape={rir.shape}")
+
+        # Only the first TARGET_SAMPLES output samples survive _crop_or_pad.
+        # RIR taps after that point cannot contribute to a causal convolution
+        # prefix, so discard them before scipy allocates its full convolution
+        # result.  Convolving one ear at a time also avoids scipy's 2-D path
+        # allocating an unnecessary two-channel full-length temporary.  This
+        # is bit-equivalent to raw-RIR -> full convolution -> first 10 seconds
+        # for official_bat, while preventing pathological long RIR files from
+        # exhausting host memory in B/D/E evaluation.
+        rir_for_output = rir[:, :TARGET_SAMPLES]
+        rendered = np.zeros((2, TARGET_SAMPLES), dtype=np.float32)
+        for channel in range(2):
+            channel_full = signal.fftconvolve(audio[0], rir_for_output[channel], mode="full")
+            rendered[channel, : min(TARGET_SAMPLES, channel_full.shape[0])] = channel_full[:TARGET_SAMPLES]
+            del channel_full
         if not np.isfinite(rendered).all():
             raise ValueError(f"Non-finite rendered audio: audio={audio_id} reverb={reverb_id}")
-        return torch.from_numpy(self._crop_or_pad(rendered)).float()
+        return torch.from_numpy(rendered).float()
 
     def render_record(self, record: dict[str, Any]):
         import torch

@@ -299,8 +299,8 @@ def main() -> None:
         "checkpoints": checkpoints,
         "official_generation_contract": {
             "do_sample": False,
-            "num_beams": 4,
-            "max_new_tokens": 200,
+            "num_beams": 1,
+            "max_new_tokens": 10,
             "top_p": 1.0,
             "repetition_penalty": 1.0,
             "length_penalty": 1.0,
