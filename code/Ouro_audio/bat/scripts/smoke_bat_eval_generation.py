@@ -73,8 +73,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--max-records-per-split", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=2)
-    parser.add_argument("--max-new-tokens", type=int, default=200)
-    parser.add_argument("--num-beams", type=int, default=4)
+    parser.add_argument("--max-new-tokens", type=int, default=10)
+    parser.add_argument("--num-beams", type=int, default=1)
     parser.add_argument("--rir-policy", choices=("official_bat", "checkpoint_matched"), default="official_bat")
     parser.add_argument("--include-nonbinary", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -307,11 +307,9 @@ def selected_specs(include_nonbinary: bool) -> list[dict[str, Any]]:
 
 
 def effective_generation_limits(spec_name: str, max_new_tokens: int, num_beams: int) -> tuple[int, int]:
-    """Apply the same bounded A/C generation contract as formal evaluation."""
+    """Apply the common bounded generation contract to every BAT split."""
 
-    if spec_name in {"A", "C"}:
-        return min(max_new_tokens, 10), 1
-    return max_new_tokens, num_beams
+    return min(max_new_tokens, 10), 1
 
 
 def is_cuda_oom(exc: BaseException) -> bool:
@@ -327,6 +325,8 @@ def main() -> None:
     fail_if_public(args.output_report)
     if args.max_records_per_split <= 0 or args.repeat <= 0 or args.max_new_tokens <= 0 or args.num_beams <= 0:
         raise ValueError("max-records-per-split, repeat, max-new-tokens and num-beams must be positive")
+    if args.max_new_tokens > 10 or args.num_beams != 1:
+        raise ValueError("BAT evaluation smoke requires max_new_tokens<=10 and num_beams=1")
     if not torch.cuda.is_available():
         raise RuntimeError("Phase-II generation smoke requires a submitted CUDA job")
     device = torch.device(args.device)
@@ -557,7 +557,7 @@ def main() -> None:
             "binary_answer_prompt_mode": args.binary_answer_prompt,
             "binary_answer_prompt_count": binary_prompt_count,
             "binary_answer_prompt_text": 'Please answer only "yes" or "no".',
-            "A_C_default_cap": {"max_new_tokens": 10, "num_beams": 1},
+            "all_eval_types_generation_cap": {"max_new_tokens": 10, "num_beams": 1},
         },
         "termination": {
             "aborted_on_cuda_oom": aborted_on_cuda_oom,

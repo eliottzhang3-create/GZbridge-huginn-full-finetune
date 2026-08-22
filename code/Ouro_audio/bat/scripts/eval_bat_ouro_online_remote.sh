@@ -48,10 +48,9 @@ ARGS=(
   --label-csv "${LABEL_CSV}"
 )
 
-# Leave generation limits unset by default so the Python evaluator selects
-# task-specific safe defaults: A/C => 10 tokens, greedy single beam; the
-# location/reasoning families retain their historical limits unless the user
-# explicitly overrides them.
+# Leave generation limits unset by default so the Python evaluator selects the
+# common BAT contract: every evaluation type uses 10 new tokens and greedy
+# single-beam generation. Explicit larger values are rejected by the evaluator.
 if [[ -n "${BAT_EVAL_MAX_NEW_TOKENS:-}" ]]; then
   ARGS+=(--max-new-tokens "${BAT_EVAL_MAX_NEW_TOKENS}")
 fi

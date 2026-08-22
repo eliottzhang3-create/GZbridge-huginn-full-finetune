@@ -68,13 +68,12 @@ SPEC_BY_NAME = {spec["name"]: spec for spec in EVAL_SPECS if spec["name"] in SUP
 def default_generation_limits(eval_type: str) -> tuple[int, int]:
     """Return safe defaults for one-record online evaluation."""
 
-    # A/C classification answers are the problematic case in practice: an
-    # unconstrained model can continue producing text instead of terminating
-    # after the label list. Ten new tokens and greedy decoding are sufficient
-    # for the BAT classification contract and avoid beam-cache amplification.
-    if eval_type in {"A", "C"}:
-        return 10, 1
-    return 200, 4
+    # All BAT evaluation answers are short. Ten new tokens and greedy decoding
+    # are sufficient for detection, location, and binary reasoning answers,
+    # while avoiding beam-cache amplification.
+    if eval_type not in SUPPORTED_TYPES:
+        raise ValueError(f"Unsupported evaluation type: {eval_type}")
+    return 10, 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -490,10 +489,10 @@ def main() -> None:
     fail_if_public(args.output_report)
     if args.start_index < 0 or args.max_records < 0 or args.max_new_tokens <= 0 or args.num_beams <= 0:
         raise ValueError("start-index/max-records must be non-negative and generation limits positive")
-    if args.eval_type in {"A", "C"} and args.max_new_tokens > 10:
-        raise ValueError("A/C evaluation is capped at max_new_tokens<=10 to prevent runaway generations")
-    if args.eval_type in {"A", "C"} and args.num_beams != 1:
-        raise ValueError("A/C evaluation requires greedy single-beam generation: num_beams=1")
+    if args.max_new_tokens > 10:
+        raise ValueError("BAT evaluation is capped at max_new_tokens<=10 to prevent runaway generations")
+    if args.num_beams != 1:
+        raise ValueError("BAT evaluation requires greedy single-beam generation: num_beams=1")
     if args.output_jsonl.exists() and not args.overwrite:
         raise FileExistsError(f"Refusing to overwrite existing JSONL: {args.output_jsonl}")
     if args.output_report.exists() and not args.overwrite:
