@@ -223,12 +223,13 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 def default_generation_limits(eval_type: str) -> tuple[int, int]:
     """Return safe defaults for one-record online evaluation."""
 
-    # All BAT evaluation answers are short. Ten new tokens and greedy decoding
-    # are sufficient for detection, location, and binary reasoning answers,
-    # while avoiding beam-cache amplification.
+    # Keep the requested stable evaluation contract: greedy decoding with a
+    # 24-token response budget.  The budget is long enough for a complete
+    # location answer such as ``left, front, above; 2.5m`` while retaining the
+    # one-beam memory behavior that avoided the earlier native crashes.
     if eval_type not in SUPPORTED_TYPES:
         raise ValueError(f"Unsupported evaluation type: {eval_type}")
-    return 10, 1
+    return 24, 1
 
 
 def parse_args() -> argparse.Namespace:
@@ -539,7 +540,13 @@ class DetectionScorer:
 def location_score(reference: str, generated: str) -> dict[str, Any]:
     gt = parse_location(reference)
     pred = parse_location(generated)
-    doa_correct = bool(gt.get("status") == "ok" and pred.get("status") == "ok" and gt.get("direction") == pred.get("direction"))
+    # DoA and distance are separate BAT metrics.  A missing/invalid distance
+    # must not erase an otherwise valid three-axis direction prediction.
+    doa_correct = bool(
+        gt.get("direction") is not None
+        and pred.get("direction") is not None
+        and gt.get("direction") == pred.get("direction")
+    )
     distance_valid = bool(gt.get("distance_m") is not None and pred.get("distance_m") is not None)
     distance_abs_error = abs(float(pred["distance_m"]) - float(gt["distance_m"])) if distance_valid else None
     within_half_meter = bool(distance_valid and distance_abs_error <= 0.5)
@@ -547,6 +554,8 @@ def location_score(reference: str, generated: str) -> dict[str, Any]:
         "reference_parser": gt,
         "generated_parser": pred,
         "doa_correct": doa_correct,
+        "direction_parse_valid": bool(pred.get("direction") is not None),
+        "distance_parse_valid": bool(pred.get("distance_m") is not None),
         "distance_abs_error_m": distance_abs_error,
         "distance_within_0_5m": within_half_meter,
         "distance_der_error": not within_half_meter,
@@ -556,12 +565,16 @@ def location_score(reference: str, generated: str) -> dict[str, Any]:
 def binary_score(reference: str, generated: str) -> dict[str, Any]:
     gt = parse_yes_no(reference)
     pred = parse_yes_no(generated)
-    correct = bool(gt.get("value") is not None and pred.get("value") is not None and gt["value"] == pred["value"])
+    correct = bool(
+        gt.get("status") == "ok"
+        and pred.get("status") == "ok"
+        and gt.get("value") == pred.get("value")
+    )
     return {
         "reference_parser": gt,
         "generated_parser": pred,
         "correct": correct,
-        "parser_policy": "one unique yes/no token; both tokens or no token is invalid",
+        "parser_policy": "normalized text must be exactly yes or no",
     }
 
 
@@ -613,9 +626,26 @@ def metric_summary(spec_name: str, location_rows: list[dict[str, Any]], binary_r
             "dp_distance_error_rate_percent": 100.0 * der / total if total else 0.0,
             "invalid_reference_count": sum(int(row["reference_parser"].get("status") != "ok") for row in location_rows),
             "invalid_prediction_count": sum(int(row["generated_parser"].get("status") != "ok") for row in location_rows),
+            "invalid_reference_direction_count": sum(
+                int(row["reference_parser"].get("direction") is None) for row in location_rows
+            ),
+            "invalid_prediction_direction_count": sum(
+                int(row["generated_parser"].get("direction") is None) for row in location_rows
+            ),
+            "invalid_reference_distance_count": sum(
+                int(row["reference_parser"].get("distance_m") is None) for row in location_rows
+            ),
+            "invalid_prediction_distance_count": sum(
+                int(row["generated_parser"].get("distance_m") is None) for row in location_rows
+            ),
+            "valid_distance_pair_count": sum(
+                int(row["distance_abs_error_m"] is not None) for row in location_rows
+            ),
             "distance_abs_error_mean_m": (
                 sum(row["distance_abs_error_m"] for row in location_rows if row["distance_abs_error_m"] is not None)
-                / max(1, sum(row["distance_abs_error_m"] is not None for row in location_rows))
+                / sum(row["distance_abs_error_m"] is not None for row in location_rows)
+                if any(row["distance_abs_error_m"] is not None for row in location_rows)
+                else None
             ),
         }
     if spec_name.startswith("E-"):
@@ -644,8 +674,8 @@ def main() -> None:
     fail_if_public(args.output_report)
     if args.start_index < 0 or args.max_records < 0 or args.max_new_tokens <= 0 or args.num_beams <= 0:
         raise ValueError("start-index/max-records must be non-negative and generation limits positive")
-    if args.max_new_tokens > 10:
-        raise ValueError("BAT evaluation is capped at max_new_tokens<=10 to prevent runaway generations")
+    if args.max_new_tokens > 24:
+        raise ValueError("BAT evaluation is capped at max_new_tokens<=24")
     if args.num_beams != 1:
         raise ValueError("BAT evaluation requires greedy single-beam generation: num_beams=1")
     if args.output_jsonl.exists() and not args.overwrite:
@@ -1164,6 +1194,7 @@ def main() -> None:
             "errors": errors_count,
         },
         "generation": {
+            "contract": "current_stable_greedy_24",
             "do_sample": False,
             "num_beams": args.num_beams,
             "max_new_tokens": args.max_new_tokens,
@@ -1172,6 +1203,11 @@ def main() -> None:
             "length_penalty": 1.0,
             "use_cache": True,
             "binary_answer_prompt": args.binary_answer_prompt,
+            "research_reference": {
+                "do_sample": False,
+                "num_beams": 4,
+                "max_new_tokens": 200,
+            },
         },
         "termination": {
             "aborted_on_cuda_oom": aborted_on_cuda_oom,

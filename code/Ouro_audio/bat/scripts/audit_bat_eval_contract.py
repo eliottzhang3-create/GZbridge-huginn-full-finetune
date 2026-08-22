@@ -297,13 +297,24 @@ def main() -> None:
         "sources": sources,
         "models": models,
         "checkpoints": checkpoints,
-        "official_generation_contract": {
-            "do_sample": False,
-            "num_beams": 1,
-            "max_new_tokens": 10,
-            "top_p": 1.0,
-            "repetition_penalty": 1.0,
-            "length_penalty": 1.0,
+        "generation_contracts": {
+            "current_stable_eval": {
+                "do_sample": False,
+                "num_beams": 1,
+                "max_new_tokens": 24,
+                "top_p": 1.0,
+                "repetition_penalty": 1.0,
+                "length_penalty": 1.0,
+            },
+            "research_reference": {
+                "do_sample": False,
+                "num_beams": 4,
+                "max_new_tokens": 200,
+                "top_p": 1.0,
+                "repetition_penalty": 1.0,
+                "length_penalty": 1.0,
+            },
+            "note": "Current results use the stable one-beam 24-token contract requested for Ouro evaluation; they are not claimed as strict official-decoder reproduction.",
         },
         "audio_contracts": {
             "official_bat": "raw RIR -> convolution -> final [2,320000] crop/pad",

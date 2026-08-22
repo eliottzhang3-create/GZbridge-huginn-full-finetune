@@ -235,17 +235,22 @@ def parse_yes_no(text: str) -> dict[str, Any]:
     normalized = re.sub(r"\s+", " ", text.strip().lower()).strip(" .,!?:;\n\t")
     matches = re.findall(r"\b(yes|no)\b", normalized)
     unique = sorted(set(matches))
+    strict_exact = normalized in {"yes", "no"}
     return {
         "normalized": normalized,
-        "strict_exact": normalized in {"yes", "no"},
-        "value": unique[0] if len(unique) == 1 else None,
-        "status": "ok" if len(unique) == 1 else "invalid_yes_no",
+        "strict_exact": strict_exact,
+        # Canonical E scoring accepts only a normalized exact yes/no answer.
+        # A verbose answer containing one yes/no token is retained in the
+        # audit output but is not a valid prediction.
+        "value": normalized if strict_exact else None,
+        "token_matches": unique,
+        "status": "ok" if strict_exact else "invalid_yes_no",
     }
 
 
 def parse_location(text: str) -> dict[str, Any]:
     normalized = re.sub(r"\s+", " ", text.strip().lower())
-    axis_values = {}
+    axis_values: dict[str, str | None] = {}
     for axis, values in {
         "horizontal": ("left", "right"),
         "depth": ("front", "behind"),
@@ -255,11 +260,16 @@ def parse_location(text: str) -> dict[str, Any]:
         axis_values[axis] = found[0] if len(found) == 1 else None
     distance_matches = re.findall(r"(?<![a-z0-9])([0-9]+(?:\.[0-9]+)?)\s*(?:m|meter|meters)\b", normalized)
     distance = float(distance_matches[0]) if len(distance_matches) == 1 else None
-    ok = all(value is not None for value in axis_values.values()) and distance is not None
+    direction = axis_values if all(value is not None for value in axis_values.values()) else None
+    direction_status = "ok" if direction is not None else "invalid_direction"
+    distance_status = "ok" if distance is not None else "invalid_distance"
+    ok = direction is not None and distance is not None
     return {
         "normalized": normalized,
-        "direction": axis_values if ok else None,
+        "direction": direction,
+        "direction_status": direction_status,
         "distance_m": distance,
+        "distance_status": distance_status,
         "status": "ok" if ok else "invalid_location",
     }
 

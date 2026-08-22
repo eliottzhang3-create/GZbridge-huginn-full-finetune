@@ -604,10 +604,10 @@ generation：
 use_cache      = true
 do_sample      = false
 num_beams      = 1
-max_new_tokens = 10
+max_new_tokens = 24
 ~~~
 
-max_new_tokens 只限制回答阶段新 token，不包括 prompt/audio prefix。旧 200 token、beam=4 已移除。
+max_new_tokens 只限制回答阶段新 token，不包括 prompt/audio prefix。当前稳定评测使用 24 token、single-beam；调研记录的官方参考配置为 200 token、beam=4，当前不作为 Ouro 稳定任务配置。
 
 ### 最近异常
 
@@ -690,7 +690,7 @@ GPU allocated/reserved
 7. 固定 176/compile：历史 smoke，当前正式禁用。
 8. SIGBUS/SIGSEGV：workers=0、local Arrow prewarm、faulthandler、runtime monitor。
 9. BF16 Spatial-AST cache：掉线、存储和 coverage 风险，当前不依赖。
-10. eval 长生成：统一 greedy single beam、10 new tokens、逐条释放、首个 Python OOM 停止。
+10. eval 长生成：统一 greedy single beam、24 new tokens、逐条释放、首个 Python OOM 停止。
 
 ---
 
@@ -795,6 +795,7 @@ smoke/resume：
 eval：
   bat/scripts/audit_bat_eval_contract.py
   bat/scripts/eval_bat_ouro_online.py
+  bat/scripts/aggregate_bat_e_metrics.py
   bat/scripts/smoke_bat_eval_generation.py
   bat/run_eval_bat_ouro_online_3090.sh
   bat/run_smoke_bat_eval_generation_3090.sh
@@ -818,6 +819,6 @@ eval：
 6. 当前正式训练关闭 compile 和固定 176，使用动态 batch padding、max_length=512 ceiling、workers=0。
 7. Ouro 队列 pdgpu-5090；Qwen3 队列 pdgpu-3090；均为 8 GPU、32 CPU、256G。
 8. 两条正式线都使用 job-local /tmp Arrow/ModelScope cache、runtime monitor、每 3000 steps 保存、最多 2 个 checkpoint。
-9. Eval 使用 max_new_tokens=10、num_beams=1、use_cache=true；A/C 用模型 lm_head token-row embedding 做 Detection mAP。
+9. Eval 使用 max_new_tokens=24、num_beams=1、use_cache=true；A/C 用模型 lm_head token-row embedding 做 Detection mAP。
 10. 最近 B/D/E eval 进程在少量记录后消失，progress 显示没有 Python OOM；数据字段正常，下一步做逐记录 renderer/generate/native crash 诊断。
 11. 新 agent 必须先 git pull --ff-only，再核对实际脚本和 report，不要复用旧命令或旧结论。

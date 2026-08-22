@@ -65,7 +65,7 @@ ARGS=(
 )
 
 # Leave generation limits unset by default so the Python evaluator selects the
-# common BAT contract: every evaluation type uses 10 new tokens and greedy
+# current stable BAT evaluation contract: every evaluation type uses 24 new tokens and greedy
 # single-beam generation. Explicit larger values are rejected by the evaluator.
 if [[ -n "${BAT_EVAL_MAX_NEW_TOKENS:-}" ]]; then
   ARGS+=(--max-new-tokens "${BAT_EVAL_MAX_NEW_TOKENS}")

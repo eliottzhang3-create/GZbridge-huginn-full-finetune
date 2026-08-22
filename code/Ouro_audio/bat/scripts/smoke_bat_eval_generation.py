@@ -309,7 +309,7 @@ def selected_specs(include_nonbinary: bool) -> list[dict[str, Any]]:
 def effective_generation_limits(spec_name: str, max_new_tokens: int, num_beams: int) -> tuple[int, int]:
     """Apply the common bounded generation contract to every BAT split."""
 
-    return min(max_new_tokens, 10), 1
+    return min(max_new_tokens, 24), 1
 
 
 def is_cuda_oom(exc: BaseException) -> bool:
@@ -325,8 +325,8 @@ def main() -> None:
     fail_if_public(args.output_report)
     if args.max_records_per_split <= 0 or args.repeat <= 0 or args.max_new_tokens <= 0 or args.num_beams <= 0:
         raise ValueError("max-records-per-split, repeat, max-new-tokens and num-beams must be positive")
-    if args.max_new_tokens > 10 or args.num_beams != 1:
-        raise ValueError("BAT evaluation smoke requires max_new_tokens<=10 and num_beams=1")
+    if args.max_new_tokens > 24 or args.num_beams != 1:
+        raise ValueError("BAT evaluation smoke requires max_new_tokens<=24 and num_beams=1")
     if not torch.cuda.is_available():
         raise RuntimeError("Phase-II generation smoke requires a submitted CUDA job")
     device = torch.device(args.device)
@@ -557,7 +557,7 @@ def main() -> None:
             "binary_answer_prompt_mode": args.binary_answer_prompt,
             "binary_answer_prompt_count": binary_prompt_count,
             "binary_answer_prompt_text": 'Please answer only "yes" or "no".',
-            "all_eval_types_generation_cap": {"max_new_tokens": 10, "num_beams": 1},
+            "all_eval_types_generation_cap": {"max_new_tokens": 24, "num_beams": 1},
         },
         "termination": {
             "aborted_on_cuda_oom": aborted_on_cuda_oom,
