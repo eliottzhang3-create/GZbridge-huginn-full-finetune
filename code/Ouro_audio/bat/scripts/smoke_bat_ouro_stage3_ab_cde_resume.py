@@ -400,8 +400,14 @@ def main() -> None:
                         else:
                             binary_equivalent = True
                         denominator = int(num_items_in_batch.detach().cpu().item()) if torch.is_tensor(num_items_in_batch) else int(num_items_in_batch or manual_count)
-                        ddp_world_size_rescale = current_world if num_items_in_batch is not None else 1
-                        swift_ce = float((swift_losses.sum() / denominator * ddp_world_size_rescale).detach().cpu())
+                        # Ouro's Swift/Trainer path already returns the local
+                        # loss sum divided by the supplied denominator.  The
+                        # DDP gradient reduction is separate from this scalar
+                        # reporting path; multiplying by world_size here
+                        # would count the same factor twice (and produced an
+                        # exactly 8x false mismatch in the previous smoke).
+                        ddp_world_size_rescale = 1
+                        swift_ce = float((swift_losses.sum() / denominator).detach().cpu())
                         trainer_ce = float(loss.detach().float().cpu())
                         if not math.isclose(swift_ce, trainer_ce, rel_tol=2e-3, abs_tol=2e-3):
                             raise RuntimeError(f"Swift CE mismatch trainer={trainer_ce} reproduced={swift_ce}")
@@ -509,18 +515,29 @@ def main() -> None:
                 try:
                     if sorted(int(item["rank"]) for item in reports) != list(range(EXPECTED_WORLD_SIZE)):
                         combined_issues.append("rank_reports_incomplete")
-                    all_active_lengths = [
-                        int(value)
+                    missing_batches = [
+                        int(report_item["rank"])
                         for report_item in reports
-                        for value in report_item["forward_audit"]["batch"]["dynamic_padding"]["per_example_active_lengths"]
+                        if not isinstance(report_item["forward_audit"].get("batch"), dict)
                     ]
-                    if len(set(all_active_lengths)) < 2:
-                        combined_issues.append("dynamic_padding_not_observed_across_global_batch")
+                    if missing_batches:
+                        combined_issues.append(
+                            f"checkpoint_audit_skipped_missing_forward_batch:ranks={missing_batches}"
+                        )
+                    else:
+                        all_active_lengths = [
+                            int(value)
+                            for report_item in reports
+                            for value in report_item["forward_audit"]["batch"]["dynamic_padding"]["per_example_active_lengths"]
+                        ]
+                        if len(set(all_active_lengths)) < 2:
+                            combined_issues.append("dynamic_padding_not_observed_across_global_batch")
                     if any(int(item["global_step"]) != args.max_steps for item in reports):
                         combined_issues.append("global_step_mismatch_across_ranks")
-                    checkpoint = checkpoint_report_for_step(
-                        checkpoint_path(args.output_dir, args.max_steps), args.max_steps, expected_world_size=EXPECTED_WORLD_SIZE
-                    )
+                    if not missing_batches:
+                        checkpoint = checkpoint_report_for_step(
+                            checkpoint_path(args.output_dir, args.max_steps), args.max_steps, expected_world_size=EXPECTED_WORLD_SIZE
+                        )
                 except Exception as exc:
                     rank0_error = f"checkpoint_audit:{type(exc).__name__}: {exc}"
                     combined_issues.append(rank0_error)
