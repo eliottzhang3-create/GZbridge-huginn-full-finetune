@@ -192,6 +192,17 @@ def parameter_contract(model: torch.nn.Module, model_kind: str) -> dict[str, Any
         raise RuntimeError("BAT plugin audio contract is missing")
     if contract.get("audio_token_count") != 64:
         raise RuntimeError(f"Expected 64 audio tokens, contract={contract}")
+    expected_hidden = int(MODEL_SETTINGS[model_kind]["hidden_size"])
+    config_hidden = int(getattr(getattr(base, "config", None), "hidden_size", -1))
+    hidden_key = "ouro_hidden_size" if model_kind == "ouro" else "qwen3_hidden_size"
+    contract_hidden = int(
+        contract.get("model_hidden_size", contract.get(hidden_key, contract.get("hidden_size", -1)))
+    )
+    if config_hidden != expected_hidden or contract_hidden != expected_hidden:
+        raise RuntimeError(
+            f"{model_kind} hidden-size contract mismatch: expected={expected_hidden} "
+            f"config={config_hidden} plugin={contract_hidden}"
+        )
     return {
         "total_parameters": total_parameters,
         "trainable_parameter_count": trainable_parameter_count,

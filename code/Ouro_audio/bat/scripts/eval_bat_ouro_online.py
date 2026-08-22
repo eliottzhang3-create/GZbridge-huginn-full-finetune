@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Formal BAT Ouro evaluation: generate and score each record online.
+"""Formal BAT evaluation: generate and score one record stream online.
 
-One process evaluates exactly one official split (A, B, C, D, E-direction, or
-E-distance).  Audio rendering, model generation, parsing, and metric
+One process evaluates exactly one official split.  Ouro supports A, B, C, D,
+E-direction, and E-distance; Qwen3 is deliberately restricted to A, B, C, D.
+Audio rendering, model generation, parsing, and metric
 accumulation happen in the same loop.  A JSONL row and a progress snapshot are
 flushed after every example so an interrupted long evaluation leaves usable
 diagnostics without requiring a second offline scoring pass.
@@ -63,8 +64,16 @@ from bat.scripts.smoke_bat_eval_generation import (
 )
 
 
-SUPPORTED_TYPES = ("A", "B", "C", "D", "E-direction", "E-distance")
-SPEC_BY_NAME = {spec["name"]: spec for spec in EVAL_SPECS if spec["name"] in SUPPORTED_TYPES}
+MODEL_SUPPORTED_TYPES = {
+    "ouro": ("A", "B", "C", "D", "E-direction", "E-distance"),
+    # Qwen3 is intentionally evaluated only on the four Table-4 A--D
+    # splits.  Keeping this restriction in the evaluator (rather than only in
+    # the shell launcher) prevents an accidental E run with the Qwen3
+    # checkpoint.
+    "qwen3": ("A", "B", "C", "D"),
+}
+SUPPORTED_TYPES = tuple(sorted({name for names in MODEL_SUPPORTED_TYPES.values() for name in names}))
+SPEC_BY_NAME = {spec["name"]: spec for spec in EVAL_SPECS}
 
 
 def _process_rss_bytes() -> int | None:
@@ -234,6 +243,7 @@ def default_generation_limits(eval_type: str) -> tuple[int, int]:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--model-kind", choices=tuple(MODEL_SETTINGS), default="ouro")
     parser.add_argument("--eval-type", choices=SUPPORTED_TYPES, required=True)
     parser.add_argument("--model-path", type=Path, required=True)
     parser.add_argument("--plugin-path", type=Path, required=True)
@@ -291,7 +301,7 @@ def import_plugin(path: Path) -> ModuleType:
 
 
 def prepare_environment(args: argparse.Namespace) -> None:
-    settings = MODEL_SETTINGS["ouro"]
+    settings = MODEL_SETTINGS[args.model_kind]
     os.environ[settings["model_env"]] = str(args.model_path.resolve())
     os.environ["BAT_AUDIO_ROOT"] = str(args.audio_root.resolve())
     os.environ["BAT_REVERB_ROOT"] = str(args.reverb_root.resolve())
@@ -300,13 +310,13 @@ def prepare_environment(args: argparse.Namespace) -> None:
     os.environ["BAT_QFORMER_SOURCE"] = str(args.qformer_source.resolve())
 
 
-def load_template(model: torch.nn.Module, processor: Any) -> Any:
+def load_template(model_kind: str, processor: Any) -> Any:
     try:
         from swift import get_template
     except ImportError:
         from swift.template import get_template
     template = get_template(
-        template_type="ouro_bat_audio_prefix",
+        template_type=MODEL_SETTINGS[model_kind]["template_type"],
         processor=processor,
         max_length=512,
         use_chat_template=False,
@@ -318,9 +328,14 @@ def load_template(model: torch.nn.Module, processor: Any) -> Any:
     return template
 
 
-def build_input(template: Any, record: dict[str, Any], binary_prompt_mode: str) -> tuple[list[int], dict[str, Any]]:
+def build_input(
+    template: Any,
+    record: dict[str, Any],
+    model_kind: str,
+    binary_prompt_mode: str,
+) -> tuple[list[int], dict[str, Any]]:
     original = str(record["question"])
-    apply_prompt = binary_answer_prompt_applies(record, "ouro", binary_prompt_mode)
+    apply_prompt = binary_answer_prompt_applies(record, model_kind, binary_prompt_mode)
     effective = original
     if apply_prompt:
         effective = f'{original}\n\nPlease answer only "yes" or "no".'
@@ -334,6 +349,7 @@ def build_input(template: Any, record: dict[str, Any], binary_prompt_mode: str) 
     if len(ids) <= 64:
         raise RuntimeError(f"Template produced no text after audio prefix: {len(ids)}")
     return ids, {
+        "model_kind": model_kind,
         "original_instruction": original,
         "effective_instruction": effective,
         "binary_answer_prompt_applied": apply_prompt,
@@ -672,6 +688,12 @@ def main() -> None:
         args.num_beams = default_num_beams
     fail_if_public(args.output_jsonl)
     fail_if_public(args.output_report)
+    if args.eval_type not in MODEL_SUPPORTED_TYPES[args.model_kind]:
+        allowed = ", ".join(MODEL_SUPPORTED_TYPES[args.model_kind])
+        raise ValueError(
+            f"Evaluation type {args.eval_type!r} is not enabled for model-kind {args.model_kind}; "
+            f"allowed types: {allowed}"
+        )
     if args.start_index < 0 or args.max_records < 0 or args.max_new_tokens <= 0 or args.num_beams <= 0:
         raise ValueError("start-index/max-records must be non-negative and generation limits positive")
     if args.max_new_tokens > 24:
@@ -695,9 +717,9 @@ def main() -> None:
             raise FileNotFoundError(path)
     prepare_environment(args)
     plugin = import_plugin(args.plugin_path.resolve())
-    settings = MODEL_SETTINGS["ouro"]
+    settings = MODEL_SETTINGS[args.model_kind]
     if plugin.MODEL_TYPE != settings["model_type"] or plugin.TEMPLATE_TYPE != settings["template_type"]:
-        raise RuntimeError("Ouro plugin registration constants do not match")
+        raise RuntimeError(f"{args.model_kind} plugin registration constants do not match")
     package_report = {name: importlib.metadata.version(name) for name in ("ms-swift", "transformers", "peft")}
     split_path = args.qa_root / spec["relative_path"]
     records, container = load_json_records(split_path)
@@ -716,6 +738,7 @@ def main() -> None:
         status="starting",
         event="evaluation_start",
         phase="startup",
+        model_kind=args.model_kind,
         eval_type=args.eval_type,
         split=spec["relative_path"],
         selected_records=len(selected),
@@ -758,7 +781,9 @@ def main() -> None:
 
     atexit.register(mark_unfinished_exit)
     output_jsonl.parent.mkdir(parents=True, exist_ok=True)
-    print("========== BAT OURO ONLINE EVALUATION ==========")
+    print(f"========== BAT {args.model_kind.upper()} ONLINE EVALUATION ==========")
+    if args.model_kind == "qwen3":
+        print("[scope] Qwen3 ABCD-only evaluation; E is disabled by contract")
     print(f"[type] {args.eval_type} split={spec['relative_path']} records={len(selected)}")
     print(f"[renderer] policy={args.rir_policy} audio={args.audio_root} reverb={args.reverb_root}")
     print(f"[generation] do_sample=false num_beams={args.num_beams} max_new_tokens={args.max_new_tokens} use_cache=true")
@@ -792,6 +817,11 @@ def main() -> None:
         attn_impl="sdpa",
         model_kwargs={"local_files_only": True, "low_cpu_mem_usage": True},
     )
+    if base_model.__class__.__name__ != settings["model_class"]:
+        raise RuntimeError(
+            f"Unexpected {args.model_kind} base model class: "
+            f"expected={settings['model_class']} got={base_model.__class__.__name__}"
+        )
     heartbeat.write(
         status="starting",
         event="base_model_load_done",
@@ -817,7 +847,7 @@ def main() -> None:
     model.eval()
     heartbeat.write(status="starting", event="freeze_eval_done", phase="freeze_eval")
     heartbeat.write(status="starting", event="template_load_start", phase="template_load")
-    template = load_template(base_model, processor)
+    template = load_template(args.model_kind, processor)
     heartbeat.write(status="starting", event="template_load_done", phase="template_load")
     heartbeat.write(status="starting", event="tokenizer_load_start", phase="tokenizer_load")
     tokenizer = tokenizer_from_processor(processor)
@@ -827,7 +857,7 @@ def main() -> None:
     heartbeat.write(status="starting", event="renderer_init_done", phase="renderer_init")
     heartbeat.write(status="starting", event="contract_check_start", phase="contract_check")
     from bat.scripts.smoke_bat_eval_generation import parameter_contract
-    contract = parameter_contract(model, "ouro")
+    contract = parameter_contract(model, args.model_kind)
     heartbeat.write(status="starting", event="contract_check_done", phase="contract_check", model_contract=contract)
     heartbeat.write(status="starting", event="scorer_init_start", phase="scorer_init")
     detection = DetectionScorer(args, model, tokenizer) if args.eval_type in {"A", "C"} else None
@@ -933,7 +963,9 @@ def main() -> None:
                     record_index=absolute_index,
                     eval_id=eval_id,
                 )
-                input_ids, prompt_audit = build_input(template, record, args.binary_answer_prompt)
+                input_ids, prompt_audit = build_input(
+                    template, record, args.model_kind, args.binary_answer_prompt
+                )
                 heartbeat.write(
                     status="running",
                     event="input_done",
@@ -1165,15 +1197,17 @@ def main() -> None:
         "status": "ok" if not aborted_on_cuda_oom and errors_count == 0 and metrics.get("status", "ok") == "ok" else "incomplete",
         "scope": "formal_online_generate_and_score",
         "official_bat_contract": {
+            "model_kind": args.model_kind,
             "eval_type": args.eval_type,
             "relative_path": spec["relative_path"],
             "table4_metric": spec["table4_metric"],
+            "qwen3_abcd_only": args.model_kind == "qwen3",
             "no_offline_second_pass": True,
             "renderer_rir_policy": args.rir_policy,
             "audio_root_read_only": str(args.audio_root.resolve()),
         },
         "model": {
-            "kind": "ouro",
+            "kind": args.model_kind,
             "base_path": str(args.model_path.resolve()),
             "checkpoint": str(args.checkpoint.resolve()),
             "checkpoint_adapter": file_inventory(args.checkpoint / "adapter_model.safetensors"),
