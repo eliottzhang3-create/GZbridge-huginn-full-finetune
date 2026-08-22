@@ -122,6 +122,20 @@ def load_adapter(base_model: torch.nn.Module, checkpoint: Path) -> torch.nn.Modu
     return model
 
 
+def freeze_for_evaluation(model: torch.nn.Module) -> None:
+    """Make the loaded adapter a strictly inference-only model.
+
+    PEFT's ``modules_to_save`` wrappers can keep their parameters marked as
+    trainable even when ``is_trainable=False`` is passed to
+    ``from_pretrained``.  That is useful for continuing training, but is not
+    the contract we want for evaluation.  The checkpoint weights remain
+    loaded; this only disables autograd for the evaluation process.
+    """
+    model.eval()
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+
+
 def base_model_of(model: torch.nn.Module) -> torch.nn.Module:
     getter = getattr(model, "get_base_model", None)
     if callable(getter):
@@ -139,17 +153,29 @@ def parameter_contract(model: torch.nn.Module, model_kind: str) -> dict[str, Any
     qformer_trainable = sum(parameter.numel() for parameter in qformer.parameters() if parameter.requires_grad)
     native_trainable = 0
     lora_trainable = 0
+    total_parameters = 0
+    trainable_parameter_count = 0
+    trainable_names: list[str] = []
+    loaded_lora_parameters = 0
+    loaded_qformer_parameters = 0
     for name, parameter in model.named_parameters():
+        total_parameters += parameter.numel()
+        if "lora_A" in name or "lora_B" in name:
+            loaded_lora_parameters += parameter.numel()
+        if "audio_qformer" in name:
+            loaded_qformer_parameters += parameter.numel()
         if not parameter.requires_grad:
             continue
+        trainable_parameter_count += parameter.numel()
+        trainable_names.append(name)
         if "lora_A" in name or "lora_B" in name:
             lora_trainable += parameter.numel()
         elif "audio_qformer" not in name:
             native_trainable += parameter.numel()
-    if spatial_trainable or qformer_trainable or native_trainable or lora_trainable:
+    if trainable_parameter_count:
         raise RuntimeError(
             "Evaluation model must be fully frozen after adapter loading: "
-            f"spatial={spatial_trainable} qformer={qformer_trainable} native={native_trainable} lora={lora_trainable}"
+            f"total={trainable_parameter_count} preview={trainable_names[:8]}"
         )
     contract = getattr(base, MODEL_SETTINGS[model_kind]["plugin_contract_attr"], None)
     if not isinstance(contract, dict):
@@ -157,10 +183,16 @@ def parameter_contract(model: torch.nn.Module, model_kind: str) -> dict[str, Any
     if contract.get("audio_token_count") != 64:
         raise RuntimeError(f"Expected 64 audio tokens, contract={contract}")
     return {
+        "total_parameters": total_parameters,
+        "trainable_parameter_count": trainable_parameter_count,
+        "trainable_name_count": len(trainable_names),
+        "trainable_name_preview": trainable_names[:8],
         "spatial_ast_trainable_parameters": spatial_trainable,
         "qformer_trainable_parameters": qformer_trainable,
         "native_trainable_parameters": native_trainable,
         "lora_trainable_parameters": lora_trainable,
+        "loaded_lora_parameters": loaded_lora_parameters,
+        "loaded_qformer_parameters": loaded_qformer_parameters,
         "spatial_ast_dtype_set": sorted({str(parameter.dtype) for parameter in spatial.parameters()}),
         "audio_contract": contract,
     }
@@ -199,6 +231,38 @@ def parse_smoke_output(record: dict[str, Any], generated_text: str) -> dict[str,
         "normalized": generated_text.strip(),
         "status": "ok" if generated_text.strip() else "empty_generation",
     }
+
+
+def reference_comparison(record: dict[str, Any], generated_text: str) -> dict[str, Any]:
+    """Return descriptive reference-vs-generation information, not a score."""
+    reference = str(record.get("answer", ""))
+    generated = str(generated_text)
+    normalized_reference = " ".join(reference.strip().lower().split())
+    normalized_generated = " ".join(generated.strip().lower().split())
+    generated_parser = parse_smoke_output(record, generated)
+    reference_parser = parse_smoke_output(record, reference)
+    comparison: dict[str, Any] = {
+        "reference_answer": reference,
+        "generated_text": generated,
+        "normalized_text_exact_match": normalized_reference == normalized_generated,
+        "reference_parser": reference_parser,
+        "generated_parser": generated_parser,
+        "parser_value_match": None,
+        "formal_metric_computed": False,
+    }
+    if reference_parser.get("task_parser") == "yes_no":
+        comparison["parser_value_match"] = (
+            reference_parser.get("value") is not None
+            and reference_parser.get("value") == generated_parser.get("value")
+        )
+    elif reference_parser.get("task_parser") == "location":
+        comparison["parser_value_match"] = (
+            reference_parser.get("direction") is not None
+            and reference_parser.get("direction") == generated_parser.get("direction")
+            and reference_parser.get("distance_m") is not None
+            and reference_parser.get("distance_m") == generated_parser.get("distance_m")
+        )
+    return comparison
 
 
 def selected_specs(include_nonbinary: bool) -> list[dict[str, Any]]:
@@ -261,7 +325,7 @@ def main() -> None:
     if base_model.__class__.__name__ != settings["model_class"]:
         raise RuntimeError(f"Unexpected base model class: {base_model.__class__.__name__}")
     model = load_adapter(base_model, args.checkpoint)
-    model.eval()
+    freeze_for_evaluation(model)
     torch.cuda.synchronize(device)
     load_seconds = time.perf_counter() - load_started
     contract_report = parameter_contract(model, args.model_kind)
@@ -322,6 +386,7 @@ def main() -> None:
                         "generated_text": generated_text,
                         "elapsed_seconds": elapsed,
                         "parser": parse_smoke_output(record, generated_text),
+                        "reference_comparison": reference_comparison(record, generated_text),
                     })
                 deterministic = all(row["generated_text"] == repeat_rows[0]["generated_text"] for row in repeat_rows[1:])
                 if not deterministic:
@@ -397,6 +462,30 @@ def main() -> None:
         },
         "sample_count": len(output_rows),
         "successful_sample_count": sum(row.get("status", "ok") != "error" for row in output_rows),
+        "sample_reference_comparisons": [
+            {
+                "eval_id": row.get("eval_id"),
+                "split": row.get("split"),
+                "official_type": row.get("official_type"),
+                "question_id": row.get("question_id"),
+                "question": row.get("question"),
+                "reference_answer": row.get("ground_truth_answer"),
+                "generations": [
+                    {
+                        "repeat_index": repeat.get("repeat_index"),
+                        "generated_text": repeat.get("generated_text"),
+                        "reference_comparison": repeat.get("reference_comparison"),
+                    }
+                    for repeat in row.get("repeats", [])
+                ],
+            }
+            for row in output_rows
+        ],
+        "reference_comparison_scope": {
+            "included_in_each_repeat": True,
+            "formal_metric_computed": False,
+            "note": "Reference comparisons are smoke diagnostics only; they are not Table 4 scores.",
+        },
         "output_jsonl": str(args.output_jsonl.resolve()),
         "issues": issues,
     }
