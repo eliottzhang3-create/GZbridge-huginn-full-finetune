@@ -23,8 +23,7 @@ REVERB_ROOT=${BAT_EVAL_REVERB_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/
 SPATIAL_AST_ROOT=${BAT_EVAL_SPATIAL_AST_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/Spatial-AST}
 SPATIAL_AST_CHECKPOINT=${BAT_EVAL_SPATIAL_AST_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/models/BAT/SpatialAST/finetuned.pth}
 QFORMER_SOURCE=${BAT_EVAL_QFORMER_SOURCE:-/hpc_stor03/sjtu_home/jinwei.zhang/code/OWL/src/slam_llm/models/projector.py}
-LABEL_CSV=${BAT_EVAL_LABEL_CSV:-/hpc_stor03/public/shared/data/raa/AudioSet/metadata/class_labels_indices_subset.csv}
-LABEL_EMBEDDINGS=${BAT_EVAL_LABEL_EMBEDDINGS:-/hpc_stor03/public/shared/data/raa/AudioSet/metadata/audioset_class_embeds.npy}
+LABEL_CSV=${BAT_EVAL_LABEL_CSV:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/SpatialSoundQA/class_labels_indices_subset.csv}
 
 ARGS=(
   --eval-type "${BAT_EVAL_TYPE}"
@@ -46,10 +45,8 @@ ARGS=(
   --num-beams "${BAT_EVAL_NUM_BEAMS:-4}"
   --rir-policy "${BAT_EVAL_RIR_POLICY:-official_bat}"
   --binary-answer-prompt "${BAT_EVAL_BINARY_ANSWER_PROMPT:-off}"
-  --detection-mode "${BAT_EVAL_DETECTION_MODE:-official_semantic}"
+  --detection-mode "${BAT_EVAL_DETECTION_MODE:-model_output_embedding}"
   --label-csv "${LABEL_CSV}"
-  --label-embeddings "${LABEL_EMBEDDINGS}"
-  --embedding-model "${BAT_EVAL_EMBEDDING_MODEL:-text-embedding-ada-002}"
 )
 
 if [[ "${BAT_EVAL_OVERWRITE:-0}" == "1" ]]; then

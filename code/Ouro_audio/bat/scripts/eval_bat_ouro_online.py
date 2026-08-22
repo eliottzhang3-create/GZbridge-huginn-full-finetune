@@ -7,11 +7,13 @@ accumulation happen in the same loop.  A JSONL row and a progress snapshot are
 flushed after every example so an interrupted long evaluation leaves usable
 diagnostics without requiring a second offline scoring pass.
 
-For A/C, ``official_semantic`` follows the BAT/SLAM evaluation contract:
-generated text is embedded and compared by cosine similarity with the 355
-AudioSet class embeddings, then AP is computed per class and averaged.  The
-semantic backend is intentionally explicit; ``diagnostic_exact`` is available
-only as a non-official fallback when no embedding service/assets are present.
+For A/C, the paper-style 355-class detection metric is computed without an
+external embedding service: each AudioSet class name and each generated
+answer are represented in the loaded model's ``lm_head.weight`` token-output
+space.  Token rows are mean-pooled and L2-normalized, cosine similarity to
+each class vector is used as the prediction score, and AP is computed per
+class and averaged.  The ground-truth label-to-class mapping is retained only
+to construct the required 355-dimensional multi-hot target vector.
 """
 
 from __future__ import annotations
@@ -85,16 +87,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--binary-answer-prompt", choices=("off", "on", "auto"), default="off")
     parser.add_argument(
         "--detection-mode",
-        choices=("official_semantic", "diagnostic_exact"),
-        default="official_semantic",
-        help="Used only for A/C; diagnostic_exact is explicitly non-official.",
+        choices=("model_output_embedding", "official_semantic", "diagnostic_exact"),
+        default="model_output_embedding",
+        help=(
+            "Used only for A/C. model_output_embedding is the local model-lm_head "
+            "embedding metric; official_semantic is a backward-compatible alias."
+        ),
     )
     parser.add_argument("--label-csv", type=Path, default=None)
-    parser.add_argument("--label-embeddings", type=Path, default=None)
-    # The official SLAM/BAT calculate_map.py calls text-embedding-ada-002;
-    # audioset_class_embeds.npy is expected to be in that same embedding space.
-    parser.add_argument("--embedding-model", default="text-embedding-ada-002")
-    parser.add_argument("--openai-api-key-env", default="OPENAI_API_KEY")
+    # Kept as a compatibility argument for old launchers.  It is intentionally
+    # not read: class vectors are built from this model's lm_head below.
+    parser.add_argument("--label-embeddings", type=Path, default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--embedding-model", default=None, help=argparse.SUPPRESS)
+    parser.add_argument("--openai-api-key-env", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--overwrite", action="store_true")
     return parser.parse_args()
 
@@ -174,41 +179,37 @@ def split_labels(answer: str) -> list[str]:
 
 
 class DetectionScorer:
-    """Online accumulator for the official A/C detection mAP contract."""
+    """Online accumulator for the paper-style A/C detection mAP contract.
 
-    def __init__(self, args: argparse.Namespace) -> None:
-        self.mode = args.detection_mode
+    ``target`` remains a 355-dimensional multi-hot vector because AP is
+    defined per AudioSet class.  Both sides of the semantic comparison use
+    the same model-specific output space: the rows of ``lm_head.weight``
+    corresponding to the tokenizer's subword pieces.  A phrase is represented
+    by the mean of its token rows followed by L2 normalization.
+    """
+
+    def __init__(self, args: argparse.Namespace, model: torch.nn.Module, tokenizer: Any) -> None:
+        import numpy as np
+
+        self.mode = "model_output_embedding" if args.detection_mode == "official_semantic" else args.detection_mode
         self.label_csv = args.label_csv
-        self.label_embeddings_path = args.label_embeddings
-        self.embedding_model = args.embedding_model
-        self.client = None
-        self.cache: dict[str, list[float]] = {}
+        self.model = model
+        self.tokenizer = tokenizer
+        self.output_weight: torch.Tensor | None = None
+        self.embedding_dimension: int | None = None
+        self.cache: dict[tuple[int, ...], list[float]] = {}
         self.targets: list[list[int]] = []
         self.predictions: list[list[float]] = []
         self.unknown_target_labels: list[str] = []
         self.labels: list[str] = []
         self.label_to_index: dict[str, int] = {}
-        self.label_embeddings = None
-        if self.mode == "official_semantic":
-            if self.label_csv is None or self.label_embeddings_path is None:
-                raise ValueError("official_semantic requires --label-csv and --label-embeddings")
-            self._load_label_assets()
-            api_key = os.environ.get(args.openai_api_key_env)
-            if not api_key:
-                raise RuntimeError(
-                    f"Missing {args.openai_api_key_env}; official A/C mAP requires the BAT text-embedding backend"
-                )
-            try:
-                from openai import OpenAI
-            except ImportError as exc:
-                raise RuntimeError("official_semantic requires the openai Python package") from exc
-            self.client = OpenAI(api_key=api_key)
-        else:
-            self._load_label_assets(require_embeddings=False)
+        self.label_embeddings: np.ndarray | None = None
+        self._load_label_assets()
+        if self.mode == "model_output_embedding":
+            self._load_model_output_space()
+            self._build_label_embeddings()
 
-    def _load_label_assets(self, require_embeddings: bool = True) -> None:
-        import numpy as np
-
+    def _load_label_assets(self) -> None:
         if self.label_csv is None or not self.label_csv.is_file():
             raise FileNotFoundError(f"Missing AudioSet label CSV: {self.label_csv}")
         with self.label_csv.open("r", encoding="utf-8", newline="") as handle:
@@ -220,63 +221,117 @@ class DetectionScorer:
             label = str(row.get("display_name", row.get("name", ""))).strip().lower()
             if label:
                 self.labels.append(label)
-        self.label_to_index = {label: index for index, label in enumerate(self.labels)}
         if len(self.labels) != 355:
             raise ValueError(f"Expected 355 AudioSet subset labels, got {len(self.labels)}")
-        if require_embeddings:
-            if self.label_embeddings_path is None or not self.label_embeddings_path.is_file():
-                raise FileNotFoundError(f"Missing AudioSet label embeddings: {self.label_embeddings_path}")
-            embeddings = np.asarray(np.load(self.label_embeddings_path, allow_pickle=False), dtype=np.float32)
-            if embeddings.ndim != 2 or embeddings.shape[0] != 355:
-                raise ValueError(f"Expected [355,D] label embeddings, got {embeddings.shape}")
-            norms = np.linalg.norm(embeddings, axis=1, keepdims=True)
-            if not np.isfinite(embeddings).all() or np.any(norms == 0):
-                raise ValueError("Label embeddings contain non-finite or zero-norm rows")
-            self.label_embeddings = embeddings / norms
+        if len(set(self.labels)) != len(self.labels):
+            raise ValueError("AudioSet label CSV contains duplicate display names")
+        self.label_to_index = {label: index for index, label in enumerate(self.labels)}
 
-    def _embed(self, text: str) -> list[float]:
-        if text in self.cache:
-            return self.cache[text]
-        response = self.client.embeddings.create(model=self.embedding_model, input=[text])
-        vector = list(response.data[0].embedding)
-        self.cache[text] = vector
-        return vector
+    def _load_model_output_space(self) -> None:
+        base = base_model_of(self.model)
+        output_layer = base.get_output_embeddings() if hasattr(base, "get_output_embeddings") else None
+        if output_layer is None or not hasattr(output_layer, "weight"):
+            output_layer = getattr(base, "lm_head", None)
+        if output_layer is None or not hasattr(output_layer, "weight"):
+            raise RuntimeError("Model has no usable lm_head output embedding matrix")
+        weight = output_layer.weight.detach()
+        if weight.ndim != 2:
+            raise RuntimeError(f"Expected lm_head.weight [vocab,hidden], got {tuple(weight.shape)}")
+        if not torch.isfinite(weight).all():
+            raise RuntimeError("lm_head.weight contains non-finite values")
+        self.output_weight = weight
+        self.embedding_dimension = int(weight.shape[1])
 
-    def add(self, reference: str, generated: str) -> dict[str, Any]:
+    def _token_ids(self, text: str) -> tuple[int, ...]:
+        encoded = self.tokenizer(text, add_special_tokens=False, return_attention_mask=False)
+        ids = encoded["input_ids"] if isinstance(encoded, dict) else encoded.input_ids
+        if ids and isinstance(ids[0], list):
+            ids = ids[0]
+        special_ids = {int(value) for value in (getattr(self.tokenizer, "all_special_ids", None) or [])}
+        vocab_size = int(self.output_weight.shape[0]) if self.output_weight is not None else None
+        clean = [int(value) for value in ids if int(value) not in special_ids]
+        if vocab_size is not None:
+            clean = [value for value in clean if 0 <= value < vocab_size]
+        return tuple(clean)
+
+    def _embed_token_ids(self, token_ids: tuple[int, ...]) -> list[float]:
+        import numpy as np
+
+        if self.output_weight is None or not token_ids:
+            raise ValueError("Cannot embed empty text in model output space")
+        key = tuple(token_ids)
+        if key in self.cache:
+            return self.cache[key]
+        indices = torch.tensor(token_ids, dtype=torch.long, device=self.output_weight.device)
+        vector = self.output_weight.index_select(0, indices).float().mean(dim=0)
+        norm = torch.linalg.vector_norm(vector)
+        if not torch.isfinite(vector).all() or not torch.isfinite(norm) or float(norm) == 0.0:
+            raise ValueError("Model output-space embedding is non-finite or zero-norm")
+        normalized = (vector / norm).detach().cpu().numpy().astype(np.float32).tolist()
+        self.cache[key] = normalized
+        return normalized
+
+    def _build_label_embeddings(self) -> None:
+        import numpy as np
+
+        vectors = [self._embed_token_ids(self._token_ids(label)) for label in self.labels]
+        embeddings = np.asarray(vectors, dtype=np.float32)
+        if embeddings.shape != (355, self.embedding_dimension):
+            raise RuntimeError(f"Unexpected model label embedding shape: {embeddings.shape}")
+        self.label_embeddings = embeddings
+
+    def add(
+        self,
+        reference: str,
+        generated: str,
+        generated_token_ids: Any | None = None,
+    ) -> dict[str, Any]:
         import numpy as np
 
         target = np.zeros((355,), dtype=np.int8)
+        target_labels = split_labels(reference)
         unknown = []
-        for label in split_labels(reference):
+        for label in target_labels:
             index = self.label_to_index.get(label)
             if index is None:
                 unknown.append(label)
             else:
                 target[index] = 1
         self.unknown_target_labels.extend(unknown)
-        if self.mode == "official_semantic":
-            vector = np.asarray(self._embed(generated), dtype=np.float32)
-            if vector.ndim != 1 or self.label_embeddings.shape[1] != vector.shape[0]:
-                raise ValueError(
-                    f"Embedding width mismatch labels={self.label_embeddings.shape[1]} text={vector.shape[0]}"
-                )
-            vector_norm = float(np.linalg.norm(vector))
-            if not np.isfinite(vector).all() or vector_norm == 0:
-                raise ValueError("Generated text embedding is invalid")
-            scores = (self.label_embeddings @ (vector / vector_norm)).astype(np.float32)
+        if self.mode == "model_output_embedding":
+            if generated_token_ids is None:
+                token_ids = self._token_ids(generated)
+            else:
+                if isinstance(generated_token_ids, torch.Tensor):
+                    values = generated_token_ids.detach().flatten().tolist()
+                else:
+                    values = list(generated_token_ids)
+                special_ids = {int(value) for value in (getattr(self.tokenizer, "all_special_ids", None) or [])}
+                token_ids = tuple(int(value) for value in values if int(value) not in special_ids)
+            vector = np.asarray(self._embed_token_ids(token_ids), dtype=np.float32)
+            scores = (self.label_embeddings @ vector).astype(np.float32)
         else:
             normalized = generated.lower()
             scores = np.asarray(
-                [1.0 if re.search(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", normalized) else 0.0 for label in self.labels],
+                [
+                    1.0
+                    if re.search(rf"(?<![a-z0-9]){re.escape(label)}(?![a-z0-9])", normalized)
+                    else 0.0
+                    for label in self.labels
+                ],
                 dtype=np.float32,
             )
         self.targets.append(target.tolist())
         self.predictions.append(scores.tolist())
         return {
-            "target_labels": split_labels(reference),
+            "target_labels": target_labels,
             "unknown_target_labels": unknown,
             "score_mode": self.mode,
-            "official_metric": self.mode == "official_semantic",
+            "embedding_space": "model_lm_head_token_rows" if self.mode == "model_output_embedding" else None,
+            "embedding_dimension": self.embedding_dimension if self.mode == "model_output_embedding" else None,
+            "embedding_pooling": "mean_token_rows_then_l2_normalize" if self.mode == "model_output_embedding" else None,
+            "ground_truth_target_encoding": "355d_multi_hot_from_semicolon_labels",
+            "official_metric": False,
         }
 
     def finalize(self) -> dict[str, Any]:
@@ -299,12 +354,16 @@ class DetectionScorer:
             "per_class_ap_count": int(ap.size),
             "record_count": len(self.targets),
             "score_mode": self.mode,
-            "official_metric": self.mode == "official_semantic",
-            "embedding_model": self.embedding_model if self.mode == "official_semantic" else None,
+            "official_metric": False,
+            "embedding_space": "model_lm_head_token_rows" if self.mode == "model_output_embedding" else None,
+            "embedding_dimension": self.embedding_dimension if self.mode == "model_output_embedding" else None,
+            "embedding_pooling": "mean_token_rows_then_l2_normalize" if self.mode == "model_output_embedding" else None,
+            "ground_truth_target_encoding": "355d_multi_hot_from_semicolon_labels",
+            "class_vector_source": "AudioSet class name tokenized with the same model tokenizer, then lm_head rows",
             "label_count": len(self.labels),
             "unknown_target_label_count": len(self.unknown_target_labels),
             "unknown_target_label_examples": sorted(set(self.unknown_target_labels))[:20],
-            "unique_text_embedding_count": len(self.cache),
+            "unique_token_sequence_embedding_count": len(self.cache),
         }
 
 
@@ -407,7 +466,6 @@ def main() -> None:
     selected = records[args.start_index:end]
     if not selected:
         raise ValueError(f"No records selected: start={args.start_index} end={end} total={len(records)}")
-    detection = DetectionScorer(args) if args.eval_type in {"A", "C"} else None
     location_rows: list[dict[str, Any]] = []
     binary_rows: list[dict[str, Any]] = []
     errors: list[dict[str, Any]] = []
@@ -419,7 +477,11 @@ def main() -> None:
     print(f"[renderer] policy={args.rir_policy} audio={args.audio_root} reverb={args.reverb_root}")
     print(f"[generation] do_sample=false num_beams={args.num_beams} max_new_tokens={args.max_new_tokens} use_cache=true")
     if args.eval_type in {"A", "C"}:
-        print(f"[detection] mode={args.detection_mode} labels={args.label_csv} embeddings={args.label_embeddings}")
+        resolved_mode = "model_output_embedding" if args.detection_mode == "official_semantic" else args.detection_mode
+        print(
+            f"[detection] mode={resolved_mode} label_csv={args.label_csv} "
+            "embedding_space=model_lm_head_token_rows pooling=mean_then_l2"
+        )
     load_started = time.perf_counter()
     try:
         from swift import get_model_processor
@@ -443,6 +505,7 @@ def main() -> None:
     renderer = BATEvalAudioRenderer(args.audio_root, args.reverb_root, args.rir_policy)
     from bat.scripts.smoke_bat_eval_generation import parameter_contract
     contract = parameter_contract(model, "ouro")
+    detection = DetectionScorer(args, model, tokenizer) if args.eval_type in {"A", "C"} else None
     torch.cuda.synchronize(device)
     load_seconds = time.perf_counter() - load_started
     errors_count = 0
@@ -488,7 +551,7 @@ def main() -> None:
                     score = binary_score(str(record["answer"]), generated_text)
                     binary_rows.append(score)
                 else:
-                    score = detection.add(str(record["answer"]), generated_text)
+                    score = detection.add(str(record["answer"]), generated_text, generated_ids)
                 row = {
                     "status": "ok",
                     "eval_id": eval_id,
