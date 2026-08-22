@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${BAT_EVAL_TYPE:?Set BAT_EVAL_TYPE to A, B, C, D, E-direction, or E-distance}"
+: "${BAT_EVAL_OUTPUT_JSONL:?Set BAT_EVAL_OUTPUT_JSONL}"
+: "${BAT_EVAL_OUTPUT_REPORT:?Set BAT_EVAL_OUTPUT_REPORT}"
+
+ENV_PREFIX=/hpc_stor03/sjtu_home/jinwei.zhang/env/miniconda3/envs/swift_ouro
+REPO=/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune
+PYTHON=${ENV_PREFIX}/bin/python
+
+source /hpc_stor03/sjtu_home/jinwei.zhang/env/miniconda3/etc/profile.d/conda.sh
+conda activate /hpc_stor03/sjtu_home/jinwei.zhang/env/miniconda3/envs/swift_ouro
+export PYTHONPATH="${REPO}/code/Ouro_audio:${PYTHONPATH:-}"
+export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
+export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
+
+MODEL_PATH=${BAT_EVAL_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B}
+CHECKPOINT=${BAT_EVAL_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/bat/stage3_ab_cde_localcache_0819_v2/v0-20260819-120617/checkpoint-10500}
+QA_ROOT=${BAT_EVAL_QA_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/SpatialSoundQA/closed-end}
+AUDIO_ROOT=${BAT_EVAL_AUDIO_ROOT:-/hpc_stor03/public/shared/data/raa/AudioSet}
+REVERB_ROOT=${BAT_EVAL_REVERB_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/SpatialSoundQA/mp3d_reverb}
+SPATIAL_AST_ROOT=${BAT_EVAL_SPATIAL_AST_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/Spatial-AST}
+SPATIAL_AST_CHECKPOINT=${BAT_EVAL_SPATIAL_AST_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/models/BAT/SpatialAST/finetuned.pth}
+QFORMER_SOURCE=${BAT_EVAL_QFORMER_SOURCE:-/hpc_stor03/sjtu_home/jinwei.zhang/code/OWL/src/slam_llm/models/projector.py}
+LABEL_CSV=${BAT_EVAL_LABEL_CSV:-/hpc_stor03/public/shared/data/raa/AudioSet/metadata/class_labels_indices_subset.csv}
+LABEL_EMBEDDINGS=${BAT_EVAL_LABEL_EMBEDDINGS:-/hpc_stor03/public/shared/data/raa/AudioSet/metadata/audioset_class_embeds.npy}
+
+ARGS=(
+  --eval-type "${BAT_EVAL_TYPE}"
+  --model-path "${MODEL_PATH}"
+  --plugin-path "${REPO}/code/Ouro_audio/plugins/ouro_bat_spatial_ast_swift.py"
+  --checkpoint "${CHECKPOINT}"
+  --qa-root "${QA_ROOT}"
+  --audio-root "${AUDIO_ROOT}"
+  --reverb-root "${REVERB_ROOT}"
+  --spatial-ast-root "${SPATIAL_AST_ROOT}"
+  --spatial-ast-checkpoint "${SPATIAL_AST_CHECKPOINT}"
+  --qformer-source "${QFORMER_SOURCE}"
+  --output-jsonl "${BAT_EVAL_OUTPUT_JSONL}"
+  --output-report "${BAT_EVAL_OUTPUT_REPORT}"
+  --device "${BAT_EVAL_DEVICE:-cuda:0}"
+  --start-index "${BAT_EVAL_START_INDEX:-0}"
+  --max-records "${BAT_EVAL_MAX_RECORDS:-0}"
+  --max-new-tokens "${BAT_EVAL_MAX_NEW_TOKENS:-200}"
+  --num-beams "${BAT_EVAL_NUM_BEAMS:-4}"
+  --rir-policy "${BAT_EVAL_RIR_POLICY:-official_bat}"
+  --binary-answer-prompt "${BAT_EVAL_BINARY_ANSWER_PROMPT:-off}"
+  --detection-mode "${BAT_EVAL_DETECTION_MODE:-official_semantic}"
+  --label-csv "${LABEL_CSV}"
+  --label-embeddings "${LABEL_EMBEDDINGS}"
+  --embedding-model "${BAT_EVAL_EMBEDDING_MODEL:-text-embedding-ada-002}"
+)
+
+if [[ "${BAT_EVAL_OVERWRITE:-0}" == "1" ]]; then
+  ARGS+=(--overwrite)
+fi
+
+cd "${REPO}"
+exec "${PYTHON}" -u code/Ouro_audio/bat/scripts/eval_bat_ouro_online.py "${ARGS[@]}"

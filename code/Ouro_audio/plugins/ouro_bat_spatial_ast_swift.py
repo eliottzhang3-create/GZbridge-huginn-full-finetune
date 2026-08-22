@@ -81,6 +81,13 @@ AUDIO_AUDIT_ENABLED = os.environ.get("BAT_AUDIO_AUDIT", "0") == "1"
 DEFAULT_TRAIN_SEQUENCE_LENGTH = 176
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def env_path(name: str, default: Path) -> Path:
     return Path(os.environ.get(name, str(default))).expanduser().resolve()
 
@@ -383,6 +390,7 @@ class OuroBATTemplate(Template):
             env_path("BAT_REVERB_ROOT", DEFAULT_REVERB_ROOT),
         )
         self.audio_token_count = AUDIO_TOKEN_COUNT
+        self.fixed_sequence_length = env_bool("BAT_FIXED_SEQUENCE_LENGTH", True)
         self.train_sequence_length = int(
             os.environ.get("BAT_MAX_SEQUENCE_LENGTH", str(DEFAULT_TRAIN_SEQUENCE_LENGTH))
         )
@@ -424,14 +432,13 @@ class OuroBATTemplate(Template):
                 f"input_ids={len(input_ids)} labels={len(labels)}"
             )
 
-        # Training always uses one static full width so the compiled Ouro core
-        # sees one shape throughout all three curriculum stages.  The audio
-        # prefix consumes 64 positions, therefore only the text portion is
-        # budgeted here.  This check deliberately happens before
-        # ``load_item``: an overlong record is retained, truncated, and only
-        # then pays the AudioSet/RIR rendering cost.
+        # Fixed-width mode is retained for old smoke tests.  Formal training
+        # sets BAT_FIXED_SEQUENCE_LENGTH=false: each example keeps its natural
+        # text width and Swift's batch collator pads only to that batch's
+        # longest example.  The optional max_length argument remains an upper
+        # bound supplied by Swift, not a fixed batch width.
         training_mode = getattr(self, "mode", "train") == "train"
-        if training_mode:
+        if training_mode and self.fixed_sequence_length:
             text_budget = self.train_sequence_length - self.audio_token_count
             if len(input_ids) > text_budget:
                 input_ids = input_ids[:text_budget]
@@ -451,16 +458,32 @@ class OuroBATTemplate(Template):
             encoded["attention_mask"] = [
                 1
             ] * (self.audio_token_count + valid_text_length) + [0] * pad_count
+        elif training_mode:
+            text_budget = self.train_sequence_length - self.audio_token_count
+            if len(input_ids) > text_budget:
+                input_ids = input_ids[:text_budget]
+                if labels is not None:
+                    labels = labels[:text_budget]
+            valid_text_length = len(input_ids)
+            encoded["attention_mask"] = [1] * (self.audio_token_count + valid_text_length)
 
-        # The expensive waveform path is intentionally after the text budget
-        # decision.  Truncation never drops the record; it only limits the
-        # language-side context to the production fixed width.
+        # The expensive waveform path is intentionally after the text-width
+        # decision.  Truncation never drops the record; in dynamic mode the
+        # language-side context remains at its natural width (up to Swift's
+        # max_length ceiling).
         waveform = self.audio_renderer.load_item(audios[0])
         prefix_ids = [int(dummy_id)] * self.audio_token_count
         encoded["input_ids"] = prefix_ids + list(input_ids)
         if labels is not None:
             encoded["labels"] = [-100] * self.audio_token_count + list(labels)
         encoded["audio_waveform"] = waveform
+        encoded["bat_text_contract"] = {
+            "training_mode": training_mode,
+            "fixed_sequence_length": bool(self.fixed_sequence_length),
+            "natural_text_length": len(input_ids),
+            "audio_prefix_tokens": self.audio_token_count,
+            "pre_collation_sequence_length": len(encoded["input_ids"]),
+        }
         if AUDIO_AUDIT_ENABLED:
             # Preserve only the source metadata needed by the smoke audit.
             # The model forward consumes this field before calling Ouro.

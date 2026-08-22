@@ -29,7 +29,10 @@ PER_DEVICE_BATCH_SIZE = 8
 WORLD_SIZE_REQUIRED = 8
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 0.002
-MAX_SEQUENCE_LENGTH = 176
+# Dynamic mode no longer uses the old 176-token BAT cap.  512 is only a
+# tokenizer/model safety ceiling; examples below it retain natural width and
+# the batch collator pads to the current batch's longest example.
+MAX_LENGTH_CEILING = 512
 PERIODIC_SAVE_STEPS = 3_000
 MAX_PERIODIC_CHECKPOINTS = 2
 WARMUP_RATIO = 0.13
@@ -194,6 +197,11 @@ def ensure_final_checkpoint(trainer) -> Path:
 
 def main() -> None:
     args = parse_args()
+    # Formal Stage-III runs intentionally use dynamic batch padding.  Keep the
+    # setting in the Python entry point as well as the remote wrapper so a
+    # manually launched torchrun cannot silently fall back to fixed width.
+    os.environ["BAT_FIXED_SEQUENCE_LENGTH"] = "false"
+    os.environ["BAT_MAX_SEQUENCE_LENGTH"] = str(MAX_LENGTH_CEILING)
     validate_base_contract()
     actual_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if args.world_size != WORLD_SIZE_REQUIRED or actual_world_size != WORLD_SIZE_REQUIRED:
@@ -314,7 +322,7 @@ def main() -> None:
         "--model", str(args.model_path), "--model_type", MODEL_TYPE, "--template", TEMPLATE_TYPE,
         "--external_plugins", str(args.plugin_path), "--dataset", str(args.dataset),
         "--split_dataset_ratio", "0", "--dataset_shuffle", "false", "--train_dataloader_shuffle", "false",
-        "--sortish_sampler", "false", "--group_by_length", "false", "--max_length", str(MAX_SEQUENCE_LENGTH),
+        "--sortish_sampler", "false", "--group_by_length", "false", "--max_length", str(MAX_LENGTH_CEILING),
         "--output_dir", str(args.output_dir), "--tuner_type", "lora", "--tuner_backend", "peft",
         "--target_modules", *BAT_TRAINING.lora_target_modules, "--modules_to_save", "audio_qformer",
         "--freeze_llm", "true", "--freeze_vit", "true", "--freeze_aligner", "false",
@@ -356,7 +364,11 @@ def main() -> None:
         f"[checkpoint] native_save_strategy=steps save_steps={PERIODIC_SAVE_STEPS} "
         f"save_total_limit={MAX_PERIODIC_CHECKPOINTS} full_resumable=true"
     )
-    print(f"[data] dataloader_num_workers=0 pin_memory=false")
+    print(
+        f"[data] dataloader_num_workers=0 pin_memory=false "
+        f"padding=dynamic_batch max_length_ceiling={MAX_LENGTH_CEILING} "
+        f"fixed_sequence_length={os.environ['BAT_FIXED_SEQUENCE_LENGTH']}"
+    )
     print(
         f"[cache] HF_DATASETS_CACHE={os.environ.get('HF_DATASETS_CACHE')} "
         f"local_arrow_cache={os.environ.get('BAT_LOCAL_ARROW_CACHE')} "

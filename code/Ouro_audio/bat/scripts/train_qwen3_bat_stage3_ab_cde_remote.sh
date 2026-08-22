@@ -18,7 +18,8 @@ export OPENBLAS_NUM_THREADS=1
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
-export BAT_MAX_SEQUENCE_LENGTH=176
+export BAT_FIXED_SEQUENCE_LENGTH=false
+export BAT_MAX_SEQUENCE_LENGTH=512
 export BAT_AUDIO_AUDIT=0
 export BAT_RUNTIME_MONITOR_INTERVAL_STEPS="${BAT_RUNTIME_MONITOR_INTERVAL_STEPS:-500}"
 export PYTHONFAULTHANDLER=1
@@ -83,6 +84,7 @@ echo "dataset=$DATASET"
 echo "report=$REPORT"
 echo "output_dir=$OUTPUT_DIR"
 echo "dataloader_num_workers_per_rank=0"
+echo "padding=dynamic_batch max_length_ceiling=512 fixed_sequence_length=false"
 echo "torch_compile=false eager_transformer=true"
 echo "HF_DATASETS_CACHE=$HF_DATASETS_CACHE"
 echo "MODELSCOPE_CACHE=$MODELSCOPE_CACHE"

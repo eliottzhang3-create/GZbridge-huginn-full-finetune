@@ -24,6 +24,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from bat.configs.training import BAT_TRAINING
+from bat.cache_contract import assert_local_arrow_cache
 from bat.qwen3_compile import (
     compile_qwen3_transformer_core,
     dynamo_counter_summary,
@@ -32,7 +33,6 @@ from bat.qwen3_compile import (
 from smoke_qwen3_bat_lora import (
     EXPECTED_AUDIO_TOKENS,
     EXPECTED_QWEN3_LAYERS,
-    EXPECTED_SEQUENCE_LENGTH,
     TARGET_MODULES,
     adapter_config_report,
     find_module,
@@ -52,10 +52,11 @@ from smoke_qwen3_bat_lora import (
 MODEL_TYPE = "qwen3_bat_spatial_ast"
 TEMPLATE_TYPE = "qwen3_bat_audio_prefix"
 EXPECTED_WORLD_SIZE = 8
-EXPECTED_LOCAL_BATCH = 2
+EXPECTED_LOCAL_BATCH = 8
 EXPECTED_GLOBAL_BATCH = EXPECTED_WORLD_SIZE * EXPECTED_LOCAL_BATCH
-EXPECTED_RECORDS = 16
+EXPECTED_RECORDS = 128
 EXPECTED_SMOKE_STEPS = 2
+MAX_LENGTH_CEILING = 512
 STAGE3_TYPES = {"A", "B", "C", "D", "E"}
 
 
@@ -196,6 +197,77 @@ def audit_audio_batch(model: torch.nn.Module, inputs: dict[str, Any]) -> dict[st
     }
 
 
+def audit_dynamic_padding(
+    input_ids: torch.Tensor,
+    labels: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> dict[str, Any]:
+    if input_ids.ndim != 2 or labels.shape != input_ids.shape or attention_mask.shape != input_ids.shape:
+        raise RuntimeError(
+            "Dynamic-padding tensors are not aligned: "
+            f"input={tuple(input_ids.shape)} labels={tuple(labels.shape)} attention={tuple(attention_mask.shape)}"
+        )
+    batch_size, batch_width = input_ids.shape
+    if batch_width < EXPECTED_AUDIO_TOKENS + 1 or batch_width > MAX_LENGTH_CEILING:
+        raise RuntimeError(
+            f"Dynamic batch width={batch_width} outside [{EXPECTED_AUDIO_TOKENS + 1}, {MAX_LENGTH_CEILING}]"
+        )
+    active_lengths = attention_mask.to(torch.long).sum(dim=1)
+    if int(active_lengths.max().item()) != batch_width:
+        raise RuntimeError(
+            f"Collator width={batch_width} does not equal longest active length={int(active_lengths.max().item())}"
+        )
+    if int(active_lengths.min().item()) < EXPECTED_AUDIO_TOKENS + 1:
+        raise RuntimeError(f"Invalid active length(s): {active_lengths.tolist()}")
+    observed_within_batch = len(set(int(value) for value in active_lengths.tolist())) >= 2
+    if not bool((attention_mask[:, :EXPECTED_AUDIO_TOKENS] == 1).all().item()):
+        raise RuntimeError("Audio prefix positions are not all active in attention_mask")
+    padding_mask = attention_mask == 0
+    if padding_mask.any() and not bool((labels[padding_mask] == -100).all().item()):
+        raise RuntimeError("Batch padding positions are not fully ignored by labels")
+    for row_index, row in enumerate(attention_mask.tolist()):
+        seen_padding = False
+        for value in row:
+            if value == 0:
+                seen_padding = True
+            elif seen_padding:
+                raise RuntimeError(f"Non-right padding detected in row {row_index}: {row}")
+    valid_label_counts = (labels != -100).sum(dim=1)
+    if not bool((labels[:, :EXPECTED_AUDIO_TOKENS] == -100).all().item()):
+        raise RuntimeError("Audio prefix labels are not fully ignored")
+    if bool((valid_label_counts <= 0).any().item()):
+        raise RuntimeError("At least one sample has no assistant-response target labels")
+    target_spans: list[dict[str, int]] = []
+    for row_index in range(batch_size):
+        target_indices = torch.nonzero(labels[row_index] != -100, as_tuple=False).flatten()
+        if target_indices.numel() == 0:
+            raise RuntimeError(f"No assistant target labels in row {row_index}")
+        first = int(target_indices[0].item())
+        last = int(target_indices[-1].item())
+        expected = torch.arange(first, last + 1, device=target_indices.device)
+        if not torch.equal(target_indices, expected):
+            raise RuntimeError(f"Assistant target labels are not contiguous in row {row_index}")
+        if first <= EXPECTED_AUDIO_TOKENS:
+            raise RuntimeError(
+                "Assistant target starts at the audio boundary; no user/system prompt labels were masked "
+                f"in row {row_index}: first_target_index={first}"
+            )
+        target_spans.append({"first_target_index": first, "last_target_index": last})
+    return {
+        "mode": "dynamic_batch_padding",
+        "max_length_ceiling": MAX_LENGTH_CEILING,
+        "batch_sequence_length": batch_width,
+        "per_example_active_lengths": [int(value) for value in active_lengths.tolist()],
+        "observed_within_batch": observed_within_batch,
+        "per_example_assistant_target_counts": [int(value) for value in valid_label_counts.tolist()],
+        "assistant_target_spans": target_spans,
+        "padding_token_count": int(padding_mask.sum().item()),
+        "padding_labels_all_ignore": True,
+        "audio_prefix_labels_all_ignore": True,
+        "assistant_targets_present": True,
+    }
+
+
 def checkpoint_path(output_dir: Path, expected_step: int) -> Path:
     candidates = sorted(path for path in output_dir.rglob(f"checkpoint-{expected_step}") if path.is_dir())
     if len(candidates) != 1:
@@ -285,7 +357,7 @@ def make_argv(args: argparse.Namespace, target_steps: int, save_steps: int, warm
         "--model", str(args.model_path), "--model_type", MODEL_TYPE, "--template", TEMPLATE_TYPE,
         "--external_plugins", str(args.plugin_path), "--dataset", str(args.dataset),
         "--split_dataset_ratio", "0", "--dataset_shuffle", "false", "--train_dataloader_shuffle", "false",
-        "--sortish_sampler", "false", "--group_by_length", "false", "--max_length", str(EXPECTED_SEQUENCE_LENGTH),
+        "--sortish_sampler", "false", "--group_by_length", "false", "--max_length", str(MAX_LENGTH_CEILING),
         "--remove_unused_columns", "false", "--output_dir", str(args.output_dir),
         "--tuner_type", "lora", "--tuner_backend", "peft", "--target_modules", *TARGET_MODULES,
         "--modules_to_save", "audio_qformer", "--freeze_llm", "true", "--freeze_vit", "true",
@@ -299,7 +371,8 @@ def make_argv(args: argparse.Namespace, target_steps: int, save_steps: int, warm
         "--dataloader_num_workers", str(args.dataloader_num_workers),
         "--dataloader_pin_memory", "true" if args.dataloader_num_workers > 0 else "false",
         "--dataset_num_proc", "1",
-        "--lazy_tokenize", "false", "--load_from_cache_file", "false", "--loss_scale", "all",
+        "--lazy_tokenize", "true", "--load_from_cache_file", "false", "--loss_scale", "default",
+        "--is_binary_loss_scale", "true",
         "--seed", "42", "--data_seed", "42", "--optim", "adamw_torch", "--adam_beta1", str(BAT_TRAINING.beta1),
         "--adam_beta2", str(BAT_TRAINING.beta2), "--weight_decay", str(BAT_TRAINING.weight_decay),
         "--attn_impl", "sdpa", "--bf16", "true", "--report_to", "none",
@@ -311,6 +384,8 @@ def make_argv(args: argparse.Namespace, target_steps: int, save_steps: int, warm
 
 
 def main() -> None:
+    os.environ["BAT_FIXED_SEQUENCE_LENGTH"] = "false"
+    os.environ["BAT_MAX_SEQUENCE_LENGTH"] = str(MAX_LENGTH_CEILING)
     args = parse_args()
     os.environ["BAT_AUDIO_AUDIT"] = "1"
     BAT_TRAINING.validate()
@@ -357,6 +432,13 @@ def main() -> None:
 
     class AuditedDistributedSwiftSft(SwiftSft):
         def train(self, trainer):
+            cache_root = os.environ.get("BAT_LOCAL_ARROW_CACHE")
+            modelscope_cache = os.environ.get("MODELSCOPE_CACHE")
+            if not cache_root or not modelscope_cache:
+                raise RuntimeError("BAT_LOCAL_ARROW_CACHE and MODELSCOPE_CACHE are required for the resume smoke")
+            cache_audit = assert_local_arrow_cache(trainer.train_dataset, [cache_root, modelscope_cache])
+            if cache_audit.get("status") != "ok":
+                raise RuntimeError(f"Qwen3 resume smoke Arrow cache audit failed: {cache_audit}")
             model = trainer.model
             causal = find_module(model, "Qwen3ForCausalLM")
             qformer = find_trainable_module(model, "BATQFormer")
@@ -398,6 +480,7 @@ def main() -> None:
                 "forward": 0, "backward": 0, "layer_forward": 0, "layer_backward": 0,
                 "loss": None, "batch": None, "audio_batch": None, "gradient_audit": None,
                 "past_key_values_present": None, "audio_forward_audit": None,
+                "arrow_cache_audit": cache_audit,
             }
             handles: list[Any] = []
             if not args.torch_compile:
@@ -424,10 +507,9 @@ def main() -> None:
                     input_ids = inputs["input_ids"]
                     attention_mask = inputs["attention_mask"]
                     waveform = inputs.get("audio_waveforms")
-                    if shape_tuple(input_ids) != (args.per_device_batch_size, EXPECTED_SEQUENCE_LENGTH):
-                        raise RuntimeError(f"Unexpected Qwen3 local input shape: {shape_tuple(input_ids)}")
-                    if shape_tuple(labels) != shape_tuple(input_ids) or shape_tuple(attention_mask) != shape_tuple(input_ids):
-                        raise RuntimeError("Qwen3 DDP input/label/attention shapes are not aligned")
+                    dynamic_padding = audit_dynamic_padding(input_ids, labels, attention_mask)
+                    if input_ids.shape[0] != args.per_device_batch_size:
+                        raise RuntimeError(f"Unexpected Qwen3 local batch size: {shape_tuple(input_ids)}")
                     if shape_tuple(waveform) != (args.per_device_batch_size, 2, 320000):
                         raise RuntimeError(f"Unexpected Qwen3 local waveform shape: {shape_tuple(waveform)}")
                     if logits.ndim != 3 or tuple(logits.shape[:2]) != tuple(labels.shape):
@@ -544,6 +626,9 @@ def main() -> None:
                         "ddp_world_size_rescale": ddp_world_size_rescale,
                         "swift_reproduced_ce": swift_formula_value,
                         "loss_scale_binary_equivalent": loss_scale_binary_equivalent,
+                        "loss_scope": "assistant_response_only_via_labels_-100",
+                        "loss_scale_argument": "default",
+                        "dynamic_padding": dynamic_padding,
                         "trainer_ce": trainer_value,
                         "next_token_alignment": {
                             "logits_slice": "logits[:, :-1]",
@@ -623,6 +708,13 @@ def main() -> None:
                 try:
                     if sorted(int(item["rank"]) for item in reports) != list(range(EXPECTED_WORLD_SIZE)):
                         raise RuntimeError("Missing rank report")
+                    all_active_lengths = [
+                        int(value)
+                        for report_item in reports
+                        for value in report_item["forward_audit"]["batch"]["dynamic_padding"]["per_example_active_lengths"]
+                    ]
+                    if len(set(all_active_lengths)) < 2:
+                        raise RuntimeError("Dynamic padding was not observed across the global batch")
                     signatures = [
                         (item["parameters"]["trainable_parameter_counts"], item["lora"]["module_count"],
                          item["lora"]["rank"], tuple(item["lora"]["target_modules"]),

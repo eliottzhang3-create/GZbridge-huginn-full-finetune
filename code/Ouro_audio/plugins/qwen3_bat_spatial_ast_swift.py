@@ -72,6 +72,13 @@ QWEN3_HIDDEN_SIZE = 2560
 EXPECTED_QWEN3_LAYERS = 36
 EXPECTED_QWEN3_VOCAB_SIZE = 151936
 DEFAULT_TRAIN_SEQUENCE_LENGTH = 176
+
+
+def env_bool(name: str, default: bool) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 AUDIO_AUDIT_ENABLED = os.environ.get("BAT_AUDIO_AUDIT", "0") == "1"
 
 
@@ -417,6 +424,7 @@ class Qwen3BATTemplate(Template):
             env_path("BAT_REVERB_ROOT", DEFAULT_REVERB_ROOT),
         )
         self.audio_token_count = AUDIO_TOKEN_COUNT
+        self.fixed_sequence_length = env_bool("BAT_FIXED_SEQUENCE_LENGTH", True)
         self.train_sequence_length = int(
             os.environ.get("BAT_MAX_SEQUENCE_LENGTH", str(DEFAULT_TRAIN_SEQUENCE_LENGTH))
         )
@@ -467,7 +475,7 @@ class Qwen3BATTemplate(Template):
         training_mode = getattr(self, "mode", "train") == "train"
         valid_text_length = len(input_ids)
         pad_count = 0
-        if training_mode:
+        if training_mode and self.fixed_sequence_length:
             text_budget = self.train_sequence_length - self.audio_token_count
             if len(input_ids) > text_budget:
                 input_ids = input_ids[:text_budget]
@@ -482,20 +490,35 @@ class Qwen3BATTemplate(Template):
                 [1] * (self.audio_token_count + valid_text_length)
                 + [0] * pad_count
             )
+        elif training_mode:
+            text_budget = self.train_sequence_length - self.audio_token_count
+            if len(input_ids) > text_budget:
+                input_ids = input_ids[:text_budget]
+                if labels is not None:
+                    labels = labels[:text_budget]
+            valid_text_length = len(input_ids)
+            encoded["attention_mask"] = [1] * (self.audio_token_count + valid_text_length)
 
         waveform = self.audio_renderer.load_item(audios[0])
         encoded["input_ids"] = [int(dummy_id)] * self.audio_token_count + list(input_ids)
         if labels is not None:
             encoded["labels"] = [-100] * self.audio_token_count + list(labels)
         encoded["audio_waveform"] = waveform
+        encoded["bat_text_contract"] = {
+            "training_mode": training_mode,
+            "fixed_sequence_length": bool(self.fixed_sequence_length),
+            "natural_text_length": len(input_ids),
+            "audio_prefix_tokens": self.audio_token_count,
+            "pre_collation_sequence_length": len(encoded["input_ids"]),
+        }
         if AUDIO_AUDIT_ENABLED:
             encoded["bat_audio_record"] = dict(audios[0])
-            encoded["bat_text_contract"] = {
+            encoded["bat_text_contract"].update({
                 "training_mode": training_mode,
                 "valid_text_length": valid_text_length,
                 "padding_count": pad_count,
                 "total_sequence_length": len(encoded["input_ids"]),
-            }
+            })
         return encoded
 
     def _data_collator_mm_data(self, batch: list[dict[str, Any]]) -> dict[str, Any]:

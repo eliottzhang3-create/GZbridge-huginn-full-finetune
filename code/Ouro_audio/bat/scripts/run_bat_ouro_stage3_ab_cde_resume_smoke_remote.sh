@@ -16,6 +16,8 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-4}"
 export HF_HUB_OFFLINE=1
 export TRANSFORMERS_OFFLINE=1
 export TOKENIZERS_PARALLELISM=false
+export BAT_FIXED_SEQUENCE_LENGTH=false
+export BAT_MAX_SEQUENCE_LENGTH=512
 
 MODEL_PATH="${OURO_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B}"
 PLUGIN_PATH="${OURO_BAT_PLUGIN_PATH:-$REPO_ROOT/code/Ouro_audio/plugins/ouro_bat_spatial_ast_swift.py}"
@@ -25,6 +27,19 @@ SMOKE_MANIFEST="$ROOT_DIR/smoke_manifest_128.jsonl"
 TRAIN_DIR="$ROOT_DIR/train"
 FRESH_REPORT="$ROOT_DIR/fresh_report.json"
 RESUMED_REPORT="$ROOT_DIR/resumed_report.json"
+LOCAL_CACHE_ROOT="${BAT_LOCAL_CACHE_ROOT:-/tmp/bat_ouro_resume_arrow_cache_${USER:-user}_$$}"
+LOCAL_ARROW_CACHE="$LOCAL_CACHE_ROOT/datasets"
+LOCAL_MODELSCOPE_CACHE="$LOCAL_CACHE_ROOT/modelscope"
+PREWARM_REPORT="$ROOT_DIR/arrow_cache_prewarm.json"
+case "$LOCAL_CACHE_ROOT" in
+  /tmp/*) ;;
+  *) echo "Refusing non-local cache path: $LOCAL_CACHE_ROOT" >&2; exit 2;;
+esac
+export BAT_LOCAL_CACHE_ROOT="$LOCAL_CACHE_ROOT"
+export BAT_LOCAL_ARROW_CACHE="$LOCAL_ARROW_CACHE"
+export HF_DATASETS_CACHE="$LOCAL_ARROW_CACHE"
+export MODELSCOPE_CACHE="$LOCAL_MODELSCOPE_CACHE"
+export BAT_ARROW_PREWARM_REPORT="$PREWARM_REPORT"
 
 case "$ROOT_DIR" in
   /hpc_stor03/public|/hpc_stor03/public/*) echo "Refusing public output" >&2; exit 2;;
@@ -37,12 +52,18 @@ fi
 echo "========== BAT OURO STAGE-III SPATIAL-AST/CHECKPOINT/RESUME SMOKE =========="
 echo "[source-manifest] $SOURCE_MANIFEST"
 echo "[root] $ROOT_DIR"
-echo "[contract] world_size=8 per_device_batch_size=8 global_batch_size=64"
+echo "[contract] world_size=8 per_device_batch_size=8 global_batch_size=64 padding=dynamic_batch max_length_ceiling=512"
 
 python -u code/Ouro_audio/bat/scripts/prepare_bat_stage3_ab_cde_resume_manifest.py \
   --source-manifest "$SOURCE_MANIFEST" \
   --output "$SMOKE_MANIFEST" \
   --records-per-group 64
+
+mkdir -p "$LOCAL_ARROW_CACHE" "$LOCAL_MODELSCOPE_CACHE"
+python -u code/Ouro_audio/bat/scripts/prewarm_bat_arrow_cache.py \
+  --manifest "$SMOKE_MANIFEST" \
+  --cache-dir "$LOCAL_ARROW_CACHE" \
+  --report "$PREWARM_REPORT"
 
 torchrun --standalone --nproc_per_node=8 \
   code/Ouro_audio/bat/scripts/smoke_bat_ouro_stage3_ab_cde_resume.py \

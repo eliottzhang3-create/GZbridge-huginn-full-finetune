@@ -30,7 +30,10 @@ PER_DEVICE_BATCH_SIZE = 8
 WORLD_SIZE_REQUIRED = 8
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 0.002
-MAX_SEQUENCE_LENGTH = 176
+# Dynamic mode no longer uses the old 176-token BAT cap.  512 is only a
+# tokenizer/model safety ceiling; examples below it retain natural width and
+# the batch collator pads to the current batch's longest example.
+MAX_LENGTH_CEILING = 512
 EXPECTED_QWEN3_LAYERS = 36
 EXPECTED_LORA_TARGETS = ("q_proj", "v_proj")
 PERIODIC_SAVE_STEPS = 3_000
@@ -238,6 +241,10 @@ def ensure_final_checkpoint(trainer) -> Path:
 
 def main() -> None:
     args = parse_args()
+    # Make the formal dynamic-padding contract explicit in the Python entry
+    # point, not only in the shell wrapper.
+    os.environ["BAT_FIXED_SEQUENCE_LENGTH"] = "false"
+    os.environ["BAT_MAX_SEQUENCE_LENGTH"] = str(MAX_LENGTH_CEILING)
     validate_base_contract()
     actual_world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if args.world_size != WORLD_SIZE_REQUIRED or actual_world_size != WORLD_SIZE_REQUIRED:
@@ -378,7 +385,7 @@ def main() -> None:
         "--model", str(args.model_path), "--model_type", MODEL_TYPE, "--template", TEMPLATE_TYPE,
         "--external_plugins", str(args.plugin_path), "--dataset", str(args.dataset),
         "--split_dataset_ratio", "0", "--dataset_shuffle", "false", "--train_dataloader_shuffle", "false",
-        "--sortish_sampler", "false", "--group_by_length", "false", "--max_length", str(MAX_SEQUENCE_LENGTH),
+        "--sortish_sampler", "false", "--group_by_length", "false", "--max_length", str(MAX_LENGTH_CEILING),
         "--output_dir", str(args.output_dir), "--tuner_type", "lora", "--tuner_backend", "peft",
         "--target_modules", *EXPECTED_LORA_TARGETS, "--modules_to_save", "audio_qformer",
         "--freeze_llm", "true", "--freeze_vit", "true", "--freeze_aligner", "false",
@@ -413,7 +420,11 @@ def main() -> None:
         print(f"[smoke] BAT_MAX_STEPS_OVERRIDE={total_steps}; this is not a production run")
     print(f"[model] Qwen3-4B base; Spatial-AST frozen FP32; Q-Former trainable random init; Qwen3 native frozen")
     print(f"[lora] targets={EXPECTED_LORA_TARGETS} rank=8 alpha=32 dropout=0.05")
-    print(f"[audio] tokens=64 sequence_length={MAX_SEQUENCE_LENGTH} RIR=crop_or_zero_pad_to_2s")
+    print(
+        f"[audio] tokens=64 RIR=crop_or_zero_pad_to_2s "
+        f"padding=dynamic_batch max_length_ceiling={MAX_LENGTH_CEILING} "
+        f"fixed_sequence_length={os.environ['BAT_FIXED_SEQUENCE_LENGTH']}"
+    )
     print(
         f"[schedule] selected_manifest_epochs=[1] records={report['actual_training_schedule']['selected_record_count']} "
         f"learning_rate={LEARNING_RATE} warmup_steps={warmup_steps} scheduler=half-cycle cosine decay"
