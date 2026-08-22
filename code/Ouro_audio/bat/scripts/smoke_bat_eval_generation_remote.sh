@@ -15,7 +15,7 @@ AUDIO_ROOT="${BAT_EVAL_AUDIO_ROOT:-/hpc_stor03/public/shared/data/raa/AudioSet}"
 REVERB_ROOT="${BAT_EVAL_REVERB_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/SpatialSoundQA/mp3d_reverb}"
 SPATIAL_AST_ROOT="${BAT_EVAL_SPATIAL_AST_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang/code/Spatial-AST}"
 SPATIAL_AST_CHECKPOINT="${BAT_EVAL_SPATIAL_AST_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/models/BAT/SpatialAST/finetuned.pth}"
-QFORMER_SOURCE="${BAT_EVAL_QFORMER_SOURCE:-$ROOT/code/OWL/src/slam_llm/models/projector.py}"
+QFORMER_SOURCE="${BAT_EVAL_QFORMER_SOURCE:-/hpc_stor03/sjtu_home/jinwei.zhang/code/OWL/src/slam_llm/models/projector.py}"
 
 if [ "$MODEL_KIND" = "ouro" ]; then
   MODEL_PATH="${BAT_EVAL_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B}"
