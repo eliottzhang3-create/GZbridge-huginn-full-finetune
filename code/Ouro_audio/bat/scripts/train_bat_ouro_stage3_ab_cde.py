@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Train Ouro on the custom two-epoch Stage-III A+B -> C+D+E route.
+"""Train one epoch of the custom Stage-III A+B -> C+D+E route.
 
 This Ouro-only entry point uses a simple native Trainer checkpoint policy:
 save a full resumable checkpoint every ``PERIODIC_SAVE_STEPS`` optimizer
 steps and retain at most ``MAX_PERIODIC_CHECKPOINTS`` checkpoints.  The
-Qwen3 entry point has its own implementation and is not modified here.
+The supplied manifest contains two ordered epochs; this entry point selects
+only the first epoch by deriving ``max_steps`` from its two manifest blocks.
 """
 
 from __future__ import annotations
@@ -29,9 +30,10 @@ WORLD_SIZE_REQUIRED = 8
 GRADIENT_ACCUMULATION_STEPS = 1
 LEARNING_RATE = 0.002
 MAX_SEQUENCE_LENGTH = 176
-PERIODIC_SAVE_STEPS = 3_500
-MAX_PERIODIC_CHECKPOINTS = 4
+PERIODIC_SAVE_STEPS = 3_000
+MAX_PERIODIC_CHECKPOINTS = 2
 WARMUP_RATIO = 0.13
+LOSS_SCALE = "default"
 
 
 def parse_args() -> argparse.Namespace:
@@ -106,19 +108,25 @@ def load_and_validate_report(path: Path, global_batch_size: int) -> dict[str, An
     if previous_record % global_batch_size:
         raise ValueError(f"Manifest records are not divisible by actual global batch: {previous_record}/{global_batch_size}")
 
-    actual_step = 0
-    actual_boundaries: dict[str, int] = {}
-    for item in blocks:
-        actual_step += int(item["written_records"]) // global_batch_size
-        if str(item["group"]) == "C+D+E":
-            actual_boundaries[str(int(item["epoch"]))] = actual_step
-    if set(actual_boundaries) != {"1", "2"}:
-        raise ValueError(f"Unable to compute actual epoch boundaries: {actual_boundaries}")
+    first_epoch_blocks = [item for item in blocks if int(item["epoch"]) == 1]
+    if len(first_epoch_blocks) != 2 or [str(item["group"]) for item in first_epoch_blocks] != ["A+B", "C+D+E"]:
+        raise ValueError(f"Unable to identify the first A+B -> C+D+E epoch: {first_epoch_blocks}")
+    first_epoch_records = sum(int(item["written_records"]) for item in first_epoch_blocks)
+    first_epoch_steps = first_epoch_records // global_batch_size
+    if first_epoch_steps <= 0:
+        raise ValueError(f"First epoch has no optimizer steps: records={first_epoch_records}")
+    first_epoch_boundaries = {
+        "A+B": int(first_epoch_blocks[0]["written_records"]) // global_batch_size,
+        "C+D+E": first_epoch_steps,
+    }
     report["actual_training_schedule"] = {
         "global_batch_size": global_batch_size,
-        "total_steps": actual_step,
-        "warmup_steps": int(math.ceil(actual_step * WARMUP_RATIO)),
-        "epoch_boundary_steps": actual_boundaries,
+        "selected_manifest_epochs": [1],
+        "selected_record_count": first_epoch_records,
+        "total_manifest_record_count": int(report["total_records"]),
+        "total_steps": first_epoch_steps,
+        "warmup_steps": int(math.ceil(first_epoch_steps * WARMUP_RATIO)),
+        "epoch_boundary_steps": first_epoch_boundaries,
         "route_report_global_batch_size": int(report["global_batch_size"]),
         "route_report_learning_rate": report.get("learning_rate"),
     }
@@ -322,7 +330,8 @@ def main() -> None:
         "--remove_unused_columns", "false", "--dataloader_num_workers", "0",
         "--dataloader_pin_memory", "false", "--dataloader_drop_last", "false",
         "--dataset_num_proc", "1", "--lazy_tokenize", "true", "--load_from_cache_file", "false",
-        "--loss_scale", "all", "--seed", "42", "--data_seed", "42", "--optim", "adamw_torch",
+        "--loss_scale", LOSS_SCALE, "--is_binary_loss_scale", "true",
+        "--seed", "42", "--data_seed", "42", "--optim", "adamw_torch",
         "--adam_beta1", str(BAT_TRAINING.beta1), "--adam_beta2", str(BAT_TRAINING.beta2),
         "--weight_decay", str(BAT_TRAINING.weight_decay), "--attn_impl", "sdpa", "--bf16", "true",
         "--ddp_find_unused_parameters", "false", "--average_tokens_across_devices", "false", "--report_to", "none",
@@ -338,7 +347,11 @@ def main() -> None:
     )
     if override_text:
         print(f"[smoke] BAT_MAX_STEPS_OVERRIDE={total_steps}; this is not a production run")
-    print(f"[schedule] learning_rate={LEARNING_RATE} warmup_steps={warmup_steps} scheduler=half-cycle cosine decay")
+    print(
+        f"[schedule] selected_manifest_epochs=[1] records={report['actual_training_schedule']['selected_record_count']} "
+        f"learning_rate={LEARNING_RATE} warmup_steps={warmup_steps} scheduler=half-cycle cosine decay"
+    )
+    print(f"[loss] loss_scale={LOSS_SCALE}; user/system/multimodal prompt tokens masked, assistant response only")
     print(
         f"[checkpoint] native_save_strategy=steps save_steps={PERIODIC_SAVE_STEPS} "
         f"save_total_limit={MAX_PERIODIC_CHECKPOINTS} full_resumable=true"
