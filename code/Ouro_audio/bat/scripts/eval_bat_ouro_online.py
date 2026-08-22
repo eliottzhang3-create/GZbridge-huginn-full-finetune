@@ -21,6 +21,7 @@ from __future__ import annotations
 import argparse
 import atexit
 import csv
+import faulthandler
 import gc
 import importlib.metadata
 import importlib.util
@@ -692,6 +693,26 @@ def main() -> None:
         rir_policy=args.rir_policy,
     )
 
+    faulthandler_path = output_jsonl.with_name(output_jsonl.name + ".faulthandler.log")
+    faulthandler_handle = None
+    try:
+        faulthandler_path.parent.mkdir(parents=True, exist_ok=True)
+        faulthandler_handle = faulthandler_path.open("a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=faulthandler_handle, all_threads=True)
+        heartbeat.write(
+            status="starting",
+            event="faulthandler_enabled",
+            phase="startup",
+            faulthandler=str(faulthandler_path),
+        )
+    except Exception as exc:
+        heartbeat.write(
+            status="starting",
+            event="faulthandler_enable_failed",
+            phase="startup",
+            error=f"{type(exc).__name__}: {exc}",
+        )
+
     def mark_unfinished_exit() -> None:
         if not heartbeat.finished:
             heartbeat.write(
@@ -718,10 +739,19 @@ def main() -> None:
             "embedding_space=model_lm_head_token_rows pooling=mean_then_l2"
         )
     load_started = time.perf_counter()
+    heartbeat.write(status="starting", event="import_swift_start", phase="import_swift")
     try:
         from swift import get_model_processor
     except ImportError:
         from swift.model import get_model_processor
+    heartbeat.write(status="starting", event="import_swift_done", phase="import_swift")
+    heartbeat.write(
+        status="starting",
+        event="base_model_load_start",
+        phase="base_model_load",
+        model_path=str(args.model_path.resolve()),
+        device=str(device),
+    )
     base_model, processor = get_model_processor(
         str(args.model_path.resolve()),
         model_type=settings["model_type"],
@@ -732,16 +762,49 @@ def main() -> None:
         attn_impl="sdpa",
         model_kwargs={"local_files_only": True, "low_cpu_mem_usage": True},
     )
+    heartbeat.write(
+        status="starting",
+        event="base_model_load_done",
+        phase="base_model_load",
+        base_model_class=base_model.__class__.__name__,
+        runtime=_runtime_snapshot(device),
+    )
+    heartbeat.write(
+        status="starting",
+        event="adapter_load_start",
+        phase="adapter_load",
+        checkpoint=str(args.checkpoint.resolve()),
+    )
     model = load_adapter(base_model, args.checkpoint)
+    heartbeat.write(
+        status="starting",
+        event="adapter_load_done",
+        phase="adapter_load",
+        model_class=model.__class__.__name__,
+        runtime=_runtime_snapshot(device),
+    )
     freeze_for_evaluation(model)
     model.eval()
+    heartbeat.write(status="starting", event="freeze_eval_done", phase="freeze_eval")
+    heartbeat.write(status="starting", event="template_load_start", phase="template_load")
     template = load_template(base_model, processor)
+    heartbeat.write(status="starting", event="template_load_done", phase="template_load")
+    heartbeat.write(status="starting", event="tokenizer_load_start", phase="tokenizer_load")
     tokenizer = tokenizer_from_processor(processor)
+    heartbeat.write(status="starting", event="tokenizer_load_done", phase="tokenizer_load")
+    heartbeat.write(status="starting", event="renderer_init_start", phase="renderer_init")
     renderer = BATEvalAudioRenderer(args.audio_root, args.reverb_root, args.rir_policy)
+    heartbeat.write(status="starting", event="renderer_init_done", phase="renderer_init")
+    heartbeat.write(status="starting", event="contract_check_start", phase="contract_check")
     from bat.scripts.smoke_bat_eval_generation import parameter_contract
     contract = parameter_contract(model, "ouro")
+    heartbeat.write(status="starting", event="contract_check_done", phase="contract_check", model_contract=contract)
+    heartbeat.write(status="starting", event="scorer_init_start", phase="scorer_init")
     detection = DetectionScorer(args, model, tokenizer) if args.eval_type in {"A", "C"} else None
+    heartbeat.write(status="starting", event="scorer_init_done", phase="scorer_init")
+    heartbeat.write(status="starting", event="cuda_sync_start", phase="cuda_sync")
     torch.cuda.synchronize(device)
+    heartbeat.write(status="starting", event="cuda_sync_done", phase="cuda_sync")
     load_seconds = time.perf_counter() - load_started
     heartbeat.write(
         status="running",
@@ -1119,6 +1182,7 @@ def main() -> None:
             "jsonl": str(output_jsonl),
             "progress": str(progress_path.resolve()),
             "heartbeat": str(heartbeat_path.resolve()),
+            "faulthandler": str(faulthandler_path.resolve()),
             "report": str(args.output_report.resolve()),
         },
         "errors": errors[:100],
@@ -1141,6 +1205,9 @@ def main() -> None:
         report_status=report["status"],
     )
     heartbeat.mark_finished()
+    if faulthandler_handle is not None:
+        faulthandler.disable()
+        faulthandler_handle.close()
     print(f"[report] {args.output_report}")
     print(f"[jsonl] {output_jsonl}")
     print(f"[status] {report['status']} metrics={json.dumps(metrics, ensure_ascii=False)}")

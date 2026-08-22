@@ -15,6 +15,7 @@ export PYTHONPATH="${REPO}/code/Ouro_audio:${PYTHONPATH:-}"
 export PYTHONUNBUFFERED=1 PYTHONFAULTHANDLER=1
 export OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
+export TORCH_SHOW_CPP_STACKTRACES="${TORCH_SHOW_CPP_STACKTRACES:-1}"
 
 MODEL_PATH=${BAT_EVAL_MODEL_PATH:-/hpc_stor03/sjtu_home/jinwei.zhang/models/Ouro-1.4B}
 CHECKPOINT=${BAT_EVAL_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/outputs/ouro/bat/stage3_ab_cde_localcache_0819_v2/v0-20260819-120617/checkpoint-10500}
@@ -25,6 +26,21 @@ SPATIAL_AST_ROOT=${BAT_EVAL_SPATIAL_AST_ROOT:-/hpc_stor03/sjtu_home/jinwei.zhang
 SPATIAL_AST_CHECKPOINT=${BAT_EVAL_SPATIAL_AST_CHECKPOINT:-/hpc_stor03/sjtu_home/jinwei.zhang/models/BAT/SpatialAST/finetuned.pth}
 QFORMER_SOURCE=${BAT_EVAL_QFORMER_SOURCE:-/hpc_stor03/sjtu_home/jinwei.zhang/code/OWL/src/slam_llm/models/projector.py}
 LABEL_CSV=${BAT_EVAL_LABEL_CSV:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/SpatialSoundQA/class_labels_indices_subset.csv}
+LAUNCHER_STATUS="${BAT_EVAL_LAUNCHER_STATUS:-${BAT_EVAL_OUTPUT_REPORT}.launcher_status.txt}"
+
+write_launcher_status() {
+  local code="$?"
+  {
+    echo "exit_code=${code}"
+    echo "hostname=$(hostname)"
+    echo "pid=$$"
+    echo "updated_unix=$(date +%s)"
+    echo "heartbeat=${BAT_EVAL_OUTPUT_JSONL}.heartbeat.json"
+    echo "faulthandler=${BAT_EVAL_OUTPUT_JSONL}.faulthandler.log"
+  } > "${LAUNCHER_STATUS}"
+  return "${code}"
+}
+trap write_launcher_status EXIT
 
 ARGS=(
   --eval-type "${BAT_EVAL_TYPE}"
@@ -63,4 +79,4 @@ if [[ "${BAT_EVAL_OVERWRITE:-0}" == "1" ]]; then
 fi
 
 cd "${REPO}"
-exec "${PYTHON}" -u code/Ouro_audio/bat/scripts/eval_bat_ouro_online.py "${ARGS[@]}"
+"${PYTHON}" -u code/Ouro_audio/bat/scripts/eval_bat_ouro_online.py "${ARGS[@]}"
