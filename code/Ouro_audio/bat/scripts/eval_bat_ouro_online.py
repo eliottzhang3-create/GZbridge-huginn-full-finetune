@@ -288,6 +288,16 @@ def fail_if_public(path: Path) -> None:
     normalized = str(path.expanduser()).replace("\\", "/")
     if not path.is_absolute() or normalized.startswith("/hpc_stor03/public"):
         raise ValueError(f"Output must be an absolute private path: {path}")
+    # A path such as ``/A.jsonl`` is absolute but is not a usable private
+    # evaluation output on the HPC container.  Catch an unset shell variable
+    # before loading the multi-shard model (otherwise the failure appears only
+    # after the expensive startup phase).
+    if path.parent == Path("/"):
+        raise ValueError(
+            f"Output path resolves directly under the filesystem root: {path}. "
+            "Define BAT_EVAL_OUTPUT_JSONL/BAT_EVAL_OUTPUT_REPORT with a private "
+            "directory, for example /hpc_stor03/sjtu_home/<user>/outputs/..."
+        )
 
 
 def import_plugin(path: Path) -> ModuleType:

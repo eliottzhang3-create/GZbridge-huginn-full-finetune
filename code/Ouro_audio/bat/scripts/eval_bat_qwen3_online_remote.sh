@@ -33,6 +33,20 @@ QFORMER_SOURCE=${BAT_EVAL_QFORMER_SOURCE:-/hpc_stor03/sjtu_home/jinwei.zhang/cod
 LABEL_CSV=${BAT_EVAL_LABEL_CSV:-/hpc_stor03/sjtu_home/jinwei.zhang/data/BAT/SpatialSoundQA/class_labels_indices_subset.csv}
 LAUNCHER_STATUS="${BAT_EVAL_LAUNCHER_STATUS:-${BAT_EVAL_OUTPUT_REPORT}.launcher_status.txt}"
 
+validate_output_path() {
+  local path="$1" name="$2"
+  if [[ "$(dirname -- "$path")" == "/" ]]; then
+    echo "${name} resolves to ${path}; define it under a private output directory (for example /hpc_stor03/sjtu_home/<user>/outputs/...)" >&2
+    exit 2
+  fi
+  if [[ "$path" == /hpc_stor03/public/* ]]; then
+    echo "${name} must not use /hpc_stor03/public: ${path}" >&2
+    exit 2
+  fi
+}
+validate_output_path "${BAT_EVAL_OUTPUT_JSONL}" BAT_EVAL_OUTPUT_JSONL
+validate_output_path "${BAT_EVAL_OUTPUT_REPORT}" BAT_EVAL_OUTPUT_REPORT
+
 write_launcher_status() {
   local code="$?"
   {

@@ -10,6 +10,11 @@ case "${BAT_EVAL_TYPE}" in
   *) echo "Qwen3 evaluator only supports A/B/C/D; refusing ${BAT_EVAL_TYPE}" >&2; exit 2 ;;
 esac
 
+if [[ "$(dirname -- "$BAT_EVAL_OUTPUT_JSONL")" == "/" || "$(dirname -- "$BAT_EVAL_OUTPUT_REPORT")" == "/" ]]; then
+  echo "Qwen3 evaluation outputs must be under a private directory; got JSONL=${BAT_EVAL_OUTPUT_JSONL} REPORT=${BAT_EVAL_OUTPUT_REPORT}" >&2
+  exit 2
+fi
+
 REPO=/hpc_stor03/sjtu_home/jinwei.zhang/code/GZbridge-huginn-full-finetune
 STAMP=$(date +%m%d%H%M)
 JOB_NAME="bat-qwen3-eval-${BAT_EVAL_TYPE}-${STAMP}"
